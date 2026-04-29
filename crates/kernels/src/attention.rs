@@ -46,4 +46,3 @@ pub struct AttentionDecodeSpec {
     pub output_bf16: DevicePtr,
     pub shape: AttentionShape,
 }
-

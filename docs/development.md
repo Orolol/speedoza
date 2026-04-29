@@ -19,6 +19,7 @@ export QWEN36_FP4_KERNEL_LIB_DIR="$PWD/target/cuda"
 export LD_LIBRARY_PATH="$QWEN36_FP4_KERNEL_LIB_DIR:${LD_LIBRARY_PATH:-}"
 ./scripts/smoke_cuda.sh
 cargo test --workspace --features qwen36-fp4-kernels/cuda
+cargo clippy --workspace --features qwen36-fp4-kernels/cuda -- -D warnings
 ```
 
 ## Kernel Development Loop
@@ -65,6 +66,7 @@ Correctness comes first. For each hot-path optimization, capture:
 - `cargo test --workspace`
 - `./scripts/build_cuda.sh`
 - `./scripts/smoke_cuda.sh`
+- `cargo test --workspace --features qwen36-fp4-kernels/cuda`
+- `cargo clippy --workspace --features qwen36-fp4-kernels/cuda -- -D warnings`
 - `model_layout.json` regenerated if model metadata logic changed
 - docs updated if commands, environment variables, or ABI changed
-

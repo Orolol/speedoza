@@ -114,7 +114,7 @@ python3 -m pip install --user -U "huggingface_hub[cli]"
 If the model requires authentication:
 
 ```bash
-huggingface-cli login
+hf auth login
 ```
 
 Download:
@@ -123,9 +123,8 @@ Download:
 MODEL_DIR=/models/Qwen3.6-27B-Text-NVFP4-MTP
 mkdir -p "$MODEL_DIR"
 
-huggingface-cli download sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP \
-  --local-dir "$MODEL_DIR" \
-  --local-dir-use-symlinks False
+hf download sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP \
+  --local-dir "$MODEL_DIR"
 ```
 
 ## First Commands
@@ -142,6 +141,20 @@ Generate model metadata:
 cargo run -p qwen36-fp4 -- discover \
   --model-dir "$MODEL_DIR" \
   --output model_layout.json
+```
+
+Validate weight bindings against the checkpoint:
+
+```bash
+cargo run -p qwen36-fp4 -- validate-weights --model-dir "$MODEL_DIR"
+```
+
+Validate CUDA runtime allocation and upload with the real checkpoint:
+
+```bash
+cargo run -p qwen36-fp4 --features cuda -- gpu-load \
+  --model-dir "$MODEL_DIR" \
+  --max-context 2256
 ```
 
 Estimate KV/state budget:
@@ -169,4 +182,3 @@ export QWEN36_FP4_KERNEL_LIB_DIR="$PWD/target/cuda"
 export LD_LIBRARY_PATH="$QWEN36_FP4_KERNEL_LIB_DIR:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 export QWEN36_FP4_SM=120
 ```
-

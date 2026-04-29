@@ -107,7 +107,10 @@ mod tests {
             parse_layer_index("model.language_model.layers.63.self_attn.q_proj.weight"),
             Some(63)
         );
-        assert_eq!(parse_layer_index("mtp.layers.0.self_attn.q_proj.weight"), None);
+        assert_eq!(
+            parse_layer_index("mtp.layers.0.self_attn.q_proj.weight"),
+            None
+        );
         assert_eq!(parse_layer_index("lm_head.weight"), None);
     }
 }

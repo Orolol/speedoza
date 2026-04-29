@@ -21,4 +21,3 @@ pub fn greedy_argmax(logits: &[f32]) -> Option<u32> {
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(idx, _)| idx as u32)
 }
-

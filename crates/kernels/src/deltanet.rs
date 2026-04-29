@@ -51,7 +51,10 @@ pub struct DeltaNetDecodeSpec {
     pub state_bf16: DevicePtr,
     pub conv_history_bf16: DevicePtr,
     pub output_bf16: DevicePtr,
+    pub gate_f32: DevicePtr,
+    pub beta_f32: DevicePtr,
     pub shape: DeltaNetShape,
     pub state_decay: f32,
     pub update_scale: f32,
+    pub qk_l2norm: bool,
 }

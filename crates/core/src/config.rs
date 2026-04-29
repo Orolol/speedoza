@@ -2,8 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 
-pub const QWEN36_TEXT_NVFP4_MTP_MODEL_ID: &str =
-    "sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP";
+pub const QWEN36_TEXT_NVFP4_MTP_MODEL_ID: &str = "sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HuggingFaceConfig {
@@ -126,9 +125,9 @@ impl TryFrom<&HuggingFaceConfig> for ModelTopology {
             attention_num_heads: required("num_attention_heads", cfg.num_attention_heads)?,
             attention_num_kv_heads: required("num_key_value_heads", cfg.num_key_value_heads)?,
             attention_head_dim: required("head_dim", cfg.head_dim)?,
-            partial_rotary_factor: cfg.partial_rotary_factor.unwrap_or_else(|| {
-                rope.and_then(|r| r.partial_rotary_factor).unwrap_or(0.25)
-            }),
+            partial_rotary_factor: cfg
+                .partial_rotary_factor
+                .unwrap_or_else(|| rope.and_then(|r| r.partial_rotary_factor).unwrap_or(0.25)),
             linear_num_key_heads: required("linear_num_key_heads", cfg.linear_num_key_heads)?,
             linear_num_value_heads: required("linear_num_value_heads", cfg.linear_num_value_heads)?,
             linear_key_head_dim: required("linear_key_head_dim", cfg.linear_key_head_dim)?,
@@ -244,6 +243,27 @@ impl ModelTopology {
         (self.attention_head_dim as f32 * self.partial_rotary_factor).round() as usize
     }
 
+    pub fn linear_attention_qkv_dim(&self) -> usize {
+        self.linear_num_key_heads * self.linear_key_head_dim * 2
+            + self.linear_num_value_heads * self.linear_value_head_dim
+    }
+
+    pub fn linear_attention_value_dim(&self) -> usize {
+        self.linear_num_value_heads * self.linear_value_head_dim
+    }
+
+    pub fn full_attention_q_dim_with_gate(&self) -> usize {
+        self.attention_num_heads * self.attention_head_dim * 2
+    }
+
+    pub fn full_attention_q_dim(&self) -> usize {
+        self.attention_num_heads * self.attention_head_dim
+    }
+
+    pub fn full_attention_kv_dim(&self) -> usize {
+        self.attention_num_kv_heads * self.attention_head_dim
+    }
+
     pub fn deltanet_state_bytes(&self) -> usize {
         self.linear_attention_layers().len()
             * self.linear_num_value_heads
@@ -277,4 +297,3 @@ mod tests {
         assert_eq!(topology.deltanet_state_bytes(), 75_497_472);
     }
 }
-

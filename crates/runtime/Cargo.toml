@@ -9,9 +9,14 @@ license.workspace = true
 name = "qwen36_fp4_runtime"
 path = "src/lib.rs"
 
+[features]
+default = []
+cuda = ["qwen36-fp4-kernels/cuda", "qwen36-fp4-loader"]
+
 [dependencies]
 qwen36-fp4-core = { path = "../core" }
 qwen36-fp4-kernels = { path = "../kernels" }
+qwen36-fp4-loader = { path = "../loader", optional = true }
+anyhow.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-

@@ -1,14 +1,16 @@
+#[cfg(feature = "cuda")]
+use std::io::{self, Write};
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(not(feature = "cuda"))]
+use anyhow::bail;
 use clap::{Parser, Subcommand, ValueEnum};
-use qwen36_fp4_core::{
-    KvCacheDtype, MemoryBudget, ModelTopology, QWEN36_TEXT_NVFP4_MTP_MODEL_ID,
-};
+use qwen36_fp4_core::{KvCacheDtype, MemoryBudget, ModelTopology, QWEN36_TEXT_NVFP4_MTP_MODEL_ID};
 use qwen36_fp4_loader::{
-    discover_model_layout_with_id, read_topology, write_model_layout_json,
+    MappedModel, discover_model_layout_with_id, read_topology, write_model_layout_json,
 };
-use qwen36_fp4_runtime::{Engine, EngineConfig};
+use qwen36_fp4_runtime::{Engine, EngineConfig, LayerWeights, ModelWeightsManifest};
 use qwen36_fp4_tokenizer::{ChatMessage, QwenTokenizer};
 
 #[derive(Debug, Parser)]
@@ -46,6 +48,16 @@ enum Command {
         text: String,
         #[arg(long, default_value_t = false)]
         add_special_tokens: bool,
+    },
+    ValidateWeights {
+        #[arg(long)]
+        model_dir: PathBuf,
+    },
+    GpuLoad {
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 2256)]
+        max_context: usize,
     },
     Chat {
         #[arg(long)]
@@ -113,32 +125,201 @@ fn main() -> Result<()> {
             let tokens = tokenizer.encode(&text, add_special_tokens)?;
             println!("{}", serde_json::to_string(&tokens)?);
         }
+        Command::ValidateWeights { model_dir } => {
+            let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+            let manifest = ModelWeightsManifest::from_layout(&layout)?;
+            let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
+            let sampled_tensors = sample_weight_tensors(&mapped_model, &manifest)?;
+            let full_attention_layers = manifest
+                .layers
+                .iter()
+                .filter(|layer| matches!(layer, LayerWeights::FullAttention(_)))
+                .count();
+            let linear_attention_layers = manifest.layers.len() - full_attention_layers;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "layers": manifest.layers.len(),
+                    "full_attention_layers": full_attention_layers,
+                    "linear_attention_layers": linear_attention_layers,
+                    "mtp_tensors": manifest.mtp_tensors.len(),
+                    "embed_tokens": manifest.embed_tokens.name,
+                    "final_norm": manifest.final_norm.name,
+                    "lm_head": manifest.lm_head.name,
+                    "sampled_tensors": sampled_tensors,
+                }))?
+            );
+        }
+        Command::GpuLoad {
+            model_dir,
+            max_context,
+        } => {
+            gpu_load(model_dir, max_context)?;
+        }
         Command::Chat {
             model_dir,
             prompt,
             max_new_tokens,
             mtp_speculative_tokens,
         } => {
-            let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
-            let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
-            let messages = vec![ChatMessage {
-                role: "user".to_owned(),
-                content: prompt,
-            }];
-            let prompt_tokens = tokenizer.encode_chat(&messages, true)?;
-            let config = EngineConfig {
-                mtp_speculative_tokens,
-                ..EngineConfig::default()
-            };
-            let mut engine = Engine::no_cuda(&layout, config);
-            let _ = max_new_tokens;
-            if let Err(err) = engine.prefill(&prompt_tokens) {
-                bail!(
-                    "CUDA backend is not linked; prefill/decode cannot run with backend {}: {err}",
-                    engine.backend_name()
-                );
-            }
+            run_chat(model_dir, prompt, max_new_tokens, mtp_speculative_tokens)?;
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_chat(
+    model_dir: PathBuf,
+    prompt: String,
+    max_new_tokens: usize,
+    mtp_speculative_tokens: usize,
+) -> Result<()> {
+    let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+    let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
+    let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
+    let messages = vec![ChatMessage {
+        role: "user".to_owned(),
+        content: prompt,
+    }];
+    let prompt_tokens = tokenizer.encode_chat(&messages, true)?;
+    let config = EngineConfig {
+        max_context: prompt_tokens.len().saturating_add(max_new_tokens).max(1),
+        kv_cache_dtype: KvCacheDtype::Bf16,
+        mtp_speculative_tokens,
+        ..EngineConfig::default()
+    };
+    let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, config)?;
+    engine.prefill(&prompt_tokens)?;
+
+    let mut generated = Vec::new();
+    for idx in 0..max_new_tokens {
+        let token = engine.sample_greedy()?;
+        generated.push(token);
+        let text = tokenizer.decode(&[token], true)?;
+        print!("{text}");
+        io::stdout().flush()?;
+        if token == 248044 {
+            break;
+        }
+        if idx + 1 < max_new_tokens {
+            engine.decode_one(token)?;
+        }
+    }
+    println!();
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn run_chat(
+    model_dir: PathBuf,
+    prompt: String,
+    max_new_tokens: usize,
+    mtp_speculative_tokens: usize,
+) -> Result<()> {
+    let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+    let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
+    let messages = vec![ChatMessage {
+        role: "user".to_owned(),
+        content: prompt,
+    }];
+    let prompt_tokens = tokenizer.encode_chat(&messages, true)?;
+    let config = EngineConfig {
+        mtp_speculative_tokens,
+        ..EngineConfig::default()
+    };
+    let mut engine = Engine::no_cuda_with_weights(&layout, config)?;
+    let _ = max_new_tokens;
+    if let Err(err) = engine.prefill(&prompt_tokens) {
+        bail!(
+            "CUDA backend is not linked; prefill/decode cannot run with backend {}: {err}",
+            engine.backend_name()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn gpu_load(model_dir: PathBuf, max_context: usize) -> Result<()> {
+    let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+    let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
+    let config = EngineConfig {
+        max_context,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::cuda_with_mapped_weights(&mapped_model, config)?;
+    let (gpu_tensors, gpu_weight_bytes) = engine
+        .gpu_weight_summary()
+        .ok_or_else(|| anyhow::anyhow!("CUDA engine did not expose uploaded weights"))?;
+    let gpu_buffer_bytes = engine
+        .gpu_buffer_bytes()
+        .ok_or_else(|| anyhow::anyhow!("CUDA engine did not expose runtime buffers"))?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "backend": engine.backend_name(),
+            "max_context": engine.config.max_context,
+            "gpu_tensors": gpu_tensors,
+            "gpu_weight_bytes": gpu_weight_bytes,
+            "gpu_weight_gib": bytes_to_gib(gpu_weight_bytes),
+            "gpu_runtime_buffer_bytes": gpu_buffer_bytes,
+            "gpu_runtime_buffer_gib": bytes_to_gib(gpu_buffer_bytes),
+        }))?
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn gpu_load(_model_dir: PathBuf, _max_context: usize) -> Result<()> {
+    bail!("gpu-load requires rebuilding qwen36 with --features cuda and the CUDA shared library")
+}
+
+#[cfg(feature = "cuda")]
+fn bytes_to_gib(bytes: u64) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0 / 1024.0
+}
+
+fn sample_weight_tensors(
+    model: &MappedModel,
+    manifest: &ModelWeightsManifest,
+) -> Result<Vec<serde_json::Value>> {
+    representative_weight_names(manifest)
+        .into_iter()
+        .map(|name| {
+            let tensor_name = name.clone();
+            model.with_tensor(&name, |tensor| {
+                Ok(serde_json::json!({
+                    "name": tensor_name,
+                    "dtype": format!("{:?}", tensor.dtype()),
+                    "shape": tensor.shape().to_vec(),
+                    "size_bytes": tensor.data().len(),
+                }))
+            })
+        })
+        .collect()
+}
+
+fn representative_weight_names(manifest: &ModelWeightsManifest) -> Vec<String> {
+    let mut names = vec![
+        manifest.embed_tokens.name.clone(),
+        manifest.final_norm.name.clone(),
+        manifest.lm_head.name.clone(),
+    ];
+    if let Some(layer) = manifest.layers.first() {
+        match layer {
+            LayerWeights::LinearAttention(layer) => {
+                names.push(layer.in_proj_qkv.weight().name.clone());
+                names.push(layer.conv1d_weight.name.clone());
+            }
+            LayerWeights::FullAttention(layer) => {
+                names.push(layer.q_proj.weight().name.clone());
+                names.push(layer.k_norm.name.clone());
+            }
+        }
+    }
+    if let Some(tensor) = manifest.mtp_tensors.first() {
+        names.push(tensor.name.clone());
+    }
+    names
 }

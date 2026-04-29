@@ -53,4 +53,3 @@ pub enum QuantStorage {
     Fp32Scale,
     Other,
 }
-

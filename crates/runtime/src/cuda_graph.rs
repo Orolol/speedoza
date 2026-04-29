@@ -29,4 +29,3 @@ impl CudaGraphPlan {
             .find(|bucket| context <= bucket.max_context)
     }
 }
-

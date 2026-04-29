@@ -10,6 +10,6 @@ pub struct RmsNormSpec {
     pub input_bf16: DevicePtr,
     pub weight_bf16: DevicePtr,
     pub residual_bf16: DevicePtr,
+    pub residual_out_bf16: DevicePtr,
     pub output_bf16: DevicePtr,
 }
-

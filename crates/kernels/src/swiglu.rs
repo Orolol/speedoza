@@ -10,4 +10,3 @@ pub struct SwiGluSpec {
     pub up_bf16: DevicePtr,
     pub output_bf16: DevicePtr,
 }
-

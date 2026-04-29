@@ -3,8 +3,10 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <vector>
 
 namespace {
@@ -46,6 +48,51 @@ void copy_bf16(qwen36_device_ptr_t dst, const std::vector<float> &src) {
       cudaMemcpy(reinterpret_cast<void *>(dst.ptr), tmp.data(),
                  tmp.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice),
       "cudaMemcpy H2D");
+}
+
+template <typename T>
+void copy_raw(qwen36_device_ptr_t dst, const std::vector<T> &src) {
+  must_cuda<T>(
+      cudaMemcpy(reinterpret_cast<void *>(dst.ptr), src.data(),
+                 src.size() * sizeof(T), cudaMemcpyHostToDevice),
+      "cudaMemcpy H2D");
+}
+
+std::vector<float> read_bf16(qwen36_device_ptr_t src, size_t count) {
+  std::vector<__nv_bfloat16> tmp(count);
+  must_cuda<__nv_bfloat16>(
+      cudaMemcpy(tmp.data(), reinterpret_cast<void *>(src.ptr),
+                 tmp.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost),
+      "cudaMemcpy D2H");
+  std::vector<float> out(count);
+  for (size_t i = 0; i < count; ++i) {
+    out[i] = __bfloat162float(tmp[i]);
+  }
+  return out;
+}
+
+template <typename T> T read_one(qwen36_device_ptr_t src) {
+  T value{};
+  must_cuda<T>(cudaMemcpy(&value, reinterpret_cast<void *>(src.ptr), sizeof(T),
+                          cudaMemcpyDeviceToHost),
+               "cudaMemcpy D2H");
+  return value;
+}
+
+template <typename T> std::vector<T> read_raw(qwen36_device_ptr_t src, size_t count) {
+  std::vector<T> values(count);
+  must_cuda<T>(cudaMemcpy(values.data(), reinterpret_cast<void *>(src.ptr),
+                          count * sizeof(T), cudaMemcpyDeviceToHost),
+               "cudaMemcpy D2H");
+  return values;
+}
+
+void expect_close(float actual, float expected, float tolerance,
+                  const char *what) {
+  if (fabsf(actual - expected) > tolerance) {
+    fprintf(stderr, "%s expected %.6f got %.6f\n", what, expected, actual);
+    exit(1);
+  }
 }
 
 } // namespace
@@ -101,7 +148,7 @@ int main() {
   tq_spec.mode = 0;
   must_status(qwen36_turboquant_attention(&tq_spec), "turboquant attention");
 
-  qwen36_deltanet_shape_t delta_shape{1, 2, 8, 8, 4};
+  qwen36_deltanet_shape_t delta_shape{2, 4, 2, 1, 4};
   qwen36_device_ptr_t dq = dev_alloc<__nv_bfloat16>(delta_shape.qk_heads *
                                                     delta_shape.key_dim);
   qwen36_device_ptr_t dk = dev_alloc<__nv_bfloat16>(delta_shape.qk_heads *
@@ -112,12 +159,10 @@ int main() {
       delta_shape.v_heads * delta_shape.value_dim * delta_shape.key_dim);
   qwen36_device_ptr_t dout =
       dev_alloc<__nv_bfloat16>(delta_shape.v_heads * delta_shape.value_dim);
-  copy_bf16(dq, std::vector<float>(delta_shape.qk_heads * delta_shape.key_dim,
-                                   0.125f));
-  copy_bf16(dk, std::vector<float>(delta_shape.qk_heads * delta_shape.key_dim,
-                                   0.25f));
+  copy_bf16(dq, {1.0f, 0.0f, 2.0f, 0.0f});
+  copy_bf16(dk, {1.0f, 0.0f, 1.0f, 0.0f});
   copy_bf16(dv, std::vector<float>(delta_shape.v_heads * delta_shape.value_dim,
-                                   0.5f));
+                                   1.0f));
   must_cuda<__nv_bfloat16>(
       cudaMemset(reinterpret_cast<void *>(state.ptr), 0,
                  delta_shape.v_heads * delta_shape.value_dim *
@@ -135,6 +180,270 @@ int main() {
   delta_spec.state_decay = 1.0f;
   delta_spec.update_scale = 1.0f;
   must_status(qwen36_deltanet_decode(&delta_spec), "deltanet");
+  std::vector<float> delta_values = read_bf16(dout, 4);
+  expect_close(delta_values[0], 1.0f, 0.02f, "deltanet head repeat[0]");
+  expect_close(delta_values[1], 1.0f, 0.02f, "deltanet head repeat[1]");
+  expect_close(delta_values[2], 2.0f, 0.02f, "deltanet head repeat[2]");
+  expect_close(delta_values[3], 2.0f, 0.02f, "deltanet head repeat[3]");
+
+  qwen36_device_ptr_t exact_state = dev_alloc<__nv_bfloat16>(
+      delta_shape.v_heads * delta_shape.value_dim * delta_shape.key_dim);
+  qwen36_device_ptr_t exact_out =
+      dev_alloc<__nv_bfloat16>(delta_shape.v_heads * delta_shape.value_dim);
+  qwen36_device_ptr_t exact_gate = dev_alloc<float>(delta_shape.v_heads);
+  qwen36_device_ptr_t exact_beta = dev_alloc<float>(delta_shape.v_heads);
+  must_cuda<__nv_bfloat16>(
+      cudaMemset(reinterpret_cast<void *>(exact_state.ptr), 0,
+                 delta_shape.v_heads * delta_shape.value_dim *
+                     delta_shape.key_dim * sizeof(__nv_bfloat16)),
+      "cudaMemset exact state");
+  copy_raw<float>(exact_gate, std::vector<float>(delta_shape.v_heads, 0.0f));
+  copy_raw<float>(exact_beta, std::vector<float>(delta_shape.v_heads, 0.5f));
+  qwen36_deltanet_decode_spec_t exact_delta_spec = delta_spec;
+  exact_delta_spec.state_bf16 = exact_state;
+  exact_delta_spec.output_bf16 = exact_out;
+  exact_delta_spec.gate_f32 = exact_gate;
+  exact_delta_spec.beta_f32 = exact_beta;
+  exact_delta_spec.qk_l2norm = 0;
+  must_status(qwen36_deltanet_decode(&exact_delta_spec), "deltanet exact");
+  std::vector<float> exact_delta_values = read_bf16(exact_out, 4);
+  const float exact_scale = 1.0f / sqrtf(static_cast<float>(delta_shape.key_dim));
+  expect_close(exact_delta_values[0], 0.5f * exact_scale, 0.02f,
+               "deltanet exact[0]");
+  expect_close(exact_delta_values[1], 0.5f * exact_scale, 0.02f,
+               "deltanet exact[1]");
+  expect_close(exact_delta_values[2], 1.0f * exact_scale, 0.02f,
+               "deltanet exact[2]");
+  expect_close(exact_delta_values[3], 1.0f * exact_scale, 0.02f,
+               "deltanet exact[3]");
+
+  qwen36_device_ptr_t norm_in = dev_alloc<__nv_bfloat16>(4);
+  qwen36_device_ptr_t norm_weight = dev_alloc<__nv_bfloat16>(4);
+  qwen36_device_ptr_t norm_residual = dev_alloc<__nv_bfloat16>(4);
+  qwen36_device_ptr_t norm_out = dev_alloc<__nv_bfloat16>(4);
+  copy_bf16(norm_in, {1.0f, 2.0f, 3.0f, 4.0f});
+  copy_bf16(norm_weight, {0.0f, 0.0f, 0.0f, 0.0f});
+  copy_bf16(norm_residual, {1.0f, 0.0f, -1.0f, 0.0f});
+  qwen36_rmsnorm_spec_t norm_spec{};
+  norm_spec.rows = 1;
+  norm_spec.hidden = 4;
+  norm_spec.eps = 1.0e-6f;
+  norm_spec.input_bf16 = norm_in;
+  norm_spec.weight_bf16 = norm_weight;
+  norm_spec.residual_bf16 = norm_residual;
+  norm_spec.output_bf16 = norm_out;
+  must_status(qwen36_rmsnorm(&norm_spec), "rmsnorm");
+  std::vector<float> norm_values = read_bf16(norm_out, 4);
+  const float norm_scale = 1.0f / sqrtf(7.0f + 1.0e-6f);
+  expect_close(norm_values[0], 2.0f * norm_scale, 0.02f, "rmsnorm[0]");
+  expect_close(norm_values[3], 4.0f * norm_scale, 0.02f, "rmsnorm[3]");
+
+  qwen36_device_ptr_t rope_pos = dev_alloc<int32_t>(1);
+  qwen36_device_ptr_t rope_q = dev_alloc<__nv_bfloat16>(6);
+  qwen36_device_ptr_t rope_k = dev_alloc<__nv_bfloat16>(6);
+  copy_raw<int32_t>(rope_pos, {1});
+  copy_bf16(rope_q, {1.0f, 2.0f, 0.0f, 0.0f, 9.0f, 9.0f});
+  copy_bf16(rope_k, {0.0f, 0.0f, 1.0f, 2.0f, 8.0f, 8.0f});
+  qwen36_partial_rope_spec_t rope_spec{};
+  rope_spec.tokens = 1;
+  rope_spec.q_heads = 1;
+  rope_spec.kv_heads = 1;
+  rope_spec.head_dim = 6;
+  rope_spec.rope_dims = 4;
+  rope_spec.base_theta = 10000.0;
+  rope_spec.positions_i32 = rope_pos;
+  rope_spec.q_bf16 = rope_q;
+  rope_spec.k_bf16 = rope_k;
+  must_status(qwen36_partial_rope(&rope_spec), "partial rope");
+  std::vector<float> rope_q_values = read_bf16(rope_q, 6);
+  std::vector<float> rope_k_values = read_bf16(rope_k, 6);
+  expect_close(rope_q_values[0], cosf(1.0f), 0.02f, "rope q[0]");
+  expect_close(rope_q_values[2], sinf(1.0f), 0.02f, "rope q[2]");
+  expect_close(rope_q_values[1], 2.0f * cosf(0.01f), 0.02f, "rope q[1]");
+  expect_close(rope_q_values[3], 2.0f * sinf(0.01f), 0.02f, "rope q[3]");
+  expect_close(rope_q_values[4], 9.0f, 0.02f, "rope q tail");
+  expect_close(rope_k_values[0], -sinf(1.0f), 0.02f, "rope k[0]");
+  expect_close(rope_k_values[2], cosf(1.0f), 0.02f, "rope k[2]");
+
+  qwen36_device_ptr_t swiglu_gate = dev_alloc<__nv_bfloat16>(4);
+  qwen36_device_ptr_t swiglu_up = dev_alloc<__nv_bfloat16>(4);
+  qwen36_device_ptr_t swiglu_out = dev_alloc<__nv_bfloat16>(4);
+  copy_bf16(swiglu_gate, {0.0f, 1.0f, -1.0f, 2.0f});
+  copy_bf16(swiglu_up, {1.0f, 2.0f, 3.0f, 4.0f});
+  qwen36_swiglu_spec_t swiglu_spec{};
+  swiglu_spec.rows = 1;
+  swiglu_spec.intermediate = 4;
+  swiglu_spec.gate_bf16 = swiglu_gate;
+  swiglu_spec.up_bf16 = swiglu_up;
+  swiglu_spec.output_bf16 = swiglu_out;
+  must_status(qwen36_swiglu(&swiglu_spec), "swiglu");
+  std::vector<float> swiglu_values = read_bf16(swiglu_out, 4);
+  expect_close(swiglu_values[0], 0.0f, 0.02f, "swiglu[0]");
+  expect_close(swiglu_values[1], 2.0f / (1.0f + expf(-1.0f)), 0.02f,
+               "swiglu[1]");
+
+  qwen36_device_ptr_t logits = dev_alloc<__nv_bfloat16>(4);
+  qwen36_device_ptr_t sampled = dev_alloc<uint32_t>(1);
+  copy_bf16(logits, {0.5f, 4.0f, 3.0f, 4.0f});
+  qwen36_sampling_spec_t sampling_spec{};
+  sampling_spec.vocab_size = 4;
+  sampling_spec.logits_bf16 = logits;
+  sampling_spec.output_token_u32 = sampled;
+  sampling_spec.temperature = 1.0f;
+  must_status(qwen36_sample(&sampling_spec), "sample");
+  const uint32_t token = read_one<uint32_t>(sampled);
+  if (token != 1) {
+    fprintf(stderr, "sample expected token 1 got %u\n", token);
+    exit(1);
+  }
+
+  qwen36_device_ptr_t token_ids = dev_alloc<uint32_t>(1);
+  qwen36_device_ptr_t embedding = dev_alloc<__nv_bfloat16>(8);
+  qwen36_device_ptr_t embedding_out = dev_alloc<__nv_bfloat16>(4);
+  copy_raw<uint32_t>(token_ids, {1});
+  copy_bf16(embedding, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f});
+  qwen36_embedding_lookup_spec_t embedding_spec{};
+  embedding_spec.tokens = 1;
+  embedding_spec.hidden = 4;
+  embedding_spec.vocab_size = 2;
+  embedding_spec.token_ids_u32 = token_ids;
+  embedding_spec.embedding_bf16 = embedding;
+  embedding_spec.output_bf16 = embedding_out;
+  must_status(qwen36_embedding_lookup(&embedding_spec), "embedding lookup");
+  std::vector<float> embedding_values = read_bf16(embedding_out, 4);
+  expect_close(embedding_values[0], 5.0f, 0.02f, "embedding[0]");
+  expect_close(embedding_values[3], 8.0f, 0.02f, "embedding[3]");
+
+  qwen36_device_ptr_t matvec_input = dev_alloc<__nv_bfloat16>(4);
+  qwen36_device_ptr_t matvec_weight = dev_alloc<__nv_bfloat16>(8);
+  qwen36_device_ptr_t matvec_out = dev_alloc<__nv_bfloat16>(2);
+  copy_bf16(matvec_input, {1.0f, 2.0f, 3.0f, 4.0f});
+  copy_bf16(matvec_weight, {1.0f, 0.0f, 0.0f, 1.0f,
+                            0.5f, 0.5f, 0.5f, 0.5f});
+  qwen36_bf16_matvec_spec_t matvec_spec{};
+  matvec_spec.out_features = 2;
+  matvec_spec.in_features = 4;
+  matvec_spec.input_bf16 = matvec_input;
+  matvec_spec.weight_bf16 = matvec_weight;
+  matvec_spec.output_bf16 = matvec_out;
+  must_status(qwen36_bf16_matvec(&matvec_spec), "bf16 matvec");
+  std::vector<float> matvec_values = read_bf16(matvec_out, 2);
+  expect_close(matvec_values[0], 5.0f, 0.02f, "bf16 matvec[0]");
+  expect_close(matvec_values[1], 5.0f, 0.02f, "bf16 matvec[1]");
+
+  qwen36_device_ptr_t fp4_weight = dev_alloc<uint8_t>(2);
+  qwen36_device_ptr_t fp4_scale = dev_alloc<uint8_t>(512);
+  qwen36_device_ptr_t fp4_global = dev_alloc<float>(1);
+  qwen36_device_ptr_t fp4_out = dev_alloc<__nv_bfloat16>(1);
+  copy_raw<uint8_t>(fp4_weight, {0x42, 0xA1});
+  copy_raw<uint8_t>(fp4_scale, std::vector<uint8_t>(512, 0x38));
+  copy_raw<float>(fp4_global, {1.0f});
+  qwen36_nvfp4_matvec_spec_t fp4_spec{};
+  fp4_spec.out_features = 1;
+  fp4_spec.in_features = 4;
+  fp4_spec.input_bf16 = matvec_input;
+  fp4_spec.weight_u8 = fp4_weight;
+  fp4_spec.block_scale_e4m3 = fp4_scale;
+  fp4_spec.tensor_scale_f32 = fp4_global;
+  fp4_spec.output_bf16 = fp4_out;
+  must_status(qwen36_nvfp4_matvec(&fp4_spec), "nvfp4 matvec");
+  expect_close(read_bf16(fp4_out, 1)[0], 2.5f, 0.02f, "nvfp4 matvec");
+
+  const size_t gemm_m = 128;
+  const size_t gemm_k = 128;
+  qwen36_device_ptr_t quant_input = dev_alloc<__nv_bfloat16>(gemm_k);
+  qwen36_device_ptr_t quant_fp4 = dev_alloc<uint8_t>(gemm_k / 2);
+  qwen36_device_ptr_t quant_scale = dev_alloc<uint8_t>((gemm_k / 64) * 512);
+  qwen36_device_ptr_t quant_global = dev_alloc<float>(1);
+  copy_bf16(quant_input, std::vector<float>(gemm_k, 1.0f));
+  qwen36_nvfp4_quantize_spec_t quant_spec{};
+  quant_spec.values = gemm_k;
+  quant_spec.input_bf16 = quant_input;
+  quant_spec.output_fp4 = quant_fp4;
+  quant_spec.output_scale_e4m3 = quant_scale;
+  quant_spec.output_tensor_scale_f32 = quant_global;
+  must_status(qwen36_nvfp4_quantize_bf16(&quant_spec),
+              "nvfp4 quantize");
+  expect_close(read_one<float>(quant_global), 1.0f, 0.001f,
+               "nvfp4 quantize global");
+
+  qwen36_device_ptr_t gemm_weight = dev_alloc<uint8_t>(gemm_m * gemm_k / 2);
+  qwen36_device_ptr_t gemm_scale = dev_alloc<uint8_t>(gemm_m * gemm_k / 16);
+  qwen36_device_ptr_t gemm_out = dev_alloc<__nv_bfloat16>(gemm_m);
+  qwen36_device_ptr_t gemm_workspace = dev_alloc<uint8_t>(4 * 1024 * 1024);
+  copy_raw<uint8_t>(gemm_weight, std::vector<uint8_t>(gemm_m * gemm_k / 2, 0x22));
+  copy_raw<uint8_t>(gemm_scale, std::vector<uint8_t>(gemm_m * gemm_k / 16, 0x38));
+  qwen36_nvfp4_gemm_spec_t gemm_spec{};
+  gemm_spec.m = gemm_m;
+  gemm_spec.n = 1;
+  gemm_spec.k = gemm_k;
+  gemm_spec.a_fp4 = gemm_weight;
+  gemm_spec.a_scale = gemm_scale;
+  gemm_spec.b_fp4 = quant_fp4;
+  gemm_spec.b_scale = quant_scale;
+  gemm_spec.b_scale_2 = quant_global;
+  gemm_spec.c_bf16 = gemm_out;
+  gemm_spec.workspace = gemm_workspace;
+  gemm_spec.workspace_bytes = 4 * 1024 * 1024;
+  gemm_spec.alpha = 1.0f;
+  must_status(qwen36_nvfp4_gemm(&gemm_spec), "nvfp4 gemm");
+  std::vector<float> gemm_values = read_bf16(gemm_out, gemm_m);
+  expect_close(gemm_values[0], 132.0f, 4.0f, "nvfp4 gemm[0]");
+  expect_close(gemm_values[gemm_m - 1], 132.0f, 4.0f, "nvfp4 gemm[last]");
+
+  qwen36_device_ptr_t conv_input = dev_alloc<__nv_bfloat16>(1);
+  qwen36_device_ptr_t conv_history = dev_alloc<__nv_bfloat16>(3);
+  qwen36_device_ptr_t conv_weight = dev_alloc<__nv_bfloat16>(4);
+  qwen36_device_ptr_t conv_out = dev_alloc<__nv_bfloat16>(1);
+  copy_bf16(conv_input, {2.0f});
+  copy_bf16(conv_history, {0.0f, 0.0f, 0.0f});
+  copy_bf16(conv_weight, {1.0f, 1.0f, 1.0f, 1.0f});
+  qwen36_conv1d_update_spec_t conv_spec{};
+  conv_spec.channels = 1;
+  conv_spec.kernel_size = 4;
+  conv_spec.input_bf16 = conv_input;
+  conv_spec.conv_history_bf16 = conv_history;
+  conv_spec.weight_bf16 = conv_weight;
+  conv_spec.output_bf16 = conv_out;
+  must_status(qwen36_conv1d_update(&conv_spec), "conv1d update");
+  expect_close(read_bf16(conv_out, 1)[0], 2.0f / (1.0f + expf(-2.0f)), 0.02f,
+               "conv1d update");
+
+  qwen36_device_ptr_t gate_a = dev_alloc<__nv_bfloat16>(1);
+  qwen36_device_ptr_t gate_b = dev_alloc<__nv_bfloat16>(1);
+  qwen36_device_ptr_t gate_a_log = dev_alloc<__nv_bfloat16>(1);
+  qwen36_device_ptr_t gate_dt = dev_alloc<__nv_bfloat16>(1);
+  qwen36_device_ptr_t gate_out = dev_alloc<float>(1);
+  qwen36_device_ptr_t beta_out = dev_alloc<float>(1);
+  copy_bf16(gate_a, {0.0f});
+  copy_bf16(gate_b, {0.0f});
+  copy_bf16(gate_a_log, {0.0f});
+  copy_bf16(gate_dt, {0.0f});
+  qwen36_gdn_gate_spec_t gate_spec{};
+  gate_spec.heads = 1;
+  gate_spec.a_bf16 = gate_a;
+  gate_spec.b_bf16 = gate_b;
+  gate_spec.a_log_bf16 = gate_a_log;
+  gate_spec.dt_bias_bf16 = gate_dt;
+  gate_spec.gate_f32 = gate_out;
+  gate_spec.beta_f32 = beta_out;
+  must_status(qwen36_gdn_gate(&gate_spec), "gdn gate");
+  expect_close(read_raw<float>(gate_out, 1)[0], -logf(2.0f), 0.02f,
+               "gdn gate");
+  expect_close(read_raw<float>(beta_out, 1)[0], 0.5f, 0.02f, "gdn beta");
+
+  qwen36_device_ptr_t sigmoid_gate = dev_alloc<__nv_bfloat16>(1);
+  qwen36_device_ptr_t sigmoid_input = dev_alloc<__nv_bfloat16>(1);
+  qwen36_device_ptr_t sigmoid_out = dev_alloc<__nv_bfloat16>(1);
+  copy_bf16(sigmoid_gate, {0.0f});
+  copy_bf16(sigmoid_input, {2.0f});
+  qwen36_sigmoid_gate_spec_t sigmoid_spec{};
+  sigmoid_spec.elements = 1;
+  sigmoid_spec.gate_bf16 = sigmoid_gate;
+  sigmoid_spec.input_bf16 = sigmoid_input;
+  sigmoid_spec.output_bf16 = sigmoid_out;
+  must_status(qwen36_sigmoid_gate(&sigmoid_spec), "sigmoid gate");
+  expect_close(read_bf16(sigmoid_out, 1)[0], 1.0f, 0.02f, "sigmoid gate");
 
   dev_free<__nv_bfloat16>(q);
   dev_free<__nv_bfloat16>(k);
@@ -150,6 +459,53 @@ int main() {
   dev_free<__nv_bfloat16>(dv);
   dev_free<__nv_bfloat16>(state);
   dev_free<__nv_bfloat16>(dout);
+  dev_free<__nv_bfloat16>(exact_state);
+  dev_free<__nv_bfloat16>(exact_out);
+  dev_free<float>(exact_gate);
+  dev_free<float>(exact_beta);
+  dev_free<__nv_bfloat16>(norm_in);
+  dev_free<__nv_bfloat16>(norm_weight);
+  dev_free<__nv_bfloat16>(norm_residual);
+  dev_free<__nv_bfloat16>(norm_out);
+  dev_free<int32_t>(rope_pos);
+  dev_free<__nv_bfloat16>(rope_q);
+  dev_free<__nv_bfloat16>(rope_k);
+  dev_free<__nv_bfloat16>(swiglu_gate);
+  dev_free<__nv_bfloat16>(swiglu_up);
+  dev_free<__nv_bfloat16>(swiglu_out);
+  dev_free<__nv_bfloat16>(logits);
+  dev_free<uint32_t>(sampled);
+  dev_free<uint32_t>(token_ids);
+  dev_free<__nv_bfloat16>(embedding);
+  dev_free<__nv_bfloat16>(embedding_out);
+  dev_free<__nv_bfloat16>(matvec_input);
+  dev_free<__nv_bfloat16>(matvec_weight);
+  dev_free<__nv_bfloat16>(matvec_out);
+  dev_free<uint8_t>(fp4_weight);
+  dev_free<uint8_t>(fp4_scale);
+  dev_free<float>(fp4_global);
+  dev_free<__nv_bfloat16>(fp4_out);
+  dev_free<__nv_bfloat16>(quant_input);
+  dev_free<uint8_t>(quant_fp4);
+  dev_free<uint8_t>(quant_scale);
+  dev_free<float>(quant_global);
+  dev_free<uint8_t>(gemm_weight);
+  dev_free<uint8_t>(gemm_scale);
+  dev_free<__nv_bfloat16>(gemm_out);
+  dev_free<uint8_t>(gemm_workspace);
+  dev_free<__nv_bfloat16>(conv_input);
+  dev_free<__nv_bfloat16>(conv_history);
+  dev_free<__nv_bfloat16>(conv_weight);
+  dev_free<__nv_bfloat16>(conv_out);
+  dev_free<__nv_bfloat16>(gate_a);
+  dev_free<__nv_bfloat16>(gate_b);
+  dev_free<__nv_bfloat16>(gate_a_log);
+  dev_free<__nv_bfloat16>(gate_dt);
+  dev_free<float>(gate_out);
+  dev_free<float>(beta_out);
+  dev_free<__nv_bfloat16>(sigmoid_gate);
+  dev_free<__nv_bfloat16>(sigmoid_input);
+  dev_free<__nv_bfloat16>(sigmoid_out);
 
   printf("qwen36 CUDA smoke test passed\n");
   return 0;

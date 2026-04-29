@@ -15,4 +15,7 @@ pub enum CoreError {
 
     #[error("kernel {kernel} returned error code {code}")]
     KernelLaunch { kernel: &'static str, code: i32 },
+
+    #[error("runtime error: {0}")]
+    Runtime(String),
 }

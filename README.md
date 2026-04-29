@@ -10,16 +10,22 @@ Implemented:
 
 - Rust workspace with `core`, `loader`, `tokenizer`, `kernels`, `runtime`, `mtp`, and `cli` crates.
 - `qwen36 discover` path that mmaps `.safetensors` and writes `model_layout.json`.
+- Zero-copy `MappedModel` tensor access for safetensors shards.
 - HF `config.json` parser and Qwen3.6 topology validation.
+- Runtime weight manifest validation for all layer, MTP, lm-head, embedding, and NVFP4 scale tensors.
+- CUDA runtime memory ABI plus Rust RAII buffers for device allocation, copy, memset, and synchronization.
+- Real-checkpoint GPU upload path for required manifest tensors and runtime buffers.
 - Hybrid-aware TurboQuant attention skip policy: first and last full-attention layer.
 - KV-cache and DeltaNet-state memory planning.
-- CUDA shared-library ABI and baseline kernels for FP4 GEMM, attention decode, int8 KV quantization, quantized attention, and simplified DeltaNet recurrence.
+- CUDA shared-library ABI and baseline kernels for FP4 GEMM, attention decode, int8 KV quantization, quantized attention, RMSNorm, partial RoPE, SwiGLU, greedy sampling, and DeltaNet decode.
+- MTP speculative controller with rollback/replay tests.
 
 Not final yet:
 
-- DeltaNet is a bring-up recurrence, not the exact Gated DeltaNet kernel.
+- DeltaNet decode has an exact single-token recurrence path when gate/beta tensors are supplied, but conv/projection fusion and prefill are not final.
 - TurboQuant is currently int8 per-vector KV quantization, not the full rotation/QJL implementation.
-- Runtime end-to-end inference is not wired through all model layers yet.
+- End-to-end reference decode is wired through all layers, but it uses slow scalar CUDA matvecs and still needs numerical parity work against vLLM/Transformers.
+- MTP speculative execution is not yet wired into the runtime scheduler.
 - CUDA Graph capture and final hot-path tuning are pending.
 
 ## Quick Start
@@ -40,13 +46,19 @@ cargo check --workspace --features qwen36-fp4-kernels/cuda
 Download the model, then inspect it:
 
 ```bash
-huggingface-cli download sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP \
-  --local-dir /models/Qwen3.6-27B-Text-NVFP4-MTP \
-  --local-dir-use-symlinks False
+hf download sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP \
+  --local-dir /models/Qwen3.6-27B-Text-NVFP4-MTP
 
 cargo run -p qwen36-fp4 -- discover \
   --model-dir /models/Qwen3.6-27B-Text-NVFP4-MTP \
   --output model_layout.json
+
+cargo run -p qwen36-fp4 -- validate-weights \
+  --model-dir /models/Qwen3.6-27B-Text-NVFP4-MTP
+
+cargo run -p qwen36-fp4 --features cuda -- gpu-load \
+  --model-dir /models/Qwen3.6-27B-Text-NVFP4-MTP \
+  --max-context 2256
 ```
 
 ## Documentation
@@ -66,9 +78,10 @@ cargo run -p qwen36-fp4 -- discover \
 cargo run -p qwen36-fp4 -- inspect-config --model-dir /path/to/model
 cargo run -p qwen36-fp4 -- budget --ctx 32768 --kv fp8
 cargo run -p qwen36-fp4 -- tokenize --model-dir /path/to/model --text "Bonjour"
+cargo run -p qwen36-fp4 -- validate-weights --model-dir /path/to/model
+cargo run -p qwen36-fp4 --features cuda -- gpu-load --model-dir /path/to/model --max-context 2256
 ```
 
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
-

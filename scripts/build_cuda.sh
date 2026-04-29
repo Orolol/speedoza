@@ -19,8 +19,9 @@ mkdir -p "${OUT_DIR}"
   kernels-cuda/deltanet.cu \
   kernels-cuda/attention.cu \
   kernels-cuda/turboquant.cu \
+  kernels-cuda/ops.cu \
+  kernels-cuda/runtime.cu \
   -lcublasLt \
   -o "${OUT_DIR}/libqwen36_fp4_kernels.so"
 
 echo "${OUT_DIR}/libqwen36_fp4_kernels.so"
-

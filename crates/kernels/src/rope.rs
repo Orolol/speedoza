@@ -5,7 +5,8 @@ use crate::backend::DevicePtr;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartialRopeSpec {
     pub tokens: usize,
-    pub heads: usize,
+    pub q_heads: usize,
+    pub kv_heads: usize,
     pub head_dim: usize,
     pub rope_dims: usize,
     pub base_theta: f64,
@@ -13,4 +14,3 @@ pub struct PartialRopeSpec {
     pub q_bf16: DevicePtr,
     pub k_bf16: DevicePtr,
 }
-

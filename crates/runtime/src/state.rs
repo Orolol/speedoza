@@ -22,7 +22,7 @@ impl DeltaNetStatePlan {
             * 2) as u64;
         let total_state_bytes = state_bytes_per_layer * layers as u64;
         let conv_history_bytes = (layers
-            * topology.hidden_size
+            * topology.linear_attention_qkv_dim()
             * topology.linear_conv_kernel_dim.saturating_sub(1)
             * 2) as u64;
         Self {
@@ -58,4 +58,3 @@ impl RuntimeState {
         self.accepted_tokens += accepted;
     }
 }
-

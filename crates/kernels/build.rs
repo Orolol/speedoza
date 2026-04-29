@@ -15,4 +15,3 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=dylib=qwen36_fp4_kernels");
 }
-

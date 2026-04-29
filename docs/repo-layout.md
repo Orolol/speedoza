@@ -28,7 +28,7 @@ qwen36-fp4/
 `qwen36-fp4-loader`
 
 - Reads `config.json`.
-- mmaps `.safetensors`.
+- Discovers `.safetensors` metadata and provides zero-copy `MappedModel` tensor views.
 - Emits `model_layout.json`.
 
 `qwen36-fp4-tokenizer`
@@ -46,7 +46,9 @@ qwen36-fp4/
 
 - Plans KV cache allocation.
 - Plans DeltaNet recurrent state and checkpoint buffers.
-- Provides the engine shell for prefill/decode integration.
+- Builds the per-layer model weight manifest from discovered checkpoint tensors.
+- Uploads required checkpoint tensors and runtime buffers to CUDA when built with the `cuda` feature.
+- Provides the engine shell plus the current CUDA reference prefill/decode scheduler.
 
 `qwen36-fp4-mtp`
 
@@ -55,7 +57,7 @@ qwen36-fp4/
 
 `qwen36-fp4`
 
-- CLI entrypoint: discovery, config inspection, budget estimation, tokenization, and future chat path.
+- CLI entrypoint: discovery, config inspection, budget estimation, tokenization, weight validation, CUDA GPU-load validation, and chat path.
 
 ## ABI Rule
 
@@ -66,4 +68,3 @@ Any field added to `kernels-cuda/include/qwen36_fp4.h` must be mirrored in:
 - the smoke test if the new field is required
 
 Do not change ABI layout casually. Prefer adding fields at the end of structs while the ABI is still evolving.
-

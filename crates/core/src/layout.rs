@@ -92,7 +92,9 @@ impl ModelLayout {
             .filter(|t| {
                 matches!(
                     t.role,
-                    TensorRole::Nvfp4BlockScale | TensorRole::Nvfp4TensorScale | TensorRole::Fp8Scale
+                    TensorRole::Nvfp4BlockScale
+                        | TensorRole::Nvfp4TensorScale
+                        | TensorRole::Fp8Scale
                 )
             })
             .map(|t| t.size_bytes)
@@ -170,7 +172,10 @@ fn summarize_layers(tensors: &[TensorInfo]) -> Vec<LayerSummary> {
             role_counts: BTreeMap::new(),
         });
         entry.tensor_count += 1;
-        *entry.dtype_counts.entry(dtype_key(&tensor.dtype)).or_insert(0) += 1;
+        *entry
+            .dtype_counts
+            .entry(dtype_key(&tensor.dtype))
+            .or_insert(0) += 1;
         *entry
             .role_counts
             .entry(format!("{:?}", tensor.role))
@@ -188,7 +193,10 @@ fn dtype_key(dtype: &TensorDtype) -> String {
 
 fn derive_warnings(topology: &ModelTopology, tensors: &[TensorInfo]) -> Vec<String> {
     let mut warnings = Vec::new();
-    let mtp_count = tensors.iter().filter(|t| t.name.starts_with("mtp.")).count();
+    let mtp_count = tensors
+        .iter()
+        .filter(|t| t.name.starts_with("mtp."))
+        .count();
     if topology.mtp_num_hidden_layers > 0 && mtp_count == 0 {
         warnings.push("config declares MTP but no mtp.* tensors were found".to_owned());
     }
@@ -197,7 +205,10 @@ fn derive_warnings(topology: &ModelTopology, tensors: &[TensorInfo]) -> Vec<Stri
         .filter(|t| t.name.contains("linear_attn.conv1d"))
         .count();
     if conv_count == 0 {
-        warnings.push("no linear_attn.conv1d tensors found; DeltaNet conv assumptions need verification".to_owned());
+        warnings.push(
+            "no linear_attn.conv1d tensors found; DeltaNet conv assumptions need verification"
+                .to_owned(),
+        );
     }
     warnings
 }

@@ -44,11 +44,7 @@ impl QwenTokenizer {
             .map_err(|err| anyhow!("{err}"))
     }
 
-    pub fn render_chat(
-        &self,
-        messages: &[ChatMessage],
-        add_generation_prompt: bool,
-    ) -> String {
+    pub fn render_chat(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> String {
         let _template_available = self.chat_template.is_some();
         render_minimal_qwen_chat(messages, add_generation_prompt)
     }

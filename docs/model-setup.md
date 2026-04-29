@@ -17,9 +17,8 @@ The loader expects a local Hugging Face directory containing:
 
 ```bash
 MODEL_DIR=/models/Qwen3.6-27B-Text-NVFP4-MTP
-huggingface-cli download sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP \
-  --local-dir "$MODEL_DIR" \
-  --local-dir-use-symlinks False
+hf download sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP \
+  --local-dir "$MODEL_DIR"
 ```
 
 ## Discovery
@@ -80,6 +79,28 @@ The discovery pass classifies tensors into:
 
 If `conv1d_bf16` or `mtp_bf16` are missing, do not continue to full inference until the checkpoint naming/classification has been corrected.
 
+## Weight Manifest
+
+Run:
+
+```bash
+cargo run -p qwen36-fp4 -- validate-weights \
+  --model-dir "$MODEL_DIR"
+```
+
+Expected summary for the target checkpoint:
+
+```json
+{
+  "layers": 64,
+  "full_attention_layers": 16,
+  "linear_attention_layers": 48,
+  "mtp_tensors": 15
+}
+```
+
+This check verifies the per-layer tensor names and NVFP4 triplets: packed `weight`, `weight_scale`, and `weight_scale_2`. It also verifies the bf16 exceptions for embeddings, lm head, MTP, and DeltaNet conv1d weights.
+
 ## Local Directory Hygiene
 
 Do not commit:
@@ -89,4 +110,3 @@ Do not commit:
 - generated `.so`, `.ptx`, `.cubin`, or benchmark artifacts
 
 These are ignored by `.gitignore`.
-

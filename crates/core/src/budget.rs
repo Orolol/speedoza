@@ -33,14 +33,19 @@ pub struct MemoryBudget {
 }
 
 impl MemoryBudget {
-    pub fn estimate(topology: &ModelTopology, context_tokens: usize, kv_cache_dtype: KvCacheDtype) -> Self {
+    pub fn estimate(
+        topology: &ModelTopology,
+        context_tokens: usize,
+        kv_cache_dtype: KvCacheDtype,
+    ) -> Self {
         let attention_layers = topology.attention_layers().len() as u64;
         let kv_values = attention_layers
             * 2
             * context_tokens as u64
             * topology.attention_num_kv_heads as u64
             * topology.attention_head_dim as u64;
-        let kv_cache_bytes = ((kv_values as f64 * kv_cache_dtype.bits_per_value()) / 8.0).ceil() as u64;
+        let kv_cache_bytes =
+            ((kv_values as f64 * kv_cache_dtype.bits_per_value()) / 8.0).ceil() as u64;
         let deltanet_state_bytes = topology.deltanet_state_bytes() as u64;
         let deltanet_conv_history_values = topology.linear_attention_layers().len() as u64
             * topology.hidden_size as u64
@@ -55,4 +60,3 @@ impl MemoryBudget {
         }
     }
 }
-

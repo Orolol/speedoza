@@ -9,6 +9,10 @@ license.workspace = true
 name = "qwen36"
 path = "src/main.rs"
 
+[features]
+default = []
+cuda = ["qwen36-fp4-runtime/cuda"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -17,4 +21,3 @@ qwen36-fp4-loader = { path = "../loader" }
 qwen36-fp4-runtime = { path = "../runtime" }
 qwen36-fp4-tokenizer = { path = "../tokenizer" }
 serde_json.workspace = true
-
