@@ -54,6 +54,16 @@ pub struct Nvfp4QuantizeSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Nvfp4QuantizeRowsSpec {
+    pub rows: usize,
+    pub values: usize,
+    pub input_bf16: DevicePtr,
+    pub output_fp4: DevicePtr,
+    pub output_scale_e4m3: DevicePtr,
+    pub output_tensor_scale_f32: DevicePtr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RmsNormNvfp4QuantizeSpec {
     pub hidden: usize,
     pub eps: f32,
@@ -86,7 +96,19 @@ pub struct Conv1dUpdateSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Conv1dPrefillSpec {
+    pub tokens: usize,
+    pub channels: usize,
+    pub kernel_size: usize,
+    pub input_bf16: DevicePtr,
+    pub conv_history_bf16: DevicePtr,
+    pub weight_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GdnGateSpec {
+    pub rows: usize,
     pub heads: usize,
     pub a_bf16: DevicePtr,
     pub b_bf16: DevicePtr,
@@ -100,6 +122,28 @@ pub struct GdnGateSpec {
 pub struct SigmoidGateSpec {
     pub elements: usize,
     pub gate_bf16: DevicePtr,
+    pub input_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigmoidGateStridedSpec {
+    pub rows: usize,
+    pub elements_per_row: usize,
+    pub gate_stride: usize,
+    pub input_stride: usize,
+    pub output_stride: usize,
+    pub gate_bf16: DevicePtr,
+    pub input_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopyStridedRowsSpec {
+    pub rows: usize,
+    pub values: usize,
+    pub input_stride: usize,
+    pub output_stride: usize,
     pub input_bf16: DevicePtr,
     pub output_bf16: DevicePtr,
 }

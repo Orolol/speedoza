@@ -5,9 +5,9 @@ use crate::attention::{AttentionDecodeSpec, AttentionPrefillSpec};
 use crate::deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec};
 use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
-    Bf16GemmSpec, Bf16MatVecSpec, Conv1dUpdateSpec, EmbeddingLookupSpec, GdnGateSpec,
-    Nvfp4MatVecSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, RmsNormNvfp4QuantizeSpec,
-    SigmoidGateSpec,
+    Bf16GemmSpec, Bf16MatVecSpec, Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec,
+    EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
+    Nvfp4RetileScalesSpec, RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
 };
 use crate::rmsnorm::RmsNormSpec;
 use crate::rope::PartialRopeSpec;
@@ -98,6 +98,10 @@ pub trait KernelBackend: Send + Sync {
         Err(CoreError::UnsupportedNoCuda("nvfp4_quantize_bf16"))
     }
 
+    fn nvfp4_quantize_rows(&self, _spec: &Nvfp4QuantizeRowsSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("nvfp4_quantize_rows"))
+    }
+
     fn nvfp4_retile_scales(&self, _spec: &Nvfp4RetileScalesSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("nvfp4_retile_scales"))
     }
@@ -106,12 +110,24 @@ pub trait KernelBackend: Send + Sync {
         Err(CoreError::UnsupportedNoCuda("conv1d_update"))
     }
 
+    fn conv1d_prefill(&self, _spec: &Conv1dPrefillSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("conv1d_prefill"))
+    }
+
     fn gdn_gate(&self, _spec: &GdnGateSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("gdn_gate"))
     }
 
     fn sigmoid_gate(&self, _spec: &SigmoidGateSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("sigmoid_gate"))
+    }
+
+    fn sigmoid_gate_strided(&self, _spec: &SigmoidGateStridedSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("sigmoid_gate_strided"))
+    }
+
+    fn copy_strided_rows(&self, _spec: &CopyStridedRowsSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("copy_strided_rows"))
     }
 }
 
@@ -145,6 +161,13 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::DeltaNetDecodeSpec::from(spec);
         check("qwen36_deltanet_decode", unsafe {
             ffi::qwen36_deltanet_decode(&ffi_spec)
+        })
+    }
+
+    fn attention_prefill(&self, spec: &AttentionPrefillSpec) -> Result<()> {
+        let ffi_spec = ffi::AttentionPrefillSpec::from(spec);
+        check("qwen36_attention_prefill", unsafe {
+            ffi::qwen36_attention_prefill(&ffi_spec)
         })
     }
 
@@ -233,6 +256,13 @@ impl KernelBackend for CudaBackend {
         })
     }
 
+    fn nvfp4_quantize_rows(&self, spec: &Nvfp4QuantizeRowsSpec) -> Result<()> {
+        let ffi_spec = ffi::Nvfp4QuantizeRowsSpec::from(spec);
+        check("qwen36_nvfp4_quantize_rows", unsafe {
+            ffi::qwen36_nvfp4_quantize_rows(&ffi_spec)
+        })
+    }
+
     fn nvfp4_retile_scales(&self, spec: &Nvfp4RetileScalesSpec) -> Result<()> {
         nvfp4_retile_scales(spec)
     }
@@ -241,6 +271,13 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::Conv1dUpdateSpec::from(spec);
         check("qwen36_conv1d_update", unsafe {
             ffi::qwen36_conv1d_update(&ffi_spec)
+        })
+    }
+
+    fn conv1d_prefill(&self, spec: &Conv1dPrefillSpec) -> Result<()> {
+        let ffi_spec = ffi::Conv1dPrefillSpec::from(spec);
+        check("qwen36_conv1d_prefill", unsafe {
+            ffi::qwen36_conv1d_prefill(&ffi_spec)
         })
     }
 
@@ -255,6 +292,20 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::SigmoidGateSpec::from(spec);
         check("qwen36_sigmoid_gate", unsafe {
             ffi::qwen36_sigmoid_gate(&ffi_spec)
+        })
+    }
+
+    fn sigmoid_gate_strided(&self, spec: &SigmoidGateStridedSpec) -> Result<()> {
+        let ffi_spec = ffi::SigmoidGateStridedSpec::from(spec);
+        check("qwen36_sigmoid_gate_strided", unsafe {
+            ffi::qwen36_sigmoid_gate_strided(&ffi_spec)
+        })
+    }
+
+    fn copy_strided_rows(&self, spec: &CopyStridedRowsSpec) -> Result<()> {
+        let ffi_spec = ffi::CopyStridedRowsSpec::from(spec);
+        check("qwen36_copy_strided_rows", unsafe {
+            ffi::qwen36_copy_strided_rows(&ffi_spec)
         })
     }
 }
@@ -322,6 +373,37 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct AttentionPrefillSpec {
+        pub layer_index: usize,
+        pub start_position: usize,
+        pub tokens: usize,
+        pub q_bf16: DevicePtr,
+        pub k_bf16: DevicePtr,
+        pub v_bf16: DevicePtr,
+        pub kv_cache_k: DevicePtr,
+        pub kv_cache_v: DevicePtr,
+        pub output_bf16: DevicePtr,
+        pub shape: AttentionShape,
+    }
+
+    impl From<&crate::attention::AttentionPrefillSpec> for AttentionPrefillSpec {
+        fn from(value: &crate::attention::AttentionPrefillSpec) -> Self {
+            Self {
+                layer_index: value.layer_index,
+                start_position: value.start_position,
+                tokens: value.tokens,
+                q_bf16: value.q_bf16,
+                k_bf16: value.k_bf16,
+                v_bf16: value.v_bf16,
+                kv_cache_k: value.kv_cache_k,
+                kv_cache_v: value.kv_cache_v,
+                output_bf16: value.output_bf16,
+                shape: AttentionShape::from(value.shape),
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct AttentionDecodeSpec {
         pub layer_index: usize,
         pub position: usize,
@@ -354,6 +436,9 @@ mod ffi {
     pub struct DeltaNetDecodeSpec {
         pub layer_index: usize,
         pub tokens_in_persistent_loop: usize,
+        pub q_token_stride: usize,
+        pub k_token_stride: usize,
+        pub v_token_stride: usize,
         pub q_bf16: DevicePtr,
         pub k_bf16: DevicePtr,
         pub v_bf16: DevicePtr,
@@ -373,6 +458,9 @@ mod ffi {
             Self {
                 layer_index: value.layer_index,
                 tokens_in_persistent_loop: value.tokens_in_persistent_loop,
+                q_token_stride: value.q_token_stride,
+                k_token_stride: value.k_token_stride,
+                v_token_stride: value.v_token_stride,
                 q_bf16: value.q_bf16,
                 k_bf16: value.k_bf16,
                 v_bf16: value.v_bf16,
@@ -704,6 +792,29 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct Nvfp4QuantizeRowsSpec {
+        pub rows: usize,
+        pub values: usize,
+        pub input_bf16: DevicePtr,
+        pub output_fp4: DevicePtr,
+        pub output_scale_e4m3: DevicePtr,
+        pub output_tensor_scale_f32: DevicePtr,
+    }
+
+    impl From<&crate::ops::Nvfp4QuantizeRowsSpec> for Nvfp4QuantizeRowsSpec {
+        fn from(value: &crate::ops::Nvfp4QuantizeRowsSpec) -> Self {
+            Self {
+                rows: value.rows,
+                values: value.values,
+                input_bf16: value.input_bf16,
+                output_fp4: value.output_fp4,
+                output_scale_e4m3: value.output_scale_e4m3,
+                output_tensor_scale_f32: value.output_tensor_scale_f32,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct Nvfp4RetileScalesSpec {
         pub rows: usize,
         pub inner_groups: usize,
@@ -746,7 +857,33 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct Conv1dPrefillSpec {
+        pub tokens: usize,
+        pub channels: usize,
+        pub kernel_size: usize,
+        pub input_bf16: DevicePtr,
+        pub conv_history_bf16: DevicePtr,
+        pub weight_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+    }
+
+    impl From<&crate::ops::Conv1dPrefillSpec> for Conv1dPrefillSpec {
+        fn from(value: &crate::ops::Conv1dPrefillSpec) -> Self {
+            Self {
+                tokens: value.tokens,
+                channels: value.channels,
+                kernel_size: value.kernel_size,
+                input_bf16: value.input_bf16,
+                conv_history_bf16: value.conv_history_bf16,
+                weight_bf16: value.weight_bf16,
+                output_bf16: value.output_bf16,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct GdnGateSpec {
+        pub rows: usize,
         pub heads: usize,
         pub a_bf16: DevicePtr,
         pub b_bf16: DevicePtr,
@@ -759,6 +896,7 @@ mod ffi {
     impl From<&crate::ops::GdnGateSpec> for GdnGateSpec {
         fn from(value: &crate::ops::GdnGateSpec) -> Self {
             Self {
+                rows: value.rows,
                 heads: value.heads,
                 a_bf16: value.a_bf16,
                 b_bf16: value.b_bf16,
@@ -783,6 +921,56 @@ mod ffi {
             Self {
                 elements: value.elements,
                 gate_bf16: value.gate_bf16,
+                input_bf16: value.input_bf16,
+                output_bf16: value.output_bf16,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct SigmoidGateStridedSpec {
+        pub rows: usize,
+        pub elements_per_row: usize,
+        pub gate_stride: usize,
+        pub input_stride: usize,
+        pub output_stride: usize,
+        pub gate_bf16: DevicePtr,
+        pub input_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+    }
+
+    impl From<&crate::ops::SigmoidGateStridedSpec> for SigmoidGateStridedSpec {
+        fn from(value: &crate::ops::SigmoidGateStridedSpec) -> Self {
+            Self {
+                rows: value.rows,
+                elements_per_row: value.elements_per_row,
+                gate_stride: value.gate_stride,
+                input_stride: value.input_stride,
+                output_stride: value.output_stride,
+                gate_bf16: value.gate_bf16,
+                input_bf16: value.input_bf16,
+                output_bf16: value.output_bf16,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct CopyStridedRowsSpec {
+        pub rows: usize,
+        pub values: usize,
+        pub input_stride: usize,
+        pub output_stride: usize,
+        pub input_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+    }
+
+    impl From<&crate::ops::CopyStridedRowsSpec> for CopyStridedRowsSpec {
+        fn from(value: &crate::ops::CopyStridedRowsSpec) -> Self {
+            Self {
+                rows: value.rows,
+                values: value.values,
+                input_stride: value.input_stride,
+                output_stride: value.output_stride,
                 input_bf16: value.input_bf16,
                 output_bf16: value.output_bf16,
             }
@@ -834,6 +1022,7 @@ mod ffi {
     #[link(name = "qwen36_fp4_kernels")]
     unsafe extern "C" {
         pub fn qwen36_nvfp4_gemm(spec: *const Nvfp4GemmSpec) -> i32;
+        pub fn qwen36_attention_prefill(spec: *const AttentionPrefillSpec) -> i32;
         pub fn qwen36_deltanet_decode(spec: *const DeltaNetDecodeSpec) -> i32;
         pub fn qwen36_attention_decode(spec: *const AttentionDecodeSpec) -> i32;
         pub fn qwen36_turboquant_encode_kv(spec: *const TurboQuantEncodeSpec) -> i32;
@@ -848,9 +1037,13 @@ mod ffi {
         pub fn qwen36_bf16_matvec(spec: *const Bf16MatVecSpec) -> i32;
         pub fn qwen36_nvfp4_matvec(spec: *const Nvfp4MatVecSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_bf16(spec: *const Nvfp4QuantizeSpec) -> i32;
+        pub fn qwen36_nvfp4_quantize_rows(spec: *const Nvfp4QuantizeRowsSpec) -> i32;
         pub fn qwen36_nvfp4_retile_scales(spec: *const Nvfp4RetileScalesSpec) -> i32;
         pub fn qwen36_conv1d_update(spec: *const Conv1dUpdateSpec) -> i32;
+        pub fn qwen36_conv1d_prefill(spec: *const Conv1dPrefillSpec) -> i32;
         pub fn qwen36_gdn_gate(spec: *const GdnGateSpec) -> i32;
         pub fn qwen36_sigmoid_gate(spec: *const SigmoidGateSpec) -> i32;
+        pub fn qwen36_sigmoid_gate_strided(spec: *const SigmoidGateStridedSpec) -> i32;
+        pub fn qwen36_copy_strided_rows(spec: *const CopyStridedRowsSpec) -> i32;
     }
 }

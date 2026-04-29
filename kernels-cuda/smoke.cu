@@ -486,6 +486,7 @@ int main() {
   copy_bf16(gate_a_log, {0.0f});
   copy_bf16(gate_dt, {0.0f});
   qwen36_gdn_gate_spec_t gate_spec{};
+  gate_spec.rows = 1;
   gate_spec.heads = 1;
   gate_spec.a_bf16 = gate_a;
   gate_spec.b_bf16 = gate_b;

@@ -21,9 +21,9 @@ pub use deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape};
 pub use memory::{CudaDeviceBuffer, cuda_synchronize};
 pub use nvfp4_gemm::{CublasLtFp4ScaleMode, Nvfp4GemmPlan, Nvfp4GemmSpec};
 pub use ops::{
-    Bf16GemmSpec, Bf16MatVecSpec, Conv1dUpdateSpec, EmbeddingLookupSpec, GdnGateSpec,
-    Nvfp4MatVecSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, RmsNormNvfp4QuantizeSpec,
-    SigmoidGateSpec,
+    Bf16GemmSpec, Bf16MatVecSpec, Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec,
+    EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
+    Nvfp4RetileScalesSpec, RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
 };
 pub use rmsnorm::RmsNormSpec;
 pub use rope::PartialRopeSpec;

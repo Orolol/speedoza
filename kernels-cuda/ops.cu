@@ -477,6 +477,62 @@ __global__ void nvfp4_quantize_fused_kernel(const __nv_bfloat16 *input,
   }
 }
 
+__global__ void nvfp4_quantize_rows_kernel(const __nv_bfloat16 *input,
+                                           uint8_t *output, uint8_t *scale,
+                                           float *tensor_scale, size_t rows,
+                                           size_t values) {
+  __shared__ float scratch[32];
+  __shared__ float decoded_scale;
+  const size_t group = blockIdx.x;
+  const size_t row = blockIdx.y;
+  const size_t scale_inner_dim = round_up_size(div_ceil_size(values, 16), 4);
+  const size_t start = group * 16;
+  const __nv_bfloat16 *row_input = input + row * values;
+  uint8_t *row_output = output + row * div_ceil_size(values, 2);
+  float local_amax = 0.0f;
+  for (size_t offset = threadIdx.x; offset < 16 && start + offset < values;
+       offset += blockDim.x) {
+    local_amax =
+        fmaxf(local_amax, fabsf(__bfloat162float(row_input[start + offset])));
+  }
+
+  scratch[threadIdx.x] = local_amax;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      scratch[threadIdx.x] =
+          fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    const float scale_value =
+        scratch[0] > 0.0f ? fmaxf(scratch[0] / 6.0f, 1.0e-8f) : 1.0f;
+    const uint8_t scale_code = encode_e4m3_positive(scale_value);
+    scale[vec16_scale_offset(group, row, scale_inner_dim)] = scale_code;
+    decoded_scale = fmaxf(decode_e4m3(scale_code), 1.0e-8f);
+    if (row == 0 && group == 0 && tensor_scale != nullptr) {
+      *tensor_scale = 1.0f;
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x < 8) {
+    const size_t col = start + threadIdx.x * 2;
+    if (col < values) {
+      const float value0 = __bfloat162float(row_input[col]) / decoded_scale;
+      uint8_t packed = encode_e2m1(value0);
+      if (col + 1 < values) {
+        const float value1 =
+            __bfloat162float(row_input[col + 1]) / decoded_scale;
+        packed |= static_cast<uint8_t>(encode_e2m1(value1) << 4);
+      }
+      row_output[col / 2] = packed;
+    }
+  }
+}
+
 __global__ void nvfp4_retile_scales_kernel(const uint8_t *input,
                                            uint8_t *output, size_t rows,
                                            size_t inner_groups) {
@@ -514,15 +570,56 @@ __global__ void conv1d_update_kernel(const __nv_bfloat16 *input,
   }
 }
 
+__global__ void conv1d_prefill_kernel(const __nv_bfloat16 *input,
+                                      __nv_bfloat16 *history,
+                                      const __nv_bfloat16 *weight,
+                                      __nv_bfloat16 *output, size_t tokens,
+                                      size_t channels, size_t kernel_size) {
+  for (size_t channel = blockIdx.x * blockDim.x + threadIdx.x;
+       channel < channels; channel += blockDim.x * gridDim.x) {
+    __nv_bfloat16 *channel_history = history + channel * (kernel_size - 1);
+    const __nv_bfloat16 *channel_weight = weight + channel * kernel_size;
+    for (size_t tok = 0; tok < tokens; ++tok) {
+      float sum = __bfloat162float(input[tok * channels + channel]) *
+                  __bfloat162float(channel_weight[kernel_size - 1]);
+      for (size_t k = 0; k + 1 < kernel_size; ++k) {
+        const size_t lag = kernel_size - 1 - k;
+        float hist_value = 0.0f;
+        if (tok >= lag) {
+          hist_value =
+              __bfloat162float(input[(tok - lag) * channels + channel]);
+        } else {
+          hist_value = __bfloat162float(channel_history[k + tok]);
+        }
+        sum += hist_value * __bfloat162float(channel_weight[k]);
+      }
+      const float silu = sum / (1.0f + expf(-sum));
+      output[tok * channels + channel] = __float2bfloat16(silu);
+    }
+    for (size_t k = 0; k + 1 < kernel_size; ++k) {
+      const size_t lag = kernel_size - 2 - k;
+      if (tokens > lag) {
+        channel_history[k] =
+            input[(tokens - 1 - lag) * channels + channel];
+      } else {
+        channel_history[k] = channel_history[k + tokens];
+      }
+    }
+  }
+}
+
 __global__ void gdn_gate_kernel(const __nv_bfloat16 *a, const __nv_bfloat16 *b,
                                 const __nv_bfloat16 *a_log,
                                 const __nv_bfloat16 *dt_bias, float *gate,
-                                float *beta, size_t heads) {
-  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < heads;
+                                float *beta, size_t rows, size_t heads) {
+  const size_t total = rows * heads;
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
        idx += blockDim.x * gridDim.x) {
-    const float x = __bfloat162float(a[idx]) + __bfloat162float(dt_bias[idx]);
+    const size_t head = idx % heads;
+    const float x =
+        __bfloat162float(a[idx]) + __bfloat162float(dt_bias[head]);
     const float softplus = x <= 20.0f ? log1pf(expf(x)) : x;
-    gate[idx] = -expf(__bfloat162float(a_log[idx])) * softplus;
+    gate[idx] = -expf(__bfloat162float(a_log[head])) * softplus;
     const float b_value = __bfloat162float(b[idx]);
     beta[idx] = 1.0f / (1.0f + expf(-b_value));
   }
@@ -537,6 +634,37 @@ __global__ void sigmoid_gate_kernel(const __nv_bfloat16 *gate,
     const float input_value = __bfloat162float(input[idx]);
     output[idx] = __float2bfloat16(input_value /
                                    (1.0f + expf(-gate_value)));
+  }
+}
+
+__global__ void sigmoid_gate_strided_kernel(
+    const __nv_bfloat16 *gate, const __nv_bfloat16 *input,
+    __nv_bfloat16 *output, size_t rows, size_t elements_per_row,
+    size_t gate_stride, size_t input_stride, size_t output_stride) {
+  const size_t total = rows * elements_per_row;
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += blockDim.x * gridDim.x) {
+    const size_t row = idx / elements_per_row;
+    const size_t col = idx % elements_per_row;
+    const float gate_value =
+        __bfloat162float(gate[row * gate_stride + col]);
+    const float input_value =
+        __bfloat162float(input[row * input_stride + col]);
+    output[row * output_stride + col] =
+        __float2bfloat16(input_value / (1.0f + expf(-gate_value)));
+  }
+}
+
+__global__ void copy_strided_rows_kernel(const __nv_bfloat16 *input,
+                                         __nv_bfloat16 *output, size_t rows,
+                                         size_t values, size_t input_stride,
+                                         size_t output_stride) {
+  const size_t total = rows * values;
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += blockDim.x * gridDim.x) {
+    const size_t row = idx / values;
+    const size_t col = idx % values;
+    output[row * output_stride + col] = input[row * input_stride + col];
   }
 }
 
@@ -701,6 +829,27 @@ qwen36_nvfp4_quantize_bf16(const qwen36_nvfp4_quantize_spec_t *spec) {
 }
 
 extern "C" int
+qwen36_nvfp4_quantize_rows(const qwen36_nvfp4_quantize_rows_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->rows == 0 || spec->values == 0 || spec->input_bf16.ptr == 0 ||
+      spec->output_fp4.ptr == 0 || spec->output_scale_e4m3.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+
+  const unsigned int scale_blocks =
+      static_cast<unsigned int>((spec->values + 15) / 16);
+  const dim3 grid(scale_blocks, static_cast<unsigned int>(spec->rows));
+  nvfp4_quantize_rows_kernel<<<grid, 32>>>(
+      ptr<const __nv_bfloat16>(spec->input_bf16),
+      ptr<uint8_t>(spec->output_fp4), ptr<uint8_t>(spec->output_scale_e4m3),
+      ptr<float>(spec->output_tensor_scale_f32), spec->rows, spec->values);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int
 qwen36_nvfp4_retile_scales(const qwen36_nvfp4_retile_scales_spec_t *spec) {
   if (spec == nullptr) {
     return QWEN36_STATUS_NULL_POINTER;
@@ -750,24 +899,49 @@ extern "C" int qwen36_conv1d_update(const qwen36_conv1d_update_spec_t *spec) {
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
 
+extern "C" int qwen36_conv1d_prefill(const qwen36_conv1d_prefill_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->tokens == 0 || spec->channels == 0 || spec->kernel_size < 2 ||
+      spec->input_bf16.ptr == 0 || spec->conv_history_bf16.ptr == 0 ||
+      spec->weight_bf16.ptr == 0 || spec->output_bf16.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const int threads = 256;
+  const unsigned int blocks =
+      static_cast<unsigned int>((spec->channels + threads - 1) / threads);
+  conv1d_prefill_kernel<<<blocks, threads>>>(
+      ptr<const __nv_bfloat16>(spec->input_bf16),
+      ptr<__nv_bfloat16>(spec->conv_history_bf16),
+      ptr<const __nv_bfloat16>(spec->weight_bf16),
+      ptr<__nv_bfloat16>(spec->output_bf16), spec->tokens, spec->channels,
+      spec->kernel_size);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
 extern "C" int qwen36_gdn_gate(const qwen36_gdn_gate_spec_t *spec) {
   if (spec == nullptr) {
     return QWEN36_STATUS_NULL_POINTER;
   }
-  if (spec->heads == 0 || spec->a_bf16.ptr == 0 || spec->b_bf16.ptr == 0 ||
-      spec->a_log_bf16.ptr == 0 || spec->dt_bias_bf16.ptr == 0 ||
-      spec->gate_f32.ptr == 0 || spec->beta_f32.ptr == 0) {
+  if (spec->rows == 0 || spec->heads == 0 || spec->a_bf16.ptr == 0 ||
+      spec->b_bf16.ptr == 0 || spec->a_log_bf16.ptr == 0 ||
+      spec->dt_bias_bf16.ptr == 0 || spec->gate_f32.ptr == 0 ||
+      spec->beta_f32.ptr == 0) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }
   const int threads = 128;
+  const size_t total = spec->rows * spec->heads;
   const unsigned int blocks =
-      static_cast<unsigned int>((spec->heads + threads - 1) / threads);
+      static_cast<unsigned int>((total + threads - 1) / threads);
   gdn_gate_kernel<<<blocks, threads>>>(
       ptr<const __nv_bfloat16>(spec->a_bf16),
       ptr<const __nv_bfloat16>(spec->b_bf16),
       ptr<const __nv_bfloat16>(spec->a_log_bf16),
       ptr<const __nv_bfloat16>(spec->dt_bias_bf16),
-      ptr<float>(spec->gate_f32), ptr<float>(spec->beta_f32), spec->heads);
+      ptr<float>(spec->gate_f32), ptr<float>(spec->beta_f32), spec->rows,
+      spec->heads);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
@@ -787,6 +961,56 @@ extern "C" int qwen36_sigmoid_gate(const qwen36_sigmoid_gate_spec_t *spec) {
       ptr<const __nv_bfloat16>(spec->gate_bf16),
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<__nv_bfloat16>(spec->output_bf16), spec->elements);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int
+qwen36_sigmoid_gate_strided(const qwen36_sigmoid_gate_strided_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->rows == 0 || spec->elements_per_row == 0 ||
+      spec->gate_stride < spec->elements_per_row ||
+      spec->input_stride < spec->elements_per_row ||
+      spec->output_stride < spec->elements_per_row ||
+      spec->gate_bf16.ptr == 0 || spec->input_bf16.ptr == 0 ||
+      spec->output_bf16.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const int threads = 256;
+  const size_t total = spec->rows * spec->elements_per_row;
+  const unsigned int blocks =
+      static_cast<unsigned int>((total + threads - 1) / threads);
+  sigmoid_gate_strided_kernel<<<blocks, threads>>>(
+      ptr<const __nv_bfloat16>(spec->gate_bf16),
+      ptr<const __nv_bfloat16>(spec->input_bf16),
+      ptr<__nv_bfloat16>(spec->output_bf16), spec->rows,
+      spec->elements_per_row, spec->gate_stride, spec->input_stride,
+      spec->output_stride);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int
+qwen36_copy_strided_rows(const qwen36_copy_strided_rows_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->rows == 0 || spec->values == 0 ||
+      spec->input_stride < spec->values ||
+      spec->output_stride < spec->values || spec->input_bf16.ptr == 0 ||
+      spec->output_bf16.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const int threads = 256;
+  const size_t total = spec->rows * spec->values;
+  const unsigned int blocks =
+      static_cast<unsigned int>((total + threads - 1) / threads);
+  copy_strided_rows_kernel<<<blocks, threads>>>(
+      ptr<const __nv_bfloat16>(spec->input_bf16),
+      ptr<__nv_bfloat16>(spec->output_bf16), spec->rows, spec->values,
+      spec->input_stride, spec->output_stride);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }

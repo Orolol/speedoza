@@ -45,6 +45,9 @@ pub struct DeltaNetPrefillSpec {
 pub struct DeltaNetDecodeSpec {
     pub layer_index: usize,
     pub tokens_in_persistent_loop: usize,
+    pub q_token_stride: usize,
+    pub k_token_stride: usize,
+    pub v_token_stride: usize,
     pub q_bf16: DevicePtr,
     pub k_bf16: DevicePtr,
     pub v_bf16: DevicePtr,

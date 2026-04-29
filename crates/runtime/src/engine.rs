@@ -5,10 +5,11 @@ use qwen36_fp4_core::TensorInfo;
 use qwen36_fp4_core::{CoreError, KvCacheDtype, ModelLayout, ModelTopology, Result};
 #[cfg(feature = "cuda")]
 use qwen36_fp4_kernels::{
-    AttentionDecodeSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec, Conv1dUpdateSpec,
-    CublasLtFp4ScaleMode, CudaBackend, DeltaNetDecodeSpec, DeltaNetShape, DevicePtr,
-    EmbeddingLookupSpec, GdnGateSpec, Nvfp4GemmSpec, Nvfp4QuantizeSpec, PartialRopeSpec,
-    RmsNormNvfp4QuantizeSpec, RmsNormSpec, SamplingSpec, SigmoidGateSpec, SwiGluSpec,
+    AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
+    Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode, CudaBackend,
+    DeltaNetDecodeSpec, DeltaNetShape, DevicePtr, EmbeddingLookupSpec, GdnGateSpec, Nvfp4GemmSpec,
+    Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec, RmsNormNvfp4QuantizeSpec,
+    RmsNormSpec, SamplingSpec, SigmoidGateSpec, SigmoidGateStridedSpec, SwiGluSpec,
 };
 use qwen36_fp4_kernels::{KernelBackend, NoCudaBackend};
 #[cfg(feature = "cuda")]
@@ -16,7 +17,7 @@ use qwen36_fp4_loader::MappedModel;
 
 use crate::cuda_graph::CudaGraphPlan;
 #[cfg(feature = "cuda")]
-use crate::gpu::{GpuForwardBuffers, GpuRuntimeBuffers, GpuWeightStore};
+use crate::gpu::{GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers, GpuWeightStore};
 use crate::kv_cache::KvCachePlan;
 use crate::state::{DeltaNetStatePlan, RuntimeState};
 use crate::weights::ModelWeightsManifest;
@@ -64,6 +65,8 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
     pub gpu_buffers: Option<GpuRuntimeBuffers>,
     #[cfg(feature = "cuda")]
     pub gpu_forward: Option<GpuForwardBuffers>,
+    #[cfg(feature = "cuda")]
+    pub gpu_prefill: Option<GpuPrefillBuffers>,
     backend: B,
 }
 
@@ -93,6 +96,8 @@ impl<B: KernelBackend> Engine<B> {
             gpu_buffers: None,
             #[cfg(feature = "cuda")]
             gpu_forward: None,
+            #[cfg(feature = "cuda")]
+            gpu_prefill: None,
             backend,
         }
     }
@@ -195,16 +200,183 @@ impl<B: KernelBackend> Engine<B> {
                 "prefill requires at least one prompt token".to_owned(),
             ));
         }
-        for (idx, &token) in prompt_tokens.iter().enumerate() {
-            let emit_logits = idx + 1 == prompt_tokens.len();
-            self.forward_token_cuda(token, self.state.position, emit_logits, false)?;
-            self.state.advance(1);
+        if self.state.position + prompt_tokens.len() > self.config.max_context {
+            return Err(CoreError::Runtime(format!(
+                "prefill of {} tokens at position {} exceeds configured max_context {}",
+                prompt_tokens.len(),
+                self.state.position,
+                self.config.max_context
+            )));
+        }
+        if self.config.kv_cache_dtype != KvCacheDtype::Bf16 {
+            return Err(CoreError::Runtime(
+                "reference CUDA scheduler currently requires BF16 KV cache".to_owned(),
+            ));
+        }
+
+        let mut consumed = 0;
+        while consumed < prompt_tokens.len() {
+            let start_position = self.state.position;
+            let capacity = self.cuda_prefill()?.capacity;
+            let chunk = (prompt_tokens.len() - consumed).min(capacity);
+            let chunk_tokens = &prompt_tokens[consumed..consumed + chunk];
+            let mut token_bytes = Vec::with_capacity(chunk * 4);
+            for token in chunk_tokens {
+                token_bytes.extend_from_slice(&token.to_ne_bytes());
+            }
+            let mut position_bytes = Vec::with_capacity(chunk * 4);
+            for idx in 0..chunk {
+                let position = start_position + idx;
+                let position = i32::try_from(position).map_err(|_| {
+                    CoreError::Runtime(format!("position {position} does not fit i32 for RoPE"))
+                })?;
+                position_bytes.extend_from_slice(&position.to_ne_bytes());
+            }
+            {
+                let prefill = self.cuda_prefill()?;
+                prefill.token_u32.copy_from_host(&token_bytes)?;
+                prefill.position_i32.copy_from_host(&position_bytes)?;
+            }
+
+            let emit_logits = consumed + chunk == prompt_tokens.len();
+            self.prefill_cuda_chunk(chunk, start_position, emit_logits)?;
+            self.state.advance(chunk);
+            consumed += chunk;
         }
         qwen36_fp4_kernels::cuda_synchronize()?;
         Ok(ForwardOutput {
             logits_device_ptr: self.cuda_forward()?.logits.ptr().0,
             produced_tokens: prompt_tokens.len(),
         })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn prefill_cuda_chunk(
+        &self,
+        tokens: usize,
+        start_position: usize,
+        emit_logits: bool,
+    ) -> Result<()> {
+        let manifest = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+        let weights = self.cuda_weights()?;
+        let runtime = self.cuda_runtime()?;
+        let prefill = self.cuda_prefill()?;
+
+        self.backend.embedding_lookup(&EmbeddingLookupSpec {
+            tokens,
+            hidden: self.topology.hidden_size,
+            vocab_size: self.topology.vocab_size,
+            token_ids_u32: prefill.token_u32.ptr(),
+            embedding_bf16: self.tensor_ptr(weights, &manifest.embed_tokens)?,
+            output_bf16: prefill.hidden.ptr(),
+        })?;
+
+        let mut residual_initialized = false;
+        for layer in &manifest.layers {
+            let input_residual = if residual_initialized {
+                prefill.residual.ptr()
+            } else {
+                DevicePtr::NULL
+            };
+            self.rmsnorm(
+                tokens,
+                self.topology.hidden_size,
+                prefill.hidden.ptr(),
+                self.tensor_ptr(weights, layer_common_input_norm(layer))?,
+                input_residual,
+                prefill.residual.ptr(),
+                prefill.normed.ptr(),
+            )?;
+            residual_initialized = true;
+
+            let quantized_normed =
+                if let Some(in_features) = Self::layer_input_nvfp4_in_features(layer)? {
+                    self.quantize_nvfp4_activation_rows(
+                        prefill.normed.ptr(),
+                        tokens,
+                        in_features,
+                        prefill,
+                    )?;
+                    Some(in_features)
+                } else {
+                    None
+                };
+
+            match layer {
+                LayerWeights::LinearAttention(layer) => self.run_linear_attention_layer_prefill(
+                    layer,
+                    runtime,
+                    prefill,
+                    tokens,
+                    quantized_normed,
+                )?,
+                LayerWeights::FullAttention(layer) => self.run_full_attention_layer_prefill(
+                    layer,
+                    runtime,
+                    prefill,
+                    tokens,
+                    start_position,
+                    quantized_normed,
+                )?,
+            }
+
+            let common = layer_common(layer);
+            let mlp_input_linears = [
+                (&common.mlp_gate_proj, DevicePtr::NULL),
+                (&common.mlp_up_proj, DevicePtr::NULL),
+            ];
+            self.rmsnorm(
+                tokens,
+                self.topology.hidden_size,
+                prefill.block_out.ptr(),
+                self.tensor_ptr(weights, &common.post_attention_layernorm)?,
+                prefill.residual.ptr(),
+                prefill.residual.ptr(),
+                prefill.normed.ptr(),
+            )?;
+            if let Some(in_features) = Self::common_nvfp4_in_features(&mlp_input_linears)? {
+                self.quantize_nvfp4_activation_rows(
+                    prefill.normed.ptr(),
+                    tokens,
+                    in_features,
+                    prefill,
+                )?;
+                self.run_mlp_with_quantized_input_prefill(layer, prefill, tokens, in_features)?;
+            } else {
+                self.run_mlp_prefill(layer, prefill, tokens)?;
+            }
+        }
+
+        if emit_logits {
+            let last_hidden = Self::ptr_offset(
+                prefill.hidden.ptr(),
+                (tokens - 1) * self.topology.hidden_size * 2,
+            )?;
+            let last_residual = Self::ptr_offset(
+                prefill.residual.ptr(),
+                (tokens - 1) * self.topology.hidden_size * 2,
+            )?;
+            let forward = self.cuda_forward()?;
+            self.rmsnorm(
+                1,
+                self.topology.hidden_size,
+                last_hidden,
+                self.tensor_ptr(weights, &manifest.final_norm)?,
+                last_residual,
+                DevicePtr::NULL,
+                forward.normed.ptr(),
+            )?;
+            self.bf16_matvec(
+                &manifest.lm_head,
+                forward.normed.ptr(),
+                forward.logits.ptr(),
+            )?;
+        }
+
+        Ok(())
     }
 
     #[cfg(feature = "cuda")]
@@ -416,6 +588,7 @@ impl<B: KernelBackend> Engine<B> {
             output_bf16: forward.aux.ptr(),
         })?;
         self.backend.gdn_gate(&GdnGateSpec {
+            rows: 1,
             heads: self.topology.linear_num_value_heads,
             a_bf16: forward.aux3.ptr(),
             b_bf16: forward.aux2.ptr(),
@@ -427,6 +600,9 @@ impl<B: KernelBackend> Engine<B> {
         self.backend.deltanet_decode(&DeltaNetDecodeSpec {
             layer_index: layer.layer_index,
             tokens_in_persistent_loop: 1,
+            q_token_stride: 0,
+            k_token_stride: 0,
+            v_token_stride: 0,
             q_bf16: forward.aux.ptr(),
             k_bf16: forward.aux.ptr_at(key_dim * 2)?,
             v_bf16: forward.aux.ptr_at(key_dim * 4)?,
@@ -566,6 +742,273 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn run_linear_attention_layer_prefill(
+        &self,
+        layer: &LinearAttentionLayerWeights,
+        runtime: &GpuRuntimeBuffers,
+        prefill: &GpuPrefillBuffers,
+        tokens: usize,
+        prequantized_normed: Option<usize>,
+    ) -> Result<()> {
+        let qkv_dim = self.topology.linear_attention_qkv_dim();
+        let key_dim = self.topology.linear_num_key_heads * self.topology.linear_key_head_dim;
+        let value_dim = self.topology.linear_attention_value_dim();
+        let layer_ordinal = self.linear_layer_ordinal(layer.layer_index)?;
+        let conv_history = runtime.conv_history.ptr_at(
+            layer_ordinal * qkv_dim * self.topology.linear_conv_kernel_dim.saturating_sub(1) * 2,
+        )?;
+        let state = runtime
+            .deltanet_state
+            .ptr_at(layer_ordinal * self.state.deltanet.state_bytes_per_layer as usize)?;
+
+        let in_proj_linears = [
+            (&layer.in_proj_qkv, prefill.qkv.ptr()),
+            (&layer.in_proj_b, prefill.aux2.ptr()),
+            (&layer.in_proj_a, prefill.aux3.ptr()),
+            (&layer.in_proj_z, prefill.qkv.ptr()),
+        ];
+        let shared_in_proj = match prequantized_normed {
+            Some(in_features) => Some(in_features),
+            None => Self::common_nvfp4_in_features(&in_proj_linears)?,
+        };
+        if let Some(in_features) = shared_in_proj {
+            if prequantized_normed.is_none() {
+                self.quantize_nvfp4_activation_rows(
+                    prefill.normed.ptr(),
+                    tokens,
+                    in_features,
+                    prefill,
+                )?;
+            }
+            for &(binding, output) in &in_proj_linears[..3] {
+                self.linear_with_quantized_nvfp4_rows(
+                    binding,
+                    output,
+                    tokens,
+                    in_features,
+                    prefill,
+                )?;
+            }
+        } else {
+            self.linears_same_input_rows(
+                prefill.normed.ptr(),
+                &in_proj_linears[..3],
+                tokens,
+                prefill,
+            )?;
+        }
+
+        self.backend.conv1d_prefill(&Conv1dPrefillSpec {
+            tokens,
+            channels: qkv_dim,
+            kernel_size: self.topology.linear_conv_kernel_dim,
+            input_bf16: prefill.qkv.ptr(),
+            conv_history_bf16: conv_history,
+            weight_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.conv1d_weight)?,
+            output_bf16: prefill.aux.ptr(),
+        })?;
+        self.backend.gdn_gate(&GdnGateSpec {
+            rows: tokens,
+            heads: self.topology.linear_num_value_heads,
+            a_bf16: prefill.aux3.ptr(),
+            b_bf16: prefill.aux2.ptr(),
+            a_log_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.a_log)?,
+            dt_bias_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.dt_bias)?,
+            gate_f32: prefill.gate_f32.ptr(),
+            beta_f32: prefill.beta_f32.ptr(),
+        })?;
+        self.backend.deltanet_decode(&DeltaNetDecodeSpec {
+            layer_index: layer.layer_index,
+            tokens_in_persistent_loop: tokens,
+            q_token_stride: qkv_dim,
+            k_token_stride: qkv_dim,
+            v_token_stride: qkv_dim,
+            q_bf16: prefill.aux.ptr(),
+            k_bf16: Self::ptr_offset(prefill.aux.ptr(), key_dim * 2)?,
+            v_bf16: Self::ptr_offset(prefill.aux.ptr(), key_dim * 4)?,
+            state_bf16: state,
+            conv_history_bf16: conv_history,
+            output_bf16: prefill.aux3.ptr(),
+            gate_f32: prefill.gate_f32.ptr(),
+            beta_f32: prefill.beta_f32.ptr(),
+            shape: DeltaNetShape {
+                qk_heads: self.topology.linear_num_key_heads,
+                v_heads: self.topology.linear_num_value_heads,
+                key_dim: self.topology.linear_key_head_dim,
+                value_dim: self.topology.linear_value_head_dim,
+                conv_kernel: self.topology.linear_conv_kernel_dim,
+            },
+            state_decay: 1.0,
+            update_scale: 1.0,
+            qk_l2norm: true,
+        })?;
+
+        if let Some(in_features) = shared_in_proj {
+            self.linear_with_quantized_nvfp4_rows(
+                &layer.in_proj_z,
+                prefill.qkv.ptr(),
+                tokens,
+                in_features,
+                prefill,
+            )?;
+        } else {
+            self.linear_rows(
+                &layer.in_proj_z,
+                prefill.normed.ptr(),
+                prefill.qkv.ptr(),
+                tokens,
+                prefill,
+            )?;
+        }
+        self.rmsnorm(
+            tokens * self.topology.linear_num_value_heads,
+            self.topology.linear_value_head_dim,
+            prefill.aux3.ptr(),
+            self.tensor_ptr(self.cuda_weights()?, &layer.norm_weight)?,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            prefill.aux2.ptr(),
+        )?;
+        self.backend.swiglu(&SwiGluSpec {
+            rows: tokens,
+            intermediate: value_dim,
+            gate_bf16: prefill.qkv.ptr(),
+            up_bf16: prefill.aux2.ptr(),
+            output_bf16: prefill.aux3.ptr(),
+        })?;
+        self.linear_rows(
+            &layer.out_proj,
+            prefill.aux3.ptr(),
+            prefill.block_out.ptr(),
+            tokens,
+            prefill,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_full_attention_layer_prefill(
+        &self,
+        layer: &FullAttentionLayerWeights,
+        runtime: &GpuRuntimeBuffers,
+        prefill: &GpuPrefillBuffers,
+        tokens: usize,
+        start_position: usize,
+        prequantized_normed: Option<usize>,
+    ) -> Result<()> {
+        let q_dim = self.topology.full_attention_q_dim();
+        let q_dim_with_gate = self.topology.full_attention_q_dim_with_gate();
+        let cache = runtime
+            .kv_cache
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("KV cache was not allocated".to_owned()))?;
+        let layout = self
+            .state
+            .kv_cache
+            .layers
+            .iter()
+            .find(|layout| layout.global_layer_index == layer.layer_index)
+            .ok_or_else(|| {
+                CoreError::Runtime(format!(
+                    "missing KV-cache layout for layer {}",
+                    layer.layer_index
+                ))
+            })?;
+
+        let qkv_linears = [
+            (&layer.q_proj, prefill.qkv.ptr()),
+            (&layer.k_proj, prefill.aux.ptr()),
+            (&layer.v_proj, prefill.aux2.ptr()),
+        ];
+        if let Some(in_features) = prequantized_normed {
+            for &(binding, output) in &qkv_linears {
+                self.linear_with_quantized_nvfp4_rows(
+                    binding,
+                    output,
+                    tokens,
+                    in_features,
+                    prefill,
+                )?;
+            }
+        } else {
+            self.linears_same_input_rows(prefill.normed.ptr(), &qkv_linears, tokens, prefill)?;
+        }
+
+        self.backend.copy_strided_rows(&CopyStridedRowsSpec {
+            rows: tokens,
+            values: q_dim,
+            input_stride: q_dim_with_gate,
+            output_stride: q_dim,
+            input_bf16: prefill.qkv.ptr(),
+            output_bf16: prefill.aux3.ptr(),
+        })?;
+        self.rmsnorm(
+            tokens * self.topology.attention_num_heads,
+            self.topology.attention_head_dim,
+            prefill.aux3.ptr(),
+            self.tensor_ptr(self.cuda_weights()?, &layer.q_norm)?,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            prefill.aux3.ptr(),
+        )?;
+        self.rmsnorm(
+            tokens * self.topology.attention_num_kv_heads,
+            self.topology.attention_head_dim,
+            prefill.aux.ptr(),
+            self.tensor_ptr(self.cuda_weights()?, &layer.k_norm)?,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            prefill.aux.ptr(),
+        )?;
+        self.backend.partial_rope(&PartialRopeSpec {
+            tokens,
+            q_heads: self.topology.attention_num_heads,
+            kv_heads: self.topology.attention_num_kv_heads,
+            head_dim: self.topology.attention_head_dim,
+            rope_dims: self.topology.attention_rope_dims(),
+            base_theta: self.topology.rope_theta,
+            position_i32: 0,
+            use_scalar_position: false,
+            positions_i32: prefill.position_i32.ptr(),
+            q_bf16: prefill.aux3.ptr(),
+            k_bf16: prefill.aux.ptr(),
+        })?;
+        self.backend.attention_prefill(&AttentionPrefillSpec {
+            layer_index: layer.layer_index,
+            start_position,
+            tokens,
+            q_bf16: prefill.aux3.ptr(),
+            k_bf16: prefill.aux.ptr(),
+            v_bf16: prefill.aux2.ptr(),
+            kv_cache_k: cache.ptr_at(layout.k_offset_bytes as usize)?,
+            kv_cache_v: cache.ptr_at(layout.v_offset_bytes as usize)?,
+            output_bf16: prefill.aux3.ptr(),
+            shape: AttentionShape {
+                q_heads: self.topology.attention_num_heads,
+                kv_heads: self.topology.attention_num_kv_heads,
+                head_dim: self.topology.attention_head_dim,
+                rope_dims: self.topology.attention_rope_dims(),
+            },
+        })?;
+        self.backend.sigmoid_gate_strided(&SigmoidGateStridedSpec {
+            rows: tokens,
+            elements_per_row: q_dim,
+            gate_stride: q_dim_with_gate,
+            input_stride: q_dim,
+            output_stride: q_dim,
+            gate_bf16: Self::ptr_offset(prefill.qkv.ptr(), q_dim * 2)?,
+            input_bf16: prefill.aux3.ptr(),
+            output_bf16: prefill.aux3.ptr(),
+        })?;
+        self.linear_rows(
+            &layer.o_proj,
+            prefill.aux3.ptr(),
+            prefill.block_out.ptr(),
+            tokens,
+            prefill,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
     fn run_mlp(&self, layer: &LayerWeights, forward: &GpuForwardBuffers) -> Result<()> {
         let common = match layer {
             LayerWeights::LinearAttention(layer) => &layer.common,
@@ -625,6 +1068,78 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn run_mlp_prefill(
+        &self,
+        layer: &LayerWeights,
+        prefill: &GpuPrefillBuffers,
+        tokens: usize,
+    ) -> Result<()> {
+        let common = layer_common(layer);
+        self.linears_same_input_rows(
+            prefill.normed.ptr(),
+            &[
+                (&common.mlp_gate_proj, prefill.aux.ptr()),
+                (&common.mlp_up_proj, prefill.aux2.ptr()),
+            ],
+            tokens,
+            prefill,
+        )?;
+        self.backend.swiglu(&SwiGluSpec {
+            rows: tokens,
+            intermediate: self.topology.intermediate_size,
+            gate_bf16: prefill.aux.ptr(),
+            up_bf16: prefill.aux2.ptr(),
+            output_bf16: prefill.aux3.ptr(),
+        })?;
+        self.linear_rows(
+            &common.mlp_down_proj,
+            prefill.aux3.ptr(),
+            prefill.hidden.ptr(),
+            tokens,
+            prefill,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_mlp_with_quantized_input_prefill(
+        &self,
+        layer: &LayerWeights,
+        prefill: &GpuPrefillBuffers,
+        tokens: usize,
+        quantized_in_features: usize,
+    ) -> Result<()> {
+        let common = layer_common(layer);
+        self.linear_with_quantized_nvfp4_rows(
+            &common.mlp_gate_proj,
+            prefill.aux.ptr(),
+            tokens,
+            quantized_in_features,
+            prefill,
+        )?;
+        self.linear_with_quantized_nvfp4_rows(
+            &common.mlp_up_proj,
+            prefill.aux2.ptr(),
+            tokens,
+            quantized_in_features,
+            prefill,
+        )?;
+        self.backend.swiglu(&SwiGluSpec {
+            rows: tokens,
+            intermediate: self.topology.intermediate_size,
+            gate_bf16: prefill.aux.ptr(),
+            up_bf16: prefill.aux2.ptr(),
+            output_bf16: prefill.aux3.ptr(),
+        })?;
+        self.linear_rows(
+            &common.mlp_down_proj,
+            prefill.aux3.ptr(),
+            prefill.hidden.ptr(),
+            tokens,
+            prefill,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
     fn linears_same_input(
         &self,
         input: DevicePtr,
@@ -640,6 +1155,28 @@ impl<B: KernelBackend> Engine<B> {
         self.quantize_nvfp4_activation(input, in_features)?;
         for &(binding, output) in linears {
             self.linear_with_quantized_nvfp4(binding, output, in_features)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn linears_same_input_rows(
+        &self,
+        input: DevicePtr,
+        linears: &[(&LinearWeightBinding, DevicePtr)],
+        rows: usize,
+        prefill: &GpuPrefillBuffers,
+    ) -> Result<()> {
+        let Some(in_features) = Self::common_nvfp4_in_features(linears)? else {
+            for &(binding, output) in linears {
+                self.linear_rows(binding, input, output, rows, prefill)?;
+            }
+            return Ok(());
+        };
+
+        self.quantize_nvfp4_activation_rows(input, rows, in_features, prefill)?;
+        for &(binding, output) in linears {
+            self.linear_with_quantized_nvfp4_rows(binding, output, rows, in_features, prefill)?;
         }
         Ok(())
     }
@@ -708,6 +1245,39 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn linear_rows(
+        &self,
+        binding: &LinearWeightBinding,
+        input: DevicePtr,
+        output: DevicePtr,
+        rows: usize,
+        prefill: &GpuPrefillBuffers,
+    ) -> Result<()> {
+        match binding {
+            LinearWeightBinding::Nvfp4 {
+                weight,
+                block_scale,
+                tensor_scale,
+            } => {
+                let in_features = Self::nvfp4_in_features(weight)?;
+                self.quantize_nvfp4_activation_rows(input, rows, in_features, prefill)?;
+                self.nvfp4_gemm_with_quantized_activation_rows(
+                    weight,
+                    block_scale,
+                    tensor_scale,
+                    output,
+                    rows,
+                    in_features,
+                    prefill,
+                )
+            }
+            LinearWeightBinding::Bf16 { weight } => {
+                self.bf16_gemm_rows(weight, input, output, rows)
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
     fn linear_with_quantized_nvfp4(
         &self,
         binding: &LinearWeightBinding,
@@ -741,6 +1311,43 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn linear_with_quantized_nvfp4_rows(
+        &self,
+        binding: &LinearWeightBinding,
+        output: DevicePtr,
+        rows: usize,
+        quantized_in_features: usize,
+        prefill: &GpuPrefillBuffers,
+    ) -> Result<()> {
+        let LinearWeightBinding::Nvfp4 {
+            weight,
+            block_scale,
+            tensor_scale,
+        } = binding
+        else {
+            return Err(CoreError::Runtime(
+                "quantized NVFP4 path received a BF16 linear".to_owned(),
+            ));
+        };
+        let in_features = Self::nvfp4_in_features(weight)?;
+        if in_features != quantized_in_features {
+            return Err(CoreError::Runtime(format!(
+                "quantized activation has {quantized_in_features} values but {} expects {in_features}",
+                weight.name
+            )));
+        }
+        self.nvfp4_gemm_with_quantized_activation_rows(
+            weight,
+            block_scale,
+            tensor_scale,
+            output,
+            rows,
+            in_features,
+            prefill,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
     fn quantize_nvfp4_activation(&self, input: DevicePtr, values: usize) -> Result<()> {
         let forward = self.cuda_forward()?;
         self.backend.nvfp4_quantize_bf16(&Nvfp4QuantizeSpec {
@@ -749,6 +1356,24 @@ impl<B: KernelBackend> Engine<B> {
             output_fp4: forward.activation_fp4.ptr(),
             output_scale_e4m3: forward.activation_scale.ptr(),
             output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn quantize_nvfp4_activation_rows(
+        &self,
+        input: DevicePtr,
+        rows: usize,
+        values: usize,
+        prefill: &GpuPrefillBuffers,
+    ) -> Result<()> {
+        self.backend.nvfp4_quantize_rows(&Nvfp4QuantizeRowsSpec {
+            rows,
+            values,
+            input_bf16: input,
+            output_fp4: prefill.activation_fp4.ptr(),
+            output_scale_e4m3: prefill.activation_scale.ptr(),
+            output_tensor_scale_f32: prefill.activation_scale_2.ptr(),
         })
     }
 
@@ -788,6 +1413,58 @@ impl<B: KernelBackend> Engine<B> {
             b_fp4: forward.activation_fp4.ptr(),
             b_scale: forward.activation_scale.ptr(),
             b_scale_2: forward.activation_scale_2.ptr(),
+            c_bf16: output,
+            workspace,
+            workspace_bytes,
+            alpha: self.tensor_scalar_f32(weights, tensor_scale)?,
+            scale_mode: CublasLtFp4ScaleMode::Vec16Ue4m3,
+        };
+        self.backend.nvfp4_gemm(&gemm_spec).map_err(|err| {
+            CoreError::Runtime(format!(
+                "NVFP4 cuBLASLt GEMM failed for {} (m={}, n={}, k={}): {err}",
+                weight.name, gemm_spec.m, gemm_spec.n, gemm_spec.k
+            ))
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn nvfp4_gemm_with_quantized_activation_rows(
+        &self,
+        weight: &TensorInfo,
+        block_scale: &TensorInfo,
+        tensor_scale: &TensorInfo,
+        output: DevicePtr,
+        rows: usize,
+        in_features: usize,
+        prefill: &GpuPrefillBuffers,
+    ) -> Result<()> {
+        let weights = self.cuda_weights()?;
+        let runtime = self.cuda_runtime()?;
+        let out_features = *weight
+            .shape
+            .first()
+            .ok_or_else(|| CoreError::Runtime(format!("tensor {} has empty shape", weight.name)))?;
+        let workspace = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.ptr())
+            .unwrap_or(DevicePtr::NULL);
+        let workspace_bytes = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.bytes())
+            .unwrap_or(0);
+        let gemm_spec = Nvfp4GemmSpec {
+            m: out_features,
+            n: rows,
+            k: in_features,
+            a_fp4: self.tensor_ptr(weights, weight)?,
+            a_scale: self.tensor_ptr(weights, block_scale)?,
+            a_scale_2: self.tensor_ptr(weights, tensor_scale)?,
+            b_fp4: prefill.activation_fp4.ptr(),
+            b_scale: prefill.activation_scale.ptr(),
+            b_scale_2: prefill.activation_scale_2.ptr(),
             c_bf16: output,
             workspace,
             workspace_bytes,
@@ -852,6 +1529,56 @@ impl<B: KernelBackend> Engine<B> {
             out_features,
             in_features,
             input_bf16,
+            weight_bf16,
+            output_bf16: output,
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn bf16_gemm_rows(
+        &self,
+        weight: &TensorInfo,
+        input: DevicePtr,
+        output: DevicePtr,
+        rows: usize,
+    ) -> Result<()> {
+        let out_features = *weight
+            .shape
+            .first()
+            .ok_or_else(|| CoreError::Runtime(format!("tensor {} has empty shape", weight.name)))?;
+        let in_features = *weight
+            .shape
+            .get(1)
+            .ok_or_else(|| CoreError::Runtime(format!("tensor {} is not a matrix", weight.name)))?;
+        let runtime = self.cuda_runtime()?;
+        let workspace = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.ptr())
+            .unwrap_or(DevicePtr::NULL);
+        let workspace_bytes = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.bytes())
+            .unwrap_or(0);
+        let weight_bf16 = self.tensor_ptr(self.cuda_weights()?, weight)?;
+        let gemm_result = self.backend.bf16_gemm(&Bf16GemmSpec {
+            m: out_features,
+            n: rows,
+            k: in_features,
+            a_bf16: weight_bf16,
+            b_bf16: input,
+            c_bf16: output,
+            workspace,
+            workspace_bytes,
+        });
+        if gemm_result.is_ok() || rows > 1 {
+            return gemm_result;
+        }
+        self.backend.bf16_matvec(&Bf16MatVecSpec {
+            out_features,
+            in_features,
+            input_bf16: input,
             weight_bf16,
             output_bf16: output,
         })
@@ -927,6 +1654,12 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn ptr_offset(ptr: DevicePtr, offset_bytes: usize) -> Result<DevicePtr> {
+        ptr.offset_bytes(offset_bytes)
+            .ok_or_else(|| CoreError::Runtime("CUDA pointer offset overflow".to_owned()))
+    }
+
+    #[cfg(feature = "cuda")]
     fn linear_layer_ordinal(&self, layer_index: usize) -> Result<usize> {
         self.topology
             .linear_attention_layers()
@@ -957,6 +1690,13 @@ impl<B: KernelBackend> Engine<B> {
             .as_ref()
             .ok_or_else(|| CoreError::Runtime("CUDA forward buffers are not allocated".to_owned()))
     }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_prefill(&self) -> Result<&GpuPrefillBuffers> {
+        self.gpu_prefill
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("CUDA prefill buffers are not allocated".to_owned()))
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -983,10 +1723,13 @@ impl Engine<CudaBackend> {
         let mut engine = Self::new(model.layout.topology.clone(), config, CudaBackend);
         let gpu_buffers = GpuRuntimeBuffers::allocate(&engine.state, 256 * 1024 * 1024)?;
         let gpu_forward = GpuForwardBuffers::allocate(&engine.topology)?;
+        let prefill_capacity = engine.config.max_context.min(512).max(1);
+        let gpu_prefill = GpuPrefillBuffers::allocate(&engine.topology, prefill_capacity)?;
         engine.weights = Some(manifest);
         engine.gpu_weights = Some(gpu_weights);
         engine.gpu_buffers = Some(gpu_buffers);
         engine.gpu_forward = Some(gpu_forward);
+        engine.gpu_prefill = Some(gpu_prefill);
         Ok(engine)
     }
 
@@ -997,6 +1740,10 @@ impl Engine<CudaBackend> {
     }
 
     pub fn gpu_buffer_bytes(&self) -> Option<u64> {
-        Some(self.gpu_buffers.as_ref()?.total_bytes() + self.gpu_forward.as_ref()?.total_bytes())
+        Some(
+            self.gpu_buffers.as_ref()?.total_bytes()
+                + self.gpu_forward.as_ref()?.total_bytes()
+                + self.gpu_prefill.as_ref()?.total_bytes(),
+        )
     }
 }

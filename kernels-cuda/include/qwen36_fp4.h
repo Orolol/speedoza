@@ -68,6 +68,19 @@ typedef struct {
 
 typedef struct {
   size_t layer_index;
+  size_t start_position;
+  size_t tokens;
+  qwen36_device_ptr_t q_bf16;
+  qwen36_device_ptr_t k_bf16;
+  qwen36_device_ptr_t v_bf16;
+  qwen36_device_ptr_t kv_cache_k;
+  qwen36_device_ptr_t kv_cache_v;
+  qwen36_device_ptr_t output_bf16;
+  qwen36_attention_shape_t shape;
+} qwen36_attention_prefill_spec_t;
+
+typedef struct {
+  size_t layer_index;
   size_t position;
   qwen36_device_ptr_t q_bf16;
   qwen36_device_ptr_t k_bf16;
@@ -106,6 +119,9 @@ typedef struct {
 typedef struct {
   size_t layer_index;
   size_t tokens_in_persistent_loop;
+  size_t q_token_stride;
+  size_t k_token_stride;
+  size_t v_token_stride;
   qwen36_device_ptr_t q_bf16;
   qwen36_device_ptr_t k_bf16;
   qwen36_device_ptr_t v_bf16;
@@ -213,6 +229,15 @@ typedef struct {
 
 typedef struct {
   size_t rows;
+  size_t values;
+  qwen36_device_ptr_t input_bf16;
+  qwen36_device_ptr_t output_fp4;
+  qwen36_device_ptr_t output_scale_e4m3;
+  qwen36_device_ptr_t output_tensor_scale_f32;
+} qwen36_nvfp4_quantize_rows_spec_t;
+
+typedef struct {
+  size_t rows;
   size_t inner_groups;
   qwen36_device_ptr_t input_row_major_u8;
   qwen36_device_ptr_t output_tiled_u8;
@@ -228,6 +253,17 @@ typedef struct {
 } qwen36_conv1d_update_spec_t;
 
 typedef struct {
+  size_t tokens;
+  size_t channels;
+  size_t kernel_size;
+  qwen36_device_ptr_t input_bf16;
+  qwen36_device_ptr_t conv_history_bf16;
+  qwen36_device_ptr_t weight_bf16;
+  qwen36_device_ptr_t output_bf16;
+} qwen36_conv1d_prefill_spec_t;
+
+typedef struct {
+  size_t rows;
   size_t heads;
   qwen36_device_ptr_t a_bf16;
   qwen36_device_ptr_t b_bf16;
@@ -244,6 +280,26 @@ typedef struct {
   qwen36_device_ptr_t output_bf16;
 } qwen36_sigmoid_gate_spec_t;
 
+typedef struct {
+  size_t rows;
+  size_t elements_per_row;
+  size_t gate_stride;
+  size_t input_stride;
+  size_t output_stride;
+  qwen36_device_ptr_t gate_bf16;
+  qwen36_device_ptr_t input_bf16;
+  qwen36_device_ptr_t output_bf16;
+} qwen36_sigmoid_gate_strided_spec_t;
+
+typedef struct {
+  size_t rows;
+  size_t values;
+  size_t input_stride;
+  size_t output_stride;
+  qwen36_device_ptr_t input_bf16;
+  qwen36_device_ptr_t output_bf16;
+} qwen36_copy_strided_rows_spec_t;
+
 int qwen36_cuda_malloc(qwen36_device_allocation_t *out, size_t bytes);
 int qwen36_cuda_free(qwen36_device_ptr_t ptr);
 int qwen36_cuda_memcpy_h2d(qwen36_device_ptr_t dst, const void *src,
@@ -256,6 +312,7 @@ int qwen36_cuda_synchronize(void);
 
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 int qwen36_bf16_gemm(const qwen36_bf16_gemm_spec_t *spec);
+int qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec);
 int qwen36_deltanet_decode(const qwen36_deltanet_decode_spec_t *spec);
 int qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec);
 int qwen36_turboquant_encode_kv(const qwen36_turboquant_encode_spec_t *spec);
@@ -270,10 +327,15 @@ int qwen36_embedding_lookup(const qwen36_embedding_lookup_spec_t *spec);
 int qwen36_bf16_matvec(const qwen36_bf16_matvec_spec_t *spec);
 int qwen36_nvfp4_matvec(const qwen36_nvfp4_matvec_spec_t *spec);
 int qwen36_nvfp4_quantize_bf16(const qwen36_nvfp4_quantize_spec_t *spec);
+int qwen36_nvfp4_quantize_rows(const qwen36_nvfp4_quantize_rows_spec_t *spec);
 int qwen36_nvfp4_retile_scales(const qwen36_nvfp4_retile_scales_spec_t *spec);
 int qwen36_conv1d_update(const qwen36_conv1d_update_spec_t *spec);
+int qwen36_conv1d_prefill(const qwen36_conv1d_prefill_spec_t *spec);
 int qwen36_gdn_gate(const qwen36_gdn_gate_spec_t *spec);
 int qwen36_sigmoid_gate(const qwen36_sigmoid_gate_spec_t *spec);
+int qwen36_sigmoid_gate_strided(
+    const qwen36_sigmoid_gate_strided_spec_t *spec);
+int qwen36_copy_strided_rows(const qwen36_copy_strided_rows_spec_t *spec);
 
 #ifdef __cplusplus
 }

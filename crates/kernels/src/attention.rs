@@ -24,6 +24,7 @@ impl AttentionShape {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttentionPrefillSpec {
     pub layer_index: usize,
+    pub start_position: usize,
     pub tokens: usize,
     pub q_bf16: DevicePtr,
     pub k_bf16: DevicePtr,

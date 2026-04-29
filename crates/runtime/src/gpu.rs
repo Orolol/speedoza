@@ -111,6 +111,26 @@ pub struct GpuForwardBuffers {
     pub sampled_token_u32: CudaDeviceBuffer,
 }
 
+#[derive(Debug)]
+pub struct GpuPrefillBuffers {
+    pub capacity: usize,
+    pub hidden: CudaDeviceBuffer,
+    pub residual: CudaDeviceBuffer,
+    pub normed: CudaDeviceBuffer,
+    pub block_out: CudaDeviceBuffer,
+    pub qkv: CudaDeviceBuffer,
+    pub aux: CudaDeviceBuffer,
+    pub aux2: CudaDeviceBuffer,
+    pub aux3: CudaDeviceBuffer,
+    pub gate_f32: CudaDeviceBuffer,
+    pub beta_f32: CudaDeviceBuffer,
+    pub activation_fp4: CudaDeviceBuffer,
+    pub activation_scale: CudaDeviceBuffer,
+    pub activation_scale_2: CudaDeviceBuffer,
+    pub token_u32: CudaDeviceBuffer,
+    pub position_i32: CudaDeviceBuffer,
+}
+
 impl GpuRuntimeBuffers {
     pub fn allocate(state: &RuntimeState, workspace_bytes: usize) -> Result<Self> {
         Ok(Self {
@@ -203,6 +223,65 @@ impl GpuForwardBuffers {
             self.position_i32.bytes(),
             self.logits.bytes(),
             self.sampled_token_u32.bytes(),
+        ]
+        .into_iter()
+        .map(|bytes| bytes as u64)
+        .sum()
+    }
+}
+
+impl GpuPrefillBuffers {
+    pub fn allocate(topology: &ModelTopology, capacity: usize) -> Result<Self> {
+        let capacity = capacity.max(1);
+        let hidden_bytes = capacity * topology.hidden_size * 2;
+        let wide_bf16_values = topology
+            .intermediate_size
+            .max(topology.hidden_size)
+            .max(topology.linear_attention_qkv_dim())
+            .max(topology.linear_attention_value_dim())
+            .max(topology.full_attention_q_dim_with_gate())
+            .max(topology.full_attention_q_dim());
+        let wide_bytes = capacity * wide_bf16_values * 2;
+        let activation_fp4_bytes = capacity * wide_bf16_values.div_ceil(2);
+        let activation_scale_bytes = vec16_scale_bytes(wide_bf16_values, capacity);
+        let linear_heads = topology.linear_num_value_heads;
+        Ok(Self {
+            capacity,
+            hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
+            residual: CudaDeviceBuffer::alloc(hidden_bytes)?,
+            normed: CudaDeviceBuffer::alloc(hidden_bytes)?,
+            block_out: CudaDeviceBuffer::alloc(wide_bytes)?,
+            qkv: CudaDeviceBuffer::alloc(wide_bytes)?,
+            aux: CudaDeviceBuffer::alloc(wide_bytes)?,
+            aux2: CudaDeviceBuffer::alloc(wide_bytes)?,
+            aux3: CudaDeviceBuffer::alloc(wide_bytes)?,
+            gate_f32: CudaDeviceBuffer::alloc(capacity * linear_heads * 4)?,
+            beta_f32: CudaDeviceBuffer::alloc(capacity * linear_heads * 4)?,
+            activation_fp4: CudaDeviceBuffer::alloc(activation_fp4_bytes)?,
+            activation_scale: CudaDeviceBuffer::alloc(activation_scale_bytes)?,
+            activation_scale_2: CudaDeviceBuffer::alloc(4)?,
+            token_u32: CudaDeviceBuffer::alloc(capacity * 4)?,
+            position_i32: CudaDeviceBuffer::alloc(capacity * 4)?,
+        })
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        [
+            self.hidden.bytes(),
+            self.residual.bytes(),
+            self.normed.bytes(),
+            self.block_out.bytes(),
+            self.qkv.bytes(),
+            self.aux.bytes(),
+            self.aux2.bytes(),
+            self.aux3.bytes(),
+            self.gate_f32.bytes(),
+            self.beta_f32.bytes(),
+            self.activation_fp4.bytes(),
+            self.activation_scale.bytes(),
+            self.activation_scale_2.bytes(),
+            self.token_u32.bytes(),
+            self.position_i32.bytes(),
         ]
         .into_iter()
         .map(|bytes| bytes as u64)
