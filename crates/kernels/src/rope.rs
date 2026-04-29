@@ -1,0 +1,16 @@
+use serde::{Deserialize, Serialize};
+
+use crate::backend::DevicePtr;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartialRopeSpec {
+    pub tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub rope_dims: usize,
+    pub base_theta: f64,
+    pub positions_i32: DevicePtr,
+    pub q_bf16: DevicePtr,
+    pub k_bf16: DevicePtr,
+}
+

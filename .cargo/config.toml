@@ -1,0 +1,7 @@
+[build]
+target-dir = "target"
+
+[env]
+QWEN36_FP4_CUDA_MIN_VERSION = "13.0"
+QWEN36_FP4_SM = "120"
+

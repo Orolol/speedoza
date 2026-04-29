@@ -1,0 +1,9 @@
+/target/
+.codex
+**/__pycache__/
+*.pyc
+*.so
+*.o
+*.ptx
+*.cubin
+model_layout.json

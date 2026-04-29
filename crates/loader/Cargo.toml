@@ -1,0 +1,19 @@
+[package]
+name = "qwen36-fp4-loader"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "qwen36_fp4_loader"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+memmap2.workspace = true
+qwen36-fp4-core = { path = "../core" }
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+

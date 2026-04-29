@@ -1,0 +1,17 @@
+[package]
+name = "qwen36-fp4-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "qwen36_fp4_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+qwen36-fp4-core = { path = "../core" }
+qwen36-fp4-kernels = { path = "../kernels" }
+serde.workspace = true
+thiserror.workspace = true
+
