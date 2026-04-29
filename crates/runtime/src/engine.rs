@@ -5,10 +5,10 @@ use qwen36_fp4_core::TensorInfo;
 use qwen36_fp4_core::{CoreError, KvCacheDtype, ModelLayout, ModelTopology, Result};
 #[cfg(feature = "cuda")]
 use qwen36_fp4_kernels::{
-    AttentionDecodeSpec, AttentionShape, Bf16MatVecSpec, Conv1dUpdateSpec, CublasLtFp4ScaleMode,
-    CudaBackend, DeltaNetDecodeSpec, DeltaNetShape, DevicePtr, EmbeddingLookupSpec, GdnGateSpec,
-    Nvfp4GemmSpec, Nvfp4QuantizeSpec, PartialRopeSpec, RmsNormSpec, SamplingSpec, SigmoidGateSpec,
-    SwiGluSpec,
+    AttentionDecodeSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec, Conv1dUpdateSpec,
+    CublasLtFp4ScaleMode, CudaBackend, DeltaNetDecodeSpec, DeltaNetShape, DevicePtr,
+    EmbeddingLookupSpec, GdnGateSpec, Nvfp4GemmSpec, Nvfp4QuantizeSpec, PartialRopeSpec,
+    RmsNormSpec, SamplingSpec, SigmoidGateSpec, SwiGluSpec,
 };
 use qwen36_fp4_kernels::{KernelBackend, NoCudaBackend};
 #[cfg(feature = "cuda")]
@@ -123,12 +123,21 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     pub fn decode_one(&mut self, token: u32) -> Result<ForwardOutput> {
+        self.decode_one_with_sync(token, true)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn decode_one_queued(&mut self, token: u32) -> Result<ForwardOutput> {
+        self.decode_one_with_sync(token, false)
+    }
+
+    fn decode_one_with_sync(&mut self, token: u32, sync_after: bool) -> Result<ForwardOutput> {
         if self.backend.name() == "no-cuda" {
             return Err(CoreError::UnsupportedNoCuda("engine_decode_one"));
         }
         #[cfg(feature = "cuda")]
         {
-            self.forward_token_cuda(token, self.state.position)?;
+            self.forward_token_cuda(token, self.state.position, true, sync_after)?;
             self.state.advance(1);
             Ok(ForwardOutput {
                 logits_device_ptr: self.cuda_forward()?.logits.ptr().0,
@@ -138,6 +147,7 @@ impl<B: KernelBackend> Engine<B> {
         #[cfg(not(feature = "cuda"))]
         {
             let _ = token;
+            let _ = sync_after;
             Err(CoreError::UnsupportedNoCuda("engine_decode_one"))
         }
     }
@@ -154,7 +164,6 @@ impl<B: KernelBackend> Engine<B> {
             top_p: 1.0,
             repetition_penalty: 1.0,
         })?;
-        qwen36_fp4_kernels::cuda_synchronize()?;
         let mut token = [0_u8; 4];
         forward.sampled_token_u32.copy_to_host(&mut token)?;
         Ok(u32::from_ne_bytes(token))
@@ -167,10 +176,12 @@ impl<B: KernelBackend> Engine<B> {
                 "prefill requires at least one prompt token".to_owned(),
             ));
         }
-        for &token in prompt_tokens {
-            self.forward_token_cuda(token, self.state.position)?;
+        for (idx, &token) in prompt_tokens.iter().enumerate() {
+            let emit_logits = idx + 1 == prompt_tokens.len();
+            self.forward_token_cuda(token, self.state.position, emit_logits, false)?;
             self.state.advance(1);
         }
+        qwen36_fp4_kernels::cuda_synchronize()?;
         Ok(ForwardOutput {
             logits_device_ptr: self.cuda_forward()?.logits.ptr().0,
             produced_tokens: prompt_tokens.len(),
@@ -178,7 +189,13 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
-    fn forward_token_cuda(&self, token: u32, position: usize) -> Result<()> {
+    fn forward_token_cuda(
+        &self,
+        token: u32,
+        position: usize,
+        emit_logits: bool,
+        sync_after: bool,
+    ) -> Result<()> {
         if position >= self.config.max_context {
             return Err(CoreError::Runtime(format!(
                 "position {position} exceeds configured max_context {}",
@@ -243,21 +260,25 @@ impl<B: KernelBackend> Engine<B> {
             self.run_mlp(layer, forward)?;
         }
 
-        self.rmsnorm(
-            1,
-            self.topology.hidden_size,
-            forward.hidden.ptr(),
-            self.tensor_ptr(weights, &manifest.final_norm)?,
-            forward.residual.ptr(),
-            DevicePtr::NULL,
-            forward.normed.ptr(),
-        )?;
-        self.bf16_matvec(
-            &manifest.lm_head,
-            forward.normed.ptr(),
-            forward.logits.ptr(),
-        )?;
-        qwen36_fp4_kernels::cuda_synchronize()?;
+        if emit_logits {
+            self.rmsnorm(
+                1,
+                self.topology.hidden_size,
+                forward.hidden.ptr(),
+                self.tensor_ptr(weights, &manifest.final_norm)?,
+                forward.residual.ptr(),
+                DevicePtr::NULL,
+                forward.normed.ptr(),
+            )?;
+            self.bf16_matvec(
+                &manifest.lm_head,
+                forward.normed.ptr(),
+                forward.logits.ptr(),
+            )?;
+        }
+        if sync_after {
+            qwen36_fp4_kernels::cuda_synchronize()?;
+        }
         Ok(())
     }
 
@@ -304,7 +325,21 @@ impl<B: KernelBackend> Engine<B> {
             .deltanet_state
             .ptr_at(layer_ordinal * self.state.deltanet.state_bytes_per_layer as usize)?;
 
-        self.linear(&layer.in_proj_qkv, forward.normed.ptr(), forward.qkv.ptr())?;
+        let in_proj_linears = [
+            (&layer.in_proj_qkv, forward.qkv.ptr()),
+            (&layer.in_proj_b, forward.aux2.ptr()),
+            (&layer.in_proj_a, forward.aux3.ptr()),
+            (&layer.in_proj_z, forward.qkv.ptr()),
+        ];
+        let shared_in_proj = Self::common_nvfp4_in_features(&in_proj_linears)?;
+        if let Some(in_features) = shared_in_proj {
+            self.quantize_nvfp4_activation(forward.normed.ptr(), in_features)?;
+            for &(binding, output) in &in_proj_linears[..3] {
+                self.linear_with_quantized_nvfp4(binding, output, in_features)?;
+            }
+        } else {
+            self.linears_same_input(forward.normed.ptr(), &in_proj_linears[..3])?;
+        }
         self.backend.conv1d_update(&Conv1dUpdateSpec {
             channels: qkv_dim,
             kernel_size: self.topology.linear_conv_kernel_dim,
@@ -313,8 +348,6 @@ impl<B: KernelBackend> Engine<B> {
             weight_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.conv1d_weight)?,
             output_bf16: forward.aux.ptr(),
         })?;
-        self.linear(&layer.in_proj_b, forward.normed.ptr(), forward.aux2.ptr())?;
-        self.linear(&layer.in_proj_a, forward.normed.ptr(), forward.aux3.ptr())?;
         self.backend.gdn_gate(&GdnGateSpec {
             heads: self.topology.linear_num_value_heads,
             a_bf16: forward.aux3.ptr(),
@@ -346,7 +379,11 @@ impl<B: KernelBackend> Engine<B> {
             update_scale: 1.0,
             qk_l2norm: true,
         })?;
-        self.linear(&layer.in_proj_z, forward.normed.ptr(), forward.qkv.ptr())?;
+        if let Some(in_features) = shared_in_proj {
+            self.linear_with_quantized_nvfp4(&layer.in_proj_z, forward.qkv.ptr(), in_features)?;
+        } else {
+            self.linear(&layer.in_proj_z, forward.normed.ptr(), forward.qkv.ptr())?;
+        }
         self.rmsnorm(
             self.topology.linear_num_value_heads,
             self.topology.linear_value_head_dim,
@@ -392,9 +429,14 @@ impl<B: KernelBackend> Engine<B> {
                 ))
             })?;
 
-        self.linear(&layer.q_proj, forward.normed.ptr(), forward.qkv.ptr())?;
-        self.linear(&layer.k_proj, forward.normed.ptr(), forward.aux.ptr())?;
-        self.linear(&layer.v_proj, forward.normed.ptr(), forward.aux2.ptr())?;
+        self.linears_same_input(
+            forward.normed.ptr(),
+            &[
+                (&layer.q_proj, forward.qkv.ptr()),
+                (&layer.k_proj, forward.aux.ptr()),
+                (&layer.v_proj, forward.aux2.ptr()),
+            ],
+        )?;
         self.rmsnorm(
             self.topology.attention_num_heads,
             self.topology.attention_head_dim,
@@ -455,15 +497,12 @@ impl<B: KernelBackend> Engine<B> {
             LayerWeights::LinearAttention(layer) => &layer.common,
             LayerWeights::FullAttention(layer) => &layer.common,
         };
-        self.linear(
-            &common.mlp_gate_proj,
+        self.linears_same_input(
             forward.normed.ptr(),
-            forward.aux.ptr(),
-        )?;
-        self.linear(
-            &common.mlp_up_proj,
-            forward.normed.ptr(),
-            forward.aux2.ptr(),
+            &[
+                (&common.mlp_gate_proj, forward.aux.ptr()),
+                (&common.mlp_up_proj, forward.aux2.ptr()),
+            ],
         )?;
         self.backend.swiglu(&SwiGluSpec {
             rows: 1,
@@ -480,6 +519,45 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn linears_same_input(
+        &self,
+        input: DevicePtr,
+        linears: &[(&LinearWeightBinding, DevicePtr)],
+    ) -> Result<()> {
+        let Some(in_features) = Self::common_nvfp4_in_features(linears)? else {
+            for &(binding, output) in linears {
+                self.linear(binding, input, output)?;
+            }
+            return Ok(());
+        };
+
+        self.quantize_nvfp4_activation(input, in_features)?;
+        for &(binding, output) in linears {
+            self.linear_with_quantized_nvfp4(binding, output, in_features)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn common_nvfp4_in_features(
+        linears: &[(&LinearWeightBinding, DevicePtr)],
+    ) -> Result<Option<usize>> {
+        let mut common = None;
+        for &(binding, _) in linears {
+            let LinearWeightBinding::Nvfp4 { weight, .. } = binding else {
+                return Ok(None);
+            };
+            let in_features = Self::nvfp4_in_features(weight)?;
+            match common {
+                Some(previous) if previous != in_features => return Ok(None),
+                Some(_) => {}
+                None => common = Some(in_features),
+            }
+        }
+        Ok(common)
+    }
+
+    #[cfg(feature = "cuda")]
     fn linear(
         &self,
         binding: &LinearWeightBinding,
@@ -492,58 +570,122 @@ impl<B: KernelBackend> Engine<B> {
                 block_scale,
                 tensor_scale,
             } => {
-                let weights = self.cuda_weights()?;
-                let forward = self.cuda_forward()?;
-                let runtime = self.cuda_runtime()?;
-                let out_features = *weight.shape.first().ok_or_else(|| {
-                    CoreError::Runtime(format!("tensor {} has empty shape", weight.name))
-                })?;
-                let packed_in = *weight.shape.get(1).ok_or_else(|| {
-                    CoreError::Runtime(format!("tensor {} is not a matrix", weight.name))
-                })?;
-                let in_features = packed_in * 2;
-                self.backend.nvfp4_quantize_bf16(&Nvfp4QuantizeSpec {
-                    values: in_features,
-                    input_bf16: input,
-                    output_fp4: forward.activation_fp4.ptr(),
-                    output_scale_e4m3: forward.activation_scale.ptr(),
-                    output_tensor_scale_f32: forward.activation_scale_2.ptr(),
-                })?;
-                let workspace = runtime
-                    .workspace
-                    .as_ref()
-                    .map(|buffer| buffer.ptr())
-                    .unwrap_or(DevicePtr::NULL);
-                let workspace_bytes = runtime
-                    .workspace
-                    .as_ref()
-                    .map(|buffer| buffer.bytes())
-                    .unwrap_or(0);
-                let gemm_spec = Nvfp4GemmSpec {
-                    m: out_features,
-                    n: 1,
-                    k: in_features,
-                    a_fp4: self.tensor_ptr(weights, weight)?,
-                    a_scale: self.tensor_ptr(weights, block_scale)?,
-                    a_scale_2: self.tensor_ptr(weights, tensor_scale)?,
-                    b_fp4: forward.activation_fp4.ptr(),
-                    b_scale: forward.activation_scale.ptr(),
-                    b_scale_2: forward.activation_scale_2.ptr(),
-                    c_bf16: output,
-                    workspace,
-                    workspace_bytes,
-                    alpha: self.tensor_scalar_f32(weights, tensor_scale)?,
-                    scale_mode: CublasLtFp4ScaleMode::Vec16Ue4m3,
-                };
-                self.backend.nvfp4_gemm(&gemm_spec).map_err(|err| {
-                    CoreError::Runtime(format!(
-                        "NVFP4 cuBLASLt GEMM failed for {} (m={}, n={}, k={}): {err}",
-                        weight.name, gemm_spec.m, gemm_spec.n, gemm_spec.k
-                    ))
-                })
+                let in_features = Self::nvfp4_in_features(weight)?;
+                self.quantize_nvfp4_activation(input, in_features)?;
+                self.nvfp4_gemm_with_quantized_activation(
+                    weight,
+                    block_scale,
+                    tensor_scale,
+                    output,
+                    in_features,
+                )
             }
             LinearWeightBinding::Bf16 { weight } => self.bf16_matvec(weight, input, output),
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn linear_with_quantized_nvfp4(
+        &self,
+        binding: &LinearWeightBinding,
+        output: DevicePtr,
+        quantized_in_features: usize,
+    ) -> Result<()> {
+        let LinearWeightBinding::Nvfp4 {
+            weight,
+            block_scale,
+            tensor_scale,
+        } = binding
+        else {
+            return Err(CoreError::Runtime(
+                "quantized NVFP4 path received a BF16 linear".to_owned(),
+            ));
+        };
+        let in_features = Self::nvfp4_in_features(weight)?;
+        if in_features != quantized_in_features {
+            return Err(CoreError::Runtime(format!(
+                "quantized activation has {quantized_in_features} values but {} expects {in_features}",
+                weight.name
+            )));
+        }
+        self.nvfp4_gemm_with_quantized_activation(
+            weight,
+            block_scale,
+            tensor_scale,
+            output,
+            in_features,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn quantize_nvfp4_activation(&self, input: DevicePtr, values: usize) -> Result<()> {
+        let forward = self.cuda_forward()?;
+        self.backend.nvfp4_quantize_bf16(&Nvfp4QuantizeSpec {
+            values,
+            input_bf16: input,
+            output_fp4: forward.activation_fp4.ptr(),
+            output_scale_e4m3: forward.activation_scale.ptr(),
+            output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_gemm_with_quantized_activation(
+        &self,
+        weight: &TensorInfo,
+        block_scale: &TensorInfo,
+        tensor_scale: &TensorInfo,
+        output: DevicePtr,
+        in_features: usize,
+    ) -> Result<()> {
+        let weights = self.cuda_weights()?;
+        let forward = self.cuda_forward()?;
+        let runtime = self.cuda_runtime()?;
+        let out_features = *weight
+            .shape
+            .first()
+            .ok_or_else(|| CoreError::Runtime(format!("tensor {} has empty shape", weight.name)))?;
+        let workspace = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.ptr())
+            .unwrap_or(DevicePtr::NULL);
+        let workspace_bytes = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.bytes())
+            .unwrap_or(0);
+        let gemm_spec = Nvfp4GemmSpec {
+            m: out_features,
+            n: 1,
+            k: in_features,
+            a_fp4: self.tensor_ptr(weights, weight)?,
+            a_scale: self.tensor_ptr(weights, block_scale)?,
+            a_scale_2: self.tensor_ptr(weights, tensor_scale)?,
+            b_fp4: forward.activation_fp4.ptr(),
+            b_scale: forward.activation_scale.ptr(),
+            b_scale_2: forward.activation_scale_2.ptr(),
+            c_bf16: output,
+            workspace,
+            workspace_bytes,
+            alpha: self.tensor_scalar_f32(weights, tensor_scale)?,
+            scale_mode: CublasLtFp4ScaleMode::Vec16Ue4m3,
+        };
+        self.backend.nvfp4_gemm(&gemm_spec).map_err(|err| {
+            CoreError::Runtime(format!(
+                "NVFP4 cuBLASLt GEMM failed for {} (m={}, n={}, k={}): {err}",
+                weight.name, gemm_spec.m, gemm_spec.n, gemm_spec.k
+            ))
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn nvfp4_in_features(weight: &TensorInfo) -> Result<usize> {
+        let packed_in = *weight
+            .shape
+            .get(1)
+            .ok_or_else(|| CoreError::Runtime(format!("tensor {} is not a matrix", weight.name)))?;
+        Ok(packed_in * 2)
     }
 
     #[cfg(feature = "cuda")]
@@ -556,11 +698,38 @@ impl<B: KernelBackend> Engine<B> {
             .shape
             .get(1)
             .ok_or_else(|| CoreError::Runtime(format!("tensor {} is not a matrix", weight.name)))?;
+        let runtime = self.cuda_runtime()?;
+        let workspace = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.ptr())
+            .unwrap_or(DevicePtr::NULL);
+        let workspace_bytes = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.bytes())
+            .unwrap_or(0);
+        let input_bf16 = input;
+        let weight_bf16 = self.tensor_ptr(self.cuda_weights()?, weight)?;
+        let gemm_result = self.backend.bf16_gemm(&Bf16GemmSpec {
+            m: out_features,
+            n: 1,
+            k: in_features,
+            a_bf16: weight_bf16,
+            b_bf16: input_bf16,
+            c_bf16: output,
+            workspace,
+            workspace_bytes,
+        });
+        if gemm_result.is_ok() {
+            return gemm_result;
+        }
+
         self.backend.bf16_matvec(&Bf16MatVecSpec {
             out_features,
             in_features,
-            input_bf16: input,
-            weight_bf16: self.tensor_ptr(self.cuda_weights()?, weight)?,
+            input_bf16,
+            weight_bf16,
             output_bf16: output,
         })
     }

@@ -331,6 +331,35 @@ int main() {
   expect_close(matvec_values[0], 5.0f, 0.02f, "bf16 matvec[0]");
   expect_close(matvec_values[1], 5.0f, 0.02f, "bf16 matvec[1]");
 
+  qwen36_device_ptr_t bf16_gemm_input = dev_alloc<__nv_bfloat16>(128);
+  qwen36_device_ptr_t bf16_gemm_weight = dev_alloc<__nv_bfloat16>(128 * 128);
+  qwen36_device_ptr_t bf16_gemm_out = dev_alloc<__nv_bfloat16>(128);
+  qwen36_device_ptr_t bf16_gemm_workspace = dev_alloc<uint8_t>(4 * 1024 * 1024);
+  std::vector<float> bf16_gemm_input_values(128);
+  for (size_t idx = 0; idx < bf16_gemm_input_values.size(); ++idx) {
+    bf16_gemm_input_values[idx] = static_cast<float>(idx + 1);
+  }
+  std::vector<float> bf16_gemm_weight_values(128 * 128, 0.0f);
+  bf16_gemm_weight_values[0] = 1.0f;
+  bf16_gemm_weight_values[128 + 1] = 2.0f;
+  bf16_gemm_weight_values[(127 * 128) + 127] = 3.0f;
+  copy_bf16(bf16_gemm_input, bf16_gemm_input_values);
+  copy_bf16(bf16_gemm_weight, bf16_gemm_weight_values);
+  qwen36_bf16_gemm_spec_t bf16_gemm_spec{};
+  bf16_gemm_spec.m = 128;
+  bf16_gemm_spec.n = 1;
+  bf16_gemm_spec.k = 128;
+  bf16_gemm_spec.a_bf16 = bf16_gemm_weight;
+  bf16_gemm_spec.b_bf16 = bf16_gemm_input;
+  bf16_gemm_spec.c_bf16 = bf16_gemm_out;
+  bf16_gemm_spec.workspace = bf16_gemm_workspace;
+  bf16_gemm_spec.workspace_bytes = 4 * 1024 * 1024;
+  must_status(qwen36_bf16_gemm(&bf16_gemm_spec), "bf16 gemm");
+  std::vector<float> bf16_gemm_values = read_bf16(bf16_gemm_out, 128);
+  expect_close(bf16_gemm_values[0], 1.0f, 0.5f, "bf16 gemm[0]");
+  expect_close(bf16_gemm_values[1], 4.0f, 0.5f, "bf16 gemm[1]");
+  expect_close(bf16_gemm_values[127], 384.0f, 0.5f, "bf16 gemm[last]");
+
   qwen36_device_ptr_t fp4_weight = dev_alloc<uint8_t>(2);
   qwen36_device_ptr_t fp4_scale_raw = dev_alloc<uint8_t>(1);
   qwen36_device_ptr_t fp4_scale = dev_alloc<uint8_t>(512);
@@ -489,6 +518,10 @@ int main() {
   dev_free<__nv_bfloat16>(matvec_input);
   dev_free<__nv_bfloat16>(matvec_weight);
   dev_free<__nv_bfloat16>(matvec_out);
+  dev_free<__nv_bfloat16>(bf16_gemm_input);
+  dev_free<__nv_bfloat16>(bf16_gemm_weight);
+  dev_free<__nv_bfloat16>(bf16_gemm_out);
+  dev_free<uint8_t>(bf16_gemm_workspace);
   dev_free<uint8_t>(fp4_weight);
   dev_free<uint8_t>(fp4_scale_raw);
   dev_free<uint8_t>(fp4_scale);

@@ -312,11 +312,12 @@ __global__ void nvfp4_matvec_kernel(const __nv_bfloat16 *input,
   }
 }
 
-__global__ void nvfp4_quantize_scale_kernel(const __nv_bfloat16 *input,
-                                            uint8_t *scale,
+__global__ void nvfp4_quantize_fused_kernel(const __nv_bfloat16 *input,
+                                            uint8_t *output, uint8_t *scale,
                                             float *tensor_scale,
                                             size_t values) {
   __shared__ float scratch[32];
+  __shared__ float decoded_scale;
   const size_t group = blockIdx.x;
   const size_t scale_inner_dim = round_up_size(div_ceil_size(values, 16), 4);
   const size_t start = group * 16;
@@ -340,40 +341,27 @@ __global__ void nvfp4_quantize_scale_kernel(const __nv_bfloat16 *input,
   if (threadIdx.x == 0) {
     const float scale_value =
         scratch[0] > 0.0f ? fmaxf(scratch[0] / 6.0f, 1.0e-8f) : 1.0f;
-    scale[vec16_scale_offset(group, 0, scale_inner_dim)] =
-        encode_e4m3_positive(scale_value);
+    const uint8_t scale_code = encode_e4m3_positive(scale_value);
+    scale[vec16_scale_offset(group, 0, scale_inner_dim)] = scale_code;
+    decoded_scale = fmaxf(decode_e4m3(scale_code), 1.0e-8f);
     if (group == 0 && tensor_scale != nullptr) {
       *tensor_scale = 1.0f;
     }
   }
-}
+  __syncthreads();
 
-__global__ void nvfp4_quantize_pack_kernel(const __nv_bfloat16 *input,
-                                           uint8_t *output,
-                                           const uint8_t *scale,
-                                           size_t values) {
-  const size_t pair = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t col = pair * 2;
-  if (col >= values) {
-    return;
+  if (threadIdx.x < 8) {
+    const size_t col = start + threadIdx.x * 2;
+    if (col < values) {
+      const float value0 = __bfloat162float(input[col]) / decoded_scale;
+      uint8_t packed = encode_e2m1(value0);
+      if (col + 1 < values) {
+        const float value1 = __bfloat162float(input[col + 1]) / decoded_scale;
+        packed |= static_cast<uint8_t>(encode_e2m1(value1) << 4);
+      }
+      output[col / 2] = packed;
+    }
   }
-
-  const size_t scale_inner_dim = round_up_size(div_ceil_size(values, 16), 4);
-  const float scale0 =
-      fmaxf(decode_e4m3(scale[vec16_scale_offset(col / 16, 0,
-                                                 scale_inner_dim)]),
-            1.0e-8f);
-  const float value0 = __bfloat162float(input[col]) / scale0;
-  uint8_t packed = encode_e2m1(value0);
-  if (col + 1 < values) {
-    const float scale1 =
-        fmaxf(decode_e4m3(scale[vec16_scale_offset((col + 1) / 16, 0,
-                                                   scale_inner_dim)]),
-              1.0e-8f);
-    const float value1 = __bfloat162float(input[col + 1]) / scale1;
-    packed |= static_cast<uint8_t>(encode_e2m1(value1) << 4);
-  }
-  output[pair] = packed;
 }
 
 __global__ void nvfp4_retile_scales_kernel(const uint8_t *input,
@@ -568,30 +556,11 @@ qwen36_nvfp4_quantize_bf16(const qwen36_nvfp4_quantize_spec_t *spec) {
 
   const unsigned int scale_blocks =
       static_cast<unsigned int>((spec->values + 15) / 16);
-  cudaError_t err =
-      cudaMemset(ptr<uint8_t>(spec->output_scale_e4m3), 0,
-                 vec16_scale_bytes(scale_blocks, 1));
-  if (err != cudaSuccess) {
-    return QWEN36_STATUS_CUDA_ERROR;
-  }
-  nvfp4_quantize_scale_kernel<<<scale_blocks, 32>>>(
+  nvfp4_quantize_fused_kernel<<<scale_blocks, 32>>>(
       ptr<const __nv_bfloat16>(spec->input_bf16),
-      ptr<uint8_t>(spec->output_scale_e4m3),
+      ptr<uint8_t>(spec->output_fp4), ptr<uint8_t>(spec->output_scale_e4m3),
       ptr<float>(spec->output_tensor_scale_f32), spec->values);
-  err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    return QWEN36_STATUS_CUDA_ERROR;
-  }
-
-  const int threads = 256;
-  const size_t pairs = (spec->values + 1) / 2;
-  const unsigned int blocks =
-      static_cast<unsigned int>((pairs + threads - 1) / threads);
-  nvfp4_quantize_pack_kernel<<<blocks, threads>>>(
-      ptr<const __nv_bfloat16>(spec->input_bf16),
-      ptr<uint8_t>(spec->output_fp4),
-      ptr<const uint8_t>(spec->output_scale_e4m3), spec->values);
-  err = cudaGetLastError();
+  cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
 

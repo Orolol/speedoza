@@ -5,8 +5,8 @@ use crate::attention::{AttentionDecodeSpec, AttentionPrefillSpec};
 use crate::deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec};
 use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
-    Bf16MatVecSpec, Conv1dUpdateSpec, EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec,
-    Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, SigmoidGateSpec,
+    Bf16GemmSpec, Bf16MatVecSpec, Conv1dUpdateSpec, EmbeddingLookupSpec, GdnGateSpec,
+    Nvfp4MatVecSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, SigmoidGateSpec,
 };
 use crate::rmsnorm::RmsNormSpec;
 use crate::rope::PartialRopeSpec;
@@ -79,6 +79,10 @@ pub trait KernelBackend: Send + Sync {
 
     fn bf16_matvec(&self, _spec: &Bf16MatVecSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("bf16_matvec"))
+    }
+
+    fn bf16_gemm(&self, _spec: &Bf16GemmSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("bf16_gemm"))
     }
 
     fn nvfp4_matvec(&self, _spec: &Nvfp4MatVecSpec) -> Result<()> {
@@ -193,6 +197,13 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::Bf16MatVecSpec::from(spec);
         check("qwen36_bf16_matvec", unsafe {
             ffi::qwen36_bf16_matvec(&ffi_spec)
+        })
+    }
+
+    fn bf16_gemm(&self, spec: &Bf16GemmSpec) -> Result<()> {
+        let ffi_spec = ffi::Bf16GemmSpec::from(spec);
+        check("qwen36_bf16_gemm", unsafe {
+            ffi::qwen36_bf16_gemm(&ffi_spec)
         })
     }
 
@@ -573,6 +584,33 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct Bf16GemmSpec {
+        pub m: usize,
+        pub n: usize,
+        pub k: usize,
+        pub a_bf16: DevicePtr,
+        pub b_bf16: DevicePtr,
+        pub c_bf16: DevicePtr,
+        pub workspace: DevicePtr,
+        pub workspace_bytes: usize,
+    }
+
+    impl From<&crate::ops::Bf16GemmSpec> for Bf16GemmSpec {
+        fn from(value: &crate::ops::Bf16GemmSpec) -> Self {
+            Self {
+                m: value.m,
+                n: value.n,
+                k: value.k,
+                a_bf16: value.a_bf16,
+                b_bf16: value.b_bf16,
+                c_bf16: value.c_bf16,
+                workspace: value.workspace,
+                workspace_bytes: value.workspace_bytes,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct Nvfp4MatVecSpec {
         pub out_features: usize,
         pub in_features: usize,
@@ -758,6 +796,7 @@ mod ffi {
         pub fn qwen36_swiglu(spec: *const SwiGluSpec) -> i32;
         pub fn qwen36_sample(spec: *const SamplingSpec) -> i32;
         pub fn qwen36_embedding_lookup(spec: *const EmbeddingLookupSpec) -> i32;
+        pub fn qwen36_bf16_gemm(spec: *const Bf16GemmSpec) -> i32;
         pub fn qwen36_bf16_matvec(spec: *const Bf16MatVecSpec) -> i32;
         pub fn qwen36_nvfp4_matvec(spec: *const Nvfp4MatVecSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_bf16(spec: *const Nvfp4QuantizeSpec) -> i32;

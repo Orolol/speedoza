@@ -41,6 +41,17 @@ typedef struct {
 } qwen36_nvfp4_gemm_spec_t;
 
 typedef struct {
+  size_t m;
+  size_t n;
+  size_t k;
+  qwen36_device_ptr_t a_bf16;
+  qwen36_device_ptr_t b_bf16;
+  qwen36_device_ptr_t c_bf16;
+  qwen36_device_ptr_t workspace;
+  size_t workspace_bytes;
+} qwen36_bf16_gemm_spec_t;
+
+typedef struct {
   size_t q_heads;
   size_t kv_heads;
   size_t head_dim;
@@ -229,6 +240,7 @@ int qwen36_cuda_memset(qwen36_device_ptr_t dst, int value, size_t bytes);
 int qwen36_cuda_synchronize(void);
 
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
+int qwen36_bf16_gemm(const qwen36_bf16_gemm_spec_t *spec);
 int qwen36_deltanet_decode(const qwen36_deltanet_decode_spec_t *spec);
 int qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec);
 int qwen36_turboquant_encode_kv(const qwen36_turboquant_encode_spec_t *spec);

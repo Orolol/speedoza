@@ -22,6 +22,18 @@ pub struct Bf16MatVecSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bf16GemmSpec {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub a_bf16: DevicePtr,
+    pub b_bf16: DevicePtr,
+    pub c_bf16: DevicePtr,
+    pub workspace: DevicePtr,
+    pub workspace_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Nvfp4MatVecSpec {
     pub out_features: usize,
     pub in_features: usize,
