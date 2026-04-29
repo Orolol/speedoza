@@ -376,6 +376,19 @@ __global__ void nvfp4_quantize_pack_kernel(const __nv_bfloat16 *input,
   output[pair] = packed;
 }
 
+__global__ void nvfp4_retile_scales_kernel(const uint8_t *input,
+                                           uint8_t *output, size_t rows,
+                                           size_t inner_groups) {
+  const size_t total = rows * inner_groups;
+  const size_t sf_inner_dim = round_up_size(inner_groups, 4);
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += blockDim.x * gridDim.x) {
+    const size_t row = idx / inner_groups;
+    const size_t inner = idx % inner_groups;
+    output[vec16_scale_offset(inner, row, sf_inner_dim)] = input[idx];
+  }
+}
+
 __global__ void conv1d_update_kernel(const __nv_bfloat16 *input,
                                      __nv_bfloat16 *history,
                                      const __nv_bfloat16 *weight,
@@ -578,6 +591,34 @@ qwen36_nvfp4_quantize_bf16(const qwen36_nvfp4_quantize_spec_t *spec) {
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<uint8_t>(spec->output_fp4),
       ptr<const uint8_t>(spec->output_scale_e4m3), spec->values);
+  err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int
+qwen36_nvfp4_retile_scales(const qwen36_nvfp4_retile_scales_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->rows == 0 || spec->inner_groups == 0 ||
+      spec->input_row_major_u8.ptr == 0 || spec->output_tiled_u8.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+
+  cudaError_t err =
+      cudaMemset(ptr<uint8_t>(spec->output_tiled_u8), 0,
+                 vec16_scale_bytes(spec->inner_groups, spec->rows));
+  if (err != cudaSuccess) {
+    return QWEN36_STATUS_CUDA_ERROR;
+  }
+
+  const int threads = 256;
+  const size_t total = spec->rows * spec->inner_groups;
+  const unsigned int blocks =
+      static_cast<unsigned int>((total + threads - 1) / threads);
+  nvfp4_retile_scales_kernel<<<blocks, threads>>>(
+      ptr<const uint8_t>(spec->input_row_major_u8),
+      ptr<uint8_t>(spec->output_tiled_u8), spec->rows, spec->inner_groups);
   err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }

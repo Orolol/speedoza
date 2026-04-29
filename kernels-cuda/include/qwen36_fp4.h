@@ -186,6 +186,13 @@ typedef struct {
 } qwen36_nvfp4_quantize_spec_t;
 
 typedef struct {
+  size_t rows;
+  size_t inner_groups;
+  qwen36_device_ptr_t input_row_major_u8;
+  qwen36_device_ptr_t output_tiled_u8;
+} qwen36_nvfp4_retile_scales_spec_t;
+
+typedef struct {
   size_t channels;
   size_t kernel_size;
   qwen36_device_ptr_t input_bf16;
@@ -234,6 +241,7 @@ int qwen36_embedding_lookup(const qwen36_embedding_lookup_spec_t *spec);
 int qwen36_bf16_matvec(const qwen36_bf16_matvec_spec_t *spec);
 int qwen36_nvfp4_matvec(const qwen36_nvfp4_matvec_spec_t *spec);
 int qwen36_nvfp4_quantize_bf16(const qwen36_nvfp4_quantize_spec_t *spec);
+int qwen36_nvfp4_retile_scales(const qwen36_nvfp4_retile_scales_spec_t *spec);
 int qwen36_conv1d_update(const qwen36_conv1d_update_spec_t *spec);
 int qwen36_gdn_gate(const qwen36_gdn_gate_spec_t *spec);
 int qwen36_sigmoid_gate(const qwen36_sigmoid_gate_spec_t *spec);

@@ -332,12 +332,20 @@ int main() {
   expect_close(matvec_values[1], 5.0f, 0.02f, "bf16 matvec[1]");
 
   qwen36_device_ptr_t fp4_weight = dev_alloc<uint8_t>(2);
+  qwen36_device_ptr_t fp4_scale_raw = dev_alloc<uint8_t>(1);
   qwen36_device_ptr_t fp4_scale = dev_alloc<uint8_t>(512);
   qwen36_device_ptr_t fp4_global = dev_alloc<float>(1);
   qwen36_device_ptr_t fp4_out = dev_alloc<__nv_bfloat16>(1);
   copy_raw<uint8_t>(fp4_weight, {0x42, 0xA1});
-  copy_raw<uint8_t>(fp4_scale, std::vector<uint8_t>(512, 0x38));
+  copy_raw<uint8_t>(fp4_scale_raw, {0x38});
   copy_raw<float>(fp4_global, {1.0f});
+  qwen36_nvfp4_retile_scales_spec_t retile_spec{};
+  retile_spec.rows = 1;
+  retile_spec.inner_groups = 1;
+  retile_spec.input_row_major_u8 = fp4_scale_raw;
+  retile_spec.output_tiled_u8 = fp4_scale;
+  must_status(qwen36_nvfp4_retile_scales(&retile_spec),
+              "nvfp4 retile scales");
   qwen36_nvfp4_matvec_spec_t fp4_spec{};
   fp4_spec.out_features = 1;
   fp4_spec.in_features = 4;
@@ -482,6 +490,7 @@ int main() {
   dev_free<__nv_bfloat16>(matvec_weight);
   dev_free<__nv_bfloat16>(matvec_out);
   dev_free<uint8_t>(fp4_weight);
+  dev_free<uint8_t>(fp4_scale_raw);
   dev_free<uint8_t>(fp4_scale);
   dev_free<float>(fp4_global);
   dev_free<__nv_bfloat16>(fp4_out);

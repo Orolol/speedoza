@@ -1,6 +1,8 @@
 #[cfg(feature = "cuda")]
 use std::io::{self, Write};
 use std::path::PathBuf;
+#[cfg(feature = "cuda")]
+use std::time::Instant;
 
 use anyhow::Result;
 #[cfg(not(feature = "cuda"))]
@@ -67,6 +69,18 @@ enum Command {
         #[arg(long, default_value_t = 256)]
         max_new_tokens: usize,
         #[arg(long, default_value_t = 3)]
+        mtp_speculative_tokens: usize,
+    },
+    Bench {
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long, default_value_t = 2000)]
+        prompt_tokens: usize,
+        #[arg(long, default_value_t = 256)]
+        max_new_tokens: usize,
+        #[arg(long, default_value = "x")]
+        token_text: String,
+        #[arg(long, default_value_t = 0)]
         mtp_speculative_tokens: usize,
     },
 }
@@ -164,6 +178,21 @@ fn main() -> Result<()> {
         } => {
             run_chat(model_dir, prompt, max_new_tokens, mtp_speculative_tokens)?;
         }
+        Command::Bench {
+            model_dir,
+            prompt_tokens,
+            max_new_tokens,
+            token_text,
+            mtp_speculative_tokens,
+        } => {
+            run_bench(
+                model_dir,
+                prompt_tokens,
+                max_new_tokens,
+                token_text,
+                mtp_speculative_tokens,
+            )?;
+        }
     }
     Ok(())
 }
@@ -210,6 +239,99 @@ fn run_chat(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+fn run_bench(
+    model_dir: PathBuf,
+    prompt_token_count: usize,
+    max_new_tokens: usize,
+    token_text: String,
+    mtp_speculative_tokens: usize,
+) -> Result<()> {
+    let total_start = Instant::now();
+    let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+    let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
+    let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
+    let prompt_tokens = synthetic_prompt_tokens(&tokenizer, &token_text, prompt_token_count)?;
+    let config = EngineConfig {
+        max_context: prompt_tokens.len().saturating_add(max_new_tokens).max(1),
+        kv_cache_dtype: KvCacheDtype::Bf16,
+        mtp_speculative_tokens,
+        ..EngineConfig::default()
+    };
+
+    let load_start = Instant::now();
+    let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, config)?;
+    let load_seconds = load_start.elapsed().as_secs_f64();
+
+    let prefill_start = Instant::now();
+    engine.prefill(&prompt_tokens)?;
+    let prefill_seconds = prefill_start.elapsed().as_secs_f64();
+
+    let decode_start = Instant::now();
+    let mut generated = 0_usize;
+    for idx in 0..max_new_tokens {
+        let token = engine.sample_greedy()?;
+        generated += 1;
+        if idx + 1 < max_new_tokens {
+            engine.decode_one(token)?;
+        }
+    }
+    let decode_seconds = decode_start.elapsed().as_secs_f64();
+    let total_seconds = total_start.elapsed().as_secs_f64();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "backend": "cuda",
+            "prompt_tokens": prompt_tokens.len(),
+            "generated_tokens": generated,
+            "load_seconds": load_seconds,
+            "prefill_seconds": prefill_seconds,
+            "decode_seconds": decode_seconds,
+            "total_seconds": total_seconds,
+            "prefill_tokens_per_second": rate(prompt_tokens.len(), prefill_seconds),
+            "decode_tokens_per_second": rate(generated, decode_seconds),
+            "mtp_speculative_tokens": mtp_speculative_tokens,
+        }))?
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn synthetic_prompt_tokens(
+    tokenizer: &QwenTokenizer,
+    token_text: &str,
+    target_tokens: usize,
+) -> Result<Vec<u32>> {
+    if target_tokens == 0 {
+        return Ok(Vec::new());
+    }
+    let seed = tokenizer.encode(token_text, false)?;
+    let seed = if seed.is_empty() {
+        tokenizer.encode("x", false)?
+    } else {
+        seed
+    };
+    if seed.is_empty() {
+        anyhow::bail!("tokenizer produced no tokens for benchmark seed text");
+    }
+    let mut tokens = Vec::with_capacity(target_tokens);
+    while tokens.len() < target_tokens {
+        let remaining = target_tokens - tokens.len();
+        tokens.extend(seed.iter().copied().take(remaining));
+    }
+    Ok(tokens)
+}
+
+#[cfg(feature = "cuda")]
+fn rate(tokens: usize, seconds: f64) -> f64 {
+    if seconds > 0.0 {
+        tokens as f64 / seconds
+    } else {
+        0.0
+    }
+}
+
 #[cfg(not(feature = "cuda"))]
 fn run_chat(
     model_dir: PathBuf,
@@ -237,6 +359,17 @@ fn run_chat(
         );
     }
     Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn run_bench(
+    _model_dir: PathBuf,
+    _prompt_tokens: usize,
+    _max_new_tokens: usize,
+    _token_text: String,
+    _mtp_speculative_tokens: usize,
+) -> Result<()> {
+    bail!("bench requires rebuilding qwen36 with --features cuda and the CUDA shared library")
 }
 
 #[cfg(feature = "cuda")]

@@ -6,7 +6,7 @@ use crate::deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec};
 use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
     Bf16MatVecSpec, Conv1dUpdateSpec, EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec,
-    Nvfp4QuantizeSpec, SigmoidGateSpec,
+    Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, SigmoidGateSpec,
 };
 use crate::rmsnorm::RmsNormSpec;
 use crate::rope::PartialRopeSpec;
@@ -87,6 +87,10 @@ pub trait KernelBackend: Send + Sync {
 
     fn nvfp4_quantize_bf16(&self, _spec: &Nvfp4QuantizeSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("nvfp4_quantize_bf16"))
+    }
+
+    fn nvfp4_retile_scales(&self, _spec: &Nvfp4RetileScalesSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("nvfp4_retile_scales"))
     }
 
     fn conv1d_update(&self, _spec: &Conv1dUpdateSpec) -> Result<()> {
@@ -206,6 +210,10 @@ impl KernelBackend for CudaBackend {
         })
     }
 
+    fn nvfp4_retile_scales(&self, spec: &Nvfp4RetileScalesSpec) -> Result<()> {
+        nvfp4_retile_scales(spec)
+    }
+
     fn conv1d_update(&self, spec: &Conv1dUpdateSpec) -> Result<()> {
         let ffi_spec = ffi::Conv1dUpdateSpec::from(spec);
         check("qwen36_conv1d_update", unsafe {
@@ -226,6 +234,14 @@ impl KernelBackend for CudaBackend {
             ffi::qwen36_sigmoid_gate(&ffi_spec)
         })
     }
+}
+
+#[cfg(feature = "cuda")]
+pub fn nvfp4_retile_scales(spec: &Nvfp4RetileScalesSpec) -> Result<()> {
+    let ffi_spec = ffi::Nvfp4RetileScalesSpec::from(spec);
+    check("qwen36_nvfp4_retile_scales", unsafe {
+        ffi::qwen36_nvfp4_retile_scales(&ffi_spec)
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -603,6 +619,25 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct Nvfp4RetileScalesSpec {
+        pub rows: usize,
+        pub inner_groups: usize,
+        pub input_row_major_u8: DevicePtr,
+        pub output_tiled_u8: DevicePtr,
+    }
+
+    impl From<&crate::ops::Nvfp4RetileScalesSpec> for Nvfp4RetileScalesSpec {
+        fn from(value: &crate::ops::Nvfp4RetileScalesSpec) -> Self {
+            Self {
+                rows: value.rows,
+                inner_groups: value.inner_groups,
+                input_row_major_u8: value.input_row_major_u8,
+                output_tiled_u8: value.output_tiled_u8,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct Conv1dUpdateSpec {
         pub channels: usize,
         pub kernel_size: usize,
@@ -726,6 +761,7 @@ mod ffi {
         pub fn qwen36_bf16_matvec(spec: *const Bf16MatVecSpec) -> i32;
         pub fn qwen36_nvfp4_matvec(spec: *const Nvfp4MatVecSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_bf16(spec: *const Nvfp4QuantizeSpec) -> i32;
+        pub fn qwen36_nvfp4_retile_scales(spec: *const Nvfp4RetileScalesSpec) -> i32;
         pub fn qwen36_conv1d_update(spec: *const Conv1dUpdateSpec) -> i32;
         pub fn qwen36_gdn_gate(spec: *const GdnGateSpec) -> i32;
         pub fn qwen36_sigmoid_gate(spec: *const SigmoidGateSpec) -> i32;

@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use qwen36_fp4_core::{CoreError, ModelTopology, Result, TensorDtype, TensorInfo, TensorRole};
-use qwen36_fp4_kernels::{CudaDeviceBuffer, DevicePtr, cuda_synchronize};
+use qwen36_fp4_kernels::{
+    CudaDeviceBuffer, DevicePtr, Nvfp4RetileScalesSpec, cuda_synchronize, nvfp4_retile_scales,
+};
 use qwen36_fp4_loader::MappedModel;
 
 use crate::state::RuntimeState;
@@ -38,6 +40,7 @@ impl GpuWeightStore {
             .map(|tensor| tensor.name.clone())
             .collect::<BTreeSet<_>>();
         let mut tensors = BTreeMap::new();
+        let mut staging_buffers = Vec::new();
         let mut total_bytes = 0_u64;
 
         for name in names {
@@ -45,11 +48,15 @@ impl GpuWeightStore {
                 .tensor_info(&name)
                 .cloned()
                 .ok_or_else(|| CoreError::Runtime(format!("tensor {name} is missing")))?;
-            let tensor = upload_tensor(model, info)?;
-            total_bytes += tensor.buffer.bytes() as u64;
-            tensors.insert(name, tensor);
+            let upload = upload_tensor(model, info)?;
+            total_bytes += upload.tensor.buffer.bytes() as u64;
+            if let Some(staging) = upload.staging {
+                staging_buffers.push(staging);
+            }
+            tensors.insert(name, upload.tensor);
         }
         cuda_synchronize()?;
+        drop(staging_buffers);
 
         Ok(Self {
             tensors,
@@ -203,7 +210,13 @@ impl GpuForwardBuffers {
     }
 }
 
-fn upload_tensor(model: &MappedModel, info: TensorInfo) -> Result<GpuTensor> {
+#[derive(Debug)]
+struct UploadedTensor {
+    tensor: GpuTensor,
+    staging: Option<CudaDeviceBuffer>,
+}
+
+fn upload_tensor(model: &MappedModel, info: TensorInfo) -> Result<UploadedTensor> {
     let name = info.name.clone();
     model
         .with_tensor(&name, move |view| {
@@ -216,22 +229,28 @@ fn upload_tensor(model: &MappedModel, info: TensorInfo) -> Result<GpuTensor> {
                     data.len()
                 );
             }
-            let upload_data = if info.role == TensorRole::Nvfp4BlockScale {
-                retile_vec16_scales(&info, data)?
-            } else {
-                data.to_vec()
-            };
             let scalar_f32 = (info.dtype == TensorDtype::F32 && data.len() == 4)
                 .then(|| f32::from_le_bytes(data.try_into().expect("four bytes were checked")));
-            let buffer = CudaDeviceBuffer::alloc(upload_data.len())
-                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-            buffer
-                .copy_from_host(&upload_data)
-                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-            Ok(GpuTensor {
-                info,
-                buffer,
-                scalar_f32,
+            let mut staging = None;
+            let buffer = if info.role == TensorRole::Nvfp4BlockScale {
+                let upload = upload_retiled_scales(&info, data)?;
+                staging = Some(upload.staging);
+                upload.tiled
+            } else {
+                let buffer = CudaDeviceBuffer::alloc(data.len())
+                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                buffer
+                    .copy_from_host(data)
+                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                buffer
+            };
+            Ok(UploadedTensor {
+                tensor: GpuTensor {
+                    info,
+                    buffer,
+                    scalar_f32,
+                },
+                staging,
             })
         })
         .map_err(|err| CoreError::Runtime(err.to_string()))
@@ -258,7 +277,16 @@ fn vec16_scale_bytes(inner_values: usize, outer_values: usize) -> usize {
     outer_values.div_ceil(128) * inner_groups.div_ceil(4) * 512
 }
 
-fn retile_vec16_scales(info: &TensorInfo, row_major: &[u8]) -> anyhow::Result<Vec<u8>> {
+#[derive(Debug)]
+struct RetiledScaleUpload {
+    tiled: CudaDeviceBuffer,
+    staging: CudaDeviceBuffer,
+}
+
+fn upload_retiled_scales(
+    info: &TensorInfo,
+    row_major: &[u8],
+) -> anyhow::Result<RetiledScaleUpload> {
     let outer = *info
         .shape
         .first()
@@ -277,23 +305,22 @@ fn retile_vec16_scales(info: &TensorInfo, row_major: &[u8]) -> anyhow::Result<Ve
         );
     }
 
-    let sf_inner_dim = inner_groups.div_ceil(4) * 4;
-    let mut tiled = vec![0_u8; outer.div_ceil(128) * (sf_inner_dim / 4) * 512];
-    for row in 0..outer {
-        for inner in 0..inner_groups {
-            let src = row * inner_groups + inner;
-            let dst = vec16_scale_offset(inner, row, sf_inner_dim);
-            tiled[dst] = row_major[src];
-        }
-    }
-    Ok(tiled)
-}
-
-fn vec16_scale_offset(inner: usize, outer: usize, sf_inner_dim: usize) -> usize {
-    let block_inner = (inner / 4) * 4;
-    let block_outer = outer / 128;
-    let block_offset = (block_inner + block_outer * sf_inner_dim) * 128;
-    let tile_outer = outer % 128;
-    let tile_inner = inner % 4;
-    block_offset + (tile_outer % 32) * 16 + (tile_outer / 32) * 4 + tile_inner
+    let raw =
+        CudaDeviceBuffer::alloc(row_major.len()).map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    raw.copy_from_host(row_major)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let tiled_bytes = outer.div_ceil(128) * inner_groups.div_ceil(4) * 512;
+    let tiled =
+        CudaDeviceBuffer::alloc(tiled_bytes).map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    nvfp4_retile_scales(&Nvfp4RetileScalesSpec {
+        rows: outer,
+        inner_groups,
+        input_row_major_u8: raw.ptr(),
+        output_tiled_u8: tiled.ptr(),
+    })
+    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    Ok(RetiledScaleUpload {
+        tiled,
+        staging: raw,
+    })
 }

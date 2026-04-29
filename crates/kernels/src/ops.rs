@@ -42,6 +42,14 @@ pub struct Nvfp4QuantizeSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Nvfp4RetileScalesSpec {
+    pub rows: usize,
+    pub inner_groups: usize,
+    pub input_row_major_u8: DevicePtr,
+    pub output_tiled_u8: DevicePtr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conv1dUpdateSpec {
     pub channels: usize,
     pub kernel_size: usize,
