@@ -238,6 +238,35 @@ int main() {
   expect_close(norm_values[0], 2.0f * norm_scale, 0.02f, "rmsnorm[0]");
   expect_close(norm_values[3], 4.0f * norm_scale, 0.02f, "rmsnorm[3]");
 
+  qwen36_device_ptr_t fused_norm_in = dev_alloc<__nv_bfloat16>(16);
+  qwen36_device_ptr_t fused_norm_weight = dev_alloc<__nv_bfloat16>(16);
+  qwen36_device_ptr_t fused_norm_out = dev_alloc<__nv_bfloat16>(16);
+  qwen36_device_ptr_t fused_norm_fp4 = dev_alloc<uint8_t>(8);
+  qwen36_device_ptr_t fused_norm_scale = dev_alloc<uint8_t>(512);
+  qwen36_device_ptr_t fused_norm_global = dev_alloc<float>(1);
+  copy_bf16(fused_norm_in, std::vector<float>(16, 1.0f));
+  copy_bf16(fused_norm_weight, std::vector<float>(16, 0.0f));
+  qwen36_rmsnorm_nvfp4_quantize_spec_t fused_norm_spec{};
+  fused_norm_spec.hidden = 16;
+  fused_norm_spec.eps = 1.0e-6f;
+  fused_norm_spec.input_bf16 = fused_norm_in;
+  fused_norm_spec.weight_bf16 = fused_norm_weight;
+  fused_norm_spec.output_bf16 = fused_norm_out;
+  fused_norm_spec.output_fp4 = fused_norm_fp4;
+  fused_norm_spec.output_scale_e4m3 = fused_norm_scale;
+  fused_norm_spec.output_tensor_scale_f32 = fused_norm_global;
+  must_status(qwen36_rmsnorm_nvfp4_quantize(&fused_norm_spec),
+              "rmsnorm nvfp4 quantize");
+  std::vector<float> fused_norm_values = read_bf16(fused_norm_out, 16);
+  std::vector<uint8_t> fused_norm_packed = read_raw<uint8_t>(fused_norm_fp4, 8);
+  expect_close(fused_norm_values[0], 1.0f, 0.02f,
+               "rmsnorm nvfp4 quantize bf16");
+  if (fused_norm_packed[0] != 0x77 || fused_norm_packed[7] != 0x77) {
+    fprintf(stderr, "rmsnorm nvfp4 quantize expected packed 0x77 got 0x%02x 0x%02x\n",
+            fused_norm_packed[0], fused_norm_packed[7]);
+    exit(1);
+  }
+
   qwen36_device_ptr_t rope_pos = dev_alloc<int32_t>(1);
   qwen36_device_ptr_t rope_q = dev_alloc<__nv_bfloat16>(6);
   qwen36_device_ptr_t rope_k = dev_alloc<__nv_bfloat16>(6);
@@ -504,6 +533,12 @@ int main() {
   dev_free<__nv_bfloat16>(norm_weight);
   dev_free<__nv_bfloat16>(norm_residual);
   dev_free<__nv_bfloat16>(norm_out);
+  dev_free<__nv_bfloat16>(fused_norm_in);
+  dev_free<__nv_bfloat16>(fused_norm_weight);
+  dev_free<__nv_bfloat16>(fused_norm_out);
+  dev_free<uint8_t>(fused_norm_fp4);
+  dev_free<uint8_t>(fused_norm_scale);
+  dev_free<float>(fused_norm_global);
   dev_free<int32_t>(rope_pos);
   dev_free<__nv_bfloat16>(rope_q);
   dev_free<__nv_bfloat16>(rope_k);

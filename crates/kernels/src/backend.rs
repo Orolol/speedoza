@@ -6,7 +6,8 @@ use crate::deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec};
 use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
     Bf16GemmSpec, Bf16MatVecSpec, Conv1dUpdateSpec, EmbeddingLookupSpec, GdnGateSpec,
-    Nvfp4MatVecSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, SigmoidGateSpec,
+    Nvfp4MatVecSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, RmsNormNvfp4QuantizeSpec,
+    SigmoidGateSpec,
 };
 use crate::rmsnorm::RmsNormSpec;
 use crate::rope::PartialRopeSpec;
@@ -59,6 +60,10 @@ pub trait KernelBackend: Send + Sync {
 
     fn rmsnorm(&self, _spec: &RmsNormSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("rmsnorm"))
+    }
+
+    fn rmsnorm_nvfp4_quantize(&self, _spec: &RmsNormNvfp4QuantizeSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("rmsnorm_nvfp4_quantize"))
     }
 
     fn partial_rope(&self, _spec: &PartialRopeSpec) -> Result<()> {
@@ -167,6 +172,13 @@ impl KernelBackend for CudaBackend {
     fn rmsnorm(&self, spec: &RmsNormSpec) -> Result<()> {
         let ffi_spec = ffi::RmsNormSpec::from(spec);
         check("qwen36_rmsnorm", unsafe { ffi::qwen36_rmsnorm(&ffi_spec) })
+    }
+
+    fn rmsnorm_nvfp4_quantize(&self, spec: &RmsNormNvfp4QuantizeSpec) -> Result<()> {
+        let ffi_spec = ffi::RmsNormNvfp4QuantizeSpec::from(spec);
+        check("qwen36_rmsnorm_nvfp4_quantize", unsafe {
+            ffi::qwen36_rmsnorm_nvfp4_quantize(&ffi_spec)
+        })
     }
 
     fn partial_rope(&self, spec: &PartialRopeSpec) -> Result<()> {
@@ -465,6 +477,37 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct RmsNormNvfp4QuantizeSpec {
+        pub hidden: usize,
+        pub eps: f32,
+        pub input_bf16: DevicePtr,
+        pub weight_bf16: DevicePtr,
+        pub residual_bf16: DevicePtr,
+        pub residual_out_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+        pub output_fp4: DevicePtr,
+        pub output_scale_e4m3: DevicePtr,
+        pub output_tensor_scale_f32: DevicePtr,
+    }
+
+    impl From<&crate::ops::RmsNormNvfp4QuantizeSpec> for RmsNormNvfp4QuantizeSpec {
+        fn from(value: &crate::ops::RmsNormNvfp4QuantizeSpec) -> Self {
+            Self {
+                hidden: value.hidden,
+                eps: value.eps,
+                input_bf16: value.input_bf16,
+                weight_bf16: value.weight_bf16,
+                residual_bf16: value.residual_bf16,
+                residual_out_bf16: value.residual_out_bf16,
+                output_bf16: value.output_bf16,
+                output_fp4: value.output_fp4,
+                output_scale_e4m3: value.output_scale_e4m3,
+                output_tensor_scale_f32: value.output_tensor_scale_f32,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct PartialRopeSpec {
         pub tokens: usize,
         pub q_heads: usize,
@@ -472,6 +515,8 @@ mod ffi {
         pub head_dim: usize,
         pub rope_dims: usize,
         pub base_theta: f64,
+        pub position_i32: i32,
+        pub use_scalar_position: i32,
         pub positions_i32: DevicePtr,
         pub q_bf16: DevicePtr,
         pub k_bf16: DevicePtr,
@@ -486,6 +531,8 @@ mod ffi {
                 head_dim: value.head_dim,
                 rope_dims: value.rope_dims,
                 base_theta: value.base_theta,
+                position_i32: value.position_i32,
+                use_scalar_position: i32::from(value.use_scalar_position),
                 positions_i32: value.positions_i32,
                 q_bf16: value.q_bf16,
                 k_bf16: value.k_bf16,
@@ -792,6 +839,7 @@ mod ffi {
         pub fn qwen36_turboquant_encode_kv(spec: *const TurboQuantEncodeSpec) -> i32;
         pub fn qwen36_turboquant_attention(spec: *const TurboQuantAttentionSpec) -> i32;
         pub fn qwen36_rmsnorm(spec: *const RmsNormSpec) -> i32;
+        pub fn qwen36_rmsnorm_nvfp4_quantize(spec: *const RmsNormNvfp4QuantizeSpec) -> i32;
         pub fn qwen36_partial_rope(spec: *const PartialRopeSpec) -> i32;
         pub fn qwen36_swiglu(spec: *const SwiGluSpec) -> i32;
         pub fn qwen36_sample(spec: *const SamplingSpec) -> i32;

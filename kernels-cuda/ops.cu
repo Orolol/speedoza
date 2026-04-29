@@ -71,32 +71,58 @@ __device__ uint8_t encode_e4m3_positive(float value) {
   if (!(value > 0.0f)) {
     return 0;
   }
-  float best_error = INFINITY;
-  uint8_t best_code = 0;
-  for (uint32_t code = 0; code <= 0x7e; ++code) {
-    const float decoded = decode_e4m3(static_cast<uint8_t>(code));
-    const float error = fabsf(decoded - value);
-    if (error < best_error) {
-      best_error = error;
-      best_code = static_cast<uint8_t>(code);
+  if (value >= 448.0f) {
+    return 0x7e;
+  }
+
+  constexpr float min_normal = 0x1p-6f;
+  constexpr float subnormal_step = 0x1p-9f;
+  constexpr float normal_boundary = (7.0f * subnormal_step + min_normal) * 0.5f;
+  if (value < min_normal) {
+    if (value >= normal_boundary) {
+      return 0x08;
+    }
+    int mantissa = static_cast<int>(floorf(value / subnormal_step + 0.49999994f));
+    if (mantissa <= 0) {
+      return 0;
+    }
+    return static_cast<uint8_t>(mantissa);
+  }
+
+  const uint32_t bits = __float_as_uint(value);
+  int exponent_field = static_cast<int>((bits >> 23) & 0xff) - 120;
+  uint32_t mantissa = ((bits & 0x007fffffU) + 0x0007ffffU) >> 20;
+  if (mantissa >= 8) {
+    mantissa = 0;
+    ++exponent_field;
+  }
+  if (exponent_field >= 15) {
+    exponent_field = 15;
+    if (mantissa > 6) {
+      mantissa = 6;
     }
   }
-  return best_code;
+  return static_cast<uint8_t>((exponent_field << 3) | mantissa);
 }
 
 __device__ uint8_t encode_e2m1(float value) {
   const bool negative = value < 0.0f;
   const float magnitude = fminf(fabsf(value), 6.0f);
-  const float values[8] = {0.0f, 0.5f, 1.0f, 1.5f,
-                           2.0f, 3.0f, 4.0f, 6.0f};
-  float best_error = INFINITY;
-  uint8_t best_index = 0;
-  for (uint8_t idx = 0; idx < 8; ++idx) {
-    const float error = fabsf(values[idx] - magnitude);
-    if (error < best_error) {
-      best_error = error;
-      best_index = idx;
-    }
+  uint8_t best_index = 7;
+  if (magnitude <= 0.25f) {
+    best_index = 0;
+  } else if (magnitude <= 0.75f) {
+    best_index = 1;
+  } else if (magnitude <= 1.25f) {
+    best_index = 2;
+  } else if (magnitude <= 1.75f) {
+    best_index = 3;
+  } else if (magnitude <= 2.5f) {
+    best_index = 4;
+  } else if (magnitude <= 3.5f) {
+    best_index = 5;
+  } else if (magnitude <= 5.0f) {
+    best_index = 6;
   }
   return static_cast<uint8_t>((negative ? 0x08 : 0x00) | best_index);
 }
@@ -145,6 +171,92 @@ __global__ void rmsnorm_kernel(const __nv_bfloat16 *input,
   }
 }
 
+__global__ void rmsnorm_nvfp4_quantize_kernel(
+    const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
+    const __nv_bfloat16 *residual, __nv_bfloat16 *residual_out,
+    __nv_bfloat16 *output_bf16, uint8_t *output_fp4,
+    uint8_t *output_scale, float *tensor_scale, size_t hidden, float eps) {
+  extern __shared__ float scratch[];
+  float local_sum = 0.0f;
+
+  for (size_t d = threadIdx.x; d < hidden; d += blockDim.x) {
+    float value = __bfloat162float(input[d]);
+    if (residual != nullptr) {
+      value += __bfloat162float(residual[d]);
+    }
+    local_sum += value * value;
+  }
+
+  scratch[threadIdx.x] = local_sum;
+  __syncthreads();
+
+  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float norm_scale =
+      rsqrtf(scratch[0] / static_cast<float>(hidden) + eps);
+  const size_t groups = div_ceil_size(hidden, 16);
+  const size_t scale_inner_dim = round_up_size(groups, 4);
+
+  for (size_t group = threadIdx.x; group < groups; group += blockDim.x) {
+    const size_t start = group * 16;
+    float amax = 0.0f;
+    for (size_t offset = 0; offset < 16 && start + offset < hidden; ++offset) {
+      const size_t d = start + offset;
+      float value = __bfloat162float(input[d]);
+      if (residual != nullptr) {
+        value += __bfloat162float(residual[d]);
+      }
+      if (residual_out != nullptr) {
+        residual_out[d] = __float2bfloat16(value);
+      }
+      const float weighted =
+          value * norm_scale * (1.0f + __bfloat162float(weight[d]));
+      if (output_bf16 != nullptr) {
+        output_bf16[d] = __float2bfloat16(weighted);
+      }
+      amax = fmaxf(amax, fabsf(weighted));
+    }
+
+    const float scale_value =
+        amax > 0.0f ? fmaxf(amax / 6.0f, 1.0e-8f) : 1.0f;
+    const uint8_t scale_code = encode_e4m3_positive(scale_value);
+    output_scale[vec16_scale_offset(group, 0, scale_inner_dim)] = scale_code;
+    const float decoded_scale = fmaxf(decode_e4m3(scale_code), 1.0e-8f);
+
+    for (size_t offset = 0; offset < 16 && start + offset < hidden;
+         offset += 2) {
+      const size_t d = start + offset;
+      float value0 = __bfloat162float(input[d]);
+      if (residual != nullptr) {
+        value0 += __bfloat162float(residual[d]);
+      }
+      const float weighted0 =
+          value0 * norm_scale * (1.0f + __bfloat162float(weight[d]));
+      uint8_t packed = encode_e2m1(weighted0 / decoded_scale);
+      if (d + 1 < hidden) {
+        float value1 = __bfloat162float(input[d + 1]);
+        if (residual != nullptr) {
+          value1 += __bfloat162float(residual[d + 1]);
+        }
+        const float weighted1 =
+            value1 * norm_scale * (1.0f + __bfloat162float(weight[d + 1]));
+        packed |= static_cast<uint8_t>(encode_e2m1(weighted1 / decoded_scale)
+                                       << 4);
+      }
+      output_fp4[d / 2] = packed;
+    }
+  }
+
+  if (threadIdx.x == 0 && tensor_scale != nullptr) {
+    *tensor_scale = 1.0f;
+  }
+}
+
 __device__ void apply_rope_half_pair(__nv_bfloat16 *values, size_t offset,
                                      size_t half_dim, size_t pair, float cosv,
                                      float sinv) {
@@ -156,31 +268,32 @@ __device__ void apply_rope_half_pair(__nv_bfloat16 *values, size_t offset,
   values[second] = __float2bfloat16(x1 * cosv + x0 * sinv);
 }
 
-__global__ void partial_rope_kernel(int32_t const *positions, __nv_bfloat16 *q,
-                                    __nv_bfloat16 *k, size_t q_heads,
-                                    size_t kv_heads, size_t head_dim,
-                                    size_t rope_dims, float base_theta) {
+__global__ void partial_rope_kernel(int32_t const *positions,
+                                    int32_t scalar_position,
+                                    int use_scalar_position,
+                                    __nv_bfloat16 *q, __nv_bfloat16 *k,
+                                    size_t q_heads, size_t kv_heads,
+                                    size_t head_dim, size_t rope_dims,
+                                    float base_theta) {
   const size_t half_dim = rope_dims / 2;
-  const size_t q_pairs = q_heads * half_dim;
-  const size_t pairs_per_token = (q_heads + kv_heads) * half_dim;
   const size_t token = blockIdx.y;
-  for (size_t linear = blockIdx.x * blockDim.x + threadIdx.x;
-       linear < pairs_per_token;
-       linear += blockDim.x * gridDim.x) {
-    const size_t p = linear % half_dim;
-    const float position = static_cast<float>(positions[token]);
-    const float inv_freq = powf(
-        base_theta, -static_cast<float>(2 * p) / static_cast<float>(rope_dims));
-    const float angle = position * inv_freq;
-    const float cosv = cosf(angle);
-    const float sinv = sinf(angle);
-    if (linear < q_pairs) {
-      const size_t q_head = linear / half_dim;
+  const size_t p = blockIdx.x;
+  const int32_t token_position =
+      use_scalar_position != 0 ? scalar_position : positions[token];
+  const float position = static_cast<float>(token_position);
+  const float inv_freq = powf(
+      base_theta, -static_cast<float>(2 * p) / static_cast<float>(rope_dims));
+  const float angle = position * inv_freq;
+  const float cosv = cosf(angle);
+  const float sinv = sinf(angle);
+  for (size_t head = threadIdx.x; head < q_heads + kv_heads;
+       head += blockDim.x) {
+    if (head < q_heads) {
+      const size_t q_head = head;
       const size_t head_offset = (token * q_heads + q_head) * head_dim;
       apply_rope_half_pair(q, head_offset, half_dim, p, cosv, sinv);
     } else {
-      const size_t k_linear = linear - q_pairs;
-      const size_t kv_head = k_linear / half_dim;
+      const size_t kv_head = head - q_heads;
       const size_t head_offset = (token * kv_heads + kv_head) * head_dim;
       apply_rope_half_pair(k, head_offset, half_dim, p, cosv, sinv);
     }
@@ -451,6 +564,32 @@ extern "C" int qwen36_rmsnorm(const qwen36_rmsnorm_spec_t *spec) {
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
 
+extern "C" int qwen36_rmsnorm_nvfp4_quantize(
+    const qwen36_rmsnorm_nvfp4_quantize_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->hidden == 0 || spec->input_bf16.ptr == 0 ||
+      spec->weight_bf16.ptr == 0 || spec->output_fp4.ptr == 0 ||
+      spec->output_scale_e4m3.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+
+  const int threads = 256;
+  const float eps = spec->eps == 0.0f ? 1.0e-6f : spec->eps;
+  rmsnorm_nvfp4_quantize_kernel<<<1, threads, threads * sizeof(float)>>>(
+      ptr<const __nv_bfloat16>(spec->input_bf16),
+      ptr<const __nv_bfloat16>(spec->weight_bf16),
+      ptr<const __nv_bfloat16>(spec->residual_bf16),
+      ptr<__nv_bfloat16>(spec->residual_out_bf16),
+      ptr<__nv_bfloat16>(spec->output_bf16),
+      ptr<uint8_t>(spec->output_fp4),
+      ptr<uint8_t>(spec->output_scale_e4m3),
+      ptr<float>(spec->output_tensor_scale_f32), spec->hidden, eps);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
 extern "C" int qwen36_partial_rope(const qwen36_partial_rope_spec_t *spec) {
   if (spec == nullptr) {
     return QWEN36_STATUS_NULL_POINTER;
@@ -458,22 +597,19 @@ extern "C" int qwen36_partial_rope(const qwen36_partial_rope_spec_t *spec) {
   if (spec->tokens == 0 || spec->q_heads == 0 || spec->kv_heads == 0 ||
       spec->head_dim == 0 || spec->rope_dims == 0 ||
       spec->rope_dims > spec->head_dim || (spec->rope_dims % 2) != 0 ||
-      spec->positions_i32.ptr == 0 || spec->q_bf16.ptr == 0 ||
-      spec->k_bf16.ptr == 0) {
+      (spec->positions_i32.ptr == 0 && spec->use_scalar_position == 0) ||
+      spec->q_bf16.ptr == 0 || spec->k_bf16.ptr == 0) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }
 
-  const int threads = 256;
-  const unsigned int pair_blocks =
-      static_cast<unsigned int>(((spec->q_heads + spec->kv_heads) *
-                                     (spec->rope_dims / 2) +
-                                 threads - 1) /
-                                threads);
-  const dim3 grid(pair_blocks, static_cast<unsigned int>(spec->tokens));
+  const int threads = 32;
+  const dim3 grid(static_cast<unsigned int>(spec->rope_dims / 2),
+                  static_cast<unsigned int>(spec->tokens));
   const float base_theta =
       spec->base_theta > 0.0 ? static_cast<float>(spec->base_theta) : 10000.0f;
   partial_rope_kernel<<<grid, threads>>>(
-      ptr<const int32_t>(spec->positions_i32),
+      ptr<const int32_t>(spec->positions_i32), spec->position_i32,
+      spec->use_scalar_position,
       ptr<__nv_bfloat16>(spec->q_bf16), ptr<__nv_bfloat16>(spec->k_bf16),
       spec->q_heads, spec->kv_heads, spec->head_dim, spec->rope_dims,
       base_theta);

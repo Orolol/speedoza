@@ -132,12 +132,27 @@ typedef struct {
 } qwen36_rmsnorm_spec_t;
 
 typedef struct {
+  size_t hidden;
+  float eps;
+  qwen36_device_ptr_t input_bf16;
+  qwen36_device_ptr_t weight_bf16;
+  qwen36_device_ptr_t residual_bf16;
+  qwen36_device_ptr_t residual_out_bf16;
+  qwen36_device_ptr_t output_bf16;
+  qwen36_device_ptr_t output_fp4;
+  qwen36_device_ptr_t output_scale_e4m3;
+  qwen36_device_ptr_t output_tensor_scale_f32;
+} qwen36_rmsnorm_nvfp4_quantize_spec_t;
+
+typedef struct {
   size_t tokens;
   size_t q_heads;
   size_t kv_heads;
   size_t head_dim;
   size_t rope_dims;
   double base_theta;
+  int32_t position_i32;
+  int use_scalar_position;
   qwen36_device_ptr_t positions_i32;
   qwen36_device_ptr_t q_bf16;
   qwen36_device_ptr_t k_bf16;
@@ -246,6 +261,8 @@ int qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec);
 int qwen36_turboquant_encode_kv(const qwen36_turboquant_encode_spec_t *spec);
 int qwen36_turboquant_attention(const qwen36_turboquant_attention_spec_t *spec);
 int qwen36_rmsnorm(const qwen36_rmsnorm_spec_t *spec);
+int qwen36_rmsnorm_nvfp4_quantize(
+    const qwen36_rmsnorm_nvfp4_quantize_spec_t *spec);
 int qwen36_partial_rope(const qwen36_partial_rope_spec_t *spec);
 int qwen36_swiglu(const qwen36_swiglu_spec_t *spec);
 int qwen36_sample(const qwen36_sampling_spec_t *spec);

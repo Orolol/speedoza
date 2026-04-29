@@ -232,7 +232,7 @@ fn run_chat(
             break;
         }
         if idx + 1 < max_new_tokens {
-            engine.decode_one_queued(token)?;
+            engine.decode_sampled_queued()?;
         }
     }
     println!();
@@ -270,10 +270,10 @@ fn run_bench(
     let decode_start = Instant::now();
     let mut generated = 0_usize;
     for idx in 0..max_new_tokens {
-        let token = engine.sample_greedy()?;
+        let _token = engine.sample_greedy()?;
         generated += 1;
         if idx + 1 < max_new_tokens {
-            engine.decode_one_queued(token)?;
+            engine.decode_sampled_queued()?;
         }
     }
     let decode_seconds = decode_start.elapsed().as_secs_f64();
