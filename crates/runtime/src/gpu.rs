@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 
 use qwen36_fp4_core::{CoreError, ModelTopology, Result, TensorDtype, TensorInfo, TensorRole};
 use qwen36_fp4_kernels::{
@@ -28,7 +28,7 @@ impl GpuTensor {
 
 #[derive(Debug, Default)]
 pub struct GpuWeightStore {
-    tensors: BTreeMap<String, GpuTensor>,
+    tensors: HashMap<String, GpuTensor>,
     total_bytes: u64,
 }
 
@@ -43,7 +43,7 @@ impl GpuWeightStore {
             .into_iter()
             .map(|tensor| tensor.name.clone())
             .collect::<BTreeSet<_>>();
-        let mut tensors = BTreeMap::new();
+        let mut tensors = HashMap::with_capacity(names.len());
         let mut staging_buffers = Vec::new();
         let mut total_bytes = 0_u64;
 
