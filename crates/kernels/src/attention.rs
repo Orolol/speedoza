@@ -33,6 +33,11 @@ pub struct AttentionPrefillSpec {
     pub kv_cache_v: DevicePtr,
     pub output_bf16: DevicePtr,
     pub shape: AttentionShape,
+    /// When non-NULL, prefill reads the base cache position from this device
+    /// `int32_t` instead of `start_position`. This lets a captured graph replay
+    /// across advancing positions.
+    #[serde(default)]
+    pub start_position_device_i32: DevicePtr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

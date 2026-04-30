@@ -77,6 +77,10 @@ typedef struct {
   qwen36_device_ptr_t kv_cache_v;
   qwen36_device_ptr_t output_bf16;
   qwen36_attention_shape_t shape;
+  // When non-zero, prefill reads the base cache position from this device
+  // pointer (int32) instead of `start_position`. Used by graph-captured MTP
+  // verification where the host can no longer pass advancing scalar args.
+  qwen36_device_ptr_t start_position_device_i32;
 } qwen36_attention_prefill_spec_t;
 
 typedef struct {

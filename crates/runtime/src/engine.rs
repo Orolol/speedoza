@@ -2035,6 +2035,7 @@ impl<B: KernelBackend> Engine<B> {
                 head_dim: self.topology.attention_head_dim,
                 rope_dims: self.topology.attention_rope_dims(),
             },
+            start_position_device_i32: DevicePtr::NULL,
         })?;
         self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
             rows: tokens,
@@ -2495,6 +2496,7 @@ impl<B: KernelBackend> Engine<B> {
                 head_dim: self.topology.attention_head_dim,
                 rope_dims: self.topology.attention_rope_dims(),
             },
+            start_position_device_i32: DevicePtr::NULL,
         })?;
         if layer.layer_index == 3 {
             if let Ok(dir) = std::env::var("QWEN36_DEBUG_DUMP_DIR") {

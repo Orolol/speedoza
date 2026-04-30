@@ -407,6 +407,7 @@ mod ffi {
         pub kv_cache_v: DevicePtr,
         pub output_bf16: DevicePtr,
         pub shape: AttentionShape,
+        pub start_position_device_i32: DevicePtr,
     }
 
     impl From<&crate::attention::AttentionPrefillSpec> for AttentionPrefillSpec {
@@ -422,6 +423,7 @@ mod ffi {
                 kv_cache_v: value.kv_cache_v,
                 output_bf16: value.output_bf16,
                 shape: AttentionShape::from(value.shape),
+                start_position_device_i32: value.start_position_device_i32,
             }
         }
     }

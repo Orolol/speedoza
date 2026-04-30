@@ -124,6 +124,37 @@ int main() {
   attention_spec.shape = attn;
   must_status(qwen36_attention_decode(&attention_spec), "attention");
 
+  qwen36_device_ptr_t prefill_start = dev_alloc<int32_t>(1);
+  qwen36_device_ptr_t prefill_cache_k = dev_alloc<__nv_bfloat16>(kv_values * 2);
+  qwen36_device_ptr_t prefill_cache_v = dev_alloc<__nv_bfloat16>(kv_values * 2);
+  qwen36_device_ptr_t prefill_out = dev_alloc<__nv_bfloat16>(q_values);
+  copy_raw<int32_t>(prefill_start, {1});
+  copy_bf16(prefill_cache_k, std::vector<float>(kv_values * 2, 0.0f));
+  copy_bf16(prefill_cache_v, std::vector<float>(kv_values * 2, 0.0f));
+  qwen36_attention_prefill_spec_t prefill_spec{};
+  prefill_spec.start_position = 0;
+  prefill_spec.tokens = 1;
+  prefill_spec.q_bf16 = q;
+  prefill_spec.k_bf16 = k;
+  prefill_spec.v_bf16 = v;
+  prefill_spec.kv_cache_k = prefill_cache_k;
+  prefill_spec.kv_cache_v = prefill_cache_v;
+  prefill_spec.output_bf16 = prefill_out;
+  prefill_spec.shape = attn;
+  prefill_spec.start_position_device_i32 = prefill_start;
+  must_status(qwen36_attention_prefill(&prefill_spec),
+              "attention prefill device start");
+  std::vector<float> prefill_cache_k_values =
+      read_bf16(prefill_cache_k, kv_values * 2);
+  std::vector<float> prefill_cache_v_values =
+      read_bf16(prefill_cache_v, kv_values * 2);
+  expect_close(prefill_cache_k_values[0], 0.0f, 0.02f,
+               "attention prefill scalar start ignored");
+  expect_close(prefill_cache_k_values[kv_values], 0.5f, 0.02f,
+               "attention prefill device start cache k");
+  expect_close(prefill_cache_v_values[kv_values], 1.0f, 0.02f,
+               "attention prefill device start cache v");
+
   qwen36_device_ptr_t kq = dev_alloc<int8_t>(kv_values);
   qwen36_device_ptr_t vq = dev_alloc<int8_t>(kv_values);
   qwen36_device_ptr_t meta = dev_alloc<float>(attn.kv_heads * 2);
@@ -518,6 +549,10 @@ int main() {
   dev_free<__nv_bfloat16>(cache_k);
   dev_free<__nv_bfloat16>(cache_v);
   dev_free<__nv_bfloat16>(out);
+  dev_free<int32_t>(prefill_start);
+  dev_free<__nv_bfloat16>(prefill_cache_k);
+  dev_free<__nv_bfloat16>(prefill_cache_v);
+  dev_free<__nv_bfloat16>(prefill_out);
   dev_free<int8_t>(kq);
   dev_free<int8_t>(vq);
   dev_free<float>(meta);
