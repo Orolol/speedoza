@@ -274,7 +274,8 @@ qwen36_deltanet_decode(const qwen36_deltanet_decode_spec_t *spec) {
       spec->v_bf16.ptr == 0 || spec->state_bf16.ptr == 0 ||
       spec->output_bf16.ptr == 0 || spec->shape.qk_heads == 0 ||
       spec->shape.v_heads == 0 || spec->shape.key_dim == 0 ||
-      spec->shape.value_dim == 0 || spec->tokens_in_persistent_loop == 0 ||
+      spec->shape.key_dim > 256 || spec->shape.value_dim == 0 ||
+      spec->tokens_in_persistent_loop == 0 ||
       spec->shape.v_heads % spec->shape.qk_heads != 0) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }

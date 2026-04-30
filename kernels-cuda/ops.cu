@@ -210,6 +210,9 @@ __global__ void rmsnorm_nvfp4_quantize_kernel(
   for (size_t group = threadIdx.x; group < groups; group += blockDim.x) {
     const size_t start = group * 16;
     float amax = 0.0f;
+    // Alias-safe when residual_out == residual: each group caches residual
+    // values before pass 2 writes residual_out, and no later read observes the
+    // overwritten residual storage.
     float residual_values[16];
     float weighted_values[16];
     for (size_t offset = 0; offset < 16 && start + offset < hidden; ++offset) {

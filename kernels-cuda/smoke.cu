@@ -26,6 +26,13 @@ void must_status(int status, const char *what) {
   must_cuda<int>(cudaDeviceSynchronize(), what);
 }
 
+void expect_status(int status, int expected, const char *what) {
+  if (status != expected) {
+    fprintf(stderr, "%s expected status %d got %d\n", what, expected, status);
+    exit(1);
+  }
+}
+
 template <typename T> qwen36_device_ptr_t dev_alloc(size_t count) {
   T *ptr = nullptr;
   must_cuda<T>(cudaMalloc(reinterpret_cast<void **>(&ptr), count * sizeof(T)),
@@ -247,6 +254,10 @@ int main() {
                "deltanet exact[2]");
   expect_close(exact_delta_values[3], 1.0f * exact_scale, 0.02f,
                "deltanet exact[3]");
+  qwen36_deltanet_decode_spec_t invalid_delta_spec = delta_spec;
+  invalid_delta_spec.shape.key_dim = 257;
+  expect_status(qwen36_deltanet_decode(&invalid_delta_spec),
+                QWEN36_STATUS_INVALID_ARGUMENT, "deltanet key_dim guard");
 
   qwen36_device_ptr_t norm_in = dev_alloc<__nv_bfloat16>(4);
   qwen36_device_ptr_t norm_weight = dev_alloc<__nv_bfloat16>(4);

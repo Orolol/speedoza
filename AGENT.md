@@ -182,6 +182,7 @@ Adding a new parity checkpoint takes ~5 lines:
 - Smoke tests use tiny shapes (e.g. `key_dim=4`) that often miss bugs in vectorized code paths. Smoke passing is necessary, not sufficient.
 - The engine's per-iteration recurrent flow (`prefill.residual` accumulates `embed + Σ attn_i + Σ mlp_i` *after the next layer's input RMSNorm reads it*) is non-obvious — don't refactor the residual write order without re-running parity.
 - `rmsnorm_nvfp4_quantize` must be safe when `residual_bf16 == residual_out_bf16`; decode post-attention RMSNorm uses this aliasing. Do not reintroduce a second read from the aliased residual after writing `residual_out`.
+- RMSNorm weight semantics are split intentionally: base Qwen layer norms use the model's `(1 + weight)` parameterization (`direct_weight = 0` via `rmsnorm`), while per-head Q/K norms and DeltaNet value-head norms use the weight directly (`direct_weight = 1` via `rmsnorm_direct_weight`).
 
 ## References
 

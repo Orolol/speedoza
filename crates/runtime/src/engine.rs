@@ -291,6 +291,7 @@ impl<B: KernelBackend> Engine<B> {
         if self.decode_graph.is_some() {
             return Ok(());
         }
+        Self::ensure_graph_capture_allowed()?;
         if self.backend.name() == "no-cuda" {
             return Err(CoreError::UnsupportedNoCuda("enable_decode_graph"));
         }
@@ -376,6 +377,7 @@ impl<B: KernelBackend> Engine<B> {
         if self.decode_graph.is_some() {
             return Ok(());
         }
+        Self::ensure_graph_capture_allowed()?;
         if self.config.mtp_speculative_tokens == 0 {
             return Err(CoreError::Runtime(
                 "MTP verify graph requested with MTP disabled".to_owned(),
@@ -452,6 +454,7 @@ impl<B: KernelBackend> Engine<B> {
         if self.decode_graph.is_some() {
             return Ok(());
         }
+        Self::ensure_graph_capture_allowed()?;
         if self.config.mtp_speculative_tokens == 0 {
             return Err(CoreError::Runtime(
                 "enable_mtp_decode_graph called with MTP disabled".to_owned(),
@@ -528,6 +531,25 @@ impl<B: KernelBackend> Engine<B> {
             graph_state.stream.handle().synchronize()?;
             // Drop runs the destructors below.
             drop(graph_state);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn ensure_graph_capture_allowed() -> Result<()> {
+        const DEBUG_DUMP_ENVS: [&str; 3] = [
+            "QWEN36_DEBUG_DUMP_DIR",
+            "QWEN36_DEBUG_DUMP_DECODE",
+            "QWEN36_DEBUG_DUMP_ALL_LAYERS",
+        ];
+        if DEBUG_DUMP_ENVS
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            return Err(CoreError::Runtime(
+                "graph capture is incompatible with debug dumps; unset QWEN36_DEBUG_DUMP_*"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
