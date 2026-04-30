@@ -389,7 +389,7 @@ impl<B: KernelBackend> Engine<B> {
 
         let stream = CudaStream::create()?;
         let stream_handle = stream.handle();
-        let start_position_device_i32 = self.cuda_forward()?.position_i32.ptr();
+        let start_position_device_i32 = self.cuda_prefill()?.position_i32.ptr();
         graph::set_active_stream(stream_handle);
 
         let capture_result = (|| -> Result<(graph::CudaGraph, graph::CudaGraphExec)> {
@@ -713,15 +713,9 @@ impl<B: KernelBackend> Engine<B> {
         if need_next_draft {
             let mut mtp_verify_tokens = [0_u8; 8];
             mtp_verify_tokens[..4].copy_from_slice(&draft_token.to_ne_bytes());
-            {
-                let forward = self.cuda_forward()?;
-                forward
-                    .position_i32
-                    .copy_from_host(&position_0.to_ne_bytes())?;
-                forward
-                    .mtp_verify_token_u32
-                    .copy_from_host(&mtp_verify_tokens)?;
-            }
+            self.cuda_forward()?
+                .mtp_verify_token_u32
+                .copy_from_host(&mtp_verify_tokens)?;
             self.ensure_mtp_verify_graph_two_tokens(start_position)?;
             self.launch_mtp_verify_graph_two_tokens()?;
 
