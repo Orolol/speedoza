@@ -728,7 +728,6 @@ impl<B: KernelBackend> Engine<B> {
                     next_draft_token: None,
                 });
             }
-
             let mut next_token_bytes = [0_u8; 4];
             self.cuda_forward()?
                 .mtp_verify_token_u32
