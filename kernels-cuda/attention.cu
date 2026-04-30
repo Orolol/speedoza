@@ -151,7 +151,8 @@ __global__ void attention_prefill_kernel(
     const __nv_bfloat16 *cache_v, __nv_bfloat16 *output,
     size_t start_position, const int32_t *start_position_device, size_t tokens,
     qwen36_attention_shape_t shape) {
-  extern __shared__ float scratch[];
+  __shared__ float warp_sums[8];
+  __shared__ float score_share;
   __shared__ size_t shared_start_position;
 
   const size_t qh = blockIdx.x;
@@ -172,42 +173,55 @@ __global__ void attention_prefill_kernel(
   const __nv_bfloat16 *q_tok =
       q + (token * shape.q_heads + qh) * shape.head_dim;
   const size_t d = threadIdx.x;
+  const bool active = d < shape.head_dim;
+  const unsigned warp_id = threadIdx.x >> 5;
+  const unsigned lane_id = threadIdx.x & 31;
+  const unsigned n_warps = (blockDim.x + 31) >> 5;
+  const float q_val = active ? __bfloat162float(q_tok[d]) : 0.0f;
   float acc = 0.0f;
   float max_score = -INFINITY;
   float denom = 0.0f;
 
   for (size_t t = 0; t <= position; ++t) {
-    float local = 0.0f;
-    if (d < shape.head_dim) {
-      const float qv = __bfloat162float(q_tok[d]);
-      const float kv = __bfloat162float(
-          cache_k[(t * shape.kv_heads + kvh) * shape.head_dim + d]);
-      local = qv * kv;
+    float local = active
+                      ? q_val *
+                            __bfloat162float(
+                                cache_k[(t * shape.kv_heads + kvh) *
+                                            shape.head_dim +
+                                        d])
+                      : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      local += __shfl_xor_sync(0xffffffff, local, offset);
     }
-    scratch[threadIdx.x] = local;
+    if (lane_id == 0) {
+      warp_sums[warp_id] = local;
+    }
     __syncthreads();
-    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (threadIdx.x < stride) {
-        scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+    if (warp_id == 0) {
+      float total = (lane_id < n_warps) ? warp_sums[lane_id] : 0.0f;
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        total += __shfl_xor_sync(0xffffffff, total, offset);
       }
-      __syncthreads();
+      if (lane_id == 0) {
+        score_share = total * scale;
+      }
     }
+    __syncthreads();
 
-    const float score = scratch[0] * scale;
+    const float score = score_share;
     const float new_max = fmaxf(max_score, score);
     const float old_scale =
         isinf(max_score) && max_score < 0.0f ? 0.0f : expf(max_score - new_max);
     const float score_scale = expf(score - new_max);
-    if (d < shape.head_dim) {
+    if (active) {
       const float vv = __bfloat162float(
           cache_v[(t * shape.kv_heads + kvh) * shape.head_dim + d]);
       acc = acc * old_scale + score_scale * vv;
     }
     denom = denom * old_scale + score_scale;
     max_score = new_max;
-    __syncthreads();
   }
-  if (d < shape.head_dim) {
+  if (active) {
     output[(token * shape.q_heads + qh) * shape.head_dim + d] =
         __float2bfloat16(acc / denom);
   }
@@ -241,7 +255,7 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
       spec->shape.kv_heads, spec->shape.head_dim);
   const dim3 attn_grid(static_cast<unsigned int>(spec->shape.q_heads),
                        static_cast<unsigned int>(spec->tokens));
-  attention_prefill_kernel<<<attn_grid, threads, threads * sizeof(float), qwen36_internal_active_stream()>>>(
+  attention_prefill_kernel<<<attn_grid, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->q_bf16),
       ptr<const __nv_bfloat16>(spec->kv_cache_k),
       ptr<const __nv_bfloat16>(spec->kv_cache_v),
