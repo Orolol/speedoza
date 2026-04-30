@@ -1,4 +1,5 @@
 #include "qwen36_fp4.h"
+#include "active_stream.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -148,7 +149,7 @@ qwen36_turboquant_encode_kv(const qwen36_turboquant_encode_spec_t *spec) {
   }
   const int threads = 256;
   encode_kv_kernel<<<static_cast<unsigned int>(spec->shape.kv_heads), threads,
-                     2 * threads * sizeof(float)>>>(
+                     2 * threads * sizeof(float), qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->k_bf16),
       ptr<const __nv_bfloat16>(spec->v_bf16),
       ptr<int8_t>(spec->k_quantized_i8), ptr<int8_t>(spec->v_quantized_i8),
@@ -171,7 +172,7 @@ extern "C" int qwen36_turboquant_attention(
   }
   const int threads = 256;
   turboquant_attention_kernel<<<static_cast<unsigned int>(spec->shape.q_heads),
-                                threads, 2 * sizeof(float)>>>(
+                                threads, 2 * sizeof(float), qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->q_bf16),
       ptr<const int8_t>(spec->k_quantized_i8),
       ptr<const int8_t>(spec->v_quantized_i8),

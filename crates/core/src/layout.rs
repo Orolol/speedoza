@@ -94,6 +94,7 @@ impl ModelLayout {
                     t.role,
                     TensorRole::Nvfp4BlockScale
                         | TensorRole::Nvfp4TensorScale
+                        | TensorRole::Nvfp4InputScale
                         | TensorRole::Fp8Scale
                 )
             })

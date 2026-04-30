@@ -19,6 +19,7 @@ pub enum TensorRole {
     Nvfp4PackedWeight,
     Nvfp4BlockScale,
     Nvfp4TensorScale,
+    Nvfp4InputScale,
     Bf16Weight,
     Fp8Scale,
     LmHeadBf16,
@@ -81,6 +82,9 @@ pub fn classify_tensor(name: &str, dtype: &TensorDtype) -> TensorRole {
     }
     if name.ends_with("weight_scale_2") {
         return TensorRole::Nvfp4TensorScale;
+    }
+    if name.ends_with("input_scale") {
+        return TensorRole::Nvfp4InputScale;
     }
     if name.ends_with("weight_scale") {
         return match dtype {

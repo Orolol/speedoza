@@ -89,6 +89,10 @@ typedef struct {
   qwen36_device_ptr_t kv_cache_v;
   qwen36_device_ptr_t output_bf16;
   qwen36_attention_shape_t shape;
+  // When non-zero, the kernel reads the current position from this device
+  // pointer (int32, big enough to express the full max_context). This lets
+  // CUDA-Graph captures stay valid across decode steps without re-recording.
+  qwen36_device_ptr_t position_device_i32;
 } qwen36_attention_decode_spec_t;
 
 typedef struct {
@@ -145,6 +149,7 @@ typedef struct {
   qwen36_device_ptr_t residual_bf16;
   qwen36_device_ptr_t residual_out_bf16;
   qwen36_device_ptr_t output_bf16;
+  int direct_weight;
 } qwen36_rmsnorm_spec_t;
 
 typedef struct {
@@ -158,6 +163,7 @@ typedef struct {
   qwen36_device_ptr_t output_fp4;
   qwen36_device_ptr_t output_scale_e4m3;
   qwen36_device_ptr_t output_tensor_scale_f32;
+  float input_tensor_scale_f32;
 } qwen36_rmsnorm_nvfp4_quantize_spec_t;
 
 typedef struct {
@@ -172,6 +178,10 @@ typedef struct {
   qwen36_device_ptr_t positions_i32;
   qwen36_device_ptr_t q_bf16;
   qwen36_device_ptr_t k_bf16;
+  // When non-zero (and `use_scalar_position` is set), the kernel reads the
+  // scalar position from this device pointer instead of `position_i32`. Used
+  // by graph-captured decode where the host can no longer pass scalar args.
+  qwen36_device_ptr_t scalar_position_device_i32;
 } qwen36_partial_rope_spec_t;
 
 typedef struct {
@@ -225,6 +235,7 @@ typedef struct {
   qwen36_device_ptr_t output_fp4;
   qwen36_device_ptr_t output_scale_e4m3;
   qwen36_device_ptr_t output_tensor_scale_f32;
+  float input_tensor_scale_f32;
 } qwen36_nvfp4_quantize_spec_t;
 
 typedef struct {
@@ -234,6 +245,7 @@ typedef struct {
   qwen36_device_ptr_t output_fp4;
   qwen36_device_ptr_t output_scale_e4m3;
   qwen36_device_ptr_t output_tensor_scale_f32;
+  float input_tensor_scale_f32;
 } qwen36_nvfp4_quantize_rows_spec_t;
 
 typedef struct {
@@ -293,6 +305,23 @@ typedef struct {
 
 typedef struct {
   size_t rows;
+  size_t heads;
+  size_t head_dim;
+  qwen36_device_ptr_t input_bf16;
+  qwen36_device_ptr_t output_bf16;
+} qwen36_q_proj_deinterleave_spec_t;
+
+typedef struct {
+  size_t rows;
+  size_t heads;
+  size_t head_dim;
+  qwen36_device_ptr_t gate_bf16;
+  qwen36_device_ptr_t input_bf16;
+  qwen36_device_ptr_t output_bf16;
+} qwen36_q_proj_sigmoid_gate_spec_t;
+
+typedef struct {
+  size_t rows;
   size_t values;
   size_t input_stride;
   size_t output_stride;
@@ -335,7 +364,41 @@ int qwen36_gdn_gate(const qwen36_gdn_gate_spec_t *spec);
 int qwen36_sigmoid_gate(const qwen36_sigmoid_gate_spec_t *spec);
 int qwen36_sigmoid_gate_strided(
     const qwen36_sigmoid_gate_strided_spec_t *spec);
+int qwen36_q_proj_deinterleave(
+    const qwen36_q_proj_deinterleave_spec_t *spec);
+int qwen36_q_proj_sigmoid_gate(
+    const qwen36_q_proj_sigmoid_gate_spec_t *spec);
 int qwen36_copy_strided_rows(const qwen36_copy_strided_rows_spec_t *spec);
+
+// Atomically advance a device-side int32 by 1. Used to step the decode
+// position inside a captured CUDA graph so the same graph can be replayed
+// across decode iterations without host parameter updates.
+int qwen36_increment_i32(qwen36_device_ptr_t target_i32);
+
+// All kernel launches funnel through a single ambient CUDA stream so callers
+// can switch streams (e.g. to enable graph capture) without touching every
+// kernel call site. The default value is the legacy default stream (0),
+// matching the historical behavior.
+typedef struct CUstream_st *qwen36_cuda_stream_t;
+qwen36_cuda_stream_t qwen36_get_active_stream(void);
+void qwen36_set_active_stream(qwen36_cuda_stream_t stream);
+int qwen36_cuda_stream_create(qwen36_cuda_stream_t *out);
+int qwen36_cuda_stream_destroy(qwen36_cuda_stream_t stream);
+int qwen36_cuda_stream_synchronize(qwen36_cuda_stream_t stream);
+
+// Opaque handles for CUDA graph plumbing.
+typedef struct CUgraph_st *qwen36_cuda_graph_t;
+typedef struct CUgraphExec_st *qwen36_cuda_graph_exec_t;
+
+int qwen36_cuda_stream_begin_capture(qwen36_cuda_stream_t stream);
+int qwen36_cuda_stream_end_capture(qwen36_cuda_stream_t stream,
+                                   qwen36_cuda_graph_t *out);
+int qwen36_cuda_graph_instantiate(qwen36_cuda_graph_t graph,
+                                  qwen36_cuda_graph_exec_t *out);
+int qwen36_cuda_graph_destroy(qwen36_cuda_graph_t graph);
+int qwen36_cuda_graph_exec_destroy(qwen36_cuda_graph_exec_t exec);
+int qwen36_cuda_graph_launch(qwen36_cuda_graph_exec_t exec,
+                             qwen36_cuda_stream_t stream);
 
 #ifdef __cplusplus
 }

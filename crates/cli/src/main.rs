@@ -83,6 +83,35 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         mtp_speculative_tokens: usize,
     },
+    /// Dump the post-prefill logits (top-K, plus full vector to a binary file)
+    /// so we can diff them against a reference forward pass for parity work.
+    DumpLogits {
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long, default_value = "What is 2+2?")]
+        prompt: String,
+        #[arg(long, default_value_t = false)]
+        chat_template: bool,
+        #[arg(long, default_value_t = 10)]
+        top_k: usize,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Run prefill, decode one explicit token, then dump post-decode logits.
+    DumpDecode {
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long, default_value = "hello")]
+        prompt: String,
+        #[arg(long, default_value_t = false)]
+        chat_template: bool,
+        #[arg(long)]
+        decode_token_id: u32,
+        #[arg(long, default_value_t = 10)]
+        top_k: usize,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -193,6 +222,59 @@ fn main() -> Result<()> {
                 mtp_speculative_tokens,
             )?;
         }
+        Command::DumpLogits {
+            model_dir,
+            prompt,
+            chat_template,
+            top_k,
+            out,
+        } => {
+            #[cfg(feature = "cuda")]
+            {
+                run_dump_logits(model_dir, prompt, chat_template, top_k, out)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (model_dir, prompt, chat_template, top_k, out);
+                anyhow::bail!(
+                    "dump-logits requires the cuda feature; rebuild with --features cuda"
+                );
+            }
+        }
+        Command::DumpDecode {
+            model_dir,
+            prompt,
+            chat_template,
+            decode_token_id,
+            top_k,
+            out,
+        } => {
+            #[cfg(feature = "cuda")]
+            {
+                run_dump_decode(
+                    model_dir,
+                    prompt,
+                    chat_template,
+                    decode_token_id,
+                    top_k,
+                    out,
+                )?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (
+                    model_dir,
+                    prompt,
+                    chat_template,
+                    decode_token_id,
+                    top_k,
+                    out,
+                );
+                anyhow::bail!(
+                    "dump-decode requires the cuda feature; rebuild with --features cuda"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -240,6 +322,216 @@ fn run_chat(
 }
 
 #[cfg(feature = "cuda")]
+fn run_dump_logits(
+    model_dir: PathBuf,
+    prompt: String,
+    chat_template: bool,
+    top_k: usize,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+    let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
+    let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
+
+    let prompt_tokens = if chat_template {
+        let messages = vec![ChatMessage {
+            role: "user".to_owned(),
+            content: prompt.clone(),
+        }];
+        tokenizer.encode_chat(&messages, true)?
+    } else {
+        tokenizer.encode(&prompt, true)?
+    };
+
+    eprintln!(
+        "prompt {:?} -> {} tokens: {:?}",
+        prompt,
+        prompt_tokens.len(),
+        prompt_tokens
+    );
+
+    let topology = qwen36_fp4_core::ModelTopology::expected_qwen36_text_mtp();
+    let vocab = topology.vocab_size;
+
+    let config = EngineConfig {
+        max_context: prompt_tokens.len().max(1),
+        kv_cache_dtype: KvCacheDtype::Bf16,
+        ..EngineConfig::default()
+    };
+    let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, config)?;
+    let forward = engine.prefill(&prompt_tokens)?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+
+    // Logits live on the device as `vocab` BF16 values for the last token.
+    let logits_dev = forward.logits_device_ptr;
+    if logits_dev == 0 {
+        anyhow::bail!("prefill returned a null logits pointer");
+    }
+    let mut bf16_bytes = vec![0u8; vocab * 2];
+    unsafe {
+        let status =
+            qwen36_cuda_memcpy_d2h(bf16_bytes.as_mut_ptr() as *mut _, logits_dev, vocab * 2);
+        if status != 0 {
+            anyhow::bail!("cudaMemcpy d2h returned status {status}");
+        }
+    }
+
+    // BF16 -> f32 by zero-extending into the upper 16 bits of an f32.
+    let mut logits = Vec::with_capacity(vocab);
+    for chunk in bf16_bytes.chunks_exact(2) {
+        let bits: u32 = (u16::from_le_bytes([chunk[0], chunk[1]]) as u32) << 16;
+        logits.push(f32::from_bits(bits));
+    }
+
+    let mut indexed: Vec<(usize, f32)> = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, v)| (i, v))
+        .collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    println!("top-{top_k} logits after prefill:");
+    for (rank, (id, logit)) in indexed.iter().take(top_k).enumerate() {
+        let text = tokenizer.decode(&[*id as u32], true).unwrap_or_default();
+        println!("  #{rank:<2} id={id:<7} logit={logit:>10.4}  text={text:?}");
+    }
+
+    let finite = logits.iter().filter(|x| x.is_finite()).count();
+    let nans = logits.iter().filter(|x| x.is_nan()).count();
+    let infs = logits.iter().filter(|x| x.is_infinite()).count();
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let min = logits.iter().copied().fold(f32::INFINITY, f32::min);
+    let sum: f64 = logits.iter().map(|x| *x as f64).sum();
+    println!(
+        "summary: vocab={vocab} finite={finite} nan={nans} inf={infs} max={max:.4} min={min:.4} mean={:.4}",
+        sum / vocab as f64
+    );
+
+    if let Some(path) = out {
+        std::fs::write(&path, &bf16_bytes)?;
+        eprintln!(
+            "wrote {} bytes (BF16 little-endian) to {}",
+            bf16_bytes.len(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_dump_decode(
+    model_dir: PathBuf,
+    prompt: String,
+    chat_template: bool,
+    decode_token_id: u32,
+    top_k: usize,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+    let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
+    let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
+
+    let prompt_tokens = if chat_template {
+        let messages = vec![ChatMessage {
+            role: "user".to_owned(),
+            content: prompt.clone(),
+        }];
+        tokenizer.encode_chat(&messages, true)?
+    } else {
+        tokenizer.encode(&prompt, true)?
+    };
+    let decode_text = tokenizer
+        .decode(&[decode_token_id], true)
+        .unwrap_or_else(|_| String::new());
+
+    eprintln!(
+        "prompt {:?} -> {} tokens: {:?}; decoding id={} text={:?}",
+        prompt,
+        prompt_tokens.len(),
+        prompt_tokens,
+        decode_token_id,
+        decode_text
+    );
+
+    let topology = qwen36_fp4_core::ModelTopology::expected_qwen36_text_mtp();
+    let vocab = topology.vocab_size;
+
+    let config = EngineConfig {
+        max_context: prompt_tokens.len().saturating_add(1).max(1),
+        kv_cache_dtype: KvCacheDtype::Bf16,
+        ..EngineConfig::default()
+    };
+    let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, config)?;
+    engine.prefill(&prompt_tokens)?;
+    let forward = engine.decode_one(decode_token_id)?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+
+    let logits_dev = forward.logits_device_ptr;
+    if logits_dev == 0 {
+        anyhow::bail!("decode returned a null logits pointer");
+    }
+    let mut bf16_bytes = vec![0u8; vocab * 2];
+    unsafe {
+        let status =
+            qwen36_cuda_memcpy_d2h(bf16_bytes.as_mut_ptr() as *mut _, logits_dev, vocab * 2);
+        if status != 0 {
+            anyhow::bail!("cudaMemcpy d2h returned status {status}");
+        }
+    }
+
+    let mut logits = Vec::with_capacity(vocab);
+    for chunk in bf16_bytes.chunks_exact(2) {
+        let bits: u32 = (u16::from_le_bytes([chunk[0], chunk[1]]) as u32) << 16;
+        logits.push(f32::from_bits(bits));
+    }
+
+    let mut indexed: Vec<(usize, f32)> = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, v)| (i, v))
+        .collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    println!("top-{top_k} logits after one decode step:");
+    for (rank, (id, logit)) in indexed.iter().take(top_k).enumerate() {
+        let text = tokenizer.decode(&[*id as u32], true).unwrap_or_default();
+        println!("  #{rank:<2} id={id:<7} logit={logit:>10.4}  text={text:?}");
+    }
+
+    let finite = logits.iter().filter(|x| x.is_finite()).count();
+    let nans = logits.iter().filter(|x| x.is_nan()).count();
+    let infs = logits.iter().filter(|x| x.is_infinite()).count();
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let min = logits.iter().copied().fold(f32::INFINITY, f32::min);
+    let sum: f64 = logits.iter().map(|x| *x as f64).sum();
+    println!(
+        "summary: vocab={vocab} finite={finite} nan={nans} inf={infs} max={max:.4} min={min:.4} mean={:.4}",
+        sum / vocab as f64
+    );
+
+    if let Some(path) = out {
+        std::fs::write(&path, &bf16_bytes)?;
+        eprintln!(
+            "wrote {} bytes (BF16 little-endian) to {}",
+            bf16_bytes.len(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+// FFI shim so we can read the device-side logits buffer for the parity
+// dump. The runtime/kernels crates already link the CUDA kernel library,
+// so the symbol is available transitively at link time.
+#[cfg(feature = "cuda")]
+#[link(name = "qwen36_fp4_kernels")]
+unsafe extern "C" {
+    fn qwen36_cuda_memcpy_d2h(dst: *mut core::ffi::c_void, src: u64, bytes: usize) -> i32;
+}
+
+#[cfg(feature = "cuda")]
 fn run_bench(
     model_dir: PathBuf,
     prompt_token_count: usize,
@@ -267,15 +559,24 @@ fn run_bench(
     engine.prefill(&prompt_tokens)?;
     let prefill_seconds = prefill_start.elapsed().as_secs_f64();
 
+    // Pipeline: queue sample-after-prefill, capture one decode+sample
+    // iteration into a CUDA graph, then replay it for every remaining
+    // token. The graph collapses ~600 host kernel launches per token into
+    // a single cudaGraphLaunch and reads the position from a device-side
+    // counter so the same recording works for every iteration.
     let decode_start = Instant::now();
-    let mut generated = 0_usize;
-    for idx in 0..max_new_tokens {
-        let _token = engine.sample_greedy()?;
+    engine.queue_sample_greedy()?;
+    let mut generated = 1_usize;
+    if max_new_tokens > 1 {
+        engine.enable_decode_graph()?;
         generated += 1;
-        if idx + 1 < max_new_tokens {
-            engine.decode_sampled_queued()?;
+        for _ in 2..max_new_tokens {
+            engine.decode_graph_step()?;
+            generated += 1;
         }
+        engine.disable_decode_graph()?;
     }
+    qwen36_fp4_runtime::cuda_synchronize()?;
     let decode_seconds = decode_start.elapsed().as_secs_f64();
     let total_seconds = total_start.elapsed().as_secs_f64();
 

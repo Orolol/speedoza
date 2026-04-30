@@ -1,6 +1,8 @@
 pub mod attention;
 pub mod backend;
 pub mod deltanet;
+#[cfg(feature = "cuda")]
+pub mod graph;
 pub mod memory;
 pub mod nvfp4_gemm;
 pub mod ops;
@@ -23,7 +25,8 @@ pub use nvfp4_gemm::{CublasLtFp4ScaleMode, Nvfp4GemmPlan, Nvfp4GemmSpec};
 pub use ops::{
     Bf16GemmSpec, Bf16MatVecSpec, Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec,
     EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
-    Nvfp4RetileScalesSpec, RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
+    Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec,
+    SigmoidGateSpec, SigmoidGateStridedSpec,
 };
 pub use rmsnorm::RmsNormSpec;
 pub use rope::PartialRopeSpec;

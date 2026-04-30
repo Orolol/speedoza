@@ -15,4 +15,10 @@ pub struct PartialRopeSpec {
     pub positions_i32: DevicePtr,
     pub q_bf16: DevicePtr,
     pub k_bf16: DevicePtr,
+    /// When non-NULL and `use_scalar_position` is set, the kernel reads the
+    /// scalar token position from this device `int32_t` instead of the
+    /// `position_i32` host field. Lets a captured graph step through positions
+    /// without re-recording.
+    #[serde(default)]
+    pub scalar_position_device_i32: DevicePtr,
 }

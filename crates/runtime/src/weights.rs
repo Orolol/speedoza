@@ -62,6 +62,7 @@ pub enum LinearWeightBinding {
         weight: Box<TensorInfo>,
         block_scale: Box<TensorInfo>,
         tensor_scale: Box<TensorInfo>,
+        input_scale: Box<TensorInfo>,
     },
     Bf16 {
         weight: Box<TensorInfo>,
@@ -217,7 +218,13 @@ impl LinearWeightBinding {
                 weight,
                 block_scale,
                 tensor_scale,
-            } => tensors.extend([weight.as_ref(), block_scale.as_ref(), tensor_scale.as_ref()]),
+                input_scale,
+            } => tensors.extend([
+                weight.as_ref(),
+                block_scale.as_ref(),
+                tensor_scale.as_ref(),
+                input_scale.as_ref(),
+            ]),
             Self::Bf16 { weight } => tensors.push(weight.as_ref()),
         }
     }
@@ -270,10 +277,13 @@ impl<'a> TensorLookup<'a> {
                     self.required_suffix(prefixes, &format!("{suffix}.weight_scale"))?;
                 let tensor_scale =
                     self.required_suffix(prefixes, &format!("{suffix}.weight_scale_2"))?;
+                let input_scale =
+                    self.required_suffix(prefixes, &format!("{suffix}.input_scale"))?;
                 Ok(LinearWeightBinding::Nvfp4 {
                     weight: Box::new(weight),
                     block_scale: Box::new(block_scale),
                     tensor_scale: Box::new(tensor_scale),
+                    input_scale: Box::new(input_scale),
                 })
             }
             TensorRole::Bf16Weight
@@ -478,6 +488,10 @@ mod tests {
             ));
             tensors.push(tensor(
                 &format!("{prefix}.{suffix}.weight_scale_2"),
+                TensorDtype::F32,
+            ));
+            tensors.push(tensor(
+                &format!("{prefix}.{suffix}.input_scale"),
                 TensorDtype::F32,
             ));
         }

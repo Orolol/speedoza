@@ -11,5 +11,7 @@ pub use engine::{Engine, EngineConfig, ForwardOutput};
 #[cfg(feature = "cuda")]
 pub use gpu::{GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers, GpuTensor, GpuWeightStore};
 pub use kv_cache::{KvCacheLayout, KvCachePlan};
+#[cfg(feature = "cuda")]
+pub use qwen36_fp4_kernels::cuda_synchronize;
 pub use state::{DeltaNetStatePlan, RuntimeState};
 pub use weights::{LayerWeights, LinearWeightBinding, ModelWeightsManifest};

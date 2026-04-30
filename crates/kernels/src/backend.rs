@@ -7,7 +7,8 @@ use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
     Bf16GemmSpec, Bf16MatVecSpec, Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec,
     EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
-    Nvfp4RetileScalesSpec, RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
+    Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec,
+    SigmoidGateSpec, SigmoidGateStridedSpec,
 };
 use crate::rmsnorm::RmsNormSpec;
 use crate::rope::PartialRopeSpec;
@@ -16,7 +17,7 @@ use crate::swiglu::SwiGluSpec;
 use crate::turboquant::{TurboQuantAttentionSpec, TurboQuantEncodeSpec};
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct DevicePtr(pub u64);
 
 impl DevicePtr {
@@ -124,6 +125,14 @@ pub trait KernelBackend: Send + Sync {
 
     fn sigmoid_gate_strided(&self, _spec: &SigmoidGateStridedSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("sigmoid_gate_strided"))
+    }
+
+    fn q_proj_deinterleave(&self, _spec: &QProjDeinterleaveSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("q_proj_deinterleave"))
+    }
+
+    fn q_proj_sigmoid_gate(&self, _spec: &QProjSigmoidGateSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("q_proj_sigmoid_gate"))
     }
 
     fn copy_strided_rows(&self, _spec: &CopyStridedRowsSpec) -> Result<()> {
@@ -302,6 +311,20 @@ impl KernelBackend for CudaBackend {
         })
     }
 
+    fn q_proj_deinterleave(&self, spec: &QProjDeinterleaveSpec) -> Result<()> {
+        let ffi_spec = ffi::QProjDeinterleaveSpec::from(spec);
+        check("qwen36_q_proj_deinterleave", unsafe {
+            ffi::qwen36_q_proj_deinterleave(&ffi_spec)
+        })
+    }
+
+    fn q_proj_sigmoid_gate(&self, spec: &QProjSigmoidGateSpec) -> Result<()> {
+        let ffi_spec = ffi::QProjSigmoidGateSpec::from(spec);
+        check("qwen36_q_proj_sigmoid_gate", unsafe {
+            ffi::qwen36_q_proj_sigmoid_gate(&ffi_spec)
+        })
+    }
+
     fn copy_strided_rows(&self, spec: &CopyStridedRowsSpec) -> Result<()> {
         let ffi_spec = ffi::CopyStridedRowsSpec::from(spec);
         check("qwen36_copy_strided_rows", unsafe {
@@ -414,6 +437,7 @@ mod ffi {
         pub kv_cache_v: DevicePtr,
         pub output_bf16: DevicePtr,
         pub shape: AttentionShape,
+        pub position_device_i32: DevicePtr,
     }
 
     impl From<&crate::attention::AttentionDecodeSpec> for AttentionDecodeSpec {
@@ -428,6 +452,7 @@ mod ffi {
                 kv_cache_v: value.kv_cache_v,
                 output_bf16: value.output_bf16,
                 shape: AttentionShape::from(value.shape),
+                position_device_i32: value.position_device_i32,
             }
         }
     }
@@ -547,6 +572,7 @@ mod ffi {
         pub residual_bf16: DevicePtr,
         pub residual_out_bf16: DevicePtr,
         pub output_bf16: DevicePtr,
+        pub direct_weight: i32,
     }
 
     impl From<&crate::rmsnorm::RmsNormSpec> for RmsNormSpec {
@@ -560,6 +586,7 @@ mod ffi {
                 residual_bf16: value.residual_bf16,
                 residual_out_bf16: value.residual_out_bf16,
                 output_bf16: value.output_bf16,
+                direct_weight: i32::from(value.direct_weight),
             }
         }
     }
@@ -576,6 +603,7 @@ mod ffi {
         pub output_fp4: DevicePtr,
         pub output_scale_e4m3: DevicePtr,
         pub output_tensor_scale_f32: DevicePtr,
+        pub input_tensor_scale_f32: f32,
     }
 
     impl From<&crate::ops::RmsNormNvfp4QuantizeSpec> for RmsNormNvfp4QuantizeSpec {
@@ -591,6 +619,7 @@ mod ffi {
                 output_fp4: value.output_fp4,
                 output_scale_e4m3: value.output_scale_e4m3,
                 output_tensor_scale_f32: value.output_tensor_scale_f32,
+                input_tensor_scale_f32: value.input_tensor_scale_f32,
             }
         }
     }
@@ -608,6 +637,7 @@ mod ffi {
         pub positions_i32: DevicePtr,
         pub q_bf16: DevicePtr,
         pub k_bf16: DevicePtr,
+        pub scalar_position_device_i32: DevicePtr,
     }
 
     impl From<&crate::rope::PartialRopeSpec> for PartialRopeSpec {
@@ -624,6 +654,7 @@ mod ffi {
                 positions_i32: value.positions_i32,
                 q_bf16: value.q_bf16,
                 k_bf16: value.k_bf16,
+                scalar_position_device_i32: value.scalar_position_device_i32,
             }
         }
     }
@@ -777,6 +808,7 @@ mod ffi {
         pub output_fp4: DevicePtr,
         pub output_scale_e4m3: DevicePtr,
         pub output_tensor_scale_f32: DevicePtr,
+        pub input_tensor_scale_f32: f32,
     }
 
     impl From<&crate::ops::Nvfp4QuantizeSpec> for Nvfp4QuantizeSpec {
@@ -787,6 +819,7 @@ mod ffi {
                 output_fp4: value.output_fp4,
                 output_scale_e4m3: value.output_scale_e4m3,
                 output_tensor_scale_f32: value.output_tensor_scale_f32,
+                input_tensor_scale_f32: value.input_tensor_scale_f32,
             }
         }
     }
@@ -799,6 +832,7 @@ mod ffi {
         pub output_fp4: DevicePtr,
         pub output_scale_e4m3: DevicePtr,
         pub output_tensor_scale_f32: DevicePtr,
+        pub input_tensor_scale_f32: f32,
     }
 
     impl From<&crate::ops::Nvfp4QuantizeRowsSpec> for Nvfp4QuantizeRowsSpec {
@@ -810,6 +844,7 @@ mod ffi {
                 output_fp4: value.output_fp4,
                 output_scale_e4m3: value.output_scale_e4m3,
                 output_tensor_scale_f32: value.output_tensor_scale_f32,
+                input_tensor_scale_f32: value.input_tensor_scale_f32,
             }
         }
     }
@@ -955,6 +990,50 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct QProjDeinterleaveSpec {
+        pub rows: usize,
+        pub heads: usize,
+        pub head_dim: usize,
+        pub input_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+    }
+
+    impl From<&crate::ops::QProjDeinterleaveSpec> for QProjDeinterleaveSpec {
+        fn from(value: &crate::ops::QProjDeinterleaveSpec) -> Self {
+            Self {
+                rows: value.rows,
+                heads: value.heads,
+                head_dim: value.head_dim,
+                input_bf16: value.input_bf16,
+                output_bf16: value.output_bf16,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct QProjSigmoidGateSpec {
+        pub rows: usize,
+        pub heads: usize,
+        pub head_dim: usize,
+        pub gate_bf16: DevicePtr,
+        pub input_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+    }
+
+    impl From<&crate::ops::QProjSigmoidGateSpec> for QProjSigmoidGateSpec {
+        fn from(value: &crate::ops::QProjSigmoidGateSpec) -> Self {
+            Self {
+                rows: value.rows,
+                heads: value.heads,
+                head_dim: value.head_dim,
+                gate_bf16: value.gate_bf16,
+                input_bf16: value.input_bf16,
+                output_bf16: value.output_bf16,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct CopyStridedRowsSpec {
         pub rows: usize,
         pub values: usize,
@@ -1044,6 +1123,8 @@ mod ffi {
         pub fn qwen36_gdn_gate(spec: *const GdnGateSpec) -> i32;
         pub fn qwen36_sigmoid_gate(spec: *const SigmoidGateSpec) -> i32;
         pub fn qwen36_sigmoid_gate_strided(spec: *const SigmoidGateStridedSpec) -> i32;
+        pub fn qwen36_q_proj_deinterleave(spec: *const QProjDeinterleaveSpec) -> i32;
+        pub fn qwen36_q_proj_sigmoid_gate(spec: *const QProjSigmoidGateSpec) -> i32;
         pub fn qwen36_copy_strided_rows(spec: *const CopyStridedRowsSpec) -> i32;
     }
 }

@@ -1,4 +1,5 @@
 #include "qwen36_fp4.h"
+#include "active_stream.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -132,7 +133,7 @@ __global__ void rmsnorm_kernel(const __nv_bfloat16 *input,
                                const __nv_bfloat16 *residual,
                                __nv_bfloat16 *residual_out,
                                __nv_bfloat16 *output, size_t hidden,
-                               float eps) {
+                               float eps, int direct_weight) {
   extern __shared__ float scratch[];
   const size_t row = blockIdx.x;
   float local_sum = 0.0f;
@@ -166,7 +167,8 @@ __global__ void rmsnorm_kernel(const __nv_bfloat16 *input,
     if (residual_out != nullptr) {
       residual_out[offset] = __float2bfloat16(value);
     }
-    const float weighted = value * scale * (1.0f + __bfloat162float(weight[d]));
+    const float w = __bfloat162float(weight[d]);
+    const float weighted = value * scale * (direct_weight != 0 ? w : (1.0f + w));
     output[offset] = __float2bfloat16(weighted);
   }
 }
@@ -175,7 +177,8 @@ __global__ void rmsnorm_nvfp4_quantize_kernel(
     const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
     const __nv_bfloat16 *residual, __nv_bfloat16 *residual_out,
     __nv_bfloat16 *output_bf16, uint8_t *output_fp4,
-    uint8_t *output_scale, float *tensor_scale, size_t hidden, float eps) {
+    uint8_t *output_scale, float *tensor_scale, size_t hidden, float eps,
+    float input_tensor_scale) {
   extern __shared__ float scratch[];
   float local_sum = 0.0f;
 
@@ -201,21 +204,24 @@ __global__ void rmsnorm_nvfp4_quantize_kernel(
       rsqrtf(scratch[0] / static_cast<float>(hidden) + eps);
   const size_t groups = div_ceil_size(hidden, 16);
   const size_t scale_inner_dim = round_up_size(groups, 4);
+  const float global_scale =
+      input_tensor_scale > 0.0f ? input_tensor_scale : 1.0f;
 
   for (size_t group = threadIdx.x; group < groups; group += blockDim.x) {
     const size_t start = group * 16;
     float amax = 0.0f;
+    float residual_values[16];
+    float weighted_values[16];
     for (size_t offset = 0; offset < 16 && start + offset < hidden; ++offset) {
       const size_t d = start + offset;
       float value = __bfloat162float(input[d]);
       if (residual != nullptr) {
         value += __bfloat162float(residual[d]);
       }
-      if (residual_out != nullptr) {
-        residual_out[d] = __float2bfloat16(value);
-      }
       const float weighted =
           value * norm_scale * (1.0f + __bfloat162float(weight[d]));
+      residual_values[offset] = value;
+      weighted_values[offset] = weighted;
       if (output_bf16 != nullptr) {
         output_bf16[d] = __float2bfloat16(weighted);
       }
@@ -223,37 +229,32 @@ __global__ void rmsnorm_nvfp4_quantize_kernel(
     }
 
     const float scale_value =
-        amax > 0.0f ? fmaxf(amax / 6.0f, 1.0e-8f) : 1.0f;
+        amax > 0.0f ? fmaxf(amax / (6.0f * global_scale), 1.0e-8f)
+                    : 1.0f;
     const uint8_t scale_code = encode_e4m3_positive(scale_value);
     output_scale[vec16_scale_offset(group, 0, scale_inner_dim)] = scale_code;
-    const float decoded_scale = fmaxf(decode_e4m3(scale_code), 1.0e-8f);
+    const float decoded_scale =
+        fmaxf(decode_e4m3(scale_code) * global_scale, 1.0e-8f);
 
     for (size_t offset = 0; offset < 16 && start + offset < hidden;
          offset += 2) {
       const size_t d = start + offset;
-      float value0 = __bfloat162float(input[d]);
-      if (residual != nullptr) {
-        value0 += __bfloat162float(residual[d]);
-      }
-      const float weighted0 =
-          value0 * norm_scale * (1.0f + __bfloat162float(weight[d]));
-      uint8_t packed = encode_e2m1(weighted0 / decoded_scale);
+      uint8_t packed = encode_e2m1(weighted_values[offset] / decoded_scale);
       if (d + 1 < hidden) {
-        float value1 = __bfloat162float(input[d + 1]);
-        if (residual != nullptr) {
-          value1 += __bfloat162float(residual[d + 1]);
-        }
-        const float weighted1 =
-            value1 * norm_scale * (1.0f + __bfloat162float(weight[d + 1]));
-        packed |= static_cast<uint8_t>(encode_e2m1(weighted1 / decoded_scale)
-                                       << 4);
+        packed |= static_cast<uint8_t>(
+            encode_e2m1(weighted_values[offset + 1] / decoded_scale) << 4);
       }
       output_fp4[d / 2] = packed;
+    }
+    for (size_t offset = 0; offset < 16 && start + offset < hidden; ++offset) {
+      if (residual_out != nullptr) {
+        residual_out[start + offset] = __float2bfloat16(residual_values[offset]);
+      }
     }
   }
 
   if (threadIdx.x == 0 && tensor_scale != nullptr) {
-    *tensor_scale = 1.0f;
+    *tensor_scale = global_scale;
   }
 }
 
@@ -271,6 +272,7 @@ __device__ void apply_rope_half_pair(__nv_bfloat16 *values, size_t offset,
 __global__ void partial_rope_kernel(int32_t const *positions,
                                     int32_t scalar_position,
                                     int use_scalar_position,
+                                    const int32_t *scalar_position_device,
                                     __nv_bfloat16 *q, __nv_bfloat16 *k,
                                     size_t q_heads, size_t kv_heads,
                                     size_t head_dim, size_t rope_dims,
@@ -278,8 +280,13 @@ __global__ void partial_rope_kernel(int32_t const *positions,
   const size_t half_dim = rope_dims / 2;
   const size_t token = blockIdx.y;
   const size_t p = blockIdx.x;
+  // Resolve the scalar position from device memory when available so a
+  // captured CUDA graph can step through positions without re-recording.
+  const int32_t resolved_scalar = scalar_position_device != nullptr
+                                      ? *scalar_position_device
+                                      : scalar_position;
   const int32_t token_position =
-      use_scalar_position != 0 ? scalar_position : positions[token];
+      use_scalar_position != 0 ? resolved_scalar : positions[token];
   const float position = static_cast<float>(token_position);
   const float inv_freq = powf(
       base_theta, -static_cast<float>(2 * p) / static_cast<float>(rope_dims));
@@ -390,47 +397,139 @@ __global__ void bf16_matvec_kernel(const __nv_bfloat16 *input,
   }
 }
 
-__global__ void nvfp4_matvec_kernel(const __nv_bfloat16 *input,
-                                    const uint8_t *weight,
-                                    const uint8_t *block_scale,
-                                    const float *tensor_scale,
-                                    __nv_bfloat16 *output,
-                                    size_t in_features) {
-  extern __shared__ float scratch[];
-  const size_t row = blockIdx.x;
+// Lookup table for E2M1 (FP4) decode. Index 0..7 = positive magnitudes,
+// 8..15 = the same magnitudes negated. Lives in constant memory so every
+// thread shares one cache line.
+__device__ __constant__ float kFp4Lut[16] = {
+    0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+
+// Memory-bandwidth-bound NVFP4 N=1 matvec.
+//
+// Layout: each block owns ROWS_PER_BLOCK output rows; each row is processed
+// by exactly one warp (32 lanes), so the 32 lanes cooperatively walk the
+// in_features axis and finish with a single warp-shuffle reduction (no
+// __syncthreads needed inside the row).
+//
+// Block packs 8 rows × 32 lanes = 256 threads. With 192 SMs on Blackwell,
+// 17408 / 8 = 2176 blocks fits in roughly 3 waves at 4-block-per-SM
+// occupancy — a much better fit than one-block-per-row, which serialised
+// at ~6 waves for the same matvec.
+//
+// Per-group work (16 input dims):
+// - 8 packed FP4 bytes pulled as a single 8-byte word (when aligned).
+// - 16 BF16 inputs pulled as a single 32-byte uint4 (when aligned).
+// - One block scale (e4m3) decoded via a constant-memory LUT.
+// - The 16 multiplies fold into a register accumulator.
+constexpr int kFp4MatvecRowsPerBlock = 8;
+constexpr int kFp4MatvecLanesPerRow = 32;
+constexpr int kFp4MatvecThreadsPerBlock =
+    kFp4MatvecRowsPerBlock * kFp4MatvecLanesPerRow;
+
+__global__ void __launch_bounds__(kFp4MatvecThreadsPerBlock)
+nvfp4_matvec_kernel(const __nv_bfloat16 *__restrict__ input,
+                    const uint8_t *__restrict__ weight,
+                    const uint8_t *__restrict__ block_scale,
+                    const float *__restrict__ tensor_scale,
+                    __nv_bfloat16 *__restrict__ output,
+                    size_t in_features, size_t out_features) {
+  const unsigned warp_id = threadIdx.x >> 5;       // 0..ROWS_PER_BLOCK-1
+  const unsigned lane = threadIdx.x & 31;          // 0..31
+  const size_t row = static_cast<size_t>(blockIdx.x) *
+                         kFp4MatvecRowsPerBlock +
+                     warp_id;
+  if (row >= out_features) {
+    return;
+  }
+
   const size_t packed_cols = (in_features + 1) / 2;
   const size_t scale_cols = (in_features + 15) / 16;
   const size_t scale_inner_dim = round_up_size(scale_cols, 4);
   const uint8_t *row_weight = weight + row * packed_cols;
-  const float global_scale = tensor_scale == nullptr ? 1.0f : *tensor_scale;
+  const float global_scale =
+      tensor_scale == nullptr ? 1.0f : __ldg(tensor_scale);
+
   float sum = 0.0f;
-  for (size_t col = threadIdx.x; col < in_features; col += blockDim.x) {
-    const uint8_t packed = row_weight[col / 2];
-    const float value = decode_e2m1(packed, (col & 1) != 0);
-    const size_t scale_offset =
-        vec16_scale_offset(col / 16, row, scale_inner_dim);
-    const float scale = decode_e4m3(block_scale[scale_offset]) * global_scale;
-    sum += __bfloat162float(input[col]) * value * scale;
-  }
-  scratch[threadIdx.x] = sum;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+
+  for (size_t g = lane; g < scale_cols; g += kFp4MatvecLanesPerRow) {
+    const size_t col0 = g * 16;
+    const size_t scale_off = vec16_scale_offset(g, row, scale_inner_dim);
+    const float scale =
+        decode_e4m3(__ldg(block_scale + scale_off)) * global_scale;
+
+    // Vector load: 8 packed FP4 bytes -> 16 weight values.
+    const size_t weight_byte_off = col0 / 2;
+    uint64_t packed_weights;
+    const bool fast = col0 + 16 <= in_features && (weight_byte_off & 7u) == 0;
+    if (fast) {
+      packed_weights =
+          *reinterpret_cast<const uint64_t *>(row_weight + weight_byte_off);
+    } else {
+      packed_weights = 0;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        if (col0 + 2 * i < in_features) {
+          packed_weights |=
+              static_cast<uint64_t>(row_weight[weight_byte_off + i])
+              << (i * 8);
+        }
+      }
     }
-    __syncthreads();
+
+    __nv_bfloat162 input_pairs[8];
+    if (fast && (reinterpret_cast<uintptr_t>(input + col0) & 15u) == 0) {
+      const uint4 packed_input = *reinterpret_cast<const uint4 *>(input + col0);
+      const __nv_bfloat162 *as_pairs =
+          reinterpret_cast<const __nv_bfloat162 *>(&packed_input);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        input_pairs[i] = as_pairs[i];
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const size_t col = col0 + 2 * i;
+        const __nv_bfloat16 a =
+            (col < in_features) ? input[col] : __float2bfloat16(0.0f);
+        const __nv_bfloat16 b = (col + 1 < in_features)
+                                    ? input[col + 1]
+                                    : __float2bfloat16(0.0f);
+        input_pairs[i] = __halves2bfloat162(a, b);
+      }
+    }
+
+    float local = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const uint8_t byte = (packed_weights >> (i * 8)) & 0xffu;
+      const float w0 = kFp4Lut[byte & 0x0fu];
+      const float w1 = kFp4Lut[(byte >> 4) & 0x0fu];
+      const float a0 = __bfloat162float(input_pairs[i].x);
+      const float a1 = __bfloat162float(input_pairs[i].y);
+      local += a0 * w0 + a1 * w1;
+    }
+    sum += local * scale;
   }
-  if (threadIdx.x == 0) {
-    output[row] = __float2bfloat16(scratch[0]);
+
+  // Single warp-shuffle reduction for this row's 32 lanes.
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum += __shfl_xor_sync(0xffffffff, sum, offset);
+  }
+  if (lane == 0) {
+    output[row] = __float2bfloat16(sum);
   }
 }
 
 __global__ void nvfp4_quantize_fused_kernel(const __nv_bfloat16 *input,
                                             uint8_t *output, uint8_t *scale,
                                             float *tensor_scale,
-                                            size_t values) {
+                                            size_t values,
+                                            float input_tensor_scale) {
   __shared__ float scratch[32];
   __shared__ float decoded_scale;
+  const float global_scale =
+      input_tensor_scale > 0.0f ? input_tensor_scale : 1.0f;
   const size_t group = blockIdx.x;
   const size_t scale_inner_dim = round_up_size(div_ceil_size(values, 16), 4);
   const size_t start = group * 16;
@@ -453,12 +552,14 @@ __global__ void nvfp4_quantize_fused_kernel(const __nv_bfloat16 *input,
 
   if (threadIdx.x == 0) {
     const float scale_value =
-        scratch[0] > 0.0f ? fmaxf(scratch[0] / 6.0f, 1.0e-8f) : 1.0f;
+        scratch[0] > 0.0f
+            ? fmaxf(scratch[0] / (6.0f * global_scale), 1.0e-8f)
+            : 1.0f;
     const uint8_t scale_code = encode_e4m3_positive(scale_value);
     scale[vec16_scale_offset(group, 0, scale_inner_dim)] = scale_code;
-    decoded_scale = fmaxf(decode_e4m3(scale_code), 1.0e-8f);
+    decoded_scale = fmaxf(decode_e4m3(scale_code) * global_scale, 1.0e-8f);
     if (group == 0 && tensor_scale != nullptr) {
-      *tensor_scale = 1.0f;
+      *tensor_scale = global_scale;
     }
   }
   __syncthreads();
@@ -480,9 +581,12 @@ __global__ void nvfp4_quantize_fused_kernel(const __nv_bfloat16 *input,
 __global__ void nvfp4_quantize_rows_kernel(const __nv_bfloat16 *input,
                                            uint8_t *output, uint8_t *scale,
                                            float *tensor_scale, size_t rows,
-                                           size_t values) {
+                                           size_t values,
+                                           float input_tensor_scale) {
   __shared__ float scratch[32];
   __shared__ float decoded_scale;
+  const float global_scale =
+      input_tensor_scale > 0.0f ? input_tensor_scale : 1.0f;
   const size_t group = blockIdx.x;
   const size_t row = blockIdx.y;
   const size_t scale_inner_dim = round_up_size(div_ceil_size(values, 16), 4);
@@ -508,12 +612,14 @@ __global__ void nvfp4_quantize_rows_kernel(const __nv_bfloat16 *input,
 
   if (threadIdx.x == 0) {
     const float scale_value =
-        scratch[0] > 0.0f ? fmaxf(scratch[0] / 6.0f, 1.0e-8f) : 1.0f;
+        scratch[0] > 0.0f
+            ? fmaxf(scratch[0] / (6.0f * global_scale), 1.0e-8f)
+            : 1.0f;
     const uint8_t scale_code = encode_e4m3_positive(scale_value);
     scale[vec16_scale_offset(group, row, scale_inner_dim)] = scale_code;
-    decoded_scale = fmaxf(decode_e4m3(scale_code), 1.0e-8f);
+    decoded_scale = fmaxf(decode_e4m3(scale_code) * global_scale, 1.0e-8f);
     if (row == 0 && group == 0 && tensor_scale != nullptr) {
-      *tensor_scale = 1.0f;
+      *tensor_scale = global_scale;
     }
   }
   __syncthreads();
@@ -655,6 +761,42 @@ __global__ void sigmoid_gate_strided_kernel(
   }
 }
 
+__global__ void q_proj_deinterleave_kernel(const __nv_bfloat16 *input,
+                                           __nv_bfloat16 *output,
+                                           size_t rows, size_t heads,
+                                           size_t head_dim) {
+  const size_t q_values = heads * head_dim;
+  const size_t row_stride = q_values * 2;
+  const size_t total = rows * q_values;
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += blockDim.x * gridDim.x) {
+    const size_t row = idx / q_values;
+    const size_t col = idx % q_values;
+    const size_t head = col / head_dim;
+    const size_t dim = col % head_dim;
+    output[idx] = input[row * row_stride + head * head_dim * 2 + dim];
+  }
+}
+
+__global__ void q_proj_sigmoid_gate_kernel(
+    const __nv_bfloat16 *gate, const __nv_bfloat16 *input,
+    __nv_bfloat16 *output, size_t rows, size_t heads, size_t head_dim) {
+  const size_t q_values = heads * head_dim;
+  const size_t row_stride = q_values * 2;
+  const size_t total = rows * q_values;
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += blockDim.x * gridDim.x) {
+    const size_t row = idx / q_values;
+    const size_t col = idx % q_values;
+    const size_t head = col / head_dim;
+    const size_t dim = col % head_dim;
+    const float gate_value = __bfloat162float(
+        gate[row * row_stride + head * head_dim * 2 + head_dim + dim]);
+    const float input_value = __bfloat162float(input[idx]);
+    output[idx] = __float2bfloat16(input_value / (1.0f + expf(-gate_value)));
+  }
+}
+
 __global__ void copy_strided_rows_kernel(const __nv_bfloat16 *input,
                                          __nv_bfloat16 *output, size_t rows,
                                          size_t values, size_t input_stride,
@@ -682,12 +824,13 @@ extern "C" int qwen36_rmsnorm(const qwen36_rmsnorm_spec_t *spec) {
   const int threads = 256;
   const float eps = spec->eps == 0.0f ? 1.0e-6f : spec->eps;
   rmsnorm_kernel<<<static_cast<unsigned int>(spec->rows), threads,
-                   threads * sizeof(float)>>>(
+                   threads * sizeof(float), qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<const __nv_bfloat16>(spec->weight_bf16),
       ptr<const __nv_bfloat16>(spec->residual_bf16),
       ptr<__nv_bfloat16>(spec->residual_out_bf16),
-      ptr<__nv_bfloat16>(spec->output_bf16), spec->hidden, eps);
+      ptr<__nv_bfloat16>(spec->output_bf16), spec->hidden, eps,
+      spec->direct_weight);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
@@ -705,7 +848,7 @@ extern "C" int qwen36_rmsnorm_nvfp4_quantize(
 
   const int threads = 256;
   const float eps = spec->eps == 0.0f ? 1.0e-6f : spec->eps;
-  rmsnorm_nvfp4_quantize_kernel<<<1, threads, threads * sizeof(float)>>>(
+  rmsnorm_nvfp4_quantize_kernel<<<1, threads, threads * sizeof(float), qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<const __nv_bfloat16>(spec->weight_bf16),
       ptr<const __nv_bfloat16>(spec->residual_bf16),
@@ -713,7 +856,8 @@ extern "C" int qwen36_rmsnorm_nvfp4_quantize(
       ptr<__nv_bfloat16>(spec->output_bf16),
       ptr<uint8_t>(spec->output_fp4),
       ptr<uint8_t>(spec->output_scale_e4m3),
-      ptr<float>(spec->output_tensor_scale_f32), spec->hidden, eps);
+      ptr<float>(spec->output_tensor_scale_f32), spec->hidden, eps,
+      spec->input_tensor_scale_f32);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
@@ -735,9 +879,10 @@ extern "C" int qwen36_partial_rope(const qwen36_partial_rope_spec_t *spec) {
                   static_cast<unsigned int>(spec->tokens));
   const float base_theta =
       spec->base_theta > 0.0 ? static_cast<float>(spec->base_theta) : 10000.0f;
-  partial_rope_kernel<<<grid, threads>>>(
+  partial_rope_kernel<<<grid, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const int32_t>(spec->positions_i32), spec->position_i32,
       spec->use_scalar_position,
+      ptr<const int32_t>(spec->scalar_position_device_i32),
       ptr<__nv_bfloat16>(spec->q_bf16), ptr<__nv_bfloat16>(spec->k_bf16),
       spec->q_heads, spec->kv_heads, spec->head_dim, spec->rope_dims,
       base_theta);
@@ -759,7 +904,7 @@ qwen36_embedding_lookup(const qwen36_embedding_lookup_spec_t *spec) {
   const unsigned int blocks =
       static_cast<unsigned int>((spec->hidden + threads - 1) / threads);
   const dim3 grid(blocks, static_cast<unsigned int>(spec->tokens));
-  embedding_lookup_kernel<<<grid, threads>>>(
+  embedding_lookup_kernel<<<grid, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const uint32_t>(spec->token_ids_u32),
       ptr<const __nv_bfloat16>(spec->embedding_bf16),
       ptr<__nv_bfloat16>(spec->output_bf16), spec->tokens, spec->hidden,
@@ -779,7 +924,7 @@ extern "C" int qwen36_bf16_matvec(const qwen36_bf16_matvec_spec_t *spec) {
   }
   const int threads = 256;
   bf16_matvec_kernel<<<static_cast<unsigned int>(spec->out_features), threads,
-                       threads * sizeof(float)>>>(
+                       threads * sizeof(float), qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<const __nv_bfloat16>(spec->weight_bf16),
       ptr<__nv_bfloat16>(spec->output_bf16), spec->in_features);
@@ -796,14 +941,20 @@ extern "C" int qwen36_nvfp4_matvec(const qwen36_nvfp4_matvec_spec_t *spec) {
       spec->block_scale_e4m3.ptr == 0 || spec->output_bf16.ptr == 0) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }
-  const int threads = 256;
-  nvfp4_matvec_kernel<<<static_cast<unsigned int>(spec->out_features), threads,
-                        threads * sizeof(float)>>>(
+  // ROWS_PER_BLOCK rows are handled per block (8 warps, 256 threads). This
+  // keeps the live block count down to a few hundred for the wide MLP rows
+  // while leaving enough work per warp to hide HBM latency.
+  const unsigned int blocks =
+      static_cast<unsigned int>((spec->out_features + kFp4MatvecRowsPerBlock - 1) /
+                                kFp4MatvecRowsPerBlock);
+  nvfp4_matvec_kernel<<<blocks, kFp4MatvecThreadsPerBlock, 0,
+                        qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<const uint8_t>(spec->weight_u8),
       ptr<const uint8_t>(spec->block_scale_e4m3),
       ptr<const float>(spec->tensor_scale_f32),
-      ptr<__nv_bfloat16>(spec->output_bf16), spec->in_features);
+      ptr<__nv_bfloat16>(spec->output_bf16), spec->in_features,
+      spec->out_features);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
@@ -820,10 +971,11 @@ qwen36_nvfp4_quantize_bf16(const qwen36_nvfp4_quantize_spec_t *spec) {
 
   const unsigned int scale_blocks =
       static_cast<unsigned int>((spec->values + 15) / 16);
-  nvfp4_quantize_fused_kernel<<<scale_blocks, 32>>>(
+  nvfp4_quantize_fused_kernel<<<scale_blocks, 32, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<uint8_t>(spec->output_fp4), ptr<uint8_t>(spec->output_scale_e4m3),
-      ptr<float>(spec->output_tensor_scale_f32), spec->values);
+      ptr<float>(spec->output_tensor_scale_f32), spec->values,
+      spec->input_tensor_scale_f32);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
@@ -841,10 +993,11 @@ qwen36_nvfp4_quantize_rows(const qwen36_nvfp4_quantize_rows_spec_t *spec) {
   const unsigned int scale_blocks =
       static_cast<unsigned int>((spec->values + 15) / 16);
   const dim3 grid(scale_blocks, static_cast<unsigned int>(spec->rows));
-  nvfp4_quantize_rows_kernel<<<grid, 32>>>(
+  nvfp4_quantize_rows_kernel<<<grid, 32, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<uint8_t>(spec->output_fp4), ptr<uint8_t>(spec->output_scale_e4m3),
-      ptr<float>(spec->output_tensor_scale_f32), spec->rows, spec->values);
+      ptr<float>(spec->output_tensor_scale_f32), spec->rows, spec->values,
+      spec->input_tensor_scale_f32);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
@@ -870,7 +1023,7 @@ qwen36_nvfp4_retile_scales(const qwen36_nvfp4_retile_scales_spec_t *spec) {
   const size_t total = spec->rows * spec->inner_groups;
   const unsigned int blocks =
       static_cast<unsigned int>((total + threads - 1) / threads);
-  nvfp4_retile_scales_kernel<<<blocks, threads>>>(
+  nvfp4_retile_scales_kernel<<<blocks, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const uint8_t>(spec->input_row_major_u8),
       ptr<uint8_t>(spec->output_tiled_u8), spec->rows, spec->inner_groups);
   err = cudaGetLastError();
@@ -889,7 +1042,7 @@ extern "C" int qwen36_conv1d_update(const qwen36_conv1d_update_spec_t *spec) {
   const int threads = 256;
   const unsigned int blocks =
       static_cast<unsigned int>((spec->channels + threads - 1) / threads);
-  conv1d_update_kernel<<<blocks, threads>>>(
+  conv1d_update_kernel<<<blocks, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<__nv_bfloat16>(spec->conv_history_bf16),
       ptr<const __nv_bfloat16>(spec->weight_bf16),
@@ -911,7 +1064,7 @@ extern "C" int qwen36_conv1d_prefill(const qwen36_conv1d_prefill_spec_t *spec) {
   const int threads = 256;
   const unsigned int blocks =
       static_cast<unsigned int>((spec->channels + threads - 1) / threads);
-  conv1d_prefill_kernel<<<blocks, threads>>>(
+  conv1d_prefill_kernel<<<blocks, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<__nv_bfloat16>(spec->conv_history_bf16),
       ptr<const __nv_bfloat16>(spec->weight_bf16),
@@ -935,7 +1088,7 @@ extern "C" int qwen36_gdn_gate(const qwen36_gdn_gate_spec_t *spec) {
   const size_t total = spec->rows * spec->heads;
   const unsigned int blocks =
       static_cast<unsigned int>((total + threads - 1) / threads);
-  gdn_gate_kernel<<<blocks, threads>>>(
+  gdn_gate_kernel<<<blocks, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->a_bf16),
       ptr<const __nv_bfloat16>(spec->b_bf16),
       ptr<const __nv_bfloat16>(spec->a_log_bf16),
@@ -957,7 +1110,7 @@ extern "C" int qwen36_sigmoid_gate(const qwen36_sigmoid_gate_spec_t *spec) {
   const int threads = 256;
   const unsigned int blocks =
       static_cast<unsigned int>((spec->elements + threads - 1) / threads);
-  sigmoid_gate_kernel<<<blocks, threads>>>(
+  sigmoid_gate_kernel<<<blocks, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->gate_bf16),
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<__nv_bfloat16>(spec->output_bf16), spec->elements);
@@ -982,12 +1135,58 @@ qwen36_sigmoid_gate_strided(const qwen36_sigmoid_gate_strided_spec_t *spec) {
   const size_t total = spec->rows * spec->elements_per_row;
   const unsigned int blocks =
       static_cast<unsigned int>((total + threads - 1) / threads);
-  sigmoid_gate_strided_kernel<<<blocks, threads>>>(
+  sigmoid_gate_strided_kernel<<<blocks, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->gate_bf16),
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<__nv_bfloat16>(spec->output_bf16), spec->rows,
       spec->elements_per_row, spec->gate_stride, spec->input_stride,
       spec->output_stride);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int
+qwen36_q_proj_deinterleave(const qwen36_q_proj_deinterleave_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->rows == 0 || spec->heads == 0 || spec->head_dim == 0 ||
+      spec->input_bf16.ptr == 0 || spec->output_bf16.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const int threads = 256;
+  const size_t total = spec->rows * spec->heads * spec->head_dim;
+  const unsigned int blocks =
+      static_cast<unsigned int>((total + threads - 1) / threads);
+  q_proj_deinterleave_kernel<<<blocks, threads, 0,
+                               qwen36_internal_active_stream()>>>(
+      ptr<const __nv_bfloat16>(spec->input_bf16),
+      ptr<__nv_bfloat16>(spec->output_bf16), spec->rows, spec->heads,
+      spec->head_dim);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int
+qwen36_q_proj_sigmoid_gate(const qwen36_q_proj_sigmoid_gate_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->rows == 0 || spec->heads == 0 || spec->head_dim == 0 ||
+      spec->gate_bf16.ptr == 0 || spec->input_bf16.ptr == 0 ||
+      spec->output_bf16.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const int threads = 256;
+  const size_t total = spec->rows * spec->heads * spec->head_dim;
+  const unsigned int blocks =
+      static_cast<unsigned int>((total + threads - 1) / threads);
+  q_proj_sigmoid_gate_kernel<<<blocks, threads, 0,
+                               qwen36_internal_active_stream()>>>(
+      ptr<const __nv_bfloat16>(spec->gate_bf16),
+      ptr<const __nv_bfloat16>(spec->input_bf16),
+      ptr<__nv_bfloat16>(spec->output_bf16), spec->rows, spec->heads,
+      spec->head_dim);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
@@ -1007,7 +1206,7 @@ qwen36_copy_strided_rows(const qwen36_copy_strided_rows_spec_t *spec) {
   const size_t total = spec->rows * spec->values;
   const unsigned int blocks =
       static_cast<unsigned int>((total + threads - 1) / threads);
-  copy_strided_rows_kernel<<<blocks, threads>>>(
+  copy_strided_rows_kernel<<<blocks, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<__nv_bfloat16>(spec->output_bf16), spec->rows, spec->values,
       spec->input_stride, spec->output_stride);
@@ -1029,7 +1228,7 @@ extern "C" int qwen36_swiglu(const qwen36_swiglu_spec_t *spec) {
   const size_t total = spec->rows * spec->intermediate;
   const unsigned int blocks =
       static_cast<unsigned int>((total + threads - 1) / threads);
-  swiglu_kernel<<<blocks, threads>>>(ptr<const __nv_bfloat16>(spec->gate_bf16),
+  swiglu_kernel<<<blocks, threads, 0, qwen36_internal_active_stream()>>>(ptr<const __nv_bfloat16>(spec->gate_bf16),
                                      ptr<const __nv_bfloat16>(spec->up_bf16),
                                      ptr<__nv_bfloat16>(spec->output_bf16),
                                      total);
@@ -1048,7 +1247,7 @@ extern "C" int qwen36_sample(const qwen36_sampling_spec_t *spec) {
 
   const int threads = 256;
   const size_t shared_bytes = threads * (sizeof(float) + sizeof(uint32_t));
-  sample_argmax_kernel<<<1, threads, shared_bytes>>>(
+  sample_argmax_kernel<<<1, threads, shared_bytes, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->logits_bf16),
       ptr<uint32_t>(spec->output_token_u32), spec->vocab_size,
       spec->temperature);

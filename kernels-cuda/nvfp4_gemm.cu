@@ -1,4 +1,5 @@
 #include "qwen36_fp4.h"
+#include "active_stream.h"
 
 #include <cublasLt.h>
 #include <cuda_bf16.h>
@@ -384,7 +385,8 @@ extern "C" int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec) {
         handle, plan->op_desc, &alpha, ptr(spec->a_fp4), plan->a_desc,
         ptr(spec->b_fp4), plan->b_desc, &beta, ptr(spec->c_bf16),
         plan->c_desc, ptr(spec->c_bf16), plan->d_desc, &plan->heuristic.algo,
-        ptr(spec->workspace), spec->workspace_bytes, 0);
+        ptr(spec->workspace), spec->workspace_bytes,
+        qwen36_internal_active_stream());
   }
   if (rc != CUBLAS_STATUS_SUCCESS &&
       getenv("QWEN36_DEBUG_CUBLASLT") != nullptr) {
@@ -448,7 +450,8 @@ extern "C" int qwen36_bf16_gemm(const qwen36_bf16_gemm_spec_t *spec) {
         handle, plan->op_desc, &alpha, ptr(spec->a_bf16), plan->a_desc,
         ptr(spec->b_bf16), plan->b_desc, &beta, ptr(spec->c_bf16),
         plan->c_desc, ptr(spec->c_bf16), plan->d_desc, &plan->heuristic.algo,
-        ptr(spec->workspace), spec->workspace_bytes, 0);
+        ptr(spec->workspace), spec->workspace_bytes,
+        qwen36_internal_active_stream());
   }
   if (rc != CUBLAS_STATUS_SUCCESS &&
       getenv("QWEN36_DEBUG_CUBLASLT") != nullptr) {

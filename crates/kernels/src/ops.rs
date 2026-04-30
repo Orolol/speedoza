@@ -51,6 +51,7 @@ pub struct Nvfp4QuantizeSpec {
     pub output_fp4: DevicePtr,
     pub output_scale_e4m3: DevicePtr,
     pub output_tensor_scale_f32: DevicePtr,
+    pub input_tensor_scale_f32: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +62,7 @@ pub struct Nvfp4QuantizeRowsSpec {
     pub output_fp4: DevicePtr,
     pub output_scale_e4m3: DevicePtr,
     pub output_tensor_scale_f32: DevicePtr,
+    pub input_tensor_scale_f32: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +77,7 @@ pub struct RmsNormNvfp4QuantizeSpec {
     pub output_fp4: DevicePtr,
     pub output_scale_e4m3: DevicePtr,
     pub output_tensor_scale_f32: DevicePtr,
+    pub input_tensor_scale_f32: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +136,25 @@ pub struct SigmoidGateStridedSpec {
     pub gate_stride: usize,
     pub input_stride: usize,
     pub output_stride: usize,
+    pub gate_bf16: DevicePtr,
+    pub input_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QProjDeinterleaveSpec {
+    pub rows: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub input_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QProjSigmoidGateSpec {
+    pub rows: usize,
+    pub heads: usize,
+    pub head_dim: usize,
     pub gate_bf16: DevicePtr,
     pub input_bf16: DevicePtr,
     pub output_bf16: DevicePtr,

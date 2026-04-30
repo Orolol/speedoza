@@ -92,6 +92,7 @@ fn render_minimal_qwen_chat(messages: &[ChatMessage], add_generation_prompt: boo
     }
     if add_generation_prompt {
         rendered.push_str("<|im_start|>assistant\n");
+        rendered.push_str("<think>\n");
     }
     rendered
 }
@@ -110,6 +111,6 @@ mod tests {
             true,
         );
         assert!(prompt.contains("<|im_start|>user\nBonjour<|im_end|>"));
-        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n"));
     }
 }

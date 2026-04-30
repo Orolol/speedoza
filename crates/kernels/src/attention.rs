@@ -46,4 +46,9 @@ pub struct AttentionDecodeSpec {
     pub kv_cache_v: DevicePtr,
     pub output_bf16: DevicePtr,
     pub shape: AttentionShape,
+    /// When non-NULL, the kernel reads the current position from this device
+    /// `int32_t` instead of `position`. Used by graph-captured decode so a
+    /// single recording can be replayed across iterations.
+    #[serde(default)]
+    pub position_device_i32: DevicePtr,
 }
