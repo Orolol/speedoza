@@ -610,16 +610,23 @@ impl<B: KernelBackend> Engine<B> {
             )));
         }
 
-        let mut token_bytes = Vec::with_capacity(8);
-        token_bytes.extend_from_slice(&current_token.to_ne_bytes());
-        token_bytes.extend_from_slice(&draft_token.to_ne_bytes());
-        let mut position_bytes = Vec::with_capacity(8);
-        for position in [start_position, start_position + 1] {
-            let position = i32::try_from(position).map_err(|_| {
-                CoreError::Runtime(format!("position {position} does not fit i32 for RoPE"))
-            })?;
-            position_bytes.extend_from_slice(&position.to_ne_bytes());
-        }
+        let mut token_bytes = [0_u8; 8];
+        token_bytes[..4].copy_from_slice(&current_token.to_ne_bytes());
+        token_bytes[4..].copy_from_slice(&draft_token.to_ne_bytes());
+        let position_0 = i32::try_from(start_position).map_err(|_| {
+            CoreError::Runtime(format!(
+                "position {start_position} does not fit i32 for RoPE"
+            ))
+        })?;
+        let position_1_usize = start_position + 1;
+        let position_1 = i32::try_from(position_1_usize).map_err(|_| {
+            CoreError::Runtime(format!(
+                "position {position_1_usize} does not fit i32 for RoPE"
+            ))
+        })?;
+        let mut position_bytes = [0_u8; 8];
+        position_bytes[..4].copy_from_slice(&position_0.to_ne_bytes());
+        position_bytes[4..].copy_from_slice(&position_1.to_ne_bytes());
         {
             let prefill = self.cuda_prefill()?;
             prefill.token_u32.copy_from_host(&token_bytes)?;
@@ -669,9 +676,9 @@ impl<B: KernelBackend> Engine<B> {
             });
         }
 
-        let mut mtp_tokens = Vec::with_capacity(8);
-        mtp_tokens.extend_from_slice(&draft_token.to_ne_bytes());
-        mtp_tokens.extend_from_slice(&next_token.to_ne_bytes());
+        let mut mtp_tokens = [0_u8; 8];
+        mtp_tokens[..4].copy_from_slice(&draft_token.to_ne_bytes());
+        mtp_tokens[4..].copy_from_slice(&next_token.to_ne_bytes());
         self.cuda_prefill()?.token_u32.copy_from_host(&mtp_tokens)?;
         self.run_mtp_prefill_chunk(2, start_position, self.cuda_prefill()?.normed.ptr(), true)?;
         self.queue_sample_greedy()?;
