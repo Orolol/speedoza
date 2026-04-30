@@ -6,8 +6,8 @@ use qwen36_fp4_core::{CoreError, KvCacheDtype, ModelLayout, ModelTopology, Resul
 #[cfg(feature = "cuda")]
 use qwen36_fp4_kernels::{
     AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
-    Conv1dPrefillSpec, Conv1dUpdateSpec, CublasLtFp4ScaleMode, CudaBackend, DeltaNetDecodeSpec,
-    DeltaNetShape, DevicePtr, EmbeddingLookupSpec, GdnGateSpec, Nvfp4GemmSpec,
+    Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode, CudaBackend,
+    DeltaNetDecodeSpec, DeltaNetShape, DevicePtr, EmbeddingLookupSpec, GdnGateSpec, Nvfp4GemmSpec,
     Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec, QProjDeinterleaveSpec,
     QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec, SamplingSpec, SwiGluSpec,
 };
@@ -42,7 +42,7 @@ impl Default for EngineConfig {
             max_context: 262144,
             kv_cache_dtype: KvCacheDtype::Fp8,
             turboquant: true,
-            mtp_speculative_tokens: 3,
+            mtp_speculative_tokens: 0,
             cuda_graphs: CudaGraphPlan::default(),
         }
     }
@@ -52,6 +52,15 @@ impl Default for EngineConfig {
 pub struct ForwardOutput {
     pub logits_device_ptr: u64,
     pub produced_tokens: usize,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MtpVerifyResult {
+    pub accepted: bool,
+    pub verified_token: u32,
+    pub next_token: Option<u32>,
+    pub next_draft_token: Option<u32>,
 }
 
 pub struct Engine<B: KernelBackend = NoCudaBackend> {
@@ -215,9 +224,22 @@ impl<B: KernelBackend> Engine<B> {
     #[cfg(feature = "cuda")]
     pub fn sample_greedy(&self) -> Result<u32> {
         self.queue_sample_greedy()?;
-        let forward = self.cuda_forward()?;
+        self.read_sampled_token()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn read_sampled_token(&self) -> Result<u32> {
         let mut token = [0_u8; 4];
-        forward.sampled_token_u32.copy_to_host(&mut token)?;
+        self.cuda_forward()?
+            .sampled_token_u32
+            .copy_to_host(&mut token)?;
+        Ok(u32::from_ne_bytes(token))
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn read_current_token(&self) -> Result<u32> {
+        let mut token = [0_u8; 4];
+        self.cuda_forward()?.token_u32.copy_to_host(&mut token)?;
         Ok(u32::from_ne_bytes(token))
     }
 
@@ -227,11 +249,20 @@ impl<B: KernelBackend> Engine<B> {
     /// critical path until a final `cuda_synchronize`.
     #[cfg(feature = "cuda")]
     pub fn queue_sample_greedy(&self) -> Result<()> {
-        let forward = self.cuda_forward()?;
+        self.queue_sample_greedy_into(self.cuda_forward()?.sampled_token_u32.ptr())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn queue_sample_greedy_to_current_token(&self) -> Result<()> {
+        self.queue_sample_greedy_into(self.cuda_forward()?.token_u32.ptr())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn queue_sample_greedy_into(&self, output_token_u32: DevicePtr) -> Result<()> {
         self.backend.sample(&SamplingSpec {
             vocab_size: self.topology.vocab_size,
-            logits_bf16: forward.logits.ptr(),
-            output_token_u32: forward.sampled_token_u32.ptr(),
+            logits_bf16: self.cuda_forward()?.logits.ptr(),
+            output_token_u32,
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
@@ -309,9 +340,11 @@ impl<B: KernelBackend> Engine<B> {
             }
         };
 
-        // Capture replays the kernels we just queued, so the position counter
-        // and KV cache already reflect that "one decode" was done. The host
-        // bookkeeping must mirror that.
+        // Stream capture records the decode/sample/increment sequence but does
+        // not execute it. Launch once here so callers can enable the graph and
+        // immediately read the next sampled token, matching the previous
+        // host-launched decode semantics.
+        graph::launch(exec, stream_handle)?;
         self.state.advance(1);
 
         self.decode_graph = Some(DecodeGraphState {
@@ -336,6 +369,85 @@ impl<B: KernelBackend> Engine<B> {
         Ok(())
     }
 
+    /// Capture one MTP verification iteration:
+    /// main decode from `forward.token_u32`, greedy-sample verified token back
+    /// into `forward.token_u32`, run the MTP layer from that verified token and
+    /// the target hidden state, then greedy-sample the next draft into
+    /// `forward.sampled_token_u32`.
+    #[cfg(feature = "cuda")]
+    pub fn enable_mtp_decode_graph(&mut self) -> Result<()> {
+        use qwen36_fp4_kernels::graph::{self, CudaStream};
+
+        if self.decode_graph.is_some() {
+            return Ok(());
+        }
+        if self.config.mtp_speculative_tokens == 0 {
+            return Err(CoreError::Runtime(
+                "enable_mtp_decode_graph called with MTP disabled".to_owned(),
+            ));
+        }
+        if self.backend.name() == "no-cuda" {
+            return Err(CoreError::UnsupportedNoCuda("enable_mtp_decode_graph"));
+        }
+
+        let position_i32 = i32::try_from(self.state.position).map_err(|_| {
+            CoreError::Runtime(format!(
+                "position {} does not fit i32 for graph capture",
+                self.state.position
+            ))
+        })?;
+        let forward = self.cuda_forward()?;
+        let position_buffer_ptr = forward.position_i32.ptr();
+        forward
+            .position_i32
+            .copy_from_host(&position_i32.to_ne_bytes())?;
+
+        let stream = CudaStream::create()?;
+        let stream_handle = stream.handle();
+        graph::set_active_stream(stream_handle);
+
+        let capture_result = (|| -> Result<(graph::CudaGraph, graph::CudaGraphExec)> {
+            graph::begin_capture(stream_handle)?;
+            self.forward_device_token_cuda_inner(
+                self.cuda_forward()?.token_u32.ptr(),
+                self.state.position,
+                position_buffer_ptr,
+                true,
+                false,
+            )?;
+            self.queue_sample_greedy_into(self.cuda_forward()?.token_u32.ptr())?;
+            self.run_mtp_decode_from_target_hidden(
+                self.cuda_forward()?.token_u32.ptr(),
+                self.state.position,
+                position_buffer_ptr,
+                self.cuda_forward()?.normed.ptr(),
+            )?;
+            self.queue_sample_greedy_into(self.cuda_forward()?.sampled_token_u32.ptr())?;
+            graph::increment_i32(position_buffer_ptr)?;
+            let raw_graph = graph::end_capture(stream_handle)?;
+            let exec = graph::instantiate(raw_graph)?;
+            Ok((raw_graph, exec))
+        })();
+
+        let (raw_graph, exec) = match capture_result {
+            Ok(value) => value,
+            Err(err) => {
+                graph::set_active_stream(CudaStream::NULL);
+                return Err(err);
+            }
+        };
+
+        graph::launch(exec, stream_handle)?;
+        self.state.advance(1);
+
+        self.decode_graph = Some(DecodeGraphState {
+            stream,
+            exec,
+            raw_graph,
+        });
+        Ok(())
+    }
+
     /// Tear down the captured decode graph and restore the default stream.
     /// Idempotent.
     #[cfg(feature = "cuda")]
@@ -346,6 +458,24 @@ impl<B: KernelBackend> Engine<B> {
             // Drop runs the destructors below.
             drop(graph_state);
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn reset_cuda_state(&mut self) -> Result<()> {
+        self.disable_decode_graph()?;
+        let runtime = self.cuda_runtime()?;
+        if let Some(kv_cache) = &runtime.kv_cache {
+            kv_cache.memset(0)?;
+        }
+        if let Some(mtp_kv_cache) = &runtime.mtp_kv_cache {
+            mtp_kv_cache.memset(0)?;
+        }
+        runtime.deltanet_state.memset(0)?;
+        runtime.deltanet_checkpoint.memset(0)?;
+        runtime.conv_history.memset(0)?;
+        self.state.position = 0;
+        self.state.accepted_tokens = 0;
         Ok(())
     }
 
@@ -396,6 +526,15 @@ impl<B: KernelBackend> Engine<B> {
 
             let emit_logits = consumed + chunk == prompt_tokens.len();
             self.prefill_cuda_chunk(chunk, start_position, emit_logits)?;
+            if self.config.mtp_speculative_tokens > 0 && !emit_logits {
+                let shifted_tokens = &prompt_tokens[consumed + 1..consumed + chunk + 1];
+                self.run_mtp_prefill_chunk_from_current_prefill(
+                    chunk,
+                    start_position,
+                    shifted_tokens,
+                    false,
+                )?;
+            }
             self.state.advance(chunk);
             consumed += chunk;
         }
@@ -404,6 +543,365 @@ impl<B: KernelBackend> Engine<B> {
             logits_device_ptr: self.cuda_forward()?.logits.ptr().0,
             produced_tokens: prompt_tokens.len(),
         })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn prepare_mtp_prefill_from_sampled(
+        &self,
+        prompt_tokens: &[u32],
+        sampled_token: u32,
+    ) -> Result<()> {
+        if self.config.mtp_speculative_tokens == 0 {
+            return Err(CoreError::Runtime(
+                "MTP prefill requested while mtp_speculative_tokens is 0".to_owned(),
+            ));
+        }
+        if prompt_tokens.is_empty() {
+            return Err(CoreError::Runtime(
+                "MTP prefill requires at least one prompt token".to_owned(),
+            ));
+        }
+
+        let capacity = self.cuda_prefill()?.capacity;
+        let final_chunk = (prompt_tokens.len() - 1) % capacity + 1;
+        let start = prompt_tokens.len() - final_chunk;
+        let mut shifted_tokens = Vec::with_capacity(final_chunk);
+        for idx in start..prompt_tokens.len() {
+            let token = prompt_tokens.get(idx + 1).copied().unwrap_or(sampled_token);
+            shifted_tokens.push(token);
+        }
+        self.run_mtp_prefill_chunk_from_current_prefill(final_chunk, start, &shifted_tokens, true)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn prepare_mtp_decode_from_sampled(&self, target_position: usize) -> Result<()> {
+        if self.config.mtp_speculative_tokens == 0 {
+            return Err(CoreError::Runtime(
+                "MTP decode requested while mtp_speculative_tokens is 0".to_owned(),
+            ));
+        }
+        let forward = self.cuda_forward()?;
+        self.run_mtp_decode_from_target_hidden(
+            forward.sampled_token_u32.ptr(),
+            target_position,
+            DevicePtr::NULL,
+            forward.normed.ptr(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn verify_mtp_draft_two_tokens(
+        &mut self,
+        current_token: u32,
+        draft_token: u32,
+    ) -> Result<MtpVerifyResult> {
+        if self.config.mtp_speculative_tokens == 0 {
+            return Err(CoreError::Runtime(
+                "MTP two-token verification requested while mtp_speculative_tokens is 0".to_owned(),
+            ));
+        }
+        let start_position = self.state.position;
+        if start_position + 2 > self.config.max_context {
+            return Err(CoreError::Runtime(format!(
+                "MTP two-token verification at position {start_position} exceeds max_context {}",
+                self.config.max_context
+            )));
+        }
+
+        let mut token_bytes = Vec::with_capacity(8);
+        token_bytes.extend_from_slice(&current_token.to_ne_bytes());
+        token_bytes.extend_from_slice(&draft_token.to_ne_bytes());
+        let mut position_bytes = Vec::with_capacity(8);
+        for position in [start_position, start_position + 1] {
+            let position = i32::try_from(position).map_err(|_| {
+                CoreError::Runtime(format!("position {position} does not fit i32 for RoPE"))
+            })?;
+            position_bytes.extend_from_slice(&position.to_ne_bytes());
+        }
+        {
+            let prefill = self.cuda_prefill()?;
+            prefill.token_u32.copy_from_host(&token_bytes)?;
+            prefill.position_i32.copy_from_host(&position_bytes)?;
+        }
+
+        // This mutates the target recurrent state through both tokens. If the
+        // draft is rejected, the caller must rebuild from committed tokens via
+        // `reset_cuda_state`; we avoid a large per-step full-state snapshot in
+        // the overwhelmingly common accepted path.
+        self.prefill_cuda_chunk(2, start_position, false)?;
+        self.final_norm_prefill_rows(2)?;
+
+        self.prefill_row_logits(0)?;
+        self.queue_sample_greedy_to_current_token()?;
+        let verified_token = self.read_current_token()?;
+        if verified_token != draft_token {
+            return Ok(MtpVerifyResult {
+                accepted: false,
+                verified_token,
+                next_token: None,
+                next_draft_token: None,
+            });
+        }
+
+        self.prefill_row_logits(1)?;
+        self.queue_sample_greedy_to_current_token()?;
+        let next_token = self.read_current_token()?;
+
+        let mut mtp_tokens = Vec::with_capacity(8);
+        mtp_tokens.extend_from_slice(&draft_token.to_ne_bytes());
+        mtp_tokens.extend_from_slice(&next_token.to_ne_bytes());
+        self.cuda_prefill()?.token_u32.copy_from_host(&mtp_tokens)?;
+        self.run_mtp_prefill_chunk(2, start_position, self.cuda_prefill()?.normed.ptr(), true)?;
+        self.queue_sample_greedy()?;
+        let next_draft_token = self.read_sampled_token()?;
+        self.state.advance(2);
+
+        Ok(MtpVerifyResult {
+            accepted: true,
+            verified_token,
+            next_token: Some(next_token),
+            next_draft_token: Some(next_draft_token),
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_mtp_prefill_chunk_from_current_prefill(
+        &self,
+        tokens: usize,
+        start_position: usize,
+        shifted_tokens: &[u32],
+        emit_logits: bool,
+    ) -> Result<()> {
+        if shifted_tokens.len() != tokens {
+            return Err(CoreError::Runtime(format!(
+                "MTP shifted token count {} does not match chunk size {tokens}",
+                shifted_tokens.len()
+            )));
+        }
+        let manifest = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+        let prefill = self.cuda_prefill()?;
+        let mut token_bytes = Vec::with_capacity(tokens * 4);
+        for token in shifted_tokens {
+            token_bytes.extend_from_slice(&token.to_ne_bytes());
+        }
+        prefill.token_u32.copy_from_host(&token_bytes)?;
+        self.rmsnorm(
+            tokens,
+            self.topology.hidden_size,
+            prefill.hidden.ptr(),
+            self.tensor_ptr(self.cuda_weights()?, &manifest.final_norm)?,
+            prefill.residual.ptr(),
+            DevicePtr::NULL,
+            prefill.normed.ptr(),
+        )?;
+        self.run_mtp_prefill_chunk(tokens, start_position, prefill.normed.ptr(), emit_logits)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_mtp_prefill_chunk(
+        &self,
+        tokens: usize,
+        start_position: usize,
+        target_hidden_bf16: DevicePtr,
+        emit_logits: bool,
+    ) -> Result<()> {
+        let manifest = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+        let mtp = manifest
+            .mtp
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("MTP weights are not available".to_owned()))?;
+        let layer = mtp
+            .layer(0)
+            .ok_or_else(|| CoreError::Runtime("MTP has no layers".to_owned()))?;
+        let weights = self.cuda_weights()?;
+        let runtime = self.cuda_runtime()?;
+        let prefill = self.cuda_prefill()?;
+        let hidden = self.topology.hidden_size;
+
+        self.backend.embedding_lookup(&EmbeddingLookupSpec {
+            tokens,
+            hidden,
+            vocab_size: self.topology.vocab_size,
+            token_ids_u32: prefill.token_u32.ptr(),
+            embedding_bf16: self.tensor_ptr(weights, &manifest.embed_tokens)?,
+            output_bf16: prefill.hidden.ptr(),
+        })?;
+        self.rmsnorm(
+            tokens,
+            hidden,
+            prefill.hidden.ptr(),
+            self.tensor_ptr(weights, &mtp.pre_fc_norm_embedding)?,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            prefill.aux.ptr(),
+        )?;
+        self.rmsnorm(
+            tokens,
+            hidden,
+            target_hidden_bf16,
+            self.tensor_ptr(weights, &mtp.pre_fc_norm_hidden)?,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            prefill.block_out.ptr(),
+        )?;
+        self.concat_mtp_fc_input_rows(
+            tokens,
+            prefill.aux.ptr(),
+            prefill.block_out.ptr(),
+            prefill.qkv.ptr(),
+        )?;
+        self.linear_rows(
+            &mtp.fc,
+            prefill.qkv.ptr(),
+            prefill.hidden.ptr(),
+            tokens,
+            prefill,
+        )?;
+
+        self.rmsnorm(
+            tokens,
+            hidden,
+            prefill.hidden.ptr(),
+            self.tensor_ptr(weights, &layer.common.input_layernorm)?,
+            DevicePtr::NULL,
+            prefill.residual.ptr(),
+            prefill.normed.ptr(),
+        )?;
+        self.run_mtp_full_attention_layer_prefill(layer, runtime, prefill, tokens, start_position)?;
+        self.rmsnorm(
+            tokens,
+            hidden,
+            prefill.block_out.ptr(),
+            self.tensor_ptr(weights, &layer.common.post_attention_layernorm)?,
+            prefill.residual.ptr(),
+            prefill.residual.ptr(),
+            prefill.normed.ptr(),
+        )?;
+        self.run_mtp_mlp_prefill(&layer.common, prefill, tokens)?;
+        self.rmsnorm(
+            tokens,
+            hidden,
+            prefill.hidden.ptr(),
+            self.tensor_ptr(weights, &mtp.norm)?,
+            prefill.residual.ptr(),
+            DevicePtr::NULL,
+            prefill.normed.ptr(),
+        )?;
+        if emit_logits {
+            let last_hidden = Self::ptr_offset(prefill.normed.ptr(), (tokens - 1) * hidden * 2)?;
+            self.bf16_matvec(
+                &manifest.lm_head,
+                last_hidden,
+                self.cuda_forward()?.logits.ptr(),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_mtp_decode_from_target_hidden(
+        &self,
+        token_ids_u32: DevicePtr,
+        position: usize,
+        position_device_i32: DevicePtr,
+        target_hidden_bf16: DevicePtr,
+    ) -> Result<()> {
+        let manifest = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+        let mtp = manifest
+            .mtp
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("MTP weights are not available".to_owned()))?;
+        let layer = mtp
+            .layer(0)
+            .ok_or_else(|| CoreError::Runtime("MTP has no layers".to_owned()))?;
+        let weights = self.cuda_weights()?;
+        let runtime = self.cuda_runtime()?;
+        let forward = self.cuda_forward()?;
+        let hidden = self.topology.hidden_size;
+
+        self.backend.embedding_lookup(&EmbeddingLookupSpec {
+            tokens: 1,
+            hidden,
+            vocab_size: self.topology.vocab_size,
+            token_ids_u32,
+            embedding_bf16: self.tensor_ptr(weights, &manifest.embed_tokens)?,
+            output_bf16: forward.hidden.ptr(),
+        })?;
+        self.rmsnorm(
+            1,
+            hidden,
+            forward.hidden.ptr(),
+            self.tensor_ptr(weights, &mtp.pre_fc_norm_embedding)?,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            forward.aux.ptr(),
+        )?;
+        self.rmsnorm(
+            1,
+            hidden,
+            target_hidden_bf16,
+            self.tensor_ptr(weights, &mtp.pre_fc_norm_hidden)?,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            forward.block_out.ptr(),
+        )?;
+        self.concat_mtp_fc_input_rows(
+            1,
+            forward.aux.ptr(),
+            forward.block_out.ptr(),
+            forward.qkv.ptr(),
+        )?;
+        self.linear(&mtp.fc, forward.qkv.ptr(), forward.hidden.ptr())?;
+
+        self.rmsnorm(
+            1,
+            hidden,
+            forward.hidden.ptr(),
+            self.tensor_ptr(weights, &layer.common.input_layernorm)?,
+            DevicePtr::NULL,
+            forward.residual.ptr(),
+            forward.normed.ptr(),
+        )?;
+        self.run_mtp_full_attention_layer_decode(
+            layer,
+            runtime,
+            forward,
+            position,
+            position_device_i32,
+        )?;
+        self.rmsnorm(
+            1,
+            hidden,
+            forward.block_out.ptr(),
+            self.tensor_ptr(weights, &layer.common.post_attention_layernorm)?,
+            forward.residual.ptr(),
+            forward.residual.ptr(),
+            forward.normed.ptr(),
+        )?;
+        self.run_mtp_mlp_decode(&layer.common, forward)?;
+        self.rmsnorm(
+            1,
+            hidden,
+            forward.hidden.ptr(),
+            self.tensor_ptr(weights, &mtp.norm)?,
+            forward.residual.ptr(),
+            DevicePtr::NULL,
+            forward.normed.ptr(),
+        )?;
+        self.bf16_matvec(
+            &manifest.lm_head,
+            forward.normed.ptr(),
+            forward.logits.ptr(),
+        )
     }
 
     #[cfg(feature = "cuda")]
@@ -736,6 +1234,35 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn final_norm_prefill_rows(&self, tokens: usize) -> Result<()> {
+        let manifest = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+        let prefill = self.cuda_prefill()?;
+        self.rmsnorm(
+            tokens,
+            self.topology.hidden_size,
+            prefill.hidden.ptr(),
+            self.tensor_ptr(self.cuda_weights()?, &manifest.final_norm)?,
+            prefill.residual.ptr(),
+            DevicePtr::NULL,
+            prefill.normed.ptr(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn prefill_row_logits(&self, row: usize) -> Result<()> {
+        let manifest = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+        let prefill = self.cuda_prefill()?;
+        let hidden = Self::ptr_offset(prefill.normed.ptr(), row * self.topology.hidden_size * 2)?;
+        self.bf16_matvec(&manifest.lm_head, hidden, self.cuda_forward()?.logits.ptr())
+    }
+
+    #[cfg(feature = "cuda")]
     fn forward_token_cuda(
         &self,
         token: u32,
@@ -815,6 +1342,8 @@ impl<B: KernelBackend> Engine<B> {
         let dump_decode = std::env::var("QWEN36_DEBUG_DUMP_DECODE").is_ok();
         let dump_dir = std::env::var("QWEN36_DEBUG_DUMP_DIR").ok();
         let dump_prefix = format!("decode_pos{position:05}");
+        let profile_decode = std::env::var("QWEN36_PROFILE_DECODE_LAYERS").is_ok()
+            && position_device_i32 == DevicePtr::NULL;
 
         self.backend.embedding_lookup(&EmbeddingLookupSpec {
             tokens: 1,
@@ -881,6 +1410,7 @@ impl<B: KernelBackend> Engine<B> {
                 }
             }
 
+            let attn_start = profile_decode.then(std::time::Instant::now);
             match layer {
                 LayerWeights::LinearAttention(layer) => {
                     self.run_linear_attention_layer(layer, runtime, forward, quantized_normed)?;
@@ -895,6 +1425,13 @@ impl<B: KernelBackend> Engine<B> {
                         quantized_normed,
                     )?;
                 }
+            }
+            if let Some(attn_start) = attn_start {
+                qwen36_fp4_kernels::cuda_synchronize()?;
+                eprintln!(
+                    "decode.profile layer{layer_idx:02}.attn_ms={:.3}",
+                    attn_start.elapsed().as_secs_f64() * 1000.0
+                );
             }
             if dump_decode {
                 if let Some(dir) = &dump_dir {
@@ -951,7 +1488,15 @@ impl<B: KernelBackend> Engine<B> {
                         )?;
                     }
                 }
+                let mlp_start = profile_decode.then(std::time::Instant::now);
                 self.run_mlp_with_quantized_input(layer, forward, quantized)?;
+                if let Some(mlp_start) = mlp_start {
+                    qwen36_fp4_kernels::cuda_synchronize()?;
+                    eprintln!(
+                        "decode.profile layer{layer_idx:02}.mlp_ms={:.3}",
+                        mlp_start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
             } else {
                 self.rmsnorm(
                     1,
@@ -972,7 +1517,15 @@ impl<B: KernelBackend> Engine<B> {
                         )?;
                     }
                 }
+                let mlp_start = profile_decode.then(std::time::Instant::now);
                 self.run_mlp(layer, forward)?;
+                if let Some(mlp_start) = mlp_start {
+                    qwen36_fp4_kernels::cuda_synchronize()?;
+                    eprintln!(
+                        "decode.profile layer{layer_idx:02}.mlp_ms={:.3}",
+                        mlp_start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
             }
             if dump_decode {
                 if let Some(dir) = &dump_dir {
@@ -1011,6 +1564,7 @@ impl<B: KernelBackend> Engine<B> {
         }
 
         if emit_logits {
+            let logits_start = profile_decode.then(std::time::Instant::now);
             self.rmsnorm(
                 1,
                 self.topology.hidden_size,
@@ -1035,6 +1589,13 @@ impl<B: KernelBackend> Engine<B> {
                 forward.normed.ptr(),
                 forward.logits.ptr(),
             )?;
+            if let Some(logits_start) = logits_start {
+                qwen36_fp4_kernels::cuda_synchronize()?;
+                eprintln!(
+                    "decode.profile final_logits_ms={:.3}",
+                    logits_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             if dump_decode {
                 if let Some(dir) = &dump_dir {
                     self.dump_buffer_to_disk(
@@ -1262,6 +1823,274 @@ impl<B: KernelBackend> Engine<B> {
             output_bf16: forward.aux3.ptr(),
         })?;
         self.linear(&layer.o_proj, forward.aux3.ptr(), forward.block_out.ptr())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn concat_mtp_fc_input_rows(
+        &self,
+        rows: usize,
+        embedding_normed: DevicePtr,
+        target_hidden_normed: DevicePtr,
+        output_bf16: DevicePtr,
+    ) -> Result<()> {
+        let hidden = self.topology.hidden_size;
+        self.backend.copy_strided_rows(&CopyStridedRowsSpec {
+            rows,
+            values: hidden,
+            input_stride: hidden,
+            output_stride: hidden * 2,
+            input_bf16: embedding_normed,
+            output_bf16,
+        })?;
+        self.backend.copy_strided_rows(&CopyStridedRowsSpec {
+            rows,
+            values: hidden,
+            input_stride: hidden,
+            output_stride: hidden * 2,
+            input_bf16: target_hidden_normed,
+            output_bf16: Self::ptr_offset(output_bf16, hidden * 2)?,
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_mtp_full_attention_layer_decode(
+        &self,
+        layer: &FullAttentionLayerWeights,
+        runtime: &GpuRuntimeBuffers,
+        forward: &GpuForwardBuffers,
+        position: usize,
+        position_device_i32: DevicePtr,
+    ) -> Result<()> {
+        let (kv_cache_k, kv_cache_v) = self.mtp_cache_ptrs(runtime)?;
+        let qkv_linears = [
+            (&layer.q_proj, forward.qkv.ptr()),
+            (&layer.k_proj, forward.aux.ptr()),
+            (&layer.v_proj, forward.aux2.ptr()),
+        ];
+        self.linears_same_input(forward.normed.ptr(), &qkv_linears)?;
+        self.backend.q_proj_deinterleave(&QProjDeinterleaveSpec {
+            rows: 1,
+            heads: self.topology.attention_num_heads,
+            head_dim: self.topology.attention_head_dim,
+            input_bf16: forward.qkv.ptr(),
+            output_bf16: forward.aux3.ptr(),
+        })?;
+        self.rmsnorm(
+            self.topology.attention_num_heads,
+            self.topology.attention_head_dim,
+            forward.aux3.ptr(),
+            self.tensor_ptr(self.cuda_weights()?, &layer.q_norm)?,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            forward.aux3.ptr(),
+        )?;
+        self.rmsnorm(
+            self.topology.attention_num_kv_heads,
+            self.topology.attention_head_dim,
+            forward.aux.ptr(),
+            self.tensor_ptr(self.cuda_weights()?, &layer.k_norm)?,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            forward.aux.ptr(),
+        )?;
+        self.backend.partial_rope(&PartialRopeSpec {
+            tokens: 1,
+            q_heads: self.topology.attention_num_heads,
+            kv_heads: self.topology.attention_num_kv_heads,
+            head_dim: self.topology.attention_head_dim,
+            rope_dims: self.topology.attention_rope_dims(),
+            base_theta: self.topology.rope_theta,
+            position_i32: position as i32,
+            use_scalar_position: true,
+            positions_i32: DevicePtr::NULL,
+            q_bf16: forward.aux3.ptr(),
+            k_bf16: forward.aux.ptr(),
+            scalar_position_device_i32: position_device_i32,
+        })?;
+        self.backend.attention_decode(&AttentionDecodeSpec {
+            layer_index: layer.layer_index,
+            position,
+            q_bf16: forward.aux3.ptr(),
+            k_bf16: forward.aux.ptr(),
+            v_bf16: forward.aux2.ptr(),
+            kv_cache_k,
+            kv_cache_v,
+            output_bf16: forward.aux3.ptr(),
+            shape: AttentionShape {
+                q_heads: self.topology.attention_num_heads,
+                kv_heads: self.topology.attention_num_kv_heads,
+                head_dim: self.topology.attention_head_dim,
+                rope_dims: self.topology.attention_rope_dims(),
+            },
+            position_device_i32,
+        })?;
+        self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
+            rows: 1,
+            heads: self.topology.attention_num_heads,
+            head_dim: self.topology.attention_head_dim,
+            gate_bf16: forward.qkv.ptr(),
+            input_bf16: forward.aux3.ptr(),
+            output_bf16: forward.aux3.ptr(),
+        })?;
+        self.linear(&layer.o_proj, forward.aux3.ptr(), forward.block_out.ptr())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_mtp_full_attention_layer_prefill(
+        &self,
+        layer: &FullAttentionLayerWeights,
+        runtime: &GpuRuntimeBuffers,
+        prefill: &GpuPrefillBuffers,
+        tokens: usize,
+        start_position: usize,
+    ) -> Result<()> {
+        let (kv_cache_k, kv_cache_v) = self.mtp_cache_ptrs(runtime)?;
+        let qkv_linears = [
+            (&layer.q_proj, prefill.qkv.ptr()),
+            (&layer.k_proj, prefill.aux.ptr()),
+            (&layer.v_proj, prefill.aux2.ptr()),
+        ];
+        self.linears_same_input_rows(prefill.normed.ptr(), &qkv_linears, tokens, prefill)?;
+        self.backend.q_proj_deinterleave(&QProjDeinterleaveSpec {
+            rows: tokens,
+            heads: self.topology.attention_num_heads,
+            head_dim: self.topology.attention_head_dim,
+            input_bf16: prefill.qkv.ptr(),
+            output_bf16: prefill.aux3.ptr(),
+        })?;
+        self.rmsnorm(
+            tokens * self.topology.attention_num_heads,
+            self.topology.attention_head_dim,
+            prefill.aux3.ptr(),
+            self.tensor_ptr(self.cuda_weights()?, &layer.q_norm)?,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            prefill.aux3.ptr(),
+        )?;
+        self.rmsnorm(
+            tokens * self.topology.attention_num_kv_heads,
+            self.topology.attention_head_dim,
+            prefill.aux.ptr(),
+            self.tensor_ptr(self.cuda_weights()?, &layer.k_norm)?,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            prefill.aux.ptr(),
+        )?;
+        self.backend.partial_rope(&PartialRopeSpec {
+            tokens,
+            q_heads: self.topology.attention_num_heads,
+            kv_heads: self.topology.attention_num_kv_heads,
+            head_dim: self.topology.attention_head_dim,
+            rope_dims: self.topology.attention_rope_dims(),
+            base_theta: self.topology.rope_theta,
+            position_i32: 0,
+            use_scalar_position: false,
+            positions_i32: prefill.position_i32.ptr(),
+            q_bf16: prefill.aux3.ptr(),
+            k_bf16: prefill.aux.ptr(),
+            scalar_position_device_i32: DevicePtr::NULL,
+        })?;
+        self.backend.attention_prefill(&AttentionPrefillSpec {
+            layer_index: layer.layer_index,
+            start_position,
+            tokens,
+            q_bf16: prefill.aux3.ptr(),
+            k_bf16: prefill.aux.ptr(),
+            v_bf16: prefill.aux2.ptr(),
+            kv_cache_k,
+            kv_cache_v,
+            output_bf16: prefill.aux3.ptr(),
+            shape: AttentionShape {
+                q_heads: self.topology.attention_num_heads,
+                kv_heads: self.topology.attention_num_kv_heads,
+                head_dim: self.topology.attention_head_dim,
+                rope_dims: self.topology.attention_rope_dims(),
+            },
+        })?;
+        self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
+            rows: tokens,
+            heads: self.topology.attention_num_heads,
+            head_dim: self.topology.attention_head_dim,
+            gate_bf16: prefill.qkv.ptr(),
+            input_bf16: prefill.aux3.ptr(),
+            output_bf16: prefill.aux3.ptr(),
+        })?;
+        self.linear_rows(
+            &layer.o_proj,
+            prefill.aux3.ptr(),
+            prefill.block_out.ptr(),
+            tokens,
+            prefill,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_mtp_mlp_decode(
+        &self,
+        common: &CommonLayerWeights,
+        forward: &GpuForwardBuffers,
+    ) -> Result<()> {
+        self.linears_same_input(
+            forward.normed.ptr(),
+            &[
+                (&common.mlp_gate_proj, forward.aux.ptr()),
+                (&common.mlp_up_proj, forward.aux2.ptr()),
+            ],
+        )?;
+        self.backend.swiglu(&SwiGluSpec {
+            rows: 1,
+            intermediate: self.topology.intermediate_size,
+            gate_bf16: forward.aux.ptr(),
+            up_bf16: forward.aux2.ptr(),
+            output_bf16: forward.aux3.ptr(),
+        })?;
+        self.linear(
+            &common.mlp_down_proj,
+            forward.aux3.ptr(),
+            forward.hidden.ptr(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_mtp_mlp_prefill(
+        &self,
+        common: &CommonLayerWeights,
+        prefill: &GpuPrefillBuffers,
+        tokens: usize,
+    ) -> Result<()> {
+        self.linears_same_input_rows(
+            prefill.normed.ptr(),
+            &[
+                (&common.mlp_gate_proj, prefill.aux.ptr()),
+                (&common.mlp_up_proj, prefill.aux2.ptr()),
+            ],
+            tokens,
+            prefill,
+        )?;
+        self.backend.swiglu(&SwiGluSpec {
+            rows: tokens,
+            intermediate: self.topology.intermediate_size,
+            gate_bf16: prefill.aux.ptr(),
+            up_bf16: prefill.aux2.ptr(),
+            output_bf16: prefill.aux3.ptr(),
+        })?;
+        self.linear_rows(
+            &common.mlp_down_proj,
+            prefill.aux3.ptr(),
+            prefill.hidden.ptr(),
+            tokens,
+            prefill,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn mtp_cache_ptrs(&self, runtime: &GpuRuntimeBuffers) -> Result<(DevicePtr, DevicePtr)> {
+        let cache = runtime
+            .mtp_kv_cache
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("MTP KV cache was not allocated".to_owned()))?;
+        let plane_bytes = self.mtp_kv_cache_plane_bytes()?;
+        Ok((cache.ptr(), cache.ptr_at(plane_bytes)?))
     }
 
     #[cfg(feature = "cuda")]
@@ -2425,6 +3254,19 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn mtp_kv_cache_plane_bytes(&self) -> Result<usize> {
+        let values = self
+            .config
+            .max_context
+            .checked_mul(self.topology.attention_num_kv_heads)
+            .and_then(|value| value.checked_mul(self.topology.attention_head_dim))
+            .ok_or_else(|| CoreError::Runtime("MTP KV cache size overflow".to_owned()))?;
+        values
+            .checked_mul(2)
+            .ok_or_else(|| CoreError::Runtime("MTP KV cache byte size overflow".to_owned()))
+    }
+
+    #[cfg(feature = "cuda")]
     fn linear_layer_ordinal(&self, layer_index: usize) -> Result<usize> {
         self.topology
             .linear_attention_layers()
@@ -2610,10 +3452,33 @@ fn layer_common_input_norm(layer: &LayerWeights) -> &TensorInfo {
 #[cfg(feature = "cuda")]
 impl Engine<CudaBackend> {
     pub fn cuda_with_mapped_weights(model: &MappedModel, config: EngineConfig) -> Result<Self> {
+        if config.mtp_speculative_tokens > 1 {
+            return Err(CoreError::Runtime(
+                "MTP runtime currently supports a 1-token validation path; pass --mtp-speculative-tokens 0 or 1"
+                    .to_owned(),
+            ));
+        }
         let manifest = ModelWeightsManifest::from_layout(&model.layout)?;
-        let gpu_weights = GpuWeightStore::upload_required(model, &manifest)?;
+        let include_mtp = config.mtp_speculative_tokens > 0;
+        if include_mtp && manifest.mtp.is_none() {
+            return Err(CoreError::Runtime(
+                "MTP speculative decoding requested but no structured MTP weights were found"
+                    .to_owned(),
+            ));
+        }
+        let gpu_weights = GpuWeightStore::upload_required(model, &manifest, include_mtp)?;
         let mut engine = Self::new(model.layout.topology.clone(), config, CudaBackend);
-        let gpu_buffers = GpuRuntimeBuffers::allocate(&engine.state, 256 * 1024 * 1024)?;
+        let mtp_kv_cache_bytes = if include_mtp {
+            engine
+                .mtp_kv_cache_plane_bytes()?
+                .checked_mul(2)
+                .ok_or_else(|| CoreError::Runtime("MTP KV cache size overflow".to_owned()))?
+                as u64
+        } else {
+            0
+        };
+        let gpu_buffers =
+            GpuRuntimeBuffers::allocate(&engine.state, 256 * 1024 * 1024, mtp_kv_cache_bytes)?;
         let gpu_forward = GpuForwardBuffers::allocate(&engine.topology)?;
         let prefill_capacity = engine.config.max_context.min(512).max(1);
         let gpu_prefill = GpuPrefillBuffers::allocate(&engine.topology, prefill_capacity)?;

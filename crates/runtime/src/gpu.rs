@@ -33,9 +33,13 @@ pub struct GpuWeightStore {
 }
 
 impl GpuWeightStore {
-    pub fn upload_required(model: &MappedModel, manifest: &ModelWeightsManifest) -> Result<Self> {
+    pub fn upload_required(
+        model: &MappedModel,
+        manifest: &ModelWeightsManifest,
+        include_mtp: bool,
+    ) -> Result<Self> {
         let names = manifest
-            .tensor_infos()
+            .tensor_infos_for_upload(include_mtp)
             .into_iter()
             .map(|tensor| tensor.name.clone())
             .collect::<BTreeSet<_>>();
@@ -84,6 +88,7 @@ impl GpuWeightStore {
 #[derive(Debug)]
 pub struct GpuRuntimeBuffers {
     pub kv_cache: Option<CudaDeviceBuffer>,
+    pub mtp_kv_cache: Option<CudaDeviceBuffer>,
     pub deltanet_state: CudaDeviceBuffer,
     pub deltanet_checkpoint: CudaDeviceBuffer,
     pub conv_history: CudaDeviceBuffer,
@@ -132,9 +137,14 @@ pub struct GpuPrefillBuffers {
 }
 
 impl GpuRuntimeBuffers {
-    pub fn allocate(state: &RuntimeState, workspace_bytes: usize) -> Result<Self> {
+    pub fn allocate(
+        state: &RuntimeState,
+        workspace_bytes: usize,
+        mtp_kv_cache_bytes: u64,
+    ) -> Result<Self> {
         Ok(Self {
             kv_cache: alloc_optional(state.kv_cache.total_bytes)?,
+            mtp_kv_cache: alloc_optional(mtp_kv_cache_bytes)?,
             deltanet_state: CudaDeviceBuffer::zeroed(usize_from_u64(
                 state.deltanet.total_state_bytes,
                 "DeltaNet state",
@@ -161,6 +171,9 @@ impl GpuRuntimeBuffers {
             + self.conv_history.bytes() as u64;
         if let Some(kv_cache) = &self.kv_cache {
             total += kv_cache.bytes() as u64;
+        }
+        if let Some(mtp_kv_cache) = &self.mtp_kv_cache {
+            total += mtp_kv_cache.bytes() as u64;
         }
         if let Some(workspace) = &self.workspace {
             total += workspace.bytes() as u64;

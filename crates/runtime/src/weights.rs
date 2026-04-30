@@ -9,6 +9,7 @@ pub struct ModelWeightsManifest {
     pub final_norm: TensorInfo,
     pub lm_head: TensorInfo,
     pub layers: Vec<LayerWeights>,
+    pub mtp: Option<MtpWeights>,
     pub mtp_tensors: Vec<TensorInfo>,
 }
 
@@ -56,6 +57,15 @@ pub struct FullAttentionLayerWeights {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MtpWeights {
+    pub fc: LinearWeightBinding,
+    pub pre_fc_norm_embedding: TensorInfo,
+    pub pre_fc_norm_hidden: TensorInfo,
+    pub layers: Vec<FullAttentionLayerWeights>,
+    pub norm: TensorInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "dtype", rename_all = "snake_case")]
 pub enum LinearWeightBinding {
     Nvfp4 {
@@ -96,6 +106,44 @@ impl ModelWeightsManifest {
                 "config declares MTP layers but no mtp.* tensors were found",
             ));
         }
+        let mtp = if layout.topology.mtp_num_hidden_layers > 0 {
+            let fc = lookup.required_linear(&["mtp".to_owned()], "fc")?;
+            let pre_fc_norm_embedding =
+                lookup.required_any(&["mtp.pre_fc_norm_embedding.weight"])?;
+            let pre_fc_norm_hidden = lookup.required_any(&["mtp.pre_fc_norm_hidden.weight"])?;
+            let norm = lookup.required_any(&["mtp.norm.weight"])?;
+            let mut layers = Vec::with_capacity(layout.topology.mtp_num_hidden_layers);
+            for mtp_layer_index in 0..layout.topology.mtp_num_hidden_layers {
+                let prefixes = vec![format!("mtp.layers.{mtp_layer_index}")];
+                let common = CommonLayerWeights {
+                    input_layernorm: lookup.required_suffix(&prefixes, "input_layernorm.weight")?,
+                    post_attention_layernorm: lookup
+                        .required_suffix(&prefixes, "post_attention_layernorm.weight")?,
+                    mlp_gate_proj: lookup.required_linear(&prefixes, "mlp.gate_proj")?,
+                    mlp_up_proj: lookup.required_linear(&prefixes, "mlp.up_proj")?,
+                    mlp_down_proj: lookup.required_linear(&prefixes, "mlp.down_proj")?,
+                };
+                layers.push(FullAttentionLayerWeights {
+                    layer_index: layout.topology.num_hidden_layers + mtp_layer_index,
+                    common,
+                    q_proj: lookup.required_linear(&prefixes, "self_attn.q_proj")?,
+                    k_proj: lookup.required_linear(&prefixes, "self_attn.k_proj")?,
+                    v_proj: lookup.required_linear(&prefixes, "self_attn.v_proj")?,
+                    o_proj: lookup.required_linear(&prefixes, "self_attn.o_proj")?,
+                    q_norm: lookup.required_suffix(&prefixes, "self_attn.q_norm.weight")?,
+                    k_norm: lookup.required_suffix(&prefixes, "self_attn.k_norm.weight")?,
+                });
+            }
+            Some(MtpWeights {
+                fc,
+                pre_fc_norm_embedding,
+                pre_fc_norm_hidden,
+                layers,
+                norm,
+            })
+        } else {
+            None
+        };
 
         let mut layers = Vec::with_capacity(layout.topology.num_hidden_layers);
         for (layer_index, layer_type) in layout.topology.layer_types.iter().copied().enumerate() {
@@ -149,11 +197,16 @@ impl ModelWeightsManifest {
             final_norm,
             lm_head,
             layers,
+            mtp,
             mtp_tensors,
         })
     }
 
     pub fn tensor_infos(&self) -> Vec<&TensorInfo> {
+        self.tensor_infos_for_upload(true)
+    }
+
+    pub fn tensor_infos_for_upload(&self, include_mtp: bool) -> Vec<&TensorInfo> {
         let mut tensors = vec![&self.embed_tokens, &self.final_norm, &self.lm_head];
         for layer in &self.layers {
             match layer {
@@ -181,8 +234,21 @@ impl ModelWeightsManifest {
                 }
             }
         }
-        tensors.extend(self.mtp_tensors.iter());
+        if include_mtp {
+            tensors.extend(self.mtp_tensors.iter());
+        }
         tensors
+    }
+}
+
+impl MtpWeights {
+    pub fn layer(&self, mtp_layer_index: usize) -> Option<&FullAttentionLayerWeights> {
+        let len = self.layers.len();
+        if len == 0 {
+            None
+        } else {
+            self.layers.get(mtp_layer_index % len)
+        }
     }
 }
 
@@ -340,8 +406,8 @@ mod tests {
             ),
             tensor("model.language_model.norm.weight", TensorDtype::Bf16),
             tensor("lm_head.weight", TensorDtype::Bf16),
-            tensor("mtp.layers.0.self_attn.q_proj.weight", TensorDtype::Bf16),
         ];
+        add_mtp_tensors(&mut tensors);
 
         for (layer_index, layer_type) in topology.layer_types.iter().enumerate() {
             let prefix = format!("model.language_model.layers.{layer_index}");
@@ -433,7 +499,23 @@ mod tests {
         let manifest = ModelWeightsManifest::from_layout(&layout).unwrap();
 
         assert_eq!(manifest.layers.len(), 64);
-        assert_eq!(manifest.mtp_tensors.len(), 1);
+        assert_eq!(manifest.mtp_tensors.len(), 15);
+        assert!(matches!(
+            manifest.mtp.as_ref().and_then(|mtp| mtp.layer(0)),
+            Some(layer) if matches!(layer.q_proj, LinearWeightBinding::Bf16 { .. })
+        ));
+        assert!(
+            manifest
+                .tensor_infos()
+                .iter()
+                .any(|tensor| tensor.name.starts_with("mtp."))
+        );
+        assert!(
+            !manifest
+                .tensor_infos_for_upload(false)
+                .iter()
+                .any(|tensor| tensor.name.starts_with("mtp."))
+        );
         assert!(matches!(
             &manifest.layers[0],
             LayerWeights::LinearAttention(layer) if layer.in_proj_qkv.is_nvfp4()
@@ -459,7 +541,24 @@ mod tests {
                 ),
                 tensor("model.language_model.norm.weight", TensorDtype::Bf16),
                 tensor("lm_head.weight", TensorDtype::Bf16),
+                tensor("mtp.fc.weight", TensorDtype::Bf16),
+                tensor("mtp.pre_fc_norm_embedding.weight", TensorDtype::Bf16),
+                tensor("mtp.pre_fc_norm_hidden.weight", TensorDtype::Bf16),
+                tensor("mtp.norm.weight", TensorDtype::Bf16),
+                tensor("mtp.layers.0.input_layernorm.weight", TensorDtype::Bf16),
+                tensor(
+                    "mtp.layers.0.post_attention_layernorm.weight",
+                    TensorDtype::Bf16,
+                ),
+                tensor("mtp.layers.0.mlp.gate_proj.weight", TensorDtype::Bf16),
+                tensor("mtp.layers.0.mlp.up_proj.weight", TensorDtype::Bf16),
+                tensor("mtp.layers.0.mlp.down_proj.weight", TensorDtype::Bf16),
                 tensor("mtp.layers.0.self_attn.q_proj.weight", TensorDtype::Bf16),
+                tensor("mtp.layers.0.self_attn.k_proj.weight", TensorDtype::Bf16),
+                tensor("mtp.layers.0.self_attn.v_proj.weight", TensorDtype::Bf16),
+                tensor("mtp.layers.0.self_attn.o_proj.weight", TensorDtype::Bf16),
+                tensor("mtp.layers.0.self_attn.q_norm.weight", TensorDtype::Bf16),
+                tensor("mtp.layers.0.self_attn.k_norm.weight", TensorDtype::Bf16),
                 tensor(
                     "model.language_model.layers.0.input_layernorm.weight",
                     TensorDtype::Bf16,
@@ -495,6 +594,40 @@ mod tests {
                 TensorDtype::F32,
             ));
         }
+    }
+
+    fn add_mtp_tensors(tensors: &mut Vec<TensorInfo>) {
+        add_linear(tensors, "mtp", "fc", TensorDtype::Bf16);
+        tensors.push(tensor(
+            "mtp.pre_fc_norm_embedding.weight",
+            TensorDtype::Bf16,
+        ));
+        tensors.push(tensor("mtp.pre_fc_norm_hidden.weight", TensorDtype::Bf16));
+        tensors.push(tensor("mtp.norm.weight", TensorDtype::Bf16));
+        let prefix = "mtp.layers.0";
+        tensors.push(tensor(
+            &format!("{prefix}.input_layernorm.weight"),
+            TensorDtype::Bf16,
+        ));
+        tensors.push(tensor(
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            TensorDtype::Bf16,
+        ));
+        add_linear(tensors, prefix, "mlp.gate_proj", TensorDtype::Bf16);
+        add_linear(tensors, prefix, "mlp.up_proj", TensorDtype::Bf16);
+        add_linear(tensors, prefix, "mlp.down_proj", TensorDtype::Bf16);
+        add_linear(tensors, prefix, "self_attn.q_proj", TensorDtype::Bf16);
+        add_linear(tensors, prefix, "self_attn.k_proj", TensorDtype::Bf16);
+        add_linear(tensors, prefix, "self_attn.v_proj", TensorDtype::Bf16);
+        add_linear(tensors, prefix, "self_attn.o_proj", TensorDtype::Bf16);
+        tensors.push(tensor(
+            &format!("{prefix}.self_attn.q_norm.weight"),
+            TensorDtype::Bf16,
+        ));
+        tensors.push(tensor(
+            &format!("{prefix}.self_attn.k_norm.weight"),
+            TensorDtype::Bf16,
+        ));
     }
 
     fn tensor(name: &str, dtype: TensorDtype) -> TensorInfo {

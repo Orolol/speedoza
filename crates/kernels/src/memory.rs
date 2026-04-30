@@ -101,6 +101,24 @@ impl CudaDeviceBuffer {
     }
 
     pub fn copy_from_device_ptr(&self, source: DevicePtr, bytes: usize) -> Result<()> {
+        self.copy_from_device_ptr_at(0, source, bytes)
+    }
+
+    pub fn copy_from_device_ptr_at(
+        &self,
+        destination_offset_bytes: usize,
+        source: DevicePtr,
+        bytes: usize,
+    ) -> Result<()> {
+        let end = destination_offset_bytes.checked_add(bytes).ok_or_else(|| {
+            CoreError::Runtime("device-to-device copy destination offset overflow".to_owned())
+        })?;
+        if end > self.bytes {
+            return Err(CoreError::Runtime(format!(
+                "device-to-device copy to byte range {destination_offset_bytes}..{end} exceeds destination buffer of {} bytes",
+                self.bytes
+            )));
+        }
         if bytes > self.bytes {
             return Err(CoreError::Runtime(format!(
                 "device-to-device copy of {bytes} bytes exceeds destination buffer of {} bytes",
@@ -115,8 +133,14 @@ impl CudaDeviceBuffer {
         if bytes == 0 {
             return Ok(());
         }
+        let destination = self
+            .ptr
+            .offset_bytes(destination_offset_bytes)
+            .ok_or_else(|| {
+                CoreError::Runtime("device-to-device copy destination pointer overflow".to_owned())
+            })?;
         check("qwen36_cuda_memcpy_d2d", unsafe {
-            ffi::qwen36_cuda_memcpy_d2d(self.ptr, source, bytes)
+            ffi::qwen36_cuda_memcpy_d2d(destination, source, bytes)
         })
     }
 
