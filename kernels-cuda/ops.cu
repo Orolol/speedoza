@@ -325,9 +325,8 @@ __global__ void swiglu_kernel(const __nv_bfloat16 *gate,
 __global__ void sample_argmax_kernel(const __nv_bfloat16 *logits,
                                      uint32_t *output_token,
                                      size_t vocab_size, float temperature) {
-  extern __shared__ unsigned char shared_bytes[];
-  float *scores = reinterpret_cast<float *>(shared_bytes);
-  uint32_t *indices = reinterpret_cast<uint32_t *>(scores + blockDim.x);
+  __shared__ float warp_scores[8];
+  __shared__ uint32_t warp_indices[8];
 
   float best_score = -INFINITY;
   uint32_t best_idx = 0;
@@ -341,23 +340,41 @@ __global__ void sample_argmax_kernel(const __nv_bfloat16 *logits,
     }
   }
 
-  scores[threadIdx.x] = best_score;
-  indices[threadIdx.x] = best_idx;
+  const unsigned warp_id = threadIdx.x >> 5;
+  const unsigned lane_id = threadIdx.x & 31;
+  const unsigned n_warps = (blockDim.x + 31) >> 5;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    const float candidate_score =
+        __shfl_down_sync(0xffffffff, best_score, offset);
+    const uint32_t candidate_idx =
+        __shfl_down_sync(0xffffffff, best_idx, offset);
+    if (better_score(candidate_score, candidate_idx, best_score, best_idx)) {
+      best_score = candidate_score;
+      best_idx = candidate_idx;
+    }
+  }
+  if (lane_id == 0) {
+    warp_scores[warp_id] = best_score;
+    warp_indices[warp_id] = best_idx;
+  }
   __syncthreads();
 
-  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride &&
-        better_score(scores[threadIdx.x + stride],
-                     indices[threadIdx.x + stride], scores[threadIdx.x],
-                     indices[threadIdx.x])) {
-      scores[threadIdx.x] = scores[threadIdx.x + stride];
-      indices[threadIdx.x] = indices[threadIdx.x + stride];
+  if (warp_id == 0) {
+    best_score = lane_id < n_warps ? warp_scores[lane_id] : -INFINITY;
+    best_idx = lane_id < n_warps ? warp_indices[lane_id] : UINT32_MAX;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      const float candidate_score =
+          __shfl_down_sync(0xffffffff, best_score, offset);
+      const uint32_t candidate_idx =
+          __shfl_down_sync(0xffffffff, best_idx, offset);
+      if (better_score(candidate_score, candidate_idx, best_score, best_idx)) {
+        best_score = candidate_score;
+        best_idx = candidate_idx;
+      }
     }
-    __syncthreads();
-  }
-
-  if (threadIdx.x == 0) {
-    *output_token = indices[0];
+    if (lane_id == 0) {
+      *output_token = best_idx;
+    }
   }
 }
 
@@ -1249,8 +1266,7 @@ extern "C" int qwen36_sample(const qwen36_sampling_spec_t *spec) {
   }
 
   const int threads = 256;
-  const size_t shared_bytes = threads * (sizeof(float) + sizeof(uint32_t));
-  sample_argmax_kernel<<<1, threads, shared_bytes, qwen36_internal_active_stream()>>>(
+  sample_argmax_kernel<<<1, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->logits_bf16),
       ptr<uint32_t>(spec->output_token_u32), spec->vocab_size,
       spec->temperature);
