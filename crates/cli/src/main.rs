@@ -326,7 +326,15 @@ fn run_chat(
                 break;
             }
 
-            let verify = engine.verify_mtp_draft_two_tokens(current_token, draft_token)?;
+            let remaining_after_current = max_new_tokens - generated;
+            let need_next_token = remaining_after_current > 1;
+            let need_next_draft = remaining_after_current > 2;
+            let verify = engine.verify_mtp_draft_two_tokens(
+                current_token,
+                draft_token,
+                need_next_token,
+                need_next_draft,
+            )?;
             if verify.accepted {
                 accepted_draft_tokens += 1;
                 let text = tokenizer.decode(&[draft_token], true)?;
@@ -340,9 +348,9 @@ fn run_chat(
                 current_token = verify.next_token.ok_or_else(|| {
                     anyhow::anyhow!("accepted MTP verification did not return next_token")
                 })?;
-                draft_token = verify.next_draft_token.ok_or_else(|| {
-                    anyhow::anyhow!("accepted MTP verification did not return next_draft_token")
-                })?;
+                if let Some(next_draft_token) = verify.next_draft_token {
+                    draft_token = next_draft_token;
+                }
             } else {
                 rejected_draft_tokens += 1;
                 let mut committed_tokens = prompt_tokens.clone();
@@ -762,22 +770,32 @@ fn run_bench_mtp_one(
             break;
         }
 
-        let verify = engine.verify_mtp_draft_two_tokens(current_token, draft_token)?;
+        let remaining_after_current = max_new_tokens - generated;
+        let need_next_token = remaining_after_current > 1;
+        let need_next_draft = remaining_after_current > 2;
+        let verify = engine.verify_mtp_draft_two_tokens(
+            current_token,
+            draft_token,
+            need_next_token,
+            need_next_draft,
+        )?;
         main_decode_steps += 1;
         if verify.accepted {
             accepted_draft_tokens += 1;
             emitted_tokens.push(draft_token);
             generated += 1;
-            mtp_decode_steps += 1;
+            if verify.next_draft_token.is_some() {
+                mtp_decode_steps += 1;
+            }
             if generated >= max_new_tokens {
                 break;
             }
             current_token = verify.next_token.ok_or_else(|| {
                 anyhow::anyhow!("accepted MTP verification did not return next_token")
             })?;
-            draft_token = verify.next_draft_token.ok_or_else(|| {
-                anyhow::anyhow!("accepted MTP verification did not return next_draft_token")
-            })?;
+            if let Some(next_draft_token) = verify.next_draft_token {
+                draft_token = next_draft_token;
+            }
         } else {
             rejected_draft_tokens += 1;
             rebuilds += 1;

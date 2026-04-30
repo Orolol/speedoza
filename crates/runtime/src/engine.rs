@@ -594,6 +594,8 @@ impl<B: KernelBackend> Engine<B> {
         &mut self,
         current_token: u32,
         draft_token: u32,
+        need_next_token: bool,
+        need_next_draft: bool,
     ) -> Result<MtpVerifyResult> {
         if self.config.mtp_speculative_tokens == 0 {
             return Err(CoreError::Runtime(
@@ -643,9 +645,29 @@ impl<B: KernelBackend> Engine<B> {
             });
         }
 
+        if !need_next_token {
+            self.state.advance(2);
+            return Ok(MtpVerifyResult {
+                accepted: true,
+                verified_token,
+                next_token: None,
+                next_draft_token: None,
+            });
+        }
+
         self.prefill_row_logits(1)?;
         self.queue_sample_greedy_to_current_token()?;
         let next_token = self.read_current_token()?;
+
+        if !need_next_draft {
+            self.state.advance(2);
+            return Ok(MtpVerifyResult {
+                accepted: true,
+                verified_token,
+                next_token: Some(next_token),
+                next_draft_token: None,
+            });
+        }
 
         let mut mtp_tokens = Vec::with_capacity(8);
         mtp_tokens.extend_from_slice(&draft_token.to_ne_bytes());
