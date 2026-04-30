@@ -114,6 +114,7 @@ pub struct GpuForwardBuffers {
     pub position_i32: CudaDeviceBuffer,
     pub logits: CudaDeviceBuffer,
     pub sampled_token_u32: CudaDeviceBuffer,
+    pub mtp_verify_token_u32: CudaDeviceBuffer,
 }
 
 #[derive(Debug)]
@@ -214,6 +215,7 @@ impl GpuForwardBuffers {
             position_i32: CudaDeviceBuffer::alloc(4)?,
             logits: CudaDeviceBuffer::alloc(topology.vocab_size * 2)?,
             sampled_token_u32: CudaDeviceBuffer::alloc(4)?,
+            mtp_verify_token_u32: CudaDeviceBuffer::alloc(8)?,
         })
     }
 
@@ -236,6 +238,7 @@ impl GpuForwardBuffers {
             self.position_i32.bytes(),
             self.logits.bytes(),
             self.sampled_token_u32.bytes(),
+            self.mtp_verify_token_u32.bytes(),
         ]
         .into_iter()
         .map(|bytes| bytes as u64)

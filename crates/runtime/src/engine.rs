@@ -369,6 +369,77 @@ impl<B: KernelBackend> Engine<B> {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
+    fn ensure_mtp_verify_graph_two_tokens(&mut self, start_position: usize) -> Result<()> {
+        use qwen36_fp4_kernels::graph::{self, CudaStream};
+
+        if self.decode_graph.is_some() {
+            return Ok(());
+        }
+        if self.config.mtp_speculative_tokens == 0 {
+            return Err(CoreError::Runtime(
+                "MTP verify graph requested with MTP disabled".to_owned(),
+            ));
+        }
+        if self.backend.name() == "no-cuda" {
+            return Err(CoreError::UnsupportedNoCuda(
+                "ensure_mtp_verify_graph_two_tokens",
+            ));
+        }
+
+        let stream = CudaStream::create()?;
+        let stream_handle = stream.handle();
+        let start_position_device_i32 = self.cuda_forward()?.position_i32.ptr();
+        graph::set_active_stream(stream_handle);
+
+        let capture_result = (|| -> Result<(graph::CudaGraph, graph::CudaGraphExec)> {
+            graph::begin_capture(stream_handle)?;
+            self.prefill_cuda_chunk(2, start_position, start_position_device_i32, false)?;
+            self.final_norm_prefill_rows(2)?;
+            self.prefill_row_logits(0)?;
+            self.queue_sample_greedy_to_current_token()?;
+            self.prefill_row_logits(1)?;
+            let next_token_ptr = self.cuda_forward()?.mtp_verify_token_u32.ptr_at(4)?;
+            self.queue_sample_greedy_into(next_token_ptr)?;
+            self.run_mtp_prefill_chunk_with_tokens(
+                2,
+                start_position,
+                start_position_device_i32,
+                self.cuda_prefill()?.normed.ptr(),
+                self.cuda_forward()?.mtp_verify_token_u32.ptr(),
+                true,
+            )?;
+            self.queue_sample_greedy()?;
+            let raw_graph = graph::end_capture(stream_handle)?;
+            let exec = graph::instantiate(raw_graph)?;
+            Ok((raw_graph, exec))
+        })();
+
+        let (raw_graph, exec) = match capture_result {
+            Ok(value) => value,
+            Err(err) => {
+                graph::set_active_stream(CudaStream::NULL);
+                return Err(err);
+            }
+        };
+
+        self.decode_graph = Some(DecodeGraphState {
+            stream,
+            exec,
+            raw_graph,
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn launch_mtp_verify_graph_two_tokens(&self) -> Result<()> {
+        let graph_state = self.decode_graph.as_ref().ok_or_else(|| {
+            CoreError::Runtime("MTP verify graph launch requested before capture".to_owned())
+        })?;
+        qwen36_fp4_kernels::graph::launch(graph_state.exec, graph_state.stream.handle())?;
+        graph_state.stream.handle().synchronize()
+    }
+
     /// Capture one MTP verification iteration:
     /// main decode from `forward.token_u32`, greedy-sample verified token back
     /// into `forward.token_u32`, run the MTP layer from that verified token and
@@ -639,6 +710,46 @@ impl<B: KernelBackend> Engine<B> {
             prefill.token_u32.copy_from_host(&token_bytes)?;
             prefill.position_i32.copy_from_host(&position_bytes)?;
         }
+        if need_next_draft {
+            let mut mtp_verify_tokens = [0_u8; 8];
+            mtp_verify_tokens[..4].copy_from_slice(&draft_token.to_ne_bytes());
+            {
+                let forward = self.cuda_forward()?;
+                forward
+                    .position_i32
+                    .copy_from_host(&position_0.to_ne_bytes())?;
+                forward
+                    .mtp_verify_token_u32
+                    .copy_from_host(&mtp_verify_tokens)?;
+            }
+            self.ensure_mtp_verify_graph_two_tokens(start_position)?;
+            self.launch_mtp_verify_graph_two_tokens()?;
+
+            let verified_token = self.read_current_token()?;
+            if verified_token != draft_token {
+                return Ok(MtpVerifyResult {
+                    accepted: false,
+                    verified_token,
+                    next_token: None,
+                    next_draft_token: None,
+                });
+            }
+
+            let mut next_token_bytes = [0_u8; 4];
+            self.cuda_forward()?
+                .mtp_verify_token_u32
+                .copy_to_host_at(4, &mut next_token_bytes)?;
+            let next_token = u32::from_ne_bytes(next_token_bytes);
+            let next_draft_token = self.read_sampled_token()?;
+            self.state.advance(2);
+
+            return Ok(MtpVerifyResult {
+                accepted: true,
+                verified_token,
+                next_token: Some(next_token),
+                next_draft_token: Some(next_draft_token),
+            });
+        }
 
         // This mutates the target recurrent state through both tokens. If the
         // draft is rejected, the caller must rebuild from committed tokens via
@@ -758,6 +869,26 @@ impl<B: KernelBackend> Engine<B> {
         target_hidden_bf16: DevicePtr,
         emit_logits: bool,
     ) -> Result<()> {
+        self.run_mtp_prefill_chunk_with_tokens(
+            tokens,
+            start_position,
+            start_position_device_i32,
+            target_hidden_bf16,
+            self.cuda_prefill()?.token_u32.ptr(),
+            emit_logits,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_mtp_prefill_chunk_with_tokens(
+        &self,
+        tokens: usize,
+        start_position: usize,
+        start_position_device_i32: DevicePtr,
+        target_hidden_bf16: DevicePtr,
+        token_ids_u32: DevicePtr,
+        emit_logits: bool,
+    ) -> Result<()> {
         let manifest = self
             .weights
             .as_ref()
@@ -778,7 +909,7 @@ impl<B: KernelBackend> Engine<B> {
             tokens,
             hidden,
             vocab_size: self.topology.vocab_size,
-            token_ids_u32: prefill.token_u32.ptr(),
+            token_ids_u32,
             embedding_bf16: self.tensor_ptr(weights, &manifest.embed_tokens)?,
             output_bf16: prefill.hidden.ptr(),
         })?;
