@@ -525,12 +525,13 @@ impl<B: KernelBackend> Engine<B> {
             }
 
             let emit_logits = consumed + chunk == prompt_tokens.len();
-            self.prefill_cuda_chunk(chunk, start_position, emit_logits)?;
+            self.prefill_cuda_chunk(chunk, start_position, DevicePtr::NULL, emit_logits)?;
             if self.config.mtp_speculative_tokens > 0 && !emit_logits {
                 let shifted_tokens = &prompt_tokens[consumed + 1..consumed + chunk + 1];
                 self.run_mtp_prefill_chunk_from_current_prefill(
                     chunk,
                     start_position,
+                    DevicePtr::NULL,
                     shifted_tokens,
                     false,
                 )?;
@@ -570,7 +571,13 @@ impl<B: KernelBackend> Engine<B> {
             let token = prompt_tokens.get(idx + 1).copied().unwrap_or(sampled_token);
             shifted_tokens.push(token);
         }
-        self.run_mtp_prefill_chunk_from_current_prefill(final_chunk, start, &shifted_tokens, true)
+        self.run_mtp_prefill_chunk_from_current_prefill(
+            final_chunk,
+            start,
+            DevicePtr::NULL,
+            &shifted_tokens,
+            true,
+        )
     }
 
     #[cfg(feature = "cuda")]
@@ -637,7 +644,7 @@ impl<B: KernelBackend> Engine<B> {
         // draft is rejected, the caller must rebuild from committed tokens via
         // `reset_cuda_state`; we avoid a large per-step full-state snapshot in
         // the overwhelmingly common accepted path.
-        self.prefill_cuda_chunk(2, start_position, false)?;
+        self.prefill_cuda_chunk(2, start_position, DevicePtr::NULL, false)?;
         self.final_norm_prefill_rows(2)?;
 
         self.prefill_row_logits(0)?;
@@ -680,7 +687,13 @@ impl<B: KernelBackend> Engine<B> {
         mtp_tokens[..4].copy_from_slice(&draft_token.to_ne_bytes());
         mtp_tokens[4..].copy_from_slice(&next_token.to_ne_bytes());
         self.cuda_prefill()?.token_u32.copy_from_host(&mtp_tokens)?;
-        self.run_mtp_prefill_chunk(2, start_position, self.cuda_prefill()?.normed.ptr(), true)?;
+        self.run_mtp_prefill_chunk(
+            2,
+            start_position,
+            DevicePtr::NULL,
+            self.cuda_prefill()?.normed.ptr(),
+            true,
+        )?;
         self.queue_sample_greedy()?;
         let next_draft_token = self.read_sampled_token()?;
         self.state.advance(2);
@@ -698,6 +711,7 @@ impl<B: KernelBackend> Engine<B> {
         &self,
         tokens: usize,
         start_position: usize,
+        start_position_device_i32: DevicePtr,
         shifted_tokens: &[u32],
         emit_logits: bool,
     ) -> Result<()> {
@@ -726,7 +740,13 @@ impl<B: KernelBackend> Engine<B> {
             DevicePtr::NULL,
             prefill.normed.ptr(),
         )?;
-        self.run_mtp_prefill_chunk(tokens, start_position, prefill.normed.ptr(), emit_logits)
+        self.run_mtp_prefill_chunk(
+            tokens,
+            start_position,
+            start_position_device_i32,
+            prefill.normed.ptr(),
+            emit_logits,
+        )
     }
 
     #[cfg(feature = "cuda")]
@@ -734,6 +754,7 @@ impl<B: KernelBackend> Engine<B> {
         &self,
         tokens: usize,
         start_position: usize,
+        start_position_device_i32: DevicePtr,
         target_hidden_bf16: DevicePtr,
         emit_logits: bool,
     ) -> Result<()> {
@@ -802,7 +823,14 @@ impl<B: KernelBackend> Engine<B> {
             prefill.residual.ptr(),
             prefill.normed.ptr(),
         )?;
-        self.run_mtp_full_attention_layer_prefill(layer, runtime, prefill, tokens, start_position)?;
+        self.run_mtp_full_attention_layer_prefill(
+            layer,
+            runtime,
+            prefill,
+            tokens,
+            start_position,
+            start_position_device_i32,
+        )?;
         self.rmsnorm(
             tokens,
             hidden,
@@ -938,6 +966,7 @@ impl<B: KernelBackend> Engine<B> {
         &self,
         tokens: usize,
         start_position: usize,
+        start_position_device_i32: DevicePtr,
         emit_logits: bool,
     ) -> Result<()> {
         let manifest = self
@@ -1036,6 +1065,7 @@ impl<B: KernelBackend> Engine<B> {
                     prefill,
                     tokens,
                     start_position,
+                    start_position_device_i32,
                     quantized_normed,
                 )?,
             }
@@ -1972,6 +2002,7 @@ impl<B: KernelBackend> Engine<B> {
         prefill: &GpuPrefillBuffers,
         tokens: usize,
         start_position: usize,
+        start_position_device_i32: DevicePtr,
     ) -> Result<()> {
         let (kv_cache_k, kv_cache_v) = self.mtp_cache_ptrs(runtime)?;
         let qkv_linears = [
@@ -2035,7 +2066,7 @@ impl<B: KernelBackend> Engine<B> {
                 head_dim: self.topology.attention_head_dim,
                 rope_dims: self.topology.attention_rope_dims(),
             },
-            start_position_device_i32: DevicePtr::NULL,
+            start_position_device_i32,
         })?;
         self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
             rows: tokens,
@@ -2340,6 +2371,7 @@ impl<B: KernelBackend> Engine<B> {
         prefill: &GpuPrefillBuffers,
         tokens: usize,
         start_position: usize,
+        start_position_device_i32: DevicePtr,
         prequantized_normed: Option<Nvfp4ActivationQuant<'_>>,
     ) -> Result<()> {
         let q_dim = self.topology.full_attention_q_dim();
@@ -2496,7 +2528,7 @@ impl<B: KernelBackend> Engine<B> {
                 head_dim: self.topology.attention_head_dim,
                 rope_dims: self.topology.attention_rope_dims(),
             },
-            start_position_device_i32: DevicePtr::NULL,
+            start_position_device_i32,
         })?;
         if layer.layer_index == 3 {
             if let Ok(dir) = std::env::var("QWEN36_DEBUG_DUMP_DIR") {
