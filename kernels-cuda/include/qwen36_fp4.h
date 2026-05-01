@@ -21,7 +21,12 @@ enum {
   QWEN36_STATUS_NULL_POINTER = 1,
   QWEN36_STATUS_INVALID_ARGUMENT = 2,
   QWEN36_STATUS_CUDA_ERROR = 3,
-  QWEN36_STATUS_CUBLAS_ERROR = 4
+  QWEN36_STATUS_CUBLAS_ERROR = 4,
+  // Returned by entry points whose kernel implementation has not yet
+  // landed (e.g. the Mirage megakernel path while it is being built up).
+  // The Rust runtime treats this as a soft fallback signal so it can route
+  // back to the existing cuBLASLt path without breaking parity.
+  QWEN36_STATUS_NOT_IMPLEMENTED = 5
 };
 
 typedef struct {
@@ -388,6 +393,14 @@ int qwen36_cuda_set_l2_access_window(qwen36_device_ptr_t base, size_t bytes,
 int qwen36_cuda_clear_l2_access_window(void);
 
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
+
+// Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot
+// decode shapes (M » N=1, K=hidden) on Blackwell SM120. Uses the same
+// Nvfp4GemmSpec contract as `qwen36_nvfp4_gemm` so callers can A/B route
+// via env var. Returns QWEN36_STATUS_NOT_IMPLEMENTED for shapes the
+// kernel does not yet specialise; the Rust dispatcher then falls back
+// to the cuBLASLt path. See `docs/mirage-megakernel.md`.
+int qwen36_megakernel_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 int qwen36_bf16_gemm(const qwen36_bf16_gemm_spec_t *spec);
 int qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec);
 int qwen36_deltanet_decode(const qwen36_deltanet_decode_spec_t *spec);

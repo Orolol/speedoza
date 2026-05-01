@@ -7,3 +7,6 @@
 *.ptx
 *.cubin
 model_layout.json
+
+# CUTLASS vendored (cloned per docs/mirage-megakernel.md)
+/kernels-cuda/cutlass/
