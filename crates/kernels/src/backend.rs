@@ -165,6 +165,21 @@ impl KernelBackend for CudaBackend {
 
     fn nvfp4_gemm(&self, spec: &Nvfp4GemmSpec) -> Result<()> {
         let ffi_spec = ffi::Nvfp4GemmSpec::from(spec);
+        // When the Mirage megakernel path is enabled (env var) we try the
+        // CUTLASS-templated NVFP4 GEMM first. The kernel is being built up
+        // shape-by-shape (`docs/mirage-megakernel.md`); on any unsupported
+        // shape it returns QWEN36_STATUS_NOT_IMPLEMENTED, in which case we
+        // transparently fall back to the cuBLASLt path. This keeps the
+        // engine perf-neutral while individual shapes get migrated.
+        if megakernel_enabled() {
+            let code = unsafe { ffi::qwen36_megakernel_nvfp4_gemm(&ffi_spec) };
+            // 5 == QWEN36_STATUS_NOT_IMPLEMENTED. Any other non-zero is a
+            // real failure and surfaces through `check()` like the rest of
+            // the FFI surface.
+            if code != 5 {
+                return check("qwen36_megakernel_nvfp4_gemm", code);
+            }
+        }
         check("qwen36_nvfp4_gemm", unsafe {
             ffi::qwen36_nvfp4_gemm(&ffi_spec)
         })
@@ -359,6 +374,22 @@ fn check(kernel: &'static str, code: i32) -> Result<()> {
     } else {
         Err(CoreError::KernelLaunch { kernel, code })
     }
+}
+
+/// Cached env-var lookup gating the CUTLASS-templated NVFP4 GEMM path.
+/// Set `QWEN36_USE_MEGAKERNEL_GEMM=1` to opt in; the default (unset / 0)
+/// keeps the cuBLASLt path active. Cached so the dispatch hot path does
+/// not parse the environment on every GEMM call.
+#[cfg(feature = "cuda")]
+fn megakernel_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("QWEN36_USE_MEGAKERNEL_GEMM").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -1161,6 +1192,7 @@ mod ffi {
     #[link(name = "qwen36_fp4_kernels")]
     unsafe extern "C" {
         pub fn qwen36_nvfp4_gemm(spec: *const Nvfp4GemmSpec) -> i32;
+        pub fn qwen36_megakernel_nvfp4_gemm(spec: *const Nvfp4GemmSpec) -> i32;
         pub fn qwen36_attention_prefill(spec: *const AttentionPrefillSpec) -> i32;
         pub fn qwen36_deltanet_decode(spec: *const DeltaNetDecodeSpec) -> i32;
         pub fn qwen36_attention_decode(spec: *const AttentionDecodeSpec) -> i32;
