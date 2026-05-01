@@ -131,6 +131,32 @@ in `kernels-cuda/include/qwen36_fp4.h` mirrors into
 `QWEN36_USE_MEGAKERNEL_GEMM=1`, **and** measurable bench delta on at
 least MTP=0 (target ≥ +5 tok/s, i.e. 45.5 → 50+).
 
+## Phase 1 status — measured outcome
+
+After landing the live CUTLASS NVFP4→BF16 GemmUniversalAdapter for
+SM120 (`kernels-cuda/megakernel/nvfp4_matvec_sm120.cu`) and exercising
+it through the env-gated dispatcher on every decode-path NVFP4 GEMM:
+
+| ThreadBlockShape | Bench MTP=0 (vs cuBLASLt baseline) | Notes |
+|--|--|--|
+| `<128, 128, 128>` | -5 % | wide N tile wastes SM occupancy at N=1 |
+| `<128, 8, 128>` | parity | matches SM120 FP4 MMA atom N=8 |
+| `<64, 8, 128>` | parity | more M-axis tiles, no measurable gain |
+
+**Finding:** raw GEMM swap from cuBLASLt → CUTLASS at our N=1 single-
+token decode shapes is **at parity, not faster**. cuBLASLt's FP4 path on
+Blackwell appears well-tuned for batch=1; the published "1.78× over
+cuBLASLt at BS=1" reference (vLLM HF blog) does not reproduce on our
+exact shape mix on RTX 5090 / SM120 / CUTLASS 4.4.2 with the schedules
+the `CollectiveBuilder` auto-selects for these template parameters.
+
+The remaining leverage that justifies the megakernel branch sits in the
+**epilogue fusion** (Phase 2) and **persistent multi-layer kernel**
+(Phase 3/4): the cuBLASLt path emits 1 GEMM kernel per call, so anything
+fused into the same launch (RMSNorm + SwiGLU + activation quantize on
+the GEMM output) is pure savings. CUTLASS's CollectiveEpilogue is the
+mechanism — that is the next concrete step.
+
 ## Phase 2 — Epilogue fusion
 
 Bake the post-GEMM ops into the CUTLASS epilogue:

@@ -61,7 +61,16 @@ using ElementAccumulator = float;
 using ArchTag = cutlass::arch::Sm120;
 using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 
-using ThreadBlockShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+// At N=1 (single-token decode) a wide N tile wastes SM occupancy on the
+// unused N dim. We match the SM120 FP4 MMA atom's natural N (mma.m16n8k64
+// has N=8) so each tile computes the minimum useful N region. M=128 keeps
+// the M-axis warp specialisation aligned to the atom (m16n8k64 × 8 m-units
+// = 128). Empirically this matches cuBLASLt FP4 throughput at our shapes;
+// the wider 128×128×128 schedule loses ~5 % at N=1, the narrower 64×8×128
+// is at parity with this one. The remaining gap to "beat cuBLASLt" lives
+// in the epilogue (fusing RMSNorm + SwiGLU + NVFP4 quantize into the GEMM)
+// rather than in raw mainloop tile tuning.
+using ThreadBlockShape = cute::Shape<cute::_128, cute::_8, cute::_128>;
 using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
 
 using CollectiveEpilogue =
