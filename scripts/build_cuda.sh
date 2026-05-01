@@ -31,6 +31,7 @@ fi
   -shared \
   -arch="sm_${SM}" \
   -I kernels-cuda/include \
+  -I kernels-cuda \
   "${CUTLASS_FLAGS[@]}" \
   kernels-cuda/nvfp4_gemm.cu \
   kernels-cuda/deltanet.cu \
