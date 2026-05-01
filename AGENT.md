@@ -149,6 +149,56 @@ Memory cost of the fused stores: ~5.7 GB for `MlpFusedStore` + ~2.3 GB for `Line
 - *Prefill-path MLP / DeltaNet fusion*: same combined-GEMM idea but the multi-row cuBLASLt FP4 output is column-major `(M=combined, N=tokens)`, so `swiglu` / `conv1d_update` / `gdn_gate` would need stride-aware reads (or a deinterleave scatter kernel). Would help MTP verify forwards (chunked prefill) for a small additional gain on MTP=2/3.
 - *MTP head BF16 → NVFP4*: the MTP attention + MLP run 24× per 32-token MTP=3 cycle and currently use BF16 weights. Quantising would speed it up significantly but needs a proper parity harness against the BF16 path; risks breaking the MTP parity gate.
 - *Persistent / specialised DeltaNet recurrent kernel*: the existing decode kernel is rated 5/5, but a multi-layer persistent kernel that holds state in TMEM and avoids per-layer launches could shave more. Major rewrite.
+- *Native Linux re-bench*: WSL2 adds 1–3 µs per kernel launch; with ~30 cudaGraphLaunches/sec of decode + sync points, expected delta is ~5–10 % free. Zero engineering effort and the highest-ROI experiment to run before any further CUDA work.
+
+### Mirage megakernel branch (`feat/mirage-megakernel`)
+
+Long-running side branch that lays a CUTLASS-based substrate for the
+NVFP4 GEMMs without committing to perf gains on `codex/numerical-parity-guardrails`.
+Contents (six commits, branch is opt-in via env var, perf-neutral on
+the default path):
+
+* CUTLASS 4.4.2 vendored as a shallow clone under `kernels-cuda/cutlass/`
+  (gitignored, ~200 MB). Build pipeline (`scripts/build_cuda.sh`) detects
+  the directory and compiles `kernels-cuda/megakernel/nvfp4_matvec_sm120.cu`
+  with `--expt-relaxed-constexpr --extended-lambda`.
+* `qwen36_megakernel_nvfp4_gemm` (`kernels-cuda/megakernel/`) — live
+  CUTLASS `GemmUniversalAdapter` for SM120 NVFP4 → BF16 with
+  `ThreadBlockShape = <128, 8, 128>` (matches the SM120 FP4 MMA atom
+  m16n8k64). Validated parity for every NVFP4 GEMM in the decode hot
+  path under `QWEN36_USE_MEGAKERNEL_GEMM=1`.
+* Rust-side dispatch (`crates/kernels/src/backend.rs`) routes through
+  the megakernel when the env var is set; `QWEN36_STATUS_NOT_IMPLEMENTED`
+  (= 5) is treated as a soft fallback so the cuBLASLt path still runs
+  on shapes the kernel does not specialise.
+* `cuda_set_l2_access_window` / `cuda_clear_l2_access_window` plumbing
+  on `crates/kernels/src/memory.rs` (already in `codex/numerical-parity-guardrails`,
+  ported here for completeness).
+
+**Empirical finding from the branch:** scale-factor layout is
+identical between cuBLASLt's `vec16_scale_offset` and CUTLASS's
+`Sm1xxBlkScaledConfig::SfKMajorAtom` for `SFVecSize=16`. No re-tile
+pass was needed. CUTLASS at `<128, 8, 128>` lands at perf parity with
+cuBLASLt for our N=1 decode shapes; the wider `<128, 128, 128>`
+default tile is ~5 % slower. The published "1.78× over cuBLASLt at
+BS=1" reference does not reproduce on this exact shape mix with
+the auto-selected schedule.
+
+**Phase 2 (epilogue fusion) is mathematically blocked for SwiGLU on
+our `MlpFusedStore` layout** — gate and up are stacked along M with
+intermediate=17408 = 136×128, so every 128-row epilogue tile is
+*entirely* gate or *entirely* up. SwiGLU needs to pair `gate[i]` with
+`up[i + intermediate]`, which live in separate tiles, and CUTLASS
+epilogues do not share state across tiles. Restructuring to batched
+GEMM with L=2 just moves the pairing problem. Full deep-dive in
+`docs/mirage-megakernel.md`.
+
+The only tractable Phase 2 win remaining is `LinCombBlockScaleFactor`
+on down_proj (NVFP4 output) + a new RMSNorm-from-NVFP4 kernel
+variant — estimated 3–6 % MTP=0, ~1–2 days of focused kernel + parity
+work. Recommended only after the WSL2 vs native Linux experiment
+above is complete, since it gates whether 100 tok/s is reachable
+without further CUTLASS work.
 
 Reproduce with:
 
