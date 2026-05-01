@@ -38,6 +38,22 @@ pub struct AttentionPrefillSpec {
     /// across advancing positions.
     #[serde(default)]
     pub start_position_device_i32: DevicePtr,
+    /// Optional scratch buffers used by the short-prefill split-KV path for
+    /// MTP verification/recovery chunks. Layout matches `AttentionDecodeSpec`
+    /// and is reused once per token in the chunk.
+    #[serde(default)]
+    pub partial_acc_f32: DevicePtr,
+    #[serde(default)]
+    pub partial_max_f32: DevicePtr,
+    #[serde(default)]
+    pub partial_denom_f32: DevicePtr,
+    /// Number of split-KV blocks per q-head for short prefill. Values 0/1 keep
+    /// the normal prefill kernels.
+    #[serde(default)]
+    pub prefill_n_splits: usize,
+    /// Timesteps covered by each split block. When 0, the CUDA default is used.
+    #[serde(default)]
+    pub split_timesteps_per_block: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,4 +72,29 @@ pub struct AttentionDecodeSpec {
     /// single recording can be replayed across iterations.
     #[serde(default)]
     pub position_device_i32: DevicePtr,
+    /// Optional scratch buffers used by the split-KV (FlashDecoding-style)
+    /// path. When all three are non-NULL the kernel splits the attention
+    /// over the time axis into chunks of `split_timesteps_per_block`,
+    /// trading per-block work for SM occupancy on long contexts. Must be
+    /// large enough for the model's `max_context`. Layout:
+    ///   - `partial_acc_f32`: `[q_heads, n_splits, head_dim]` FP32
+    ///   - `partial_max_f32`:  `[q_heads, n_splits]` FP32
+    ///   - `partial_denom_f32`: `[q_heads, n_splits]` FP32
+    ///     where `n_splits = ceil((max_context) / split_timesteps_per_block)`.
+    #[serde(default)]
+    pub partial_acc_f32: DevicePtr,
+    #[serde(default)]
+    pub partial_max_f32: DevicePtr,
+    #[serde(default)]
+    pub partial_denom_f32: DevicePtr,
+    /// Number of split-KV blocks per q-head. Set by the engine from
+    /// `max_context`, *not* the current position, so the same value works
+    /// for graph capture *and* graph replay even as the position grows. A
+    /// value of 0 (or 1) tells the kernel to skip the split path and run
+    /// the per-q-head kernel inline.
+    #[serde(default)]
+    pub decode_n_splits: usize,
+    /// Timesteps covered by each split block. When 0, the CUDA default is used.
+    #[serde(default)]
+    pub split_timesteps_per_block: usize,
 }

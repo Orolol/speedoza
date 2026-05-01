@@ -131,6 +131,39 @@ int main() {
   attention_spec.shape = attn;
   must_status(qwen36_attention_decode(&attention_spec), "attention");
 
+  constexpr size_t split_position = 513;
+  constexpr size_t split_n_splits = 2;
+  qwen36_device_ptr_t split_cache_k =
+      dev_alloc<__nv_bfloat16>((split_position + 1) * kv_values);
+  qwen36_device_ptr_t split_cache_v =
+      dev_alloc<__nv_bfloat16>((split_position + 1) * kv_values);
+  qwen36_device_ptr_t split_out = dev_alloc<__nv_bfloat16>(q_values);
+  qwen36_device_ptr_t split_partial_acc =
+      dev_alloc<float>(attn.q_heads * split_n_splits * attn.head_dim);
+  qwen36_device_ptr_t split_partial_max =
+      dev_alloc<float>(attn.q_heads * split_n_splits);
+  qwen36_device_ptr_t split_partial_denom =
+      dev_alloc<float>(attn.q_heads * split_n_splits);
+  copy_bf16(split_cache_k,
+            std::vector<float>((split_position + 1) * kv_values, 0.5f));
+  copy_bf16(split_cache_v,
+            std::vector<float>((split_position + 1) * kv_values, 1.0f));
+  qwen36_attention_decode_spec_t split_attention_spec = attention_spec;
+  split_attention_spec.position = split_position;
+  split_attention_spec.kv_cache_k = split_cache_k;
+  split_attention_spec.kv_cache_v = split_cache_v;
+  split_attention_spec.output_bf16 = split_out;
+  split_attention_spec.partial_acc_f32 = split_partial_acc;
+  split_attention_spec.partial_max_f32 = split_partial_max;
+  split_attention_spec.partial_denom_f32 = split_partial_denom;
+  split_attention_spec.decode_n_splits = split_n_splits;
+  must_status(qwen36_attention_decode(&split_attention_spec),
+              "attention split decode");
+  std::vector<float> split_values = read_bf16(split_out, q_values);
+  for (size_t i = 0; i < split_values.size(); ++i) {
+    expect_close(split_values[i], 1.0f, 0.02f, "attention split decode");
+  }
+
   qwen36_device_ptr_t prefill_start = dev_alloc<int32_t>(1);
   qwen36_device_ptr_t prefill_cache_k = dev_alloc<__nv_bfloat16>(kv_values * 2);
   qwen36_device_ptr_t prefill_cache_v = dev_alloc<__nv_bfloat16>(kv_values * 2);
@@ -161,6 +194,48 @@ int main() {
                "attention prefill device start cache k");
   expect_close(prefill_cache_v_values[kv_values], 1.0f, 0.02f,
                "attention prefill device start cache v");
+
+  qwen36_device_ptr_t prefill_split_q =
+      dev_alloc<__nv_bfloat16>(q_values * 2);
+  qwen36_device_ptr_t prefill_split_k =
+      dev_alloc<__nv_bfloat16>(kv_values * 2);
+  qwen36_device_ptr_t prefill_split_v =
+      dev_alloc<__nv_bfloat16>(kv_values * 2);
+  qwen36_device_ptr_t prefill_split_cache_k =
+      dev_alloc<__nv_bfloat16>((split_position + 2) * kv_values);
+  qwen36_device_ptr_t prefill_split_cache_v =
+      dev_alloc<__nv_bfloat16>((split_position + 2) * kv_values);
+  qwen36_device_ptr_t prefill_split_out =
+      dev_alloc<__nv_bfloat16>(q_values * 2);
+  copy_bf16(prefill_split_q, std::vector<float>(q_values * 2, 0.25f));
+  copy_bf16(prefill_split_k, std::vector<float>(kv_values * 2, 0.5f));
+  copy_bf16(prefill_split_v, std::vector<float>(kv_values * 2, 1.0f));
+  copy_bf16(prefill_split_cache_k,
+            std::vector<float>((split_position + 2) * kv_values, 0.5f));
+  copy_bf16(prefill_split_cache_v,
+            std::vector<float>((split_position + 2) * kv_values, 1.0f));
+  qwen36_attention_prefill_spec_t prefill_split_spec{};
+  prefill_split_spec.start_position = split_position;
+  prefill_split_spec.tokens = 2;
+  prefill_split_spec.q_bf16 = prefill_split_q;
+  prefill_split_spec.k_bf16 = prefill_split_k;
+  prefill_split_spec.v_bf16 = prefill_split_v;
+  prefill_split_spec.kv_cache_k = prefill_split_cache_k;
+  prefill_split_spec.kv_cache_v = prefill_split_cache_v;
+  prefill_split_spec.output_bf16 = prefill_split_out;
+  prefill_split_spec.shape = attn;
+  prefill_split_spec.partial_acc_f32 = split_partial_acc;
+  prefill_split_spec.partial_max_f32 = split_partial_max;
+  prefill_split_spec.partial_denom_f32 = split_partial_denom;
+  prefill_split_spec.prefill_n_splits = split_n_splits;
+  must_status(qwen36_attention_prefill(&prefill_split_spec),
+              "attention prefill split");
+  std::vector<float> prefill_split_values =
+      read_bf16(prefill_split_out, q_values * 2);
+  for (size_t i = 0; i < prefill_split_values.size(); ++i) {
+    expect_close(prefill_split_values[i], 1.0f, 0.02f,
+                 "attention prefill split");
+  }
 
   qwen36_device_ptr_t kq = dev_alloc<int8_t>(kv_values);
   qwen36_device_ptr_t vq = dev_alloc<int8_t>(kv_values);
@@ -355,16 +430,20 @@ int main() {
 
   qwen36_device_ptr_t logits = dev_alloc<__nv_bfloat16>(4);
   qwen36_device_ptr_t sampled = dev_alloc<uint32_t>(1);
+  qwen36_device_ptr_t sampled_mirror = dev_alloc<uint32_t>(1);
   copy_bf16(logits, {0.5f, 4.0f, 3.0f, 4.0f});
   qwen36_sampling_spec_t sampling_spec{};
   sampling_spec.vocab_size = 4;
   sampling_spec.logits_bf16 = logits;
   sampling_spec.output_token_u32 = sampled;
+  sampling_spec.mirror_output_token_u32 = sampled_mirror;
   sampling_spec.temperature = 1.0f;
   must_status(qwen36_sample(&sampling_spec), "sample");
   const uint32_t token = read_one<uint32_t>(sampled);
-  if (token != 1) {
-    fprintf(stderr, "sample expected token 1 got %u\n", token);
+  const uint32_t mirror_token = read_one<uint32_t>(sampled_mirror);
+  if (token != 1 || mirror_token != 1) {
+    fprintf(stderr, "sample expected token 1 got %u mirror %u\n", token,
+            mirror_token);
     exit(1);
   }
 
@@ -560,10 +639,22 @@ int main() {
   dev_free<__nv_bfloat16>(cache_k);
   dev_free<__nv_bfloat16>(cache_v);
   dev_free<__nv_bfloat16>(out);
+  dev_free<__nv_bfloat16>(split_cache_k);
+  dev_free<__nv_bfloat16>(split_cache_v);
+  dev_free<__nv_bfloat16>(split_out);
+  dev_free<float>(split_partial_acc);
+  dev_free<float>(split_partial_max);
+  dev_free<float>(split_partial_denom);
   dev_free<int32_t>(prefill_start);
   dev_free<__nv_bfloat16>(prefill_cache_k);
   dev_free<__nv_bfloat16>(prefill_cache_v);
   dev_free<__nv_bfloat16>(prefill_out);
+  dev_free<__nv_bfloat16>(prefill_split_q);
+  dev_free<__nv_bfloat16>(prefill_split_k);
+  dev_free<__nv_bfloat16>(prefill_split_v);
+  dev_free<__nv_bfloat16>(prefill_split_cache_k);
+  dev_free<__nv_bfloat16>(prefill_split_cache_v);
+  dev_free<__nv_bfloat16>(prefill_split_out);
   dev_free<int8_t>(kq);
   dev_free<int8_t>(vq);
   dev_free<float>(meta);
@@ -594,6 +685,7 @@ int main() {
   dev_free<__nv_bfloat16>(swiglu_out);
   dev_free<__nv_bfloat16>(logits);
   dev_free<uint32_t>(sampled);
+  dev_free<uint32_t>(sampled_mirror);
   dev_free<uint32_t>(token_ids);
   dev_free<__nv_bfloat16>(embedding);
   dev_free<__nv_bfloat16>(embedding_out);

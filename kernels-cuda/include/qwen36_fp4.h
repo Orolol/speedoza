@@ -81,6 +81,19 @@ typedef struct {
   // pointer (int32) instead of `start_position`. Used by graph-captured MTP
   // verification where the host can no longer pass advancing scalar args.
   qwen36_device_ptr_t start_position_device_i32;
+  // Optional scratch buffers backing the short-prefill split-KV path used by
+  // MTP verification/recovery chunks. Reused once per token in the chunk.
+  // Layout (n_splits = ceil(max_context / SPLIT_SIZE)):
+  //   partial_acc_f32   : [q_heads, n_splits, head_dim] FP32
+  //   partial_max_f32   : [q_heads, n_splits] FP32
+  //   partial_denom_f32 : [q_heads, n_splits] FP32
+  qwen36_device_ptr_t partial_acc_f32;
+  qwen36_device_ptr_t partial_max_f32;
+  qwen36_device_ptr_t partial_denom_f32;
+  // Number of split-KV blocks per q-head. A value of 0 or 1 disables this path.
+  size_t prefill_n_splits;
+  // Timesteps covered by each split block. A value of 0 uses the CUDA default.
+  size_t split_timesteps_per_block;
 } qwen36_attention_prefill_spec_t;
 
 typedef struct {
@@ -97,6 +110,23 @@ typedef struct {
   // pointer (int32, big enough to express the full max_context). This lets
   // CUDA-Graph captures stay valid across decode steps without re-recording.
   qwen36_device_ptr_t position_device_i32;
+  // Optional scratch buffers backing the split-KV (FlashDecoding-style)
+  // path. When all three are non-zero AND the current sequence is long
+  // enough to benefit, the kernel partitions the timestep loop across
+  // multiple blocks per q-head and reduces partials in a follow-up pass.
+  // Layout (n_splits = ceil(max_context / SPLIT_SIZE)):
+  //   partial_acc_f32   : [q_heads, n_splits, head_dim] FP32
+  //   partial_max_f32   : [q_heads, n_splits] FP32
+  //   partial_denom_f32 : [q_heads, n_splits] FP32
+  qwen36_device_ptr_t partial_acc_f32;
+  qwen36_device_ptr_t partial_max_f32;
+  qwen36_device_ptr_t partial_denom_f32;
+  // Number of split-KV blocks per q-head. Engine-side value derived from
+  // max_context so a graph captured at one position stays valid as it grows.
+  // A value of 0 or 1 disables the split path.
+  size_t decode_n_splits;
+  // Timesteps covered by each split block. A value of 0 uses the CUDA default.
+  size_t split_timesteps_per_block;
 } qwen36_attention_decode_spec_t;
 
 typedef struct {
@@ -197,6 +227,16 @@ typedef struct {
 } qwen36_swiglu_spec_t;
 
 typedef struct {
+  size_t intermediate;
+  qwen36_device_ptr_t gate_bf16;
+  qwen36_device_ptr_t up_bf16;
+  qwen36_device_ptr_t output_fp4;
+  qwen36_device_ptr_t output_scale_e4m3;
+  qwen36_device_ptr_t output_tensor_scale_f32;
+  float input_tensor_scale_f32;
+} qwen36_swiglu_nvfp4_quantize_spec_t;
+
+typedef struct {
   size_t vocab_size;
   qwen36_device_ptr_t logits_bf16;
   qwen36_device_ptr_t output_token_u32;
@@ -204,6 +244,7 @@ typedef struct {
   size_t top_k;
   float top_p;
   float repetition_penalty;
+  qwen36_device_ptr_t mirror_output_token_u32;
 } qwen36_sampling_spec_t;
 
 typedef struct {
@@ -342,6 +383,9 @@ int qwen36_cuda_memcpy_d2d(qwen36_device_ptr_t dst, qwen36_device_ptr_t src,
                            size_t bytes);
 int qwen36_cuda_memset(qwen36_device_ptr_t dst, int value, size_t bytes);
 int qwen36_cuda_synchronize(void);
+int qwen36_cuda_set_l2_access_window(qwen36_device_ptr_t base, size_t bytes,
+                                      float hit_ratio);
+int qwen36_cuda_clear_l2_access_window(void);
 
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 int qwen36_bf16_gemm(const qwen36_bf16_gemm_spec_t *spec);
@@ -355,6 +399,8 @@ int qwen36_rmsnorm_nvfp4_quantize(
     const qwen36_rmsnorm_nvfp4_quantize_spec_t *spec);
 int qwen36_partial_rope(const qwen36_partial_rope_spec_t *spec);
 int qwen36_swiglu(const qwen36_swiglu_spec_t *spec);
+int qwen36_swiglu_nvfp4_quantize(
+    const qwen36_swiglu_nvfp4_quantize_spec_t *spec);
 int qwen36_sample(const qwen36_sampling_spec_t *spec);
 int qwen36_embedding_lookup(const qwen36_embedding_lookup_spec_t *spec);
 int qwen36_bf16_matvec(const qwen36_bf16_matvec_spec_t *spec);

@@ -202,3 +202,46 @@ extern "C" int qwen36_cuda_memset(qwen36_device_ptr_t dst, int value,
 extern "C" int qwen36_cuda_synchronize(void) {
   return status(cudaDeviceSynchronize());
 }
+
+// Pin a memory window to the L2 cache via the active stream's access policy
+// window. Useful for hot data structures that fit in L2 (e.g. the DeltaNet
+// recurrent state), so every recurrent read is an L2 hit instead of an HBM
+// fetch. `hit_ratio` ∈ [0, 1] is the fraction of accesses to keep cached;
+// 1.0 means "cache the whole window" (still best-effort under L2 pressure).
+// Setting on the active stream applies to all kernels submitted to it,
+// including those captured into a CUDA graph.
+extern "C" int qwen36_cuda_set_l2_access_window(qwen36_device_ptr_t base,
+                                                size_t bytes,
+                                                float hit_ratio) {
+  if (base.ptr == 0 || bytes == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  if (!(hit_ratio >= 0.0f) || hit_ratio > 1.0f) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  cudaStream_t stream = qwen36_internal_active_stream();
+  if (stream == nullptr) {
+    // No-op on the legacy default stream — its attributes are not settable.
+    return QWEN36_STATUS_SUCCESS;
+  }
+  cudaStreamAttrValue attrs = {};
+  attrs.accessPolicyWindow.base_ptr = ptr(base);
+  attrs.accessPolicyWindow.num_bytes = bytes;
+  attrs.accessPolicyWindow.hitRatio = hit_ratio;
+  attrs.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+  attrs.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+  cudaError_t err = cudaStreamSetAttribute(
+      stream, cudaStreamAttributeAccessPolicyWindow, &attrs);
+  return status(err);
+}
+
+extern "C" int qwen36_cuda_clear_l2_access_window(void) {
+  cudaStream_t stream = qwen36_internal_active_stream();
+  if (stream == nullptr) {
+    return QWEN36_STATUS_SUCCESS;
+  }
+  cudaStreamAttrValue attrs = {};
+  cudaError_t err = cudaStreamSetAttribute(
+      stream, cudaStreamAttributeAccessPolicyWindow, &attrs);
+  return status(err);
+}

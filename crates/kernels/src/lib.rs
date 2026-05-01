@@ -20,7 +20,9 @@ pub use backend::nvfp4_retile_scales;
 pub use backend::{DevicePtr, KernelBackend, NoCudaBackend};
 pub use deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape};
 #[cfg(feature = "cuda")]
-pub use memory::{CudaDeviceBuffer, cuda_synchronize};
+pub use memory::{
+    CudaDeviceBuffer, cuda_clear_l2_access_window, cuda_set_l2_access_window, cuda_synchronize,
+};
 pub use nvfp4_gemm::{CublasLtFp4ScaleMode, Nvfp4GemmPlan, Nvfp4GemmSpec};
 pub use ops::{
     Bf16GemmSpec, Bf16MatVecSpec, Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec,
@@ -31,4 +33,4 @@ pub use ops::{
 pub use rmsnorm::RmsNormSpec;
 pub use rope::PartialRopeSpec;
 pub use sampling::SamplingSpec;
-pub use swiglu::SwiGluSpec;
+pub use swiglu::{SwiGluNvfp4QuantizeSpec, SwiGluSpec};

@@ -138,8 +138,31 @@ __global__ void rmsnorm_kernel(const __nv_bfloat16 *input,
   const size_t row = blockIdx.x;
   float local_sum = 0.0f;
 
-  for (size_t d = threadIdx.x; d < hidden; d += blockDim.x) {
-    const size_t offset = row * hidden + d;
+  // Vectorized pair-wise I/O via __nv_bfloat162: every BF16 buffer here is
+  // 256-byte aligned (cudaMalloc) and `hidden` for Qwen3.6 is even, so
+  // reinterpreting as bfloat162 is safe. The odd-hidden tail is handled
+  // separately at the end of each pass.
+  const size_t pairs = hidden / 2;
+  const __nv_bfloat162 *input2 =
+      reinterpret_cast<const __nv_bfloat162 *>(input + row * hidden);
+  const __nv_bfloat162 *residual2 =
+      residual != nullptr
+          ? reinterpret_cast<const __nv_bfloat162 *>(residual + row * hidden)
+          : nullptr;
+
+  for (size_t p = threadIdx.x; p < pairs; p += blockDim.x) {
+    const __nv_bfloat162 vp = input2[p];
+    float a = __low2float(vp);
+    float b = __high2float(vp);
+    if (residual2 != nullptr) {
+      const __nv_bfloat162 rp = residual2[p];
+      a += __low2float(rp);
+      b += __high2float(rp);
+    }
+    local_sum += a * a + b * b;
+  }
+  if ((hidden & 1u) != 0u && threadIdx.x == 0u) {
+    const size_t offset = row * hidden + (hidden - 1);
     float value = __bfloat162float(input[offset]);
     if (residual != nullptr) {
       value += __bfloat162float(residual[offset]);
@@ -158,7 +181,38 @@ __global__ void rmsnorm_kernel(const __nv_bfloat16 *input,
   }
 
   const float scale = rsqrtf(scratch[0] / static_cast<float>(hidden) + eps);
-  for (size_t d = threadIdx.x; d < hidden; d += blockDim.x) {
+
+  __nv_bfloat162 *output2 =
+      reinterpret_cast<__nv_bfloat162 *>(output + row * hidden);
+  __nv_bfloat162 *residual_out2 =
+      residual_out != nullptr
+          ? reinterpret_cast<__nv_bfloat162 *>(residual_out + row * hidden)
+          : nullptr;
+  const __nv_bfloat162 *weight2 =
+      reinterpret_cast<const __nv_bfloat162 *>(weight);
+
+  for (size_t p = threadIdx.x; p < pairs; p += blockDim.x) {
+    const __nv_bfloat162 vp = input2[p];
+    float a = __low2float(vp);
+    float b = __high2float(vp);
+    if (residual2 != nullptr) {
+      const __nv_bfloat162 rp = residual2[p];
+      a += __low2float(rp);
+      b += __high2float(rp);
+    }
+    if (residual_out2 != nullptr) {
+      residual_out2[p] = __floats2bfloat162_rn(a, b);
+    }
+    const __nv_bfloat162 wp = weight2[p];
+    const float wa = __low2float(wp);
+    const float wb = __high2float(wp);
+    const float scale_a = direct_weight != 0 ? wa : (1.0f + wa);
+    const float scale_b = direct_weight != 0 ? wb : (1.0f + wb);
+    output2[p] =
+        __floats2bfloat162_rn(a * scale * scale_a, b * scale * scale_b);
+  }
+  if ((hidden & 1u) != 0u && threadIdx.x == 0u) {
+    const size_t d = hidden - 1;
     const size_t offset = row * hidden + d;
     float value = __bfloat162float(input[offset]);
     if (residual != nullptr) {
@@ -168,7 +222,8 @@ __global__ void rmsnorm_kernel(const __nv_bfloat16 *input,
       residual_out[offset] = __float2bfloat16(value);
     }
     const float w = __bfloat162float(weight[d]);
-    const float weighted = value * scale * (direct_weight != 0 ? w : (1.0f + w));
+    const float weighted =
+        value * scale * (direct_weight != 0 ? w : (1.0f + w));
     output[offset] = __float2bfloat16(weighted);
   }
 }
@@ -182,7 +237,29 @@ __global__ void rmsnorm_nvfp4_quantize_kernel(
   extern __shared__ float scratch[];
   float local_sum = 0.0f;
 
-  for (size_t d = threadIdx.x; d < hidden; d += blockDim.x) {
+  // Vectorised first-pass sum-of-squares using __nv_bfloat162. The per-group
+  // quantisation pass below stays scalar because each group reads a strided
+  // slice of `weight` and writes a 16-element FP4 block; vectorising it
+  // requires unwinding the group loop.
+  const size_t pairs = hidden / 2;
+  const __nv_bfloat162 *input2 = reinterpret_cast<const __nv_bfloat162 *>(input);
+  const __nv_bfloat162 *residual2 =
+      residual != nullptr
+          ? reinterpret_cast<const __nv_bfloat162 *>(residual)
+          : nullptr;
+  for (size_t p = threadIdx.x; p < pairs; p += blockDim.x) {
+    const __nv_bfloat162 vp = input2[p];
+    float a = __low2float(vp);
+    float b = __high2float(vp);
+    if (residual2 != nullptr) {
+      const __nv_bfloat162 rp = residual2[p];
+      a += __low2float(rp);
+      b += __high2float(rp);
+    }
+    local_sum += a * a + b * b;
+  }
+  if ((hidden & 1u) != 0u && threadIdx.x == 0u) {
+    const size_t d = hidden - 1;
     float value = __bfloat162float(input[d]);
     if (residual != nullptr) {
       value += __bfloat162float(residual[d]);
@@ -322,8 +399,86 @@ __global__ void swiglu_kernel(const __nv_bfloat16 *gate,
   }
 }
 
+// SwiGLU fused with NVFP4 group-16 activation quantization. Reads `gate` and
+// `up` BF16 vectors (each `intermediate` long, contiguous), computes
+// y = silu(gate) * up per element, and writes the FP4-packed output and the
+// per-group e4m3 scales directly so the next NVFP4 GEMM (down_proj) can
+// consume the activation without a separate quantize launch.
+//
+// Launch: grid = (groups), 32 threads per block. Each block owns one
+// 16-element group.
+__global__ void swiglu_nvfp4_quantize_kernel(
+    const __nv_bfloat16 *gate, const __nv_bfloat16 *up, uint8_t *output_fp4,
+    uint8_t *output_scale, float *tensor_scale, size_t values,
+    float input_tensor_scale) {
+  __shared__ float scratch[32];
+  __shared__ float decoded_scale;
+  __shared__ float staged[16];
+
+  const float global_scale =
+      input_tensor_scale > 0.0f ? input_tensor_scale : 1.0f;
+  const size_t group = blockIdx.x;
+  const size_t scale_inner_dim = round_up_size(div_ceil_size(values, 16), 4);
+  const size_t start = group * 16;
+
+  // 32 threads cover 16 elements (one per 2 threads is wasted but simpler);
+  // thread i loads element start+i for i in [0, 16).
+  float local_amax = 0.0f;
+  if (threadIdx.x < 16) {
+    const size_t idx = start + threadIdx.x;
+    if (idx < values) {
+      const float g = __bfloat162float(gate[idx]);
+      const float u = __bfloat162float(up[idx]);
+      const float silu = g / (1.0f + expf(-g));
+      const float y = silu * u;
+      staged[threadIdx.x] = y;
+      local_amax = fabsf(y);
+    } else {
+      staged[threadIdx.x] = 0.0f;
+    }
+  }
+
+  scratch[threadIdx.x] = local_amax;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      scratch[threadIdx.x] =
+          fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    const float scale_value =
+        scratch[0] > 0.0f
+            ? fmaxf(scratch[0] / (6.0f * global_scale), 1.0e-8f)
+            : 1.0f;
+    const uint8_t scale_code = encode_e4m3_positive(scale_value);
+    output_scale[vec16_scale_offset(group, 0, scale_inner_dim)] = scale_code;
+    decoded_scale = fmaxf(decode_e4m3(scale_code) * global_scale, 1.0e-8f);
+    if (group == 0 && tensor_scale != nullptr) {
+      *tensor_scale = global_scale;
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x < 8) {
+    const size_t col = start + threadIdx.x * 2;
+    if (col < values) {
+      const float v0 = staged[threadIdx.x * 2] / decoded_scale;
+      uint8_t packed = encode_e2m1(v0);
+      if (col + 1 < values) {
+        const float v1 = staged[threadIdx.x * 2 + 1] / decoded_scale;
+        packed |= static_cast<uint8_t>(encode_e2m1(v1) << 4);
+      }
+      output_fp4[col / 2] = packed;
+    }
+  }
+}
+
 __global__ void sample_argmax_kernel(const __nv_bfloat16 *logits,
                                      uint32_t *output_token,
+                                     uint32_t *mirror_output_token,
                                      size_t vocab_size, float temperature) {
   __shared__ float warp_scores[8];
   __shared__ uint32_t warp_indices[8];
@@ -374,6 +529,9 @@ __global__ void sample_argmax_kernel(const __nv_bfloat16 *logits,
     }
     if (lane_id == 0) {
       *output_token = best_idx;
+      if (mirror_output_token != nullptr) {
+        *mirror_output_token = best_idx;
+      }
     }
   }
 }
@@ -1256,6 +1414,29 @@ extern "C" int qwen36_swiglu(const qwen36_swiglu_spec_t *spec) {
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
 
+extern "C" int
+qwen36_swiglu_nvfp4_quantize(const qwen36_swiglu_nvfp4_quantize_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->intermediate == 0 || spec->gate_bf16.ptr == 0 ||
+      spec->up_bf16.ptr == 0 || spec->output_fp4.ptr == 0 ||
+      spec->output_scale_e4m3.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const unsigned int scale_blocks =
+      static_cast<unsigned int>((spec->intermediate + 15) / 16);
+  swiglu_nvfp4_quantize_kernel<<<scale_blocks, 32, 0,
+                                 qwen36_internal_active_stream()>>>(
+      ptr<const __nv_bfloat16>(spec->gate_bf16),
+      ptr<const __nv_bfloat16>(spec->up_bf16),
+      ptr<uint8_t>(spec->output_fp4), ptr<uint8_t>(spec->output_scale_e4m3),
+      ptr<float>(spec->output_tensor_scale_f32), spec->intermediate,
+      spec->input_tensor_scale_f32);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
 extern "C" int qwen36_sample(const qwen36_sampling_spec_t *spec) {
   if (spec == nullptr) {
     return QWEN36_STATUS_NULL_POINTER;
@@ -1268,7 +1449,8 @@ extern "C" int qwen36_sample(const qwen36_sampling_spec_t *spec) {
   const int threads = 256;
   sample_argmax_kernel<<<1, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->logits_bf16),
-      ptr<uint32_t>(spec->output_token_u32), spec->vocab_size,
+      ptr<uint32_t>(spec->output_token_u32),
+      ptr<uint32_t>(spec->mirror_output_token_u32), spec->vocab_size,
       spec->temperature);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;

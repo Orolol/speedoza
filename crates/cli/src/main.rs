@@ -15,6 +15,33 @@ use qwen36_fp4_loader::{
 use qwen36_fp4_runtime::{Engine, EngineConfig, LayerWeights, ModelWeightsManifest};
 use qwen36_fp4_tokenizer::{ChatMessage, QwenTokenizer};
 
+#[cfg(feature = "cuda")]
+const DEFAULT_MTP_MAX_PROMPT_TOKENS: usize = 1_000_000;
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy)]
+struct MtpSchedule {
+    requested_tokens: usize,
+    effective_tokens: usize,
+    max_prompt_tokens: usize,
+    auto_disabled: bool,
+}
+
+#[cfg(feature = "cuda")]
+fn mtp_schedule(requested_tokens: usize, prompt_tokens: usize) -> MtpSchedule {
+    let max_prompt_tokens = std::env::var("QWEN36_MTP_MAX_PROMPT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MTP_MAX_PROMPT_TOKENS);
+    let auto_disabled = requested_tokens > 0 && prompt_tokens > max_prompt_tokens;
+    MtpSchedule {
+        requested_tokens,
+        effective_tokens: if auto_disabled { 0 } else { requested_tokens },
+        max_prompt_tokens,
+        auto_disabled,
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "qwen36")]
 #[command(about = "Qwen3.6-27B Text NVFP4 MTP single-stream runtime")]
@@ -96,6 +123,8 @@ enum Command {
         top_k: usize,
         #[arg(long)]
         out: Option<PathBuf>,
+        #[arg(long)]
+        max_context: Option<usize>,
     },
     /// Run prefill, decode one explicit token, then dump post-decode logits.
     DumpDecode {
@@ -111,6 +140,8 @@ enum Command {
         top_k: usize,
         #[arg(long)]
         out: Option<PathBuf>,
+        #[arg(long)]
+        max_context: Option<usize>,
     },
 }
 
@@ -228,14 +259,15 @@ fn main() -> Result<()> {
             chat_template,
             top_k,
             out,
+            max_context,
         } => {
             #[cfg(feature = "cuda")]
             {
-                run_dump_logits(model_dir, prompt, chat_template, top_k, out)?;
+                run_dump_logits(model_dir, prompt, chat_template, top_k, out, max_context)?;
             }
             #[cfg(not(feature = "cuda"))]
             {
-                let _ = (model_dir, prompt, chat_template, top_k, out);
+                let _ = (model_dir, prompt, chat_template, top_k, out, max_context);
                 anyhow::bail!(
                     "dump-logits requires the cuda feature; rebuild with --features cuda"
                 );
@@ -248,6 +280,7 @@ fn main() -> Result<()> {
             decode_token_id,
             top_k,
             out,
+            max_context,
         } => {
             #[cfg(feature = "cuda")]
             {
@@ -258,6 +291,7 @@ fn main() -> Result<()> {
                     decode_token_id,
                     top_k,
                     out,
+                    max_context,
                 )?;
             }
             #[cfg(not(feature = "cuda"))]
@@ -269,6 +303,7 @@ fn main() -> Result<()> {
                     decode_token_id,
                     top_k,
                     out,
+                    max_context,
                 );
                 anyhow::bail!(
                     "dump-decode requires the cuda feature; rebuild with --features cuda"
@@ -294,16 +329,26 @@ fn run_chat(
         content: prompt,
     }];
     let prompt_tokens = tokenizer.encode_chat(&messages, true)?;
+    let mtp_schedule = mtp_schedule(mtp_speculative_tokens, prompt_tokens.len());
     let config = EngineConfig {
         max_context: prompt_tokens.len().saturating_add(max_new_tokens).max(1),
         kv_cache_dtype: KvCacheDtype::Bf16,
-        mtp_speculative_tokens,
+        mtp_speculative_tokens: mtp_schedule.effective_tokens,
         ..EngineConfig::default()
     };
     let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, config)?;
     engine.prefill(&prompt_tokens)?;
 
-    if mtp_speculative_tokens > 0 {
+    if mtp_schedule.effective_tokens > 0 {
+        if mtp_schedule.effective_tokens > 1 {
+            return run_chat_mtp_multi(
+                &mut engine,
+                &tokenizer,
+                &prompt_tokens,
+                max_new_tokens,
+                mtp_schedule.effective_tokens,
+            );
+        }
         engine.queue_sample_greedy_to_current_token()?;
         qwen36_fp4_runtime::cuda_synchronize()?;
         let mut current_token = engine.read_current_token()?;
@@ -353,24 +398,14 @@ fn run_chat(
                 }
             } else {
                 rejected_draft_tokens += 1;
-                let mut committed_tokens = prompt_tokens.clone();
-                committed_tokens.extend_from_slice(&emitted_tokens);
-                engine.reset_cuda_state()?;
-                engine.prefill(&committed_tokens)?;
-                engine.queue_sample_greedy_to_current_token()?;
-                qwen36_fp4_runtime::cuda_synchronize()?;
-                current_token = engine.read_current_token()?;
-                if current_token != verify.verified_token {
-                    anyhow::bail!(
-                        "MTP rejection rebuild drifted: verified={} rebuilt={}",
-                        verify.verified_token,
-                        current_token
-                    );
+                // The engine has already rolled back the verify chunk and
+                // committed `current_token` at `start_position` — including a
+                // fresh MTP draft sampled from the newly-verified hidden
+                // state, when the loop will iterate at least once more.
+                current_token = verify.verified_token;
+                if let Some(next_draft) = verify.next_draft_token {
+                    draft_token = next_draft;
                 }
-                engine.prepare_mtp_prefill_from_sampled(&committed_tokens, current_token)?;
-                engine.queue_sample_greedy()?;
-                qwen36_fp4_runtime::cuda_synchronize()?;
-                draft_token = engine.read_sampled_token()?;
             }
         }
         if std::env::var("QWEN36_MTP_STATS").is_ok() {
@@ -420,12 +455,95 @@ fn run_chat(
 }
 
 #[cfg(feature = "cuda")]
+fn run_chat_mtp_multi(
+    engine: &mut Engine<qwen36_fp4_runtime::CudaBackend>,
+    tokenizer: &QwenTokenizer,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    draft_window: usize,
+) -> Result<()> {
+    engine.queue_sample_greedy_to_current_token()?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+    let mut current_token = engine.read_current_token()?;
+    let mut draft_tokens =
+        engine.prepare_mtp_drafts_from_sampled(prompt_tokens, current_token, draft_window)?;
+
+    let mut generated = 0_usize;
+    let mut accepted_draft_tokens = 0_usize;
+    let mut rejected_draft_tokens = 0_usize;
+
+    while generated < max_new_tokens {
+        let text = tokenizer.decode(&[current_token], true)?;
+        print!("{text}");
+        io::stdout().flush()?;
+        generated += 1;
+        if current_token == 248044 || generated >= max_new_tokens {
+            break;
+        }
+        if draft_tokens.is_empty() {
+            anyhow::bail!("MTP multi loop lost its draft window before generation completed");
+        }
+
+        let remaining_after_current = max_new_tokens - generated;
+        let verify_count = draft_tokens.len().min(remaining_after_current);
+        let need_next_token_on_full_accept = remaining_after_current > verify_count;
+        let verify = engine.verify_mtp_draft_tokens(
+            current_token,
+            &draft_tokens[..verify_count],
+            need_next_token_on_full_accept,
+            draft_window,
+        )?;
+        accepted_draft_tokens += verify.accepted_drafts;
+        if verify.rejected {
+            rejected_draft_tokens += 1;
+        }
+
+        let mut stopped = false;
+        for token in draft_tokens.iter().copied().take(verify.accepted_drafts) {
+            let text = tokenizer.decode(&[token], true)?;
+            print!("{text}");
+            io::stdout().flush()?;
+            generated += 1;
+            if token == 248044 || generated >= max_new_tokens {
+                stopped = true;
+                break;
+            }
+        }
+        if stopped {
+            break;
+        }
+
+        current_token = verify.next_token.ok_or_else(|| {
+            anyhow::anyhow!("MTP multi verification did not return the next current token")
+        })?;
+        draft_tokens = verify.next_draft_tokens;
+    }
+
+    if std::env::var("QWEN36_MTP_STATS").is_ok() {
+        let drafts = accepted_draft_tokens + rejected_draft_tokens;
+        eprintln!(
+            "mtp.stats accepted={} rejected={} acceptance_rate={:.4}",
+            accepted_draft_tokens,
+            rejected_draft_tokens,
+            if drafts > 0 {
+                accepted_draft_tokens as f64 / drafts as f64
+            } else {
+                0.0
+            }
+        );
+    }
+    println!();
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn run_dump_logits(
     model_dir: PathBuf,
     prompt: String,
     chat_template: bool,
     top_k: usize,
     out: Option<PathBuf>,
+    max_context: Option<usize>,
 ) -> Result<()> {
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
@@ -452,7 +570,10 @@ fn run_dump_logits(
     let vocab = topology.vocab_size;
 
     let config = EngineConfig {
-        max_context: prompt_tokens.len().max(1),
+        max_context: max_context
+            .unwrap_or_else(|| prompt_tokens.len().max(1))
+            .max(prompt_tokens.len())
+            .max(1),
         kv_cache_dtype: KvCacheDtype::Bf16,
         ..EngineConfig::default()
     };
@@ -525,6 +646,7 @@ fn run_dump_decode(
     decode_token_id: u32,
     top_k: usize,
     out: Option<PathBuf>,
+    max_context: Option<usize>,
 ) -> Result<()> {
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
@@ -556,7 +678,10 @@ fn run_dump_decode(
     let vocab = topology.vocab_size;
 
     let config = EngineConfig {
-        max_context: prompt_tokens.len().saturating_add(1).max(1),
+        max_context: max_context
+            .unwrap_or_else(|| prompt_tokens.len().saturating_add(1))
+            .max(prompt_tokens.len().saturating_add(1))
+            .max(1),
         kv_cache_dtype: KvCacheDtype::Bf16,
         ..EngineConfig::default()
     };
@@ -637,18 +762,19 @@ fn run_bench(
     token_text: String,
     mtp_speculative_tokens: usize,
 ) -> Result<()> {
-    if mtp_speculative_tokens > 1 {
-        anyhow::bail!("bench currently supports --mtp-speculative-tokens 0 or 1");
+    if mtp_speculative_tokens > 3 {
+        anyhow::bail!("bench currently supports --mtp-speculative-tokens 0..=3");
     }
     let total_start = Instant::now();
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
     let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
     let prompt_tokens = synthetic_prompt_tokens(&tokenizer, &token_text, prompt_token_count)?;
+    let mtp_schedule = mtp_schedule(mtp_speculative_tokens, prompt_tokens.len());
     let config = EngineConfig {
         max_context: prompt_tokens.len().saturating_add(max_new_tokens).max(1),
         kv_cache_dtype: KvCacheDtype::Bf16,
-        mtp_speculative_tokens,
+        mtp_speculative_tokens: mtp_schedule.effective_tokens,
         ..EngineConfig::default()
     };
 
@@ -660,7 +786,7 @@ fn run_bench(
     engine.prefill(&prompt_tokens)?;
     let prefill_seconds = prefill_start.elapsed().as_secs_f64();
 
-    if mtp_speculative_tokens == 1 {
+    if mtp_schedule.effective_tokens == 1 {
         return run_bench_mtp_one(
             engine,
             prompt_tokens,
@@ -668,6 +794,18 @@ fn run_bench(
             total_start,
             load_seconds,
             prefill_seconds,
+            mtp_schedule,
+        );
+    }
+    if mtp_schedule.effective_tokens > 1 {
+        return run_bench_mtp_multi(
+            engine,
+            prompt_tokens,
+            max_new_tokens,
+            total_start,
+            load_seconds,
+            prefill_seconds,
+            mtp_schedule,
         );
     }
 
@@ -676,17 +814,32 @@ fn run_bench(
     // token. The graph collapses ~600 host kernel launches per token into
     // a single cudaGraphLaunch and reads the position from a device-side
     // counter so the same recording works for every iteration.
+    //
+    // When QWEN36_PROFILE_DECODE_LAYERS=1 is set, fall back to the host
+    // launch path (decode_sampled_queued + queue_sample_greedy) so that the
+    // per-layer instrumentation in forward_device_token_cuda_inner fires —
+    // graph capture would otherwise hide the per-section sync points the
+    // profiler relies on.
+    let profile_decode = std::env::var("QWEN36_PROFILE_DECODE_LAYERS").is_ok();
     let decode_start = Instant::now();
     engine.queue_sample_greedy()?;
     let mut generated = 1_usize;
     if max_new_tokens > 1 {
-        engine.enable_decode_graph()?;
-        generated += 1;
-        for _ in 2..max_new_tokens {
-            engine.decode_graph_step()?;
+        if profile_decode {
+            for _ in 1..max_new_tokens {
+                engine.decode_sampled_queued()?;
+                engine.queue_sample_greedy()?;
+                generated += 1;
+            }
+        } else {
+            engine.enable_decode_graph()?;
             generated += 1;
+            for _ in 2..max_new_tokens {
+                engine.decode_graph_step()?;
+                generated += 1;
+            }
+            engine.disable_decode_graph()?;
         }
-        engine.disable_decode_graph()?;
     }
     qwen36_fp4_runtime::cuda_synchronize()?;
     let decode_seconds = decode_start.elapsed().as_secs_f64();
@@ -704,7 +857,10 @@ fn run_bench(
             "total_seconds": total_seconds,
             "prefill_tokens_per_second": rate(prompt_tokens.len(), prefill_seconds),
             "decode_tokens_per_second": rate(generated, decode_seconds),
-            "mtp_speculative_tokens": mtp_speculative_tokens,
+            "mtp_speculative_tokens": mtp_schedule.effective_tokens,
+            "mtp_requested_speculative_tokens": mtp_schedule.requested_tokens,
+            "mtp_auto_disabled": mtp_schedule.auto_disabled,
+            "mtp_max_prompt_tokens": mtp_schedule.max_prompt_tokens,
         }))?
     );
     Ok(())
@@ -718,6 +874,7 @@ fn run_bench_mtp_one(
     total_start: Instant,
     load_seconds: f64,
     prefill_seconds: f64,
+    mtp_schedule: MtpSchedule,
 ) -> Result<()> {
     let decode_start = Instant::now();
     if max_new_tokens == 0 {
@@ -736,7 +893,10 @@ fn run_bench_mtp_one(
                 "total_seconds": total_seconds,
                 "prefill_tokens_per_second": rate(prompt_tokens.len(), prefill_seconds),
                 "decode_tokens_per_second": 0.0,
-                "mtp_speculative_tokens": 1,
+                "mtp_speculative_tokens": mtp_schedule.effective_tokens,
+                "mtp_requested_speculative_tokens": mtp_schedule.requested_tokens,
+                "mtp_auto_disabled": mtp_schedule.auto_disabled,
+                "mtp_max_prompt_tokens": mtp_schedule.max_prompt_tokens,
                 "mtp_accepted_draft_tokens": 0,
                 "mtp_rejected_draft_tokens": 0,
                 "mtp_acceptance_rate": 0.0,
@@ -761,7 +921,11 @@ fn run_bench_mtp_one(
     let mut rejected_draft_tokens = 0_usize;
     let mut main_decode_steps = 0_usize;
     let mut mtp_decode_steps = 1_usize;
-    let mut rebuilds = 0_usize;
+    // Full reset+reprefill rebuilds should stay at 0 now that rejection recovery
+    // happens in-engine. Track rollback recoveries separately so rejection-heavy
+    // runs remain visible in the bench JSON.
+    let rebuilds = 0_usize;
+    let mut rollback_recoveries = 0_usize;
 
     while generated < max_new_tokens {
         emitted_tokens.push(current_token);
@@ -798,25 +962,14 @@ fn run_bench_mtp_one(
             }
         } else {
             rejected_draft_tokens += 1;
-            rebuilds += 1;
-            let mut committed_tokens = prompt_tokens.clone();
-            committed_tokens.extend_from_slice(&emitted_tokens);
-            engine.reset_cuda_state()?;
-            engine.prefill(&committed_tokens)?;
-            engine.queue_sample_greedy_to_current_token()?;
-            qwen36_fp4_runtime::cuda_synchronize()?;
-            current_token = engine.read_current_token()?;
-            if current_token != verify.verified_token {
-                anyhow::bail!(
-                    "MTP rejection rebuild drifted: verified={} rebuilt={}",
-                    verify.verified_token,
-                    current_token
-                );
+            rollback_recoveries += 1;
+            // S3: in-engine rollback. No reset + reprefill needed; the
+            // verify path restored the recurrent state, committed
+            // `current_token`, and produced the next draft directly.
+            current_token = verify.verified_token;
+            if let Some(next_draft) = verify.next_draft_token {
+                draft_token = next_draft;
             }
-            engine.prepare_mtp_prefill_from_sampled(&committed_tokens, current_token)?;
-            engine.queue_sample_greedy()?;
-            qwen36_fp4_runtime::cuda_synchronize()?;
-            draft_token = engine.read_sampled_token()?;
             mtp_decode_steps += 1;
         }
     }
@@ -836,7 +989,10 @@ fn run_bench_mtp_one(
             "total_seconds": total_seconds,
             "prefill_tokens_per_second": rate(prompt_tokens.len(), prefill_seconds),
             "decode_tokens_per_second": rate(generated, decode_seconds),
-            "mtp_speculative_tokens": 1,
+            "mtp_speculative_tokens": mtp_schedule.effective_tokens,
+            "mtp_requested_speculative_tokens": mtp_schedule.requested_tokens,
+            "mtp_auto_disabled": mtp_schedule.auto_disabled,
+            "mtp_max_prompt_tokens": mtp_schedule.max_prompt_tokens,
             "mtp_accepted_draft_tokens": accepted_draft_tokens,
             "mtp_rejected_draft_tokens": rejected_draft_tokens,
             "mtp_acceptance_rate": if evaluated_drafts > 0 {
@@ -846,6 +1002,137 @@ fn run_bench_mtp_one(
             },
             "main_decode_steps": main_decode_steps,
             "mtp_decode_steps": mtp_decode_steps,
+            "mtp_rollback_recoveries": rollback_recoveries,
+            "mtp_rebuilds": rebuilds,
+        }))?
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_bench_mtp_multi(
+    mut engine: Engine<qwen36_fp4_runtime::CudaBackend>,
+    prompt_tokens: Vec<u32>,
+    max_new_tokens: usize,
+    total_start: Instant,
+    load_seconds: f64,
+    prefill_seconds: f64,
+    mtp_schedule: MtpSchedule,
+) -> Result<()> {
+    let decode_start = Instant::now();
+    if max_new_tokens == 0 {
+        qwen36_fp4_runtime::cuda_synchronize()?;
+        let decode_seconds = decode_start.elapsed().as_secs_f64();
+        let total_seconds = total_start.elapsed().as_secs_f64();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "backend": "cuda",
+                "prompt_tokens": prompt_tokens.len(),
+                "generated_tokens": 0,
+                "load_seconds": load_seconds,
+                "prefill_seconds": prefill_seconds,
+                "decode_seconds": decode_seconds,
+                "total_seconds": total_seconds,
+                "prefill_tokens_per_second": rate(prompt_tokens.len(), prefill_seconds),
+                "decode_tokens_per_second": 0.0,
+                "mtp_speculative_tokens": mtp_schedule.effective_tokens,
+                "mtp_requested_speculative_tokens": mtp_schedule.requested_tokens,
+                "mtp_auto_disabled": mtp_schedule.auto_disabled,
+                "mtp_max_prompt_tokens": mtp_schedule.max_prompt_tokens,
+                "mtp_accepted_draft_tokens": 0,
+                "mtp_rejected_draft_tokens": 0,
+                "mtp_acceptance_rate": 0.0,
+                "main_decode_steps": 0,
+                "mtp_decode_steps": 0,
+                "mtp_rollback_recoveries": 0,
+                "mtp_rebuilds": 0,
+            }))?
+        );
+        return Ok(());
+    }
+
+    let draft_window = mtp_schedule.effective_tokens;
+    engine.queue_sample_greedy_to_current_token()?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+    let mut current_token = engine.read_current_token()?;
+    let mut draft_tokens =
+        engine.prepare_mtp_drafts_from_sampled(&prompt_tokens, current_token, draft_window)?;
+
+    let mut generated = 0_usize;
+    let mut accepted_draft_tokens = 0_usize;
+    let mut rejected_draft_tokens = 0_usize;
+    let mut main_decode_steps = 0_usize;
+    let mut mtp_decode_steps = draft_tokens.len();
+    let mut rollback_recoveries = 0_usize;
+    let rebuilds = 0_usize;
+
+    while generated < max_new_tokens {
+        generated += 1;
+        if generated >= max_new_tokens {
+            break;
+        }
+        if draft_tokens.is_empty() {
+            anyhow::bail!("MTP multi loop lost its draft window before generation completed");
+        }
+
+        let remaining_after_current = max_new_tokens - generated;
+        let verify_count = draft_tokens.len().min(remaining_after_current);
+        let need_next_token_on_full_accept = remaining_after_current > verify_count;
+        let verify = engine.verify_mtp_draft_tokens(
+            current_token,
+            &draft_tokens[..verify_count],
+            need_next_token_on_full_accept,
+            draft_window,
+        )?;
+        main_decode_steps += 1;
+        accepted_draft_tokens += verify.accepted_drafts;
+        if verify.rejected {
+            rejected_draft_tokens += 1;
+            rollback_recoveries += 1;
+        }
+
+        generated += verify.accepted_drafts;
+        if generated >= max_new_tokens {
+            break;
+        }
+        current_token = verify.next_token.ok_or_else(|| {
+            anyhow::anyhow!("MTP multi verification did not return the next current token")
+        })?;
+        mtp_decode_steps += verify.next_draft_tokens.len();
+        draft_tokens = verify.next_draft_tokens;
+    }
+
+    qwen36_fp4_runtime::cuda_synchronize()?;
+    let decode_seconds = decode_start.elapsed().as_secs_f64();
+    let total_seconds = total_start.elapsed().as_secs_f64();
+    let evaluated_drafts = accepted_draft_tokens + rejected_draft_tokens;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "backend": "cuda",
+            "prompt_tokens": prompt_tokens.len(),
+            "generated_tokens": generated,
+            "load_seconds": load_seconds,
+            "prefill_seconds": prefill_seconds,
+            "decode_seconds": decode_seconds,
+            "total_seconds": total_seconds,
+            "prefill_tokens_per_second": rate(prompt_tokens.len(), prefill_seconds),
+            "decode_tokens_per_second": rate(generated, decode_seconds),
+            "mtp_speculative_tokens": mtp_schedule.effective_tokens,
+            "mtp_requested_speculative_tokens": mtp_schedule.requested_tokens,
+            "mtp_auto_disabled": mtp_schedule.auto_disabled,
+            "mtp_max_prompt_tokens": mtp_schedule.max_prompt_tokens,
+            "mtp_accepted_draft_tokens": accepted_draft_tokens,
+            "mtp_rejected_draft_tokens": rejected_draft_tokens,
+            "mtp_acceptance_rate": if evaluated_drafts > 0 {
+                accepted_draft_tokens as f64 / evaluated_drafts as f64
+            } else {
+                0.0
+            },
+            "main_decode_steps": main_decode_steps,
+            "mtp_decode_steps": mtp_decode_steps,
+            "mtp_rollback_recoveries": rollback_recoveries,
             "mtp_rebuilds": rebuilds,
         }))?
     );

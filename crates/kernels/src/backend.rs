@@ -13,7 +13,7 @@ use crate::ops::{
 use crate::rmsnorm::RmsNormSpec;
 use crate::rope::PartialRopeSpec;
 use crate::sampling::SamplingSpec;
-use crate::swiglu::SwiGluSpec;
+use crate::swiglu::{SwiGluNvfp4QuantizeSpec, SwiGluSpec};
 use crate::turboquant::{TurboQuantAttentionSpec, TurboQuantEncodeSpec};
 
 #[repr(transparent)]
@@ -73,6 +73,10 @@ pub trait KernelBackend: Send + Sync {
 
     fn swiglu(&self, _spec: &SwiGluSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("swiglu"))
+    }
+
+    fn swiglu_nvfp4_quantize(&self, _spec: &SwiGluNvfp4QuantizeSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("swiglu_nvfp4_quantize"))
     }
 
     fn sample(&self, _spec: &SamplingSpec) -> Result<()> {
@@ -223,6 +227,13 @@ impl KernelBackend for CudaBackend {
     fn swiglu(&self, spec: &SwiGluSpec) -> Result<()> {
         let ffi_spec = ffi::SwiGluSpec::from(spec);
         check("qwen36_swiglu", unsafe { ffi::qwen36_swiglu(&ffi_spec) })
+    }
+
+    fn swiglu_nvfp4_quantize(&self, spec: &SwiGluNvfp4QuantizeSpec) -> Result<()> {
+        let ffi_spec = ffi::SwiGluNvfp4QuantizeSpec::from(spec);
+        check("qwen36_swiglu_nvfp4_quantize", unsafe {
+            ffi::qwen36_swiglu_nvfp4_quantize(&ffi_spec)
+        })
     }
 
     fn sample(&self, spec: &SamplingSpec) -> Result<()> {
@@ -408,6 +419,11 @@ mod ffi {
         pub output_bf16: DevicePtr,
         pub shape: AttentionShape,
         pub start_position_device_i32: DevicePtr,
+        pub partial_acc_f32: DevicePtr,
+        pub partial_max_f32: DevicePtr,
+        pub partial_denom_f32: DevicePtr,
+        pub prefill_n_splits: usize,
+        pub split_timesteps_per_block: usize,
     }
 
     impl From<&crate::attention::AttentionPrefillSpec> for AttentionPrefillSpec {
@@ -424,6 +440,11 @@ mod ffi {
                 output_bf16: value.output_bf16,
                 shape: AttentionShape::from(value.shape),
                 start_position_device_i32: value.start_position_device_i32,
+                partial_acc_f32: value.partial_acc_f32,
+                partial_max_f32: value.partial_max_f32,
+                partial_denom_f32: value.partial_denom_f32,
+                prefill_n_splits: value.prefill_n_splits,
+                split_timesteps_per_block: value.split_timesteps_per_block,
             }
         }
     }
@@ -440,6 +461,11 @@ mod ffi {
         pub output_bf16: DevicePtr,
         pub shape: AttentionShape,
         pub position_device_i32: DevicePtr,
+        pub partial_acc_f32: DevicePtr,
+        pub partial_max_f32: DevicePtr,
+        pub partial_denom_f32: DevicePtr,
+        pub decode_n_splits: usize,
+        pub split_timesteps_per_block: usize,
     }
 
     impl From<&crate::attention::AttentionDecodeSpec> for AttentionDecodeSpec {
@@ -455,6 +481,11 @@ mod ffi {
                 output_bf16: value.output_bf16,
                 shape: AttentionShape::from(value.shape),
                 position_device_i32: value.position_device_i32,
+                partial_acc_f32: value.partial_acc_f32,
+                partial_max_f32: value.partial_max_f32,
+                partial_denom_f32: value.partial_denom_f32,
+                decode_n_splits: value.decode_n_splits,
+                split_timesteps_per_block: value.split_timesteps_per_block,
             }
         }
     }
@@ -683,6 +714,31 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct SwiGluNvfp4QuantizeSpec {
+        pub intermediate: usize,
+        pub gate_bf16: DevicePtr,
+        pub up_bf16: DevicePtr,
+        pub output_fp4: DevicePtr,
+        pub output_scale_e4m3: DevicePtr,
+        pub output_tensor_scale_f32: DevicePtr,
+        pub input_tensor_scale_f32: f32,
+    }
+
+    impl From<&crate::swiglu::SwiGluNvfp4QuantizeSpec> for SwiGluNvfp4QuantizeSpec {
+        fn from(value: &crate::swiglu::SwiGluNvfp4QuantizeSpec) -> Self {
+            Self {
+                intermediate: value.intermediate,
+                gate_bf16: value.gate_bf16,
+                up_bf16: value.up_bf16,
+                output_fp4: value.output_fp4,
+                output_scale_e4m3: value.output_scale_e4m3,
+                output_tensor_scale_f32: value.output_tensor_scale_f32,
+                input_tensor_scale_f32: value.input_tensor_scale_f32,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct SamplingSpec {
         pub vocab_size: usize,
         pub logits_bf16: DevicePtr,
@@ -691,6 +747,7 @@ mod ffi {
         pub top_k: usize,
         pub top_p: f32,
         pub repetition_penalty: f32,
+        pub mirror_output_token_u32: DevicePtr,
     }
 
     impl From<&crate::sampling::SamplingSpec> for SamplingSpec {
@@ -703,6 +760,7 @@ mod ffi {
                 top_k: value.top_k,
                 top_p: value.top_p,
                 repetition_penalty: value.repetition_penalty,
+                mirror_output_token_u32: value.mirror_output_token_u32,
             }
         }
     }
@@ -1112,6 +1170,9 @@ mod ffi {
         pub fn qwen36_rmsnorm_nvfp4_quantize(spec: *const RmsNormNvfp4QuantizeSpec) -> i32;
         pub fn qwen36_partial_rope(spec: *const PartialRopeSpec) -> i32;
         pub fn qwen36_swiglu(spec: *const SwiGluSpec) -> i32;
+        pub fn qwen36_swiglu_nvfp4_quantize(
+            spec: *const SwiGluNvfp4QuantizeSpec,
+        ) -> i32;
         pub fn qwen36_sample(spec: *const SamplingSpec) -> i32;
         pub fn qwen36_embedding_lookup(spec: *const EmbeddingLookupSpec) -> i32;
         pub fn qwen36_bf16_gemm(spec: *const Bf16GemmSpec) -> i32;

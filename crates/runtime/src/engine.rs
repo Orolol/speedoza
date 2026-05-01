@@ -9,7 +9,8 @@ use qwen36_fp4_kernels::{
     Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode, CudaBackend,
     DeltaNetDecodeSpec, DeltaNetShape, DevicePtr, EmbeddingLookupSpec, GdnGateSpec, Nvfp4GemmSpec,
     Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec, QProjDeinterleaveSpec,
-    QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec, SamplingSpec, SwiGluSpec,
+    QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec, SamplingSpec,
+    SwiGluNvfp4QuantizeSpec, SwiGluSpec,
 };
 use qwen36_fp4_kernels::{KernelBackend, NoCudaBackend};
 #[cfg(feature = "cuda")]
@@ -17,7 +18,11 @@ use qwen36_fp4_loader::MappedModel;
 
 use crate::cuda_graph::CudaGraphPlan;
 #[cfg(feature = "cuda")]
-use crate::gpu::{GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers, GpuWeightStore};
+use crate::gpu::{
+    GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers, GpuWeightStore,
+    LinearAttnInProjFused, LinearAttnInProjFusedStore, MlpFusedLayer, MlpFusedStore,
+    MtpKvSnapshotLayout,
+};
 use crate::kv_cache::KvCachePlan;
 use crate::state::{DeltaNetStatePlan, RuntimeState};
 use crate::weights::ModelWeightsManifest;
@@ -26,6 +31,13 @@ use crate::weights::{
     CommonLayerWeights, FullAttentionLayerWeights, LayerWeights, LinearAttentionLayerWeights,
     LinearWeightBinding,
 };
+
+#[cfg(feature = "cuda")]
+const MTP_MAX_DRAFT_TOKENS: usize = 3;
+#[cfg(feature = "cuda")]
+const MTP_GRAPH_BUNDLE_U32S: usize = 16;
+#[cfg(feature = "cuda")]
+const MTP_GRAPH_VERIFIED_BASE: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -63,6 +75,15 @@ pub struct MtpVerifyResult {
     pub next_draft_token: Option<u32>,
 }
 
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MtpMultiVerifyResult {
+    pub accepted_drafts: usize,
+    pub rejected: bool,
+    pub next_token: Option<u32>,
+    pub next_draft_tokens: Vec<u32>,
+}
+
 pub struct Engine<B: KernelBackend = NoCudaBackend> {
     pub topology: ModelTopology,
     pub config: EngineConfig,
@@ -76,6 +97,18 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
     pub gpu_forward: Option<GpuForwardBuffers>,
     #[cfg(feature = "cuda")]
     pub gpu_prefill: Option<GpuPrefillBuffers>,
+    /// Pre-concatenated gate_proj + up_proj NVFP4 weights for the decode MLP
+    /// fast path (one cuBLASLt FP4 GEMM instead of two). Only valid when
+    /// every layer's gate/up share `tensor_scale` and `input_scale`, which
+    /// holds for the shipped Qwen3.6 NVFP4 checkpoint.
+    #[cfg(feature = "cuda")]
+    pub mlp_fused: Option<MlpFusedStore>,
+    /// Pre-concatenated DeltaNet in_proj_qkv/_b/_a/_z NVFP4 weights for the
+    /// decode linear-attention fast path (one combined cuBLASLt FP4 GEMM
+    /// instead of four). Indexed by global layer index; `None` for full-attn
+    /// layers.
+    #[cfg(feature = "cuda")]
+    pub linear_attn_in_proj_fused: Option<LinearAttnInProjFusedStore>,
     /// Capture-mode CUDA stream + instantiated decode-and-sample graph. When
     /// `Some`, decode kernels read the current position from `forward.position_i32`
     /// instead of a host scalar so the same graph can replay across iterations.
@@ -86,9 +119,19 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
 
 #[cfg(feature = "cuda")]
 struct DecodeGraphState {
+    kind: DecodeGraphKind,
     stream: qwen36_fp4_kernels::graph::OwnedCudaStream,
     exec: qwen36_fp4_kernels::graph::CudaGraphExec,
     raw_graph: qwen36_fp4_kernels::graph::CudaGraph,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeGraphKind {
+    Decode,
+    MtpDecodeOne,
+    MtpVerifyOne,
+    MtpVerifyMulti { drafts: usize },
 }
 
 #[cfg(feature = "cuda")]
@@ -141,6 +184,10 @@ impl<B: KernelBackend> Engine<B> {
             gpu_forward: None,
             #[cfg(feature = "cuda")]
             gpu_prefill: None,
+            #[cfg(feature = "cuda")]
+            mlp_fused: None,
+            #[cfg(feature = "cuda")]
+            linear_attn_in_proj_fused: None,
             #[cfg(feature = "cuda")]
             decode_graph: None,
             backend,
@@ -229,6 +276,7 @@ impl<B: KernelBackend> Engine<B> {
 
     #[cfg(feature = "cuda")]
     pub fn read_sampled_token(&self) -> Result<u32> {
+        self.synchronize_active_stream_for_host_read()?;
         let mut token = [0_u8; 4];
         self.cuda_forward()?
             .sampled_token_u32
@@ -238,6 +286,7 @@ impl<B: KernelBackend> Engine<B> {
 
     #[cfg(feature = "cuda")]
     pub fn read_current_token(&self) -> Result<u32> {
+        self.synchronize_active_stream_for_host_read()?;
         let mut token = [0_u8; 4];
         self.cuda_forward()?.token_u32.copy_to_host(&mut token)?;
         Ok(u32::from_ne_bytes(token))
@@ -259,16 +308,37 @@ impl<B: KernelBackend> Engine<B> {
 
     #[cfg(feature = "cuda")]
     fn queue_sample_greedy_into(&self, output_token_u32: DevicePtr) -> Result<()> {
+        self.queue_sample_greedy_into_with_mirror(output_token_u32, DevicePtr::NULL)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn queue_sample_greedy_into_with_mirror(
+        &self,
+        output_token_u32: DevicePtr,
+        mirror_output_token_u32: DevicePtr,
+    ) -> Result<()> {
         self.backend.sample(&SamplingSpec {
             vocab_size: self.topology.vocab_size,
             logits_bf16: self.cuda_forward()?.logits.ptr(),
             output_token_u32,
+            mirror_output_token_u32,
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
             repetition_penalty: 1.0,
         })
     }
+
+    #[cfg(feature = "cuda")]
+    fn synchronize_active_stream_for_host_read(&self) -> Result<()> {
+        let stream = qwen36_fp4_kernels::graph::get_active_stream();
+        if stream.is_null() {
+            Ok(())
+        } else {
+            stream.synchronize()
+        }
+    }
+
 
     /// Capture a single decode-and-sample iteration into a CUDA graph for
     /// replay. After this returns, [`decode_graph_step`] can be called
@@ -288,8 +358,15 @@ impl<B: KernelBackend> Engine<B> {
     pub fn enable_decode_graph(&mut self) -> Result<()> {
         use qwen36_fp4_kernels::graph::{self, CudaStream};
 
-        if self.decode_graph.is_some() {
+        if self
+            .decode_graph
+            .as_ref()
+            .is_some_and(|graph| graph.kind == DecodeGraphKind::Decode)
+        {
             return Ok(());
+        }
+        if self.decode_graph.is_some() {
+            self.disable_decode_graph()?;
         }
         Self::ensure_graph_capture_allowed()?;
         if self.backend.name() == "no-cuda" {
@@ -349,6 +426,7 @@ impl<B: KernelBackend> Engine<B> {
         self.state.advance(1);
 
         self.decode_graph = Some(DecodeGraphState {
+            kind: DecodeGraphKind::Decode,
             stream,
             exec,
             raw_graph,
@@ -374,8 +452,15 @@ impl<B: KernelBackend> Engine<B> {
     fn ensure_mtp_verify_graph_two_tokens(&mut self, start_position: usize) -> Result<()> {
         use qwen36_fp4_kernels::graph::{self, CudaStream};
 
-        if self.decode_graph.is_some() {
+        if self
+            .decode_graph
+            .as_ref()
+            .is_some_and(|graph| graph.kind == DecodeGraphKind::MtpVerifyOne)
+        {
             return Ok(());
+        }
+        if self.decode_graph.is_some() {
+            self.disable_decode_graph()?;
         }
         Self::ensure_graph_capture_allowed()?;
         if self.config.mtp_speculative_tokens == 0 {
@@ -399,7 +484,11 @@ impl<B: KernelBackend> Engine<B> {
             self.prefill_cuda_chunk(2, start_position, start_position_device_i32, false)?;
             self.final_norm_prefill_rows(2)?;
             self.prefill_row_logits(0)?;
-            self.queue_sample_greedy_to_current_token()?;
+            let verified_token_ptr = self.cuda_forward()?.mtp_verify_token_u32.ptr_at(8)?;
+            self.queue_sample_greedy_into_with_mirror(
+                self.cuda_forward()?.token_u32.ptr(),
+                verified_token_ptr,
+            )?;
             self.prefill_row_logits(1)?;
             let next_token_ptr = self.cuda_forward()?.mtp_verify_token_u32.ptr_at(4)?;
             self.queue_sample_greedy_into(next_token_ptr)?;
@@ -411,7 +500,11 @@ impl<B: KernelBackend> Engine<B> {
                 self.cuda_forward()?.mtp_verify_token_u32.ptr(),
                 true,
             )?;
-            self.queue_sample_greedy()?;
+            let next_draft_ptr = self.cuda_forward()?.mtp_verify_token_u32.ptr_at(12)?;
+            self.queue_sample_greedy_into_with_mirror(
+                self.cuda_forward()?.sampled_token_u32.ptr(),
+                next_draft_ptr,
+            )?;
             let raw_graph = graph::end_capture(stream_handle)?;
             let exec = graph::instantiate(raw_graph)?;
             Ok((raw_graph, exec))
@@ -426,6 +519,7 @@ impl<B: KernelBackend> Engine<B> {
         };
 
         self.decode_graph = Some(DecodeGraphState {
+            kind: DecodeGraphKind::MtpVerifyOne,
             stream,
             exec,
             raw_graph,
@@ -438,6 +532,121 @@ impl<B: KernelBackend> Engine<B> {
         let graph_state = self.decode_graph.as_ref().ok_or_else(|| {
             CoreError::Runtime("MTP verify graph launch requested before capture".to_owned())
         })?;
+        if graph_state.kind != DecodeGraphKind::MtpVerifyOne {
+            return Err(CoreError::Runtime(
+                "MTP=1 verify graph launch found a different active graph".to_owned(),
+            ));
+        }
+        qwen36_fp4_kernels::graph::launch(graph_state.exec, graph_state.stream.handle())?;
+        graph_state.stream.handle().synchronize()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn ensure_mtp_verify_graph_multi_tokens(
+        &mut self,
+        draft_count: usize,
+        start_position: usize,
+    ) -> Result<()> {
+        use qwen36_fp4_kernels::graph::{self, CudaStream};
+
+        if !(2..=MTP_MAX_DRAFT_TOKENS).contains(&draft_count) {
+            return Err(CoreError::Runtime(format!(
+                "MTP multi verify graph expects 2..={MTP_MAX_DRAFT_TOKENS} drafts, got {draft_count}"
+            )));
+        }
+        if self.decode_graph.as_ref().is_some_and(|graph| {
+            graph.kind
+                == (DecodeGraphKind::MtpVerifyMulti {
+                    drafts: draft_count,
+                })
+        }) {
+            return Ok(());
+        }
+        if self.decode_graph.is_some() {
+            self.disable_decode_graph()?;
+        }
+        Self::ensure_graph_capture_allowed()?;
+        if self.config.mtp_speculative_tokens == 0 {
+            return Err(CoreError::Runtime(
+                "MTP multi verify graph requested with MTP disabled".to_owned(),
+            ));
+        }
+        if self.backend.name() == "no-cuda" {
+            return Err(CoreError::UnsupportedNoCuda(
+                "ensure_mtp_verify_graph_multi_tokens",
+            ));
+        }
+
+        let stream = CudaStream::create()?;
+        let stream_handle = stream.handle();
+        let verify_tokens = draft_count + 1;
+        let start_position_device_i32 = self.cuda_prefill()?.position_i32.ptr();
+        graph::set_active_stream(stream_handle);
+
+        let capture_result = (|| -> Result<(graph::CudaGraph, graph::CudaGraphExec)> {
+            graph::begin_capture(stream_handle)?;
+
+            self.prefill_cuda_chunk(
+                verify_tokens,
+                start_position,
+                start_position_device_i32,
+                false,
+            )?;
+            self.final_norm_prefill_rows(verify_tokens)?;
+            for draft_idx in 0..draft_count {
+                self.prefill_row_logits(draft_idx)?;
+                let verified_ptr = self
+                    .cuda_forward()?
+                    .mtp_verify_token_u32
+                    .ptr_at((MTP_GRAPH_VERIFIED_BASE + draft_idx) * 4)?;
+                self.queue_sample_greedy_into(verified_ptr)?;
+            }
+
+            self.prefill_row_logits(draft_count)?;
+            let next_token_ptr = self
+                .cuda_forward()?
+                .mtp_verify_token_u32
+                .ptr_at(draft_count * 4)?;
+            self.queue_sample_greedy_into(next_token_ptr)?;
+
+            let raw_graph = graph::end_capture(stream_handle)?;
+            let exec = graph::instantiate(raw_graph)?;
+            Ok((raw_graph, exec))
+        })();
+
+        let (raw_graph, exec) = match capture_result {
+            Ok(value) => value,
+            Err(err) => {
+                graph::set_active_stream(CudaStream::NULL);
+                return Err(err);
+            }
+        };
+
+        self.decode_graph = Some(DecodeGraphState {
+            kind: DecodeGraphKind::MtpVerifyMulti {
+                drafts: draft_count,
+            },
+            stream,
+            exec,
+            raw_graph,
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn launch_mtp_verify_graph_multi_tokens(&self, draft_count: usize) -> Result<()> {
+        let graph_state = self.decode_graph.as_ref().ok_or_else(|| {
+            CoreError::Runtime("MTP multi verify graph launch requested before capture".to_owned())
+        })?;
+        if graph_state.kind
+            != (DecodeGraphKind::MtpVerifyMulti {
+                drafts: draft_count,
+            })
+        {
+            return Err(CoreError::Runtime(
+                "MTP multi verify graph launch found a different active graph".to_owned(),
+            ));
+        }
         qwen36_fp4_kernels::graph::launch(graph_state.exec, graph_state.stream.handle())?;
         graph_state.stream.handle().synchronize()
     }
@@ -451,8 +660,15 @@ impl<B: KernelBackend> Engine<B> {
     pub fn enable_mtp_decode_graph(&mut self) -> Result<()> {
         use qwen36_fp4_kernels::graph::{self, CudaStream};
 
-        if self.decode_graph.is_some() {
+        if self
+            .decode_graph
+            .as_ref()
+            .is_some_and(|graph| graph.kind == DecodeGraphKind::MtpDecodeOne)
+        {
             return Ok(());
+        }
+        if self.decode_graph.is_some() {
+            self.disable_decode_graph()?;
         }
         Self::ensure_graph_capture_allowed()?;
         if self.config.mtp_speculative_tokens == 0 {
@@ -515,6 +731,7 @@ impl<B: KernelBackend> Engine<B> {
         self.state.advance(1);
 
         self.decode_graph = Some(DecodeGraphState {
+            kind: DecodeGraphKind::MtpDecodeOne,
             stream,
             exec,
             raw_graph,
@@ -690,6 +907,366 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    pub fn prepare_mtp_drafts_from_sampled(
+        &self,
+        prompt_tokens: &[u32],
+        sampled_token: u32,
+        draft_count: usize,
+    ) -> Result<Vec<u32>> {
+        if draft_count == 0 {
+            return Ok(Vec::new());
+        }
+        if draft_count > MTP_MAX_DRAFT_TOKENS {
+            return Err(CoreError::Runtime(format!(
+                "MTP draft_count {draft_count} exceeds the supported maximum of {MTP_MAX_DRAFT_TOKENS}"
+            )));
+        }
+        if self.config.mtp_speculative_tokens == 0 {
+            return Err(CoreError::Runtime(
+                "MTP prefill requested while mtp_speculative_tokens is 0".to_owned(),
+            ));
+        }
+        if prompt_tokens.is_empty() {
+            return Err(CoreError::Runtime(
+                "MTP prefill requires at least one prompt token".to_owned(),
+            ));
+        }
+
+        let capacity = self.cuda_prefill()?.capacity;
+        let final_chunk = (prompt_tokens.len() - 1) % capacity + 1;
+        let start = prompt_tokens.len() - final_chunk;
+        let mut shifted_tokens = Vec::with_capacity(final_chunk);
+        for idx in start..prompt_tokens.len() {
+            let token = prompt_tokens.get(idx + 1).copied().unwrap_or(sampled_token);
+            shifted_tokens.push(token);
+        }
+        self.run_mtp_prefill_chunk_from_current_prefill(
+            final_chunk,
+            start,
+            DevicePtr::NULL,
+            &shifted_tokens,
+            true,
+        )?;
+        self.queue_sample_greedy()?;
+        let first_draft = self.read_sampled_token()?;
+        let mut drafts = vec![first_draft];
+
+        if draft_count > 1 {
+            let hidden = self.topology.hidden_size;
+            let target_hidden = Self::ptr_offset(
+                self.cuda_prefill()?.normed.ptr(),
+                (final_chunk - 1) * hidden * 2,
+            )?;
+            drafts.extend(self.generate_mtp_drafts_from_target(
+                first_draft,
+                target_hidden,
+                prompt_tokens.len(),
+                draft_count - 1,
+            )?);
+        }
+        Ok(drafts)
+    }
+
+    /// Snapshot the runtime state needed to roll back a 2-token MTP verify
+    /// chunk if the draft is rejected. Captures DeltaNet recurrent state, the
+    /// conv1d history buffer, and the K/V slices for the two verify positions
+    /// across all attention layers (main + MTP). All copies are GPU→GPU.
+    #[cfg(feature = "cuda")]
+    fn mtp_snapshot_state(&self, start_position: usize, token_count: usize) -> Result<()> {
+        let runtime = self.cuda_runtime()?;
+        let deltanet_bytes = runtime.deltanet_state.bytes();
+        runtime
+            .deltanet_checkpoint
+            .copy_from_device(&runtime.deltanet_state, deltanet_bytes)?;
+        let conv_bytes = runtime.conv_history.bytes();
+        if conv_bytes > 0 {
+            runtime
+                .conv_history_checkpoint
+                .copy_from_device(&runtime.conv_history, conv_bytes)?;
+        }
+        self.mtp_kv_slice_copy(start_position, token_count, /* save = */ true)
+    }
+
+    /// Restore the runtime state captured by [`mtp_snapshot_state`]. Must only
+    /// be called once per snapshot — calling it twice will overwrite live
+    /// state with stale data.
+    #[cfg(feature = "cuda")]
+    fn mtp_restore_state(&self, start_position: usize, token_count: usize) -> Result<()> {
+        let runtime = self.cuda_runtime()?;
+        let deltanet_bytes = runtime.deltanet_state.bytes();
+        runtime
+            .deltanet_state
+            .copy_from_device(&runtime.deltanet_checkpoint, deltanet_bytes)?;
+        let conv_bytes = runtime.conv_history.bytes();
+        if conv_bytes > 0 {
+            runtime
+                .conv_history
+                .copy_from_device(&runtime.conv_history_checkpoint, conv_bytes)?;
+        }
+        self.mtp_kv_slice_copy(start_position, token_count, /* save = */ false)
+    }
+
+    /// Copy the 2-token K/V slice at `start_position` between the main KV
+    /// cache (per-attention layer) and the MTP KV cache, into or out of
+    /// `mtp_kv_snapshot`. `save=true` copies live → snapshot; `save=false`
+    /// copies snapshot → live.
+    #[cfg(feature = "cuda")]
+    fn mtp_kv_slice_copy(
+        &self,
+        start_position: usize,
+        token_count: usize,
+        save: bool,
+    ) -> Result<()> {
+        if token_count == 0 || token_count > MtpKvSnapshotLayout::VERIFY_TOKENS {
+            return Err(CoreError::Runtime(format!(
+                "MTP KV snapshot token_count {token_count} is outside 1..={}",
+                MtpKvSnapshotLayout::VERIFY_TOKENS
+            )));
+        }
+        let runtime = self.cuda_runtime()?;
+        let layout = &runtime.mtp_kv_snapshot_layout;
+        let row_bytes = layout.slice_bytes / MtpKvSnapshotLayout::VERIFY_TOKENS;
+        let slice_bytes = row_bytes
+            .checked_mul(token_count)
+            .ok_or_else(|| CoreError::Runtime("MTP KV slice size overflow".to_owned()))?;
+        let position_offset = start_position
+            .checked_mul(row_bytes)
+            .ok_or_else(|| CoreError::Runtime("MTP KV slice offset overflow".to_owned()))?;
+
+        if let Some(kv_cache) = &runtime.kv_cache {
+            for (idx, layer) in self.state.kv_cache.layers.iter().enumerate() {
+                let snapshot_k = layout.main_k_offsets[idx];
+                let snapshot_v = layout.main_v_offsets[idx];
+                let live_k = (layer.k_offset_bytes as usize)
+                    .checked_add(position_offset)
+                    .ok_or_else(|| CoreError::Runtime("KV K offset overflow".to_owned()))?;
+                let live_v = (layer.v_offset_bytes as usize)
+                    .checked_add(position_offset)
+                    .ok_or_else(|| CoreError::Runtime("KV V offset overflow".to_owned()))?;
+                if save {
+                    let src_k = kv_cache.ptr_at(live_k)?;
+                    let src_v = kv_cache.ptr_at(live_v)?;
+                    runtime.mtp_kv_snapshot.copy_from_device_ptr_at(
+                        snapshot_k,
+                        src_k,
+                        slice_bytes,
+                    )?;
+                    runtime.mtp_kv_snapshot.copy_from_device_ptr_at(
+                        snapshot_v,
+                        src_v,
+                        slice_bytes,
+                    )?;
+                } else {
+                    let src_k = runtime.mtp_kv_snapshot.ptr_at(snapshot_k)?;
+                    let src_v = runtime.mtp_kv_snapshot.ptr_at(snapshot_v)?;
+                    kv_cache.copy_from_device_ptr_at(live_k, src_k, slice_bytes)?;
+                    kv_cache.copy_from_device_ptr_at(live_v, src_v, slice_bytes)?;
+                }
+            }
+        }
+
+        if let (Some(mtp_kv_cache), Some(mtp_k_off), Some(mtp_v_off)) = (
+            runtime.mtp_kv_cache.as_ref(),
+            layout.mtp_k_offset,
+            layout.mtp_v_offset,
+        ) {
+            let plane_bytes = self.mtp_kv_cache_plane_bytes()?;
+            let live_k = position_offset;
+            let live_v = plane_bytes
+                .checked_add(position_offset)
+                .ok_or_else(|| CoreError::Runtime("MTP V plane offset overflow".to_owned()))?;
+            if save {
+                let src_k = mtp_kv_cache.ptr_at(live_k)?;
+                let src_v = mtp_kv_cache.ptr_at(live_v)?;
+                runtime
+                    .mtp_kv_snapshot
+                    .copy_from_device_ptr_at(mtp_k_off, src_k, slice_bytes)?;
+                runtime
+                    .mtp_kv_snapshot
+                    .copy_from_device_ptr_at(mtp_v_off, src_v, slice_bytes)?;
+            } else {
+                let src_k = runtime.mtp_kv_snapshot.ptr_at(mtp_k_off)?;
+                let src_v = runtime.mtp_kv_snapshot.ptr_at(mtp_v_off)?;
+                mtp_kv_cache.copy_from_device_ptr_at(live_k, src_k, slice_bytes)?;
+                mtp_kv_cache.copy_from_device_ptr_at(live_v, src_v, slice_bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn write_prefill_tokens_and_positions(
+        &self,
+        tokens: &[u32],
+        start_position: usize,
+    ) -> Result<()> {
+        self.write_prefill_tokens_and_position_count(tokens, start_position, tokens.len())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn write_prefill_tokens_and_position_count(
+        &self,
+        tokens: &[u32],
+        start_position: usize,
+        position_count: usize,
+    ) -> Result<()> {
+        if position_count < tokens.len() {
+            return Err(CoreError::Runtime(format!(
+                "position_count {position_count} is smaller than token count {}",
+                tokens.len()
+            )));
+        }
+        let mut token_bytes = Vec::with_capacity(tokens.len() * 4);
+        for token in tokens.iter().copied() {
+            token_bytes.extend_from_slice(&token.to_ne_bytes());
+        }
+        let mut position_bytes = Vec::with_capacity(position_count * 4);
+        for idx in 0..position_count {
+            let position = start_position
+                .checked_add(idx)
+                .ok_or_else(|| CoreError::Runtime("prefill position overflow".to_owned()))?;
+            let position = i32::try_from(position).map_err(|_| {
+                CoreError::Runtime(format!("position {position} does not fit i32 for RoPE"))
+            })?;
+            position_bytes.extend_from_slice(&position.to_ne_bytes());
+        }
+        let prefill = self.cuda_prefill()?;
+        prefill.token_u32.copy_from_host(&token_bytes)?;
+        prefill.position_i32.copy_from_host(&position_bytes)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn sample_prefill_row_to_host(&self, row: usize) -> Result<u32> {
+        self.prefill_row_logits(row)?;
+        self.queue_sample_greedy_to_current_token()?;
+        self.read_current_token()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn generate_mtp_drafts_from_target(
+        &self,
+        first_shifted_token: u32,
+        first_target_hidden_bf16: DevicePtr,
+        first_mtp_position: usize,
+        draft_count: usize,
+    ) -> Result<Vec<u32>> {
+        let mut drafts = Vec::with_capacity(draft_count);
+        let mut shifted_token = first_shifted_token;
+        let mut target_hidden = first_target_hidden_bf16;
+        for draft_idx in 0..draft_count {
+            let position = first_mtp_position.checked_add(draft_idx).ok_or_else(|| {
+                CoreError::Runtime("MTP recursive draft position overflow".to_owned())
+            })?;
+            self.cuda_prefill()?
+                .token_u32
+                .copy_from_host(&shifted_token.to_ne_bytes())?;
+            self.run_mtp_prefill_chunk(1, position, DevicePtr::NULL, target_hidden, true)?;
+            self.queue_sample_greedy()?;
+            let draft = self.read_sampled_token()?;
+            drafts.push(draft);
+            shifted_token = draft;
+            target_hidden = self.cuda_prefill()?.normed.ptr();
+        }
+        Ok(drafts)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn generate_mtp_drafts_from_committed_prefill(
+        &self,
+        shifted_tokens: &[u32],
+        start_position: usize,
+        target_hidden_bf16: DevicePtr,
+        draft_count: usize,
+    ) -> Result<Vec<u32>> {
+        if draft_count == 0 {
+            return Ok(Vec::new());
+        }
+        if shifted_tokens.is_empty() {
+            return Err(CoreError::Runtime(
+                "MTP committed prefill requires at least one shifted token".to_owned(),
+            ));
+        }
+
+        let mut token_bytes = Vec::with_capacity(shifted_tokens.len() * 4);
+        for token in shifted_tokens {
+            token_bytes.extend_from_slice(&token.to_ne_bytes());
+        }
+        self.cuda_prefill()?
+            .token_u32
+            .copy_from_host(&token_bytes)?;
+        self.run_mtp_prefill_chunk(
+            shifted_tokens.len(),
+            start_position,
+            DevicePtr::NULL,
+            target_hidden_bf16,
+            true,
+        )?;
+        self.queue_sample_greedy()?;
+        let first_draft = self.read_sampled_token()?;
+        let mut drafts = vec![first_draft];
+
+        if draft_count > 1 {
+            let hidden = self.topology.hidden_size;
+            let last_hidden = Self::ptr_offset(
+                self.cuda_prefill()?.normed.ptr(),
+                (shifted_tokens.len() - 1) * hidden * 2,
+            )?;
+            drafts.extend(self.generate_mtp_drafts_from_target(
+                first_draft,
+                last_hidden,
+                start_position + shifted_tokens.len(),
+                draft_count - 1,
+            )?);
+        }
+        Ok(drafts)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn recover_after_mtp_multi_reject(
+        &mut self,
+        current_token: u32,
+        draft_tokens: &[u32],
+        rejected_draft_idx: usize,
+        verified_token: u32,
+        start_position: usize,
+        verify_tokens: usize,
+        next_draft_count: usize,
+    ) -> Result<MtpMultiVerifyResult> {
+        let committed_tokens = rejected_draft_idx + 1;
+        self.mtp_restore_state(start_position, verify_tokens)?;
+
+        let mut committed_input = Vec::with_capacity(committed_tokens);
+        committed_input.push(current_token);
+        committed_input.extend_from_slice(&draft_tokens[..rejected_draft_idx]);
+        self.write_prefill_tokens_and_positions(&committed_input, start_position)?;
+        self.prefill_cuda_chunk(committed_tokens, start_position, DevicePtr::NULL, false)?;
+        self.final_norm_prefill_rows(committed_tokens)?;
+
+        let next_draft_tokens = if next_draft_count > 0 {
+            let target_hidden = self.cuda_prefill()?.normed.ptr();
+            let mut shifted_tokens = Vec::with_capacity(committed_tokens);
+            shifted_tokens.extend_from_slice(&draft_tokens[..rejected_draft_idx]);
+            shifted_tokens.push(verified_token);
+            self.generate_mtp_drafts_from_committed_prefill(
+                &shifted_tokens,
+                start_position,
+                target_hidden,
+                next_draft_count,
+            )?
+        } else {
+            Vec::new()
+        };
+
+        self.state.advance(committed_tokens);
+        Ok(MtpMultiVerifyResult {
+            accepted_drafts: rejected_draft_idx,
+            rejected: true,
+            next_token: Some(verified_token),
+            next_draft_tokens,
+        })
+    }
+
+    #[cfg(feature = "cuda")]
     pub fn verify_mtp_draft_two_tokens(
         &mut self,
         current_token: u32,
@@ -732,8 +1309,15 @@ impl<B: KernelBackend> Engine<B> {
             prefill.token_u32.copy_from_host(&token_bytes)?;
             prefill.position_i32.copy_from_host(&position_bytes)?;
         }
+
+        // Snapshot DeltaNet recurrent state, conv1d history, and the K/V
+        // slices for the two verify positions before the verify chunk mutates
+        // them. On rejection we roll back these in-place rather than doing a
+        // catastrophic reset+full-reprefill from the CLI side.
+        self.mtp_snapshot_state(start_position, 2)?;
+
         if need_next_draft {
-            let mut mtp_verify_tokens = [0_u8; 8];
+            let mut mtp_verify_tokens = [0_u8; 16];
             mtp_verify_tokens[..4].copy_from_slice(&draft_token.to_ne_bytes());
             self.cuda_forward()?
                 .mtp_verify_token_u32
@@ -741,21 +1325,36 @@ impl<B: KernelBackend> Engine<B> {
             self.ensure_mtp_verify_graph_two_tokens(start_position)?;
             self.launch_mtp_verify_graph_two_tokens()?;
 
-            let verified_token = self.read_current_token()?;
-            if verified_token != draft_token {
-                return Ok(MtpVerifyResult {
-                    accepted: false,
-                    verified_token,
-                    next_token: None,
-                    next_draft_token: None,
-                });
-            }
-            let mut next_token_bytes = [0_u8; 4];
+            let mut verify_bytes = [0_u8; 16];
             self.cuda_forward()?
                 .mtp_verify_token_u32
-                .copy_to_host_at(4, &mut next_token_bytes)?;
-            let next_token = u32::from_ne_bytes(next_token_bytes);
-            let next_draft_token = self.read_sampled_token()?;
+                .copy_to_host(&mut verify_bytes)?;
+            let verified_token = u32::from_ne_bytes([
+                verify_bytes[8],
+                verify_bytes[9],
+                verify_bytes[10],
+                verify_bytes[11],
+            ]);
+            if verified_token != draft_token {
+                return self.recover_after_mtp_reject(
+                    current_token,
+                    verified_token,
+                    start_position,
+                    /* need_new_draft = */ need_next_token,
+                );
+            }
+            let next_token = u32::from_ne_bytes([
+                verify_bytes[4],
+                verify_bytes[5],
+                verify_bytes[6],
+                verify_bytes[7],
+            ]);
+            let next_draft_token = u32::from_ne_bytes([
+                verify_bytes[12],
+                verify_bytes[13],
+                verify_bytes[14],
+                verify_bytes[15],
+            ]);
             self.state.advance(2);
 
             return Ok(MtpVerifyResult {
@@ -766,10 +1365,6 @@ impl<B: KernelBackend> Engine<B> {
             });
         }
 
-        // This mutates the target recurrent state through both tokens. If the
-        // draft is rejected, the caller must rebuild from committed tokens via
-        // `reset_cuda_state`; we avoid a large per-step full-state snapshot in
-        // the overwhelmingly common accepted path.
         self.prefill_cuda_chunk(2, start_position, DevicePtr::NULL, false)?;
         self.final_norm_prefill_rows(2)?;
 
@@ -777,12 +1372,12 @@ impl<B: KernelBackend> Engine<B> {
         self.queue_sample_greedy_to_current_token()?;
         let verified_token = self.read_current_token()?;
         if verified_token != draft_token {
-            return Ok(MtpVerifyResult {
-                accepted: false,
+            return self.recover_after_mtp_reject(
+                current_token,
                 verified_token,
-                next_token: None,
-                next_draft_token: None,
-            });
+                start_position,
+                need_next_token,
+            );
         }
 
         if !need_next_token {
@@ -829,6 +1424,254 @@ impl<B: KernelBackend> Engine<B> {
             verified_token,
             next_token: Some(next_token),
             next_draft_token: Some(next_draft_token),
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn verify_mtp_draft_tokens(
+        &mut self,
+        current_token: u32,
+        draft_tokens: &[u32],
+        need_next_token_on_full_accept: bool,
+        next_draft_count: usize,
+    ) -> Result<MtpMultiVerifyResult> {
+        if self.config.mtp_speculative_tokens == 0 {
+            return Err(CoreError::Runtime(
+                "MTP multi-token verification requested while mtp_speculative_tokens is 0"
+                    .to_owned(),
+            ));
+        }
+        if draft_tokens.is_empty() || draft_tokens.len() > MTP_MAX_DRAFT_TOKENS {
+            return Err(CoreError::Runtime(format!(
+                "MTP multi-token verification expects 1..={MTP_MAX_DRAFT_TOKENS} drafts, got {}",
+                draft_tokens.len()
+            )));
+        }
+        if next_draft_count > MTP_MAX_DRAFT_TOKENS {
+            return Err(CoreError::Runtime(format!(
+                "MTP next_draft_count {next_draft_count} exceeds the supported maximum of {MTP_MAX_DRAFT_TOKENS}"
+            )));
+        }
+
+        let start_position = self.state.position;
+        let verify_tokens = draft_tokens.len() + 1;
+        if start_position + verify_tokens > self.config.max_context {
+            return Err(CoreError::Runtime(format!(
+                "MTP verification of {verify_tokens} tokens at position {start_position} exceeds max_context {}",
+                self.config.max_context
+            )));
+        }
+        let available_rows_after_verify =
+            self.config.max_context - (start_position + verify_tokens);
+        let effective_next_draft_count = next_draft_count.min(available_rows_after_verify + 1);
+        let use_multi_graph = draft_tokens.len() >= 2
+            && need_next_token_on_full_accept
+            && effective_next_draft_count == draft_tokens.len()
+            && std::env::var("QWEN36_MTP_MULTI_GRAPH_DISABLE").is_err();
+        let trace_mtp = std::env::var("QWEN36_MTP_TRACE").is_ok();
+
+        let mut verify_input = Vec::with_capacity(verify_tokens);
+        verify_input.push(current_token);
+        verify_input.extend_from_slice(draft_tokens);
+        self.write_prefill_tokens_and_position_count(&verify_input, start_position, verify_tokens)?;
+
+        self.mtp_snapshot_state(start_position, verify_tokens)?;
+        if use_multi_graph {
+            let mut graph_tokens = [0_u8; MTP_GRAPH_BUNDLE_U32S * 4];
+            for (idx, draft_token) in draft_tokens.iter().copied().enumerate() {
+                let offset = idx * 4;
+                graph_tokens[offset..offset + 4].copy_from_slice(&draft_token.to_ne_bytes());
+            }
+            self.cuda_forward()?
+                .mtp_verify_token_u32
+                .copy_from_host(&graph_tokens)?;
+            self.ensure_mtp_verify_graph_multi_tokens(draft_tokens.len(), start_position)?;
+            self.launch_mtp_verify_graph_multi_tokens(draft_tokens.len())?;
+
+            let mut verify_bytes = [0_u8; MTP_GRAPH_BUNDLE_U32S * 4];
+            self.cuda_forward()?
+                .mtp_verify_token_u32
+                .copy_to_host(&mut verify_bytes)?;
+            let mut verified_tokens = Vec::with_capacity(draft_tokens.len());
+            for (draft_idx, draft_token) in draft_tokens.iter().copied().enumerate() {
+                let offset = (MTP_GRAPH_VERIFIED_BASE + draft_idx) * 4;
+                let verified_token = u32::from_ne_bytes([
+                    verify_bytes[offset],
+                    verify_bytes[offset + 1],
+                    verify_bytes[offset + 2],
+                    verify_bytes[offset + 3],
+                ]);
+                verified_tokens.push(verified_token);
+                if verified_token != draft_token {
+                    if trace_mtp {
+                        eprintln!(
+                            "mtp.trace graph start={start_position} drafts={draft_tokens:?} verified={verified_tokens:?} reject_idx={draft_idx}"
+                        );
+                    }
+                    return self.recover_after_mtp_multi_reject(
+                        current_token,
+                        draft_tokens,
+                        draft_idx,
+                        verified_token,
+                        start_position,
+                        verify_tokens,
+                        effective_next_draft_count,
+                    );
+                }
+            }
+
+            let next_token_offset = draft_tokens.len() * 4;
+            let next_token = u32::from_ne_bytes([
+                verify_bytes[next_token_offset],
+                verify_bytes[next_token_offset + 1],
+                verify_bytes[next_token_offset + 2],
+                verify_bytes[next_token_offset + 3],
+            ]);
+            let target_hidden = self.cuda_prefill()?.normed.ptr();
+            let mut shifted_tokens = Vec::with_capacity(verify_tokens);
+            shifted_tokens.extend_from_slice(draft_tokens);
+            shifted_tokens.push(next_token);
+            let next_draft_tokens = self.generate_mtp_drafts_from_committed_prefill(
+                &shifted_tokens,
+                start_position,
+                target_hidden,
+                effective_next_draft_count,
+            )?;
+            if trace_mtp {
+                eprintln!(
+                    "mtp.trace graph start={start_position} drafts={draft_tokens:?} verified={verified_tokens:?} next={next_token} next_drafts={next_draft_tokens:?}"
+                );
+            }
+
+            self.state.advance(verify_tokens);
+            return Ok(MtpMultiVerifyResult {
+                accepted_drafts: draft_tokens.len(),
+                rejected: false,
+                next_token: Some(next_token),
+                next_draft_tokens,
+            });
+        }
+
+        self.prefill_cuda_chunk(verify_tokens, start_position, DevicePtr::NULL, false)?;
+        self.final_norm_prefill_rows(verify_tokens)?;
+
+        for (draft_idx, draft_token) in draft_tokens.iter().copied().enumerate() {
+            let verified_token = self.sample_prefill_row_to_host(draft_idx)?;
+            if verified_token != draft_token {
+                if trace_mtp {
+                    eprintln!(
+                        "mtp.trace host start={start_position} drafts={draft_tokens:?} reject_idx={draft_idx} verified={verified_token}"
+                    );
+                }
+                return self.recover_after_mtp_multi_reject(
+                    current_token,
+                    draft_tokens,
+                    draft_idx,
+                    verified_token,
+                    start_position,
+                    verify_tokens,
+                    effective_next_draft_count,
+                );
+            }
+        }
+
+        let accepted_drafts = draft_tokens.len();
+        let next_token = if need_next_token_on_full_accept {
+            Some(self.sample_prefill_row_to_host(accepted_drafts)?)
+        } else {
+            None
+        };
+        let next_draft_tokens =
+            if let (Some(next_token), true) = (next_token, effective_next_draft_count > 0) {
+                let target_hidden = self.cuda_prefill()?.normed.ptr();
+                let mut shifted_tokens = Vec::with_capacity(verify_tokens);
+                shifted_tokens.extend_from_slice(draft_tokens);
+                shifted_tokens.push(next_token);
+                self.generate_mtp_drafts_from_committed_prefill(
+                    &shifted_tokens,
+                    start_position,
+                    target_hidden,
+                    effective_next_draft_count,
+                )?
+            } else {
+                Vec::new()
+            };
+        if trace_mtp {
+            eprintln!(
+                "mtp.trace host start={start_position} drafts={draft_tokens:?} next={next_token:?} next_drafts={next_draft_tokens:?}"
+            );
+        }
+
+        self.state.advance(verify_tokens);
+        Ok(MtpMultiVerifyResult {
+            accepted_drafts,
+            rejected: false,
+            next_token,
+            next_draft_tokens,
+        })
+    }
+
+    /// Roll back the MTP verify chunk and commit just `current_token` at
+    /// `start_position`, leaving the engine in the same state as if the CLI
+    /// had run a single non-speculative decode step. When the caller needs a
+    /// new draft token (i.e. it will iterate again), this also runs the MTP
+    /// layer using `verified_token` as the shifted input so the returned
+    /// draft is the same one a fresh `prepare_mtp_prefill_from_sampled` call
+    /// would produce — at the cost of one extra layer-pass instead of a full
+    /// prompt reprefill.
+    #[cfg(feature = "cuda")]
+    fn recover_after_mtp_reject(
+        &mut self,
+        current_token: u32,
+        verified_token: u32,
+        start_position: usize,
+        need_new_draft: bool,
+    ) -> Result<MtpVerifyResult> {
+        self.mtp_restore_state(start_position, 2)?;
+
+        let token_bytes = current_token.to_ne_bytes();
+        let position = i32::try_from(start_position).map_err(|_| {
+            CoreError::Runtime(format!(
+                "position {start_position} does not fit i32 for RoPE"
+            ))
+        })?;
+        let position_bytes = position.to_ne_bytes();
+        {
+            let prefill = self.cuda_prefill()?;
+            prefill.token_u32.copy_from_host(&token_bytes)?;
+            prefill.position_i32.copy_from_host(&position_bytes)?;
+        }
+
+        // Single-token main forward to commit `current_token` at
+        // `start_position` (writes its K/V into the cache and advances the
+        // DeltaNet recurrent state).
+        self.prefill_cuda_chunk(1, start_position, DevicePtr::NULL, false)?;
+        self.final_norm_prefill_rows(1)?;
+
+        let next_draft_token = if need_new_draft {
+            // Run MTP using `verified_token` as the shifted input on top of
+            // the hidden state we just produced for `current_token`. This is
+            // the same computation a fresh `prepare_mtp_prefill_from_sampled`
+            // would do after the prompt prefill, but reusing the recovery
+            // step we already paid for.
+            let shifted_bytes = verified_token.to_ne_bytes();
+            self.cuda_prefill()?
+                .token_u32
+                .copy_from_host(&shifted_bytes)?;
+            let normed_ptr = self.cuda_prefill()?.normed.ptr();
+            self.run_mtp_prefill_chunk(1, start_position, DevicePtr::NULL, normed_ptr, true)?;
+            self.queue_sample_greedy()?;
+            Some(self.read_sampled_token()?)
+        } else {
+            None
+        };
+
+        self.state.advance(1);
+        Ok(MtpVerifyResult {
+            accepted: false,
+            verified_token,
+            next_token: None,
+            next_draft_token,
         })
     }
 
@@ -1549,7 +2392,13 @@ impl<B: KernelBackend> Engine<B> {
         let dump_prefix = format!("decode_pos{position:05}");
         let profile_decode = std::env::var("QWEN36_PROFILE_DECODE_LAYERS").is_ok()
             && position_device_i32 == DevicePtr::NULL;
+        let mut prof_embed_ms = 0.0_f64;
+        let mut prof_linear_attn_ms = 0.0_f64;
+        let mut prof_full_attn_ms = 0.0_f64;
+        let mut prof_mlp_ms = 0.0_f64;
+        let mut prof_lm_head_ms = 0.0_f64;
 
+        let embed_start = profile_decode.then(std::time::Instant::now);
         self.backend.embedding_lookup(&EmbeddingLookupSpec {
             tokens: 1,
             hidden: self.topology.hidden_size,
@@ -1558,6 +2407,10 @@ impl<B: KernelBackend> Engine<B> {
             embedding_bf16: self.tensor_ptr(weights, &manifest.embed_tokens)?,
             output_bf16: forward.hidden.ptr(),
         })?;
+        if let Some(embed_start) = embed_start {
+            qwen36_fp4_kernels::cuda_synchronize()?;
+            prof_embed_ms += embed_start.elapsed().as_secs_f64() * 1000.0;
+        }
         if dump_decode {
             if let Some(dir) = &dump_dir {
                 self.dump_buffer_to_disk(
@@ -1616,6 +2469,7 @@ impl<B: KernelBackend> Engine<B> {
             }
 
             let attn_start = profile_decode.then(std::time::Instant::now);
+            let is_linear = matches!(layer, LayerWeights::LinearAttention(_));
             match layer {
                 LayerWeights::LinearAttention(layer) => {
                     self.run_linear_attention_layer(layer, runtime, forward, quantized_normed)?;
@@ -1633,10 +2487,12 @@ impl<B: KernelBackend> Engine<B> {
             }
             if let Some(attn_start) = attn_start {
                 qwen36_fp4_kernels::cuda_synchronize()?;
-                eprintln!(
-                    "decode.profile layer{layer_idx:02}.attn_ms={:.3}",
-                    attn_start.elapsed().as_secs_f64() * 1000.0
-                );
+                let elapsed = attn_start.elapsed().as_secs_f64() * 1000.0;
+                if is_linear {
+                    prof_linear_attn_ms += elapsed;
+                } else {
+                    prof_full_attn_ms += elapsed;
+                }
             }
             if dump_decode {
                 if let Some(dir) = &dump_dir {
@@ -1697,10 +2553,7 @@ impl<B: KernelBackend> Engine<B> {
                 self.run_mlp_with_quantized_input(layer, forward, quantized)?;
                 if let Some(mlp_start) = mlp_start {
                     qwen36_fp4_kernels::cuda_synchronize()?;
-                    eprintln!(
-                        "decode.profile layer{layer_idx:02}.mlp_ms={:.3}",
-                        mlp_start.elapsed().as_secs_f64() * 1000.0
-                    );
+                    prof_mlp_ms += mlp_start.elapsed().as_secs_f64() * 1000.0;
                 }
             } else {
                 self.rmsnorm(
@@ -1726,10 +2579,7 @@ impl<B: KernelBackend> Engine<B> {
                 self.run_mlp(layer, forward)?;
                 if let Some(mlp_start) = mlp_start {
                     qwen36_fp4_kernels::cuda_synchronize()?;
-                    eprintln!(
-                        "decode.profile layer{layer_idx:02}.mlp_ms={:.3}",
-                        mlp_start.elapsed().as_secs_f64() * 1000.0
-                    );
+                    prof_mlp_ms += mlp_start.elapsed().as_secs_f64() * 1000.0;
                 }
             }
             if dump_decode {
@@ -1796,10 +2646,7 @@ impl<B: KernelBackend> Engine<B> {
             )?;
             if let Some(logits_start) = logits_start {
                 qwen36_fp4_kernels::cuda_synchronize()?;
-                eprintln!(
-                    "decode.profile final_logits_ms={:.3}",
-                    logits_start.elapsed().as_secs_f64() * 1000.0
-                );
+                prof_lm_head_ms += logits_start.elapsed().as_secs_f64() * 1000.0;
             }
             if dump_decode {
                 if let Some(dir) = &dump_dir {
@@ -1814,6 +2661,22 @@ impl<B: KernelBackend> Engine<B> {
         }
         if sync_after {
             qwen36_fp4_kernels::cuda_synchronize()?;
+        }
+        if profile_decode {
+            let total_ms = prof_embed_ms
+                + prof_linear_attn_ms
+                + prof_full_attn_ms
+                + prof_mlp_ms
+                + prof_lm_head_ms;
+            eprintln!(
+                "decode.profile.summary pos={position} embed={:.3} linear_attn={:.3} full_attn={:.3} mlp={:.3} lm_head={:.3} total_measured={:.3}",
+                prof_embed_ms,
+                prof_linear_attn_ms,
+                prof_full_attn_ms,
+                prof_mlp_ms,
+                prof_lm_head_ms,
+                total_ms
+            );
         }
         Ok(())
     }
@@ -1837,26 +2700,31 @@ impl<B: KernelBackend> Engine<B> {
             .deltanet_state
             .ptr_at(layer_ordinal * self.state.deltanet.state_bytes_per_layer as usize)?;
 
-        let in_proj_linears = [
-            (&layer.in_proj_qkv, forward.qkv.ptr()),
-            (&layer.in_proj_b, forward.aux2.ptr()),
-            (&layer.in_proj_a, forward.aux3.ptr()),
-            (&layer.in_proj_z, forward.qkv.ptr()),
-        ];
-        let shared_in_proj = match prequantized_normed {
-            Some(quantized) => Some(quantized),
-            None => Self::common_nvfp4_quant(&in_proj_linears)?,
+        // Combined qkv+b+a+z GEMM. Output layout in `forward.qkv` (BF16):
+        //   [qkv: qkv_dim] [b padded: 128] [a padded: 128] [z: value_dim].
+        // The 80-row pad after b and a sits at FP4 weight 0 so the GEMM
+        // emits zeros there — the engine simply does not read those slots.
+        let fused = self.linear_attn_in_proj_fused_layer(layer.layer_index)?;
+        let quantized = match prequantized_normed {
+            Some(q) => q,
+            None => {
+                let q = self.linear_attn_in_proj_quant(layer)?;
+                self.quantize_nvfp4_activation(forward.normed.ptr(), q)?;
+                q
+            }
         };
-        if let Some(quantized) = shared_in_proj {
-            if prequantized_normed.is_none() {
-                self.quantize_nvfp4_activation(forward.normed.ptr(), quantized)?;
-            }
-            for &(binding, output) in &in_proj_linears[..3] {
-                self.linear_with_quantized_nvfp4(binding, output, quantized)?;
-            }
-        } else {
-            self.linears_same_input(forward.normed.ptr(), &in_proj_linears[..3])?;
-        }
+        self.run_linear_attn_in_proj_fused_gemm(layer, fused, quantized, forward.qkv.ptr())?;
+
+        let b_ptr = forward.qkv.ptr().offset_bytes(fused.b_offset * 2).ok_or_else(|| {
+            CoreError::Runtime("fused DeltaNet b offset overflow".to_owned())
+        })?;
+        let a_ptr = forward.qkv.ptr().offset_bytes(fused.a_offset * 2).ok_or_else(|| {
+            CoreError::Runtime("fused DeltaNet a offset overflow".to_owned())
+        })?;
+        let z_ptr = forward.qkv.ptr().offset_bytes(fused.z_offset * 2).ok_or_else(|| {
+            CoreError::Runtime("fused DeltaNet z offset overflow".to_owned())
+        })?;
+
         self.backend.conv1d_update(&Conv1dUpdateSpec {
             channels: qkv_dim,
             kernel_size: self.topology.linear_conv_kernel_dim,
@@ -1868,8 +2736,8 @@ impl<B: KernelBackend> Engine<B> {
         self.backend.gdn_gate(&GdnGateSpec {
             rows: 1,
             heads: self.topology.linear_num_value_heads,
-            a_bf16: forward.aux3.ptr(),
-            b_bf16: forward.aux2.ptr(),
+            a_bf16: a_ptr,
+            b_bf16: b_ptr,
             a_log_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.a_log)?,
             dt_bias_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.dt_bias)?,
             gate_f32: forward.gate_f32.ptr(),
@@ -1900,11 +2768,7 @@ impl<B: KernelBackend> Engine<B> {
             update_scale: 1.0,
             qk_l2norm: true,
         })?;
-        if let Some(quantized) = shared_in_proj {
-            self.linear_with_quantized_nvfp4(&layer.in_proj_z, forward.qkv.ptr(), quantized)?;
-        } else {
-            self.linear(&layer.in_proj_z, forward.normed.ptr(), forward.qkv.ptr())?;
-        }
+        // z was emitted by the combined GEMM at `z_offset` inside `forward.qkv`.
         self.rmsnorm_direct_weight(
             self.topology.linear_num_value_heads,
             self.topology.linear_value_head_dim,
@@ -1917,7 +2781,7 @@ impl<B: KernelBackend> Engine<B> {
         self.backend.swiglu(&SwiGluSpec {
             rows: 1,
             intermediate: value_dim,
-            gate_bf16: forward.qkv.ptr(),
+            gate_bf16: z_ptr,
             up_bf16: forward.aux2.ptr(),
             output_bf16: forward.aux3.ptr(),
         })?;
@@ -2018,6 +2882,11 @@ impl<B: KernelBackend> Engine<B> {
                 rope_dims: self.topology.attention_rope_dims(),
             },
             position_device_i32,
+            partial_acc_f32: forward.attn_partial_acc.ptr(),
+            partial_max_f32: forward.attn_partial_max.ptr(),
+            partial_denom_f32: forward.attn_partial_denom.ptr(),
+            decode_n_splits: self.decode_attention_n_splits(),
+            split_timesteps_per_block: self.attention_split_timesteps_per_block(),
         })?;
         self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
             rows: 1,
@@ -2128,6 +2997,11 @@ impl<B: KernelBackend> Engine<B> {
                 rope_dims: self.topology.attention_rope_dims(),
             },
             position_device_i32,
+            partial_acc_f32: forward.attn_partial_acc.ptr(),
+            partial_max_f32: forward.attn_partial_max.ptr(),
+            partial_denom_f32: forward.attn_partial_denom.ptr(),
+            decode_n_splits: self.decode_attention_n_splits(),
+            split_timesteps_per_block: self.attention_split_timesteps_per_block(),
         })?;
         self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
             rows: 1,
@@ -2213,6 +3087,11 @@ impl<B: KernelBackend> Engine<B> {
                 rope_dims: self.topology.attention_rope_dims(),
             },
             start_position_device_i32,
+            partial_acc_f32: self.cuda_forward()?.attn_partial_acc.ptr(),
+            partial_max_f32: self.cuda_forward()?.attn_partial_max.ptr(),
+            partial_denom_f32: self.cuda_forward()?.attn_partial_denom.ptr(),
+            prefill_n_splits: self.decode_attention_n_splits(),
+            split_timesteps_per_block: self.attention_split_timesteps_per_block(),
         })?;
         self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
             rows: tokens,
@@ -2237,6 +3116,8 @@ impl<B: KernelBackend> Engine<B> {
         common: &CommonLayerWeights,
         forward: &GpuForwardBuffers,
     ) -> Result<()> {
+        // MTP head weights are BF16, so the fused FP4 GEMM path does not
+        // apply. Stay on the per-projection path here.
         self.linears_same_input(
             forward.normed.ptr(),
             &[
@@ -2675,6 +3556,11 @@ impl<B: KernelBackend> Engine<B> {
                 rope_dims: self.topology.attention_rope_dims(),
             },
             start_position_device_i32,
+            partial_acc_f32: self.cuda_forward()?.attn_partial_acc.ptr(),
+            partial_max_f32: self.cuda_forward()?.attn_partial_max.ptr(),
+            partial_denom_f32: self.cuda_forward()?.attn_partial_denom.ptr(),
+            prefill_n_splits: self.decode_attention_n_splits(),
+            split_timesteps_per_block: self.attention_split_timesteps_per_block(),
         })?;
         if layer.layer_index == 3 {
             if let Ok(dir) = std::env::var("QWEN36_DEBUG_DUMP_DIR") {
@@ -2726,29 +3612,13 @@ impl<B: KernelBackend> Engine<B> {
 
     #[cfg(feature = "cuda")]
     fn run_mlp(&self, layer: &LayerWeights, forward: &GpuForwardBuffers) -> Result<()> {
-        let common = match layer {
-            LayerWeights::LinearAttention(layer) => &layer.common,
-            LayerWeights::FullAttention(layer) => &layer.common,
+        let common = layer_common(layer);
+        let layer_idx = match layer {
+            LayerWeights::LinearAttention(layer) => layer.layer_index,
+            LayerWeights::FullAttention(layer) => layer.layer_index,
         };
-        self.linears_same_input(
-            forward.normed.ptr(),
-            &[
-                (&common.mlp_gate_proj, forward.aux.ptr()),
-                (&common.mlp_up_proj, forward.aux2.ptr()),
-            ],
-        )?;
-        self.backend.swiglu(&SwiGluSpec {
-            rows: 1,
-            intermediate: self.topology.intermediate_size,
-            gate_bf16: forward.aux.ptr(),
-            up_bf16: forward.aux2.ptr(),
-            output_bf16: forward.aux3.ptr(),
-        })?;
-        self.linear(
-            &common.mlp_down_proj,
-            forward.aux3.ptr(),
-            forward.hidden.ptr(),
-        )
+        let fused = self.mlp_fused_main(layer_idx)?;
+        self.run_mlp_fused_combined_gemm(common, fused, forward, None)
     }
 
     #[cfg(feature = "cuda")]
@@ -2759,19 +3629,234 @@ impl<B: KernelBackend> Engine<B> {
         quantized: Nvfp4ActivationQuant<'_>,
     ) -> Result<()> {
         let common = layer_common(layer);
-        self.linear_with_quantized_nvfp4(&common.mlp_gate_proj, forward.aux.ptr(), quantized)?;
-        self.linear_with_quantized_nvfp4(&common.mlp_up_proj, forward.aux2.ptr(), quantized)?;
-        self.backend.swiglu(&SwiGluSpec {
-            rows: 1,
-            intermediate: self.topology.intermediate_size,
-            gate_bf16: forward.aux.ptr(),
-            up_bf16: forward.aux2.ptr(),
-            output_bf16: forward.aux3.ptr(),
+        let layer_idx = match layer {
+            LayerWeights::LinearAttention(layer) => layer.layer_index,
+            LayerWeights::FullAttention(layer) => layer.layer_index,
+        };
+        let fused = self.mlp_fused_main(layer_idx)?;
+        self.run_mlp_fused_combined_gemm(common, fused, forward, Some(quantized))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn mlp_fused_main(&self, layer_idx: usize) -> Result<&MlpFusedLayer> {
+        let store = self.mlp_fused.as_ref().ok_or_else(|| {
+            CoreError::Runtime("MLP fused store not initialised".to_owned())
         })?;
-        self.linear(
+        store.layers.get(layer_idx).ok_or_else(|| {
+            CoreError::Runtime(format!(
+                "MLP fused store missing main layer index {layer_idx}"
+            ))
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn linear_attn_in_proj_fused_layer(
+        &self,
+        layer_idx: usize,
+    ) -> Result<&LinearAttnInProjFused> {
+        let store = self.linear_attn_in_proj_fused.as_ref().ok_or_else(|| {
+            CoreError::Runtime("DeltaNet in_proj fused store not initialised".to_owned())
+        })?;
+        store
+            .layers
+            .get(layer_idx)
+            .and_then(|entry| entry.as_ref())
+            .ok_or_else(|| {
+                CoreError::Runtime(format!(
+                    "DeltaNet in_proj fused store missing layer index {layer_idx}"
+                ))
+            })
+    }
+
+
+    #[cfg(feature = "cuda")]
+    fn linear_attn_in_proj_quant<'a>(
+        &self,
+        layer: &'a LinearAttentionLayerWeights,
+    ) -> Result<Nvfp4ActivationQuant<'a>> {
+        let LinearWeightBinding::Nvfp4 {
+            weight,
+            input_scale,
+            ..
+        } = &layer.in_proj_qkv
+        else {
+            return Err(CoreError::Runtime(
+                "fused DeltaNet in_proj requires NVFP4 in_proj_qkv".to_owned(),
+            ));
+        };
+        Ok(Nvfp4ActivationQuant {
+            in_features: Self::nvfp4_in_features(weight)?,
+            input_scale,
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_linear_attn_in_proj_fused_gemm(
+        &self,
+        layer: &LinearAttentionLayerWeights,
+        fused: &LinearAttnInProjFused,
+        quantized: Nvfp4ActivationQuant<'_>,
+        output: DevicePtr,
+    ) -> Result<()> {
+        let weights = self.cuda_weights()?;
+        let runtime = self.cuda_runtime()?;
+        let forward = self.cuda_forward()?;
+        let LinearWeightBinding::Nvfp4 {
+            tensor_scale: qkv_tensor_scale,
+            ..
+        } = &layer.in_proj_qkv
+        else {
+            return Err(CoreError::Runtime(
+                "fused DeltaNet in_proj requires NVFP4 in_proj_qkv".to_owned(),
+            ));
+        };
+        let workspace = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.ptr())
+            .unwrap_or(DevicePtr::NULL);
+        let workspace_bytes = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.bytes())
+            .unwrap_or(0);
+        let alpha = self.tensor_scalar_f32(weights, qkv_tensor_scale)?
+            * self.tensor_scalar_f32(weights, quantized.input_scale)?;
+        let gemm_spec = Nvfp4GemmSpec {
+            m: fused.combined_out_features,
+            n: 1,
+            k: quantized.in_features,
+            a_fp4: fused.combined_weight.ptr(),
+            a_scale: fused.combined_block_scale.ptr(),
+            a_scale_2: self.tensor_ptr(weights, qkv_tensor_scale)?,
+            b_fp4: forward.activation_fp4.ptr(),
+            b_scale: forward.activation_scale.ptr(),
+            b_scale_2: forward.activation_scale_2.ptr(),
+            c_bf16: output,
+            workspace,
+            workspace_bytes,
+            alpha,
+            scale_mode: CublasLtFp4ScaleMode::Vec16Ue4m3,
+        };
+        self.backend.nvfp4_gemm(&gemm_spec).map_err(|err| {
+            CoreError::Runtime(format!(
+                "fused DeltaNet in_proj GEMM failed (m={}, n=1, k={}): {err}",
+                fused.combined_out_features, quantized.in_features
+            ))
+        })
+    }
+
+    /// Single combined-GEMM MLP: writes [gate || up] into `forward.aux` in
+    /// one cuBLASLt FP4 GEMM, then runs SwiGLU on the two halves and the
+    /// down_proj GEMM. Saves one FP4 GEMM launch per layer (× 64 layers per
+    /// decode token).
+    #[cfg(feature = "cuda")]
+    fn run_mlp_fused_combined_gemm(
+        &self,
+        common: &CommonLayerWeights,
+        fused: &MlpFusedLayer,
+        forward: &GpuForwardBuffers,
+        pre_quantized: Option<Nvfp4ActivationQuant<'_>>,
+    ) -> Result<()> {
+        let weights = self.cuda_weights()?;
+        let runtime = self.cuda_runtime()?;
+        let intermediate = self.topology.intermediate_size;
+        let LinearWeightBinding::Nvfp4 {
+            weight: gate_weight,
+            tensor_scale: gate_tensor_scale,
+            input_scale: gate_input_scale,
+            ..
+        } = &common.mlp_gate_proj
+        else {
+            return Err(CoreError::Runtime(
+                "fused MLP path requires NVFP4 gate_proj".to_owned(),
+            ));
+        };
+        let in_features = Self::nvfp4_in_features(gate_weight)?;
+
+        let quantized = match pre_quantized {
+            Some(q) => q,
+            None => {
+                let q = Nvfp4ActivationQuant {
+                    in_features,
+                    input_scale: gate_input_scale,
+                };
+                self.quantize_nvfp4_activation(forward.normed.ptr(), q)?;
+                q
+            }
+        };
+
+        let workspace = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.ptr())
+            .unwrap_or(DevicePtr::NULL);
+        let workspace_bytes = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.bytes())
+            .unwrap_or(0);
+        let alpha = self.tensor_scalar_f32(weights, gate_tensor_scale)?
+            * self.tensor_scalar_f32(weights, quantized.input_scale)?;
+        let gemm_spec = Nvfp4GemmSpec {
+            m: fused.out_features,
+            n: 1,
+            k: quantized.in_features,
+            a_fp4: fused.combined_weight.ptr(),
+            a_scale: fused.combined_block_scale.ptr(),
+            a_scale_2: self.tensor_ptr(weights, gate_tensor_scale)?,
+            b_fp4: forward.activation_fp4.ptr(),
+            b_scale: forward.activation_scale.ptr(),
+            b_scale_2: forward.activation_scale_2.ptr(),
+            c_bf16: forward.aux.ptr(),
+            workspace,
+            workspace_bytes,
+            alpha,
+            scale_mode: CublasLtFp4ScaleMode::Vec16Ue4m3,
+        };
+        self.backend.nvfp4_gemm(&gemm_spec).map_err(|err| {
+            CoreError::Runtime(format!(
+                "fused MLP NVFP4 GEMM failed (m={}, n=1, k={}): {err}",
+                fused.out_features, quantized.in_features
+            ))
+        })?;
+
+        let up_offset_bytes = intermediate * 2; // BF16 size
+        let up_ptr = forward.aux.ptr().offset_bytes(up_offset_bytes).ok_or_else(|| {
+            CoreError::Runtime("fused MLP up_proj output offset overflow".to_owned())
+        })?;
+
+        // Fused SwiGLU + NVFP4 activation quantization: writes the down_proj
+        // input directly into `forward.activation_fp4` / `activation_scale`,
+        // skipping the BF16 round-trip through `forward.aux3` and the separate
+        // quantize launch.
+        let LinearWeightBinding::Nvfp4 {
+            input_scale: down_input_scale,
+            ..
+        } = &common.mlp_down_proj
+        else {
+            return Err(CoreError::Runtime(
+                "fused MLP path requires NVFP4 down_proj".to_owned(),
+            ));
+        };
+        let down_input_scale_f32 = self.tensor_scalar_f32(weights, down_input_scale)?;
+        self.backend.swiglu_nvfp4_quantize(&SwiGluNvfp4QuantizeSpec {
+            intermediate,
+            gate_bf16: forward.aux.ptr(),
+            up_bf16: up_ptr,
+            output_fp4: forward.activation_fp4.ptr(),
+            output_scale_e4m3: forward.activation_scale.ptr(),
+            output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+            input_tensor_scale_f32: down_input_scale_f32,
+        })?;
+        let down_quantized = Nvfp4ActivationQuant {
+            in_features: intermediate,
+            input_scale: down_input_scale,
+        };
+        self.linear_with_quantized_nvfp4(
             &common.mlp_down_proj,
-            forward.aux3.ptr(),
             forward.hidden.ptr(),
+            down_quantized,
         )
     }
 
@@ -3462,6 +4547,34 @@ impl<B: KernelBackend> Engine<B> {
             .ok_or_else(|| CoreError::Runtime("CUDA pointer offset overflow".to_owned()))
     }
 
+    /// Pick the split tile size for full-attention decode/prefill. 512 keeps
+    /// launch/reduce overhead down at short contexts; 64 exposes enough
+    /// T-axis parallelism for the GQA-aware kernel once the graph shape reaches
+    /// ~2K context on the 5090.
+    #[cfg(feature = "cuda")]
+    fn attention_split_timesteps_per_block(&self) -> usize {
+        if self.config.max_context >= 2048 {
+            64
+        } else {
+            512
+        }
+    }
+
+    /// Pick the number of split-KV blocks per q-head for decode attention.
+    /// Sized from `max_context` (not the current position) so the same value
+    /// is valid for both fresh kernel calls and CUDA-graph replays where the
+    /// position grows after capture. Returns 0 when the configured context
+    /// is short enough that the per-q-head kernel is faster (split + reduce
+    /// launch overhead would dominate).
+    #[cfg(feature = "cuda")]
+    fn decode_attention_n_splits(&self) -> usize {
+        let n_splits = self
+            .config
+            .max_context
+            .div_ceil(self.attention_split_timesteps_per_block());
+        if n_splits >= 2 { n_splits } else { 0 }
+    }
+
     #[cfg(feature = "cuda")]
     fn mtp_kv_cache_plane_bytes(&self) -> Result<usize> {
         let values = self
@@ -3661,11 +4774,10 @@ fn layer_common_input_norm(layer: &LayerWeights) -> &TensorInfo {
 #[cfg(feature = "cuda")]
 impl Engine<CudaBackend> {
     pub fn cuda_with_mapped_weights(model: &MappedModel, config: EngineConfig) -> Result<Self> {
-        if config.mtp_speculative_tokens > 1 {
-            return Err(CoreError::Runtime(
-                "MTP runtime currently supports a 1-token validation path; pass --mtp-speculative-tokens 0 or 1"
-                    .to_owned(),
-            ));
+        if config.mtp_speculative_tokens > MTP_MAX_DRAFT_TOKENS {
+            return Err(CoreError::Runtime(format!(
+                "MTP runtime currently supports up to {MTP_MAX_DRAFT_TOKENS} speculative tokens"
+            )));
         }
         let manifest = ModelWeightsManifest::from_layout(&model.layout)?;
         let include_mtp = config.mtp_speculative_tokens > 0;
@@ -3686,16 +4798,28 @@ impl Engine<CudaBackend> {
         } else {
             0
         };
-        let gpu_buffers =
-            GpuRuntimeBuffers::allocate(&engine.state, 256 * 1024 * 1024, mtp_kv_cache_bytes)?;
-        let gpu_forward = GpuForwardBuffers::allocate(&engine.topology)?;
+        let gpu_buffers = GpuRuntimeBuffers::allocate(
+            &engine.state,
+            256 * 1024 * 1024,
+            mtp_kv_cache_bytes,
+            &engine.topology,
+        )?;
+        let gpu_forward = GpuForwardBuffers::allocate(&engine.topology, engine.config.max_context)?;
         let prefill_capacity = engine.config.max_context.min(512).max(1);
         let gpu_prefill = GpuPrefillBuffers::allocate(&engine.topology, prefill_capacity)?;
+        let mlp_fused = MlpFusedStore::build(
+            &gpu_weights,
+            &manifest,
+            engine.topology.intermediate_size,
+        )?;
+        let linear_attn_in_proj_fused = LinearAttnInProjFusedStore::build(&gpu_weights, &manifest)?;
         engine.weights = Some(manifest);
         engine.gpu_weights = Some(gpu_weights);
         engine.gpu_buffers = Some(gpu_buffers);
         engine.gpu_forward = Some(gpu_forward);
         engine.gpu_prefill = Some(gpu_prefill);
+        engine.mlp_fused = Some(mlp_fused);
+        engine.linear_attn_in_proj_fused = Some(linear_attn_in_proj_fused);
         Ok(engine)
     }
 

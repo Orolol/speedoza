@@ -7,6 +7,7 @@ pub struct SamplingSpec {
     pub vocab_size: usize,
     pub logits_bf16: DevicePtr,
     pub output_token_u32: DevicePtr,
+    pub mirror_output_token_u32: DevicePtr,
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,

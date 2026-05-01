@@ -188,6 +188,27 @@ pub fn cuda_synchronize() -> Result<()> {
     })
 }
 
+/// Pin a memory window to the L2 cache via the active stream's access policy.
+/// `hit_ratio` is the fraction of accesses that should be cached, in [0, 1].
+/// Best effort under L2 pressure. No-op on the legacy default stream.
+#[cfg(feature = "cuda")]
+pub fn cuda_set_l2_access_window(
+    base: crate::backend::DevicePtr,
+    bytes: usize,
+    hit_ratio: f32,
+) -> Result<()> {
+    check("qwen36_cuda_set_l2_access_window", unsafe {
+        ffi::qwen36_cuda_set_l2_access_window(base, bytes, hit_ratio)
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub fn cuda_clear_l2_access_window() -> Result<()> {
+    check("qwen36_cuda_clear_l2_access_window", unsafe {
+        ffi::qwen36_cuda_clear_l2_access_window()
+    })
+}
+
 #[cfg(feature = "cuda")]
 fn check(kernel: &'static str, code: i32) -> Result<()> {
     if code == 0 {
@@ -224,6 +245,12 @@ mod ffi {
         pub fn qwen36_cuda_memcpy_d2d(dst: DevicePtr, src: DevicePtr, bytes: usize) -> i32;
         pub fn qwen36_cuda_memset(dst: DevicePtr, value: i32, bytes: usize) -> i32;
         pub fn qwen36_cuda_synchronize() -> i32;
+        pub fn qwen36_cuda_set_l2_access_window(
+            base: DevicePtr,
+            bytes: usize,
+            hit_ratio: f32,
+        ) -> i32;
+        pub fn qwen36_cuda_clear_l2_access_window() -> i32;
     }
 }
 
