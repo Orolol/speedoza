@@ -157,19 +157,98 @@ fused into the same launch (RMSNorm + SwiGLU + activation quantize on
 the GEMM output) is pure savings. CUTLASS's CollectiveEpilogue is the
 mechanism — that is the next concrete step.
 
-## Phase 2 — Epilogue fusion
+## Phase 2 — Epilogue fusion (deep-dive)
 
-Bake the post-GEMM ops into the CUTLASS epilogue:
+Originally proposed to fuse SwiGLU + NVFP4 quantize into the gate+up
+GEMM and RMSNorm + NVFP4 quantize into the down_proj GEMM. After
+investigating CUTLASS 4.4.2's EVT (Epilogue Visitor Tree) and the actual
+data flow, the realistic gains are **smaller than initially estimated
+and the implementation is genuinely multi-day**. Documented here so the
+next iteration starts from the right baseline.
 
-- `combined gate+up GEMM` output → SwiGLU → NVFP4 quantize → done
-  (replaces our current `swiglu_nvfp4_quantize_kernel`).
-- `down_proj GEMM` output → residual add → RMSNorm + NVFP4 quantize
-  (replaces the post-MLP RMSNorm + quantize kernel for the next layer).
-- `DeltaNet out_proj` output → residual add → RMSNorm + NVFP4 quantize.
+### What CUTLASS provides out of the box
 
-Each fusion saves 1–2 kernel launches per layer × 64 layers per token.
+* `cutlass::epilogue::fusion::LinCombBlockScaleFactor` (Example 79b):
+  `D = alpha * A*B + beta * C` with NVFP4 + e4m3 scale factor generation
+  on the output. Pre-built fusion, drop-in replacement for the
+  `LinearCombination` we use today.
+* `LinearCombinationBiasElementwise`: linear combination + per-row /
+  per-column bias add. Pre-built. Our model has no bias, so unused.
+* Custom EVT visitors via `cutlass::epilogue::fusion::Sm90EVT` (also
+  applies to SM100/SM120): chainable element-wise visitors for
+  arbitrary post-GEMM transformations.
 
-**Gate to land Phase 2:** parity green, MTP=0 ≥ 55 tok/s.
+### Why fusing SwiGLU into the gate+up GEMM is mathematically blocked
+
+In our current `MlpFusedStore` layout the combined weight stacks
+gate_proj and up_proj **along the M dim** (M = 2·intermediate). The
+GEMM tile partition is `(Tile_M, Tile_N)`; for our `<128, 8, 128>`
+schedule each tile sees `M_start..M_start+128` rows of the output.
+
+Because `intermediate = 17408 = 136 × 128` is a multiple of the M tile
+size, every tile is **either entirely "gate output" (m < intermediate)
+or entirely "up output" (m ≥ intermediate)** — never both. SwiGLU
+needs to pair `gate[i]` with `up[i + intermediate]`, which live in
+different tiles. CUTLASS epilogues cannot share state across tiles, so
+the fusion cannot land inside a single GEMM call without restructuring.
+
+Restructuring to put gate and up side-by-side in the N dim (batched
+GEMM with L=2) would let a single epilogue tile see both halves, but
+batched-GEMM epilogues also do not share state across batches, so the
+pairing problem just moves. There is no clean CUTLASS-native fusion.
+
+### Why fusing RMSNorm into down_proj is hard
+
+RMSNorm requires a `sum(x²)` reduction across the **M dim** (the output
+rows for a single N=1 column) before the per-element scaling. Each
+GEMM epilogue tile only sees a 128-row slice of the M=5120 down_proj
+output, so the reduction must accumulate across 40 tiles. CUTLASS does
+support split-K reductions via a follow-up "ReduceK" kernel, but
+split-M reductions across the *output* M for a single N column are not
+a standard pattern and require either an explicit second pass or a
+custom persistent kernel.
+
+### What still has tractable upside
+
+* **`LinCombBlockScaleFactor` for down_proj** — emit FP4 + scales
+  directly so the next layer's `rmsnorm_nvfp4_quantize` can read FP4
+  input instead of BF16. Requires a new RMSNorm-from-NVFP4 kernel
+  variant. Estimated saving: ~10–20 µs per layer × 64 = 0.6–1.3 ms /
+  token = **3–6 % MTP=0**. Effort: ~1–2 focused days for the kernel
+  pair + parity harness.
+
+* **In-place residual add via `beta=1, C=residual`** for down_proj
+  GEMM. Currently the residual add happens inline inside the next
+  layer's rmsnorm; pulling it into the GEMM epilogue saves one BF16
+  buffer write + read per layer, ~0.5 µs / layer × 64 = **0.03 ms /
+  token = ~0.15 %**. Negligible. Skip.
+
+* **CUTLASS persistent / streamK schedules** for very tall + skinny
+  GEMMs (M=large, N=1, K=hidden). Could shift the perf parity vs
+  cuBLASLt, but the CollectiveBuilder defaults are already in this
+  family on SM120, so this is iterative tile / schedule tuning. Effort
+  unclear, gain unclear.
+
+### Bottom line
+
+The Mirage-style branch lands a **complete, parity-verified CUTLASS
+NVFP4 substrate** that is at perf parity with cuBLASLt at our shapes.
+The next CUTLASS-side perf gain (3–6 % via `LinCombBlockScaleFactor`
+on down_proj + RMSNorm-from-NVFP4) is multi-day work for modest
+return.
+
+Higher-leverage next experiments to try BEFORE returning to CUTLASS
+EVT work:
+
+1. Boot a native Linux kernel and re-bench: WSL2 is documented to add
+   1–3 µs per kernel launch; with ~30 cudaGraphLaunches per second of
+   decode + sync points, the expected delta is **5–10 % free**.
+2. MTP head BF16 → NVFP4 quantization with a parity harness on draft
+   acceptance rate. Higher gain on MTP=2/3 but high parity risk.
+3. True Mirage cross-layer persistent kernel (Phase 4). Multi-week
+   effort, gain unclear without prototype.
+
+## Phase 2 — Epilogue fusion (deferred / planning only)
 
 ## Phase 3 — Per-layer mega-kernels
 
