@@ -34,5 +34,5 @@ pub use ops::{
 };
 pub use rmsnorm::RmsNormSpec;
 pub use rope::PartialRopeSpec;
-pub use sampling::SamplingSpec;
+pub use sampling::{SamplingRowsSpec, SamplingSpec};
 pub use swiglu::{SwiGluNvfp4QuantizeSpec, SwiGluSpec};

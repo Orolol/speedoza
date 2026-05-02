@@ -531,6 +531,7 @@ pub struct GpuForwardBuffers {
     pub token_u32: CudaDeviceBuffer,
     pub position_i32: CudaDeviceBuffer,
     pub logits: CudaDeviceBuffer,
+    pub mtp_logits: CudaDeviceBuffer,
     pub sampled_token_u32: CudaDeviceBuffer,
     /// MTP verify graph token bundle. The first four u32s keep the MTP=1
     /// layout `[draft_input, next_token, verified_token, next_draft_token]`;
@@ -747,6 +748,7 @@ impl GpuForwardBuffers {
             token_u32: CudaDeviceBuffer::alloc(4)?,
             position_i32: CudaDeviceBuffer::alloc(4)?,
             logits: CudaDeviceBuffer::alloc(topology.vocab_size * 2)?,
+            mtp_logits: CudaDeviceBuffer::alloc(topology.vocab_size * 4 * 2)?,
             sampled_token_u32: CudaDeviceBuffer::alloc(4)?,
             mtp_verify_token_u32: CudaDeviceBuffer::alloc(64)?,
             attn_partial_acc: CudaDeviceBuffer::alloc(attn_partial_acc_bytes.max(1))?,
@@ -773,6 +775,7 @@ impl GpuForwardBuffers {
             self.token_u32.bytes(),
             self.position_i32.bytes(),
             self.logits.bytes(),
+            self.mtp_logits.bytes(),
             self.sampled_token_u32.bytes(),
             self.mtp_verify_token_u32.bytes(),
             self.attn_partial_acc.bytes(),

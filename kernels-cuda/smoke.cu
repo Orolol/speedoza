@@ -431,6 +431,9 @@ int main() {
   qwen36_device_ptr_t logits = dev_alloc<__nv_bfloat16>(4);
   qwen36_device_ptr_t sampled = dev_alloc<uint32_t>(1);
   qwen36_device_ptr_t sampled_mirror = dev_alloc<uint32_t>(1);
+  qwen36_device_ptr_t logits_rows = dev_alloc<__nv_bfloat16>(8);
+  qwen36_device_ptr_t sampled_rows = dev_alloc<uint32_t>(2);
+  qwen36_device_ptr_t sampled_rows_mirror = dev_alloc<uint32_t>(1);
   copy_bf16(logits, {0.5f, 4.0f, 3.0f, 4.0f});
   qwen36_sampling_spec_t sampling_spec{};
   sampling_spec.vocab_size = 4;
@@ -444,6 +447,22 @@ int main() {
   if (token != 1 || mirror_token != 1) {
     fprintf(stderr, "sample expected token 1 got %u mirror %u\n", token,
             mirror_token);
+    exit(1);
+  }
+  copy_bf16(logits_rows, {0.5f, 4.0f, 3.0f, 4.0f, 1.0f, 2.0f, 5.0f, 4.0f});
+  qwen36_sampling_rows_spec_t sampling_rows_spec{};
+  sampling_rows_spec.rows = 2;
+  sampling_rows_spec.vocab_size = 4;
+  sampling_rows_spec.logits_bf16 = logits_rows;
+  sampling_rows_spec.output_token_u32 = sampled_rows;
+  sampling_rows_spec.mirror_last_output_token_u32 = sampled_rows_mirror;
+  sampling_rows_spec.temperature = 1.0f;
+  must_status(qwen36_sample_rows(&sampling_rows_spec), "sample rows");
+  const std::vector<uint32_t> row_tokens = read_raw<uint32_t>(sampled_rows, 2);
+  const uint32_t row_mirror_token = read_one<uint32_t>(sampled_rows_mirror);
+  if (row_tokens[0] != 1 || row_tokens[1] != 2 || row_mirror_token != 2) {
+    fprintf(stderr, "sample rows expected [1, 2] mirror 2 got [%u, %u] mirror %u\n",
+            row_tokens[0], row_tokens[1], row_mirror_token);
     exit(1);
   }
 
@@ -686,6 +705,9 @@ int main() {
   dev_free<__nv_bfloat16>(logits);
   dev_free<uint32_t>(sampled);
   dev_free<uint32_t>(sampled_mirror);
+  dev_free<__nv_bfloat16>(logits_rows);
+  dev_free<uint32_t>(sampled_rows);
+  dev_free<uint32_t>(sampled_rows_mirror);
   dev_free<uint32_t>(token_ids);
   dev_free<__nv_bfloat16>(embedding);
   dev_free<__nv_bfloat16>(embedding_out);

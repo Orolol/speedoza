@@ -14,6 +14,19 @@ pub struct SamplingSpec {
     pub repetition_penalty: f32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingRowsSpec {
+    pub rows: usize,
+    pub vocab_size: usize,
+    /// Column-major logits as produced by `Bf16GemmSpec { m: vocab, n: rows }`.
+    pub logits_bf16: DevicePtr,
+    /// Contiguous `rows` u32 outputs.
+    pub output_token_u32: DevicePtr,
+    /// Optional mirror for the final row's token.
+    pub mirror_last_output_token_u32: DevicePtr,
+    pub temperature: f32,
+}
+
 pub fn greedy_argmax(logits: &[f32]) -> Option<u32> {
     logits
         .iter()
