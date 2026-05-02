@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <math.h>
+#include <random>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -651,6 +652,46 @@ int main() {
   sigmoid_spec.output_bf16 = sigmoid_out;
   must_status(qwen36_sigmoid_gate(&sigmoid_spec), "sigmoid gate");
   expect_close(read_bf16(sigmoid_out, 1)[0], 1.0f, 0.02f, "sigmoid gate");
+
+  // Top-K argmax smoke: K=4 over a 1024-vocab BF16 logits array with
+  // planted top-4 at known indices.
+  {
+    constexpr size_t V = 1024;
+    std::mt19937 rng(0xC0FFEE);
+    std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+    std::vector<float> h_logits_f(V);
+    for (size_t i = 0; i < V; ++i) {
+      h_logits_f[i] = dist(rng);
+    }
+    const uint32_t expect[4] = {17, 200, 999, 42};
+    const float vals[4] = {10.0f, 9.5f, 9.0f, 8.5f};
+    for (int i = 0; i < 4; ++i) {
+      h_logits_f[expect[i]] = vals[i];
+    }
+
+    qwen36_device_ptr_t topk_logits = dev_alloc<__nv_bfloat16>(V);
+    qwen36_device_ptr_t topk_out = dev_alloc<uint32_t>(4);
+    copy_bf16(topk_logits, h_logits_f);
+
+    qwen36_topk_argmax_spec_t topk_spec{};
+    topk_spec.vocab_size = V;
+    topk_spec.k = 4;
+    topk_spec.logits_bf16 = topk_logits;
+    topk_spec.output_token_u32 = topk_out;
+    must_status(qwen36_topk_argmax(&topk_spec), "topk argmax");
+
+    std::vector<uint32_t> got = read_raw<uint32_t>(topk_out, 4);
+    for (int i = 0; i < 4; ++i) {
+      if (got[i] != expect[i]) {
+        fprintf(stderr, "topk smoke mismatch at %d: got %u want %u\n",
+                i, got[i], expect[i]);
+        exit(1);
+      }
+    }
+    dev_free<__nv_bfloat16>(topk_logits);
+    dev_free<uint32_t>(topk_out);
+    printf("topk smoke OK\n");
+  }
 
   dev_free<__nv_bfloat16>(q);
   dev_free<__nv_bfloat16>(k);
