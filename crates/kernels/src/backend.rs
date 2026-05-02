@@ -1202,9 +1202,7 @@ mod ffi {
         pub fn qwen36_rmsnorm_nvfp4_quantize(spec: *const RmsNormNvfp4QuantizeSpec) -> i32;
         pub fn qwen36_partial_rope(spec: *const PartialRopeSpec) -> i32;
         pub fn qwen36_swiglu(spec: *const SwiGluSpec) -> i32;
-        pub fn qwen36_swiglu_nvfp4_quantize(
-            spec: *const SwiGluNvfp4QuantizeSpec,
-        ) -> i32;
+        pub fn qwen36_swiglu_nvfp4_quantize(spec: *const SwiGluNvfp4QuantizeSpec) -> i32;
         pub fn qwen36_sample(spec: *const SamplingSpec) -> i32;
         pub fn qwen36_embedding_lookup(spec: *const EmbeddingLookupSpec) -> i32;
         pub fn qwen36_bf16_gemm(spec: *const Bf16GemmSpec) -> i32;

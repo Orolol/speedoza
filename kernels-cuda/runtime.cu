@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <cuda_runtime.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 namespace {
 
@@ -20,6 +22,59 @@ int status(cudaError_t value) {
 // so existing callers keep working; setting a non-default stream lets the
 // engine route every kernel through it (e.g. for CUDA Graph capture).
 std::atomic<cudaStream_t> g_active_stream{nullptr};
+
+std::atomic<unsigned long long> g_malloc_calls{0};
+std::atomic<unsigned long long> g_free_calls{0};
+std::atomic<unsigned long long> g_h2d_calls{0};
+std::atomic<unsigned long long> g_h2d_bytes{0};
+std::atomic<unsigned long long> g_d2h_calls{0};
+std::atomic<unsigned long long> g_d2h_bytes{0};
+std::atomic<unsigned long long> g_d2d_calls{0};
+std::atomic<unsigned long long> g_d2d_bytes{0};
+std::atomic<unsigned long long> g_d2d_async_calls{0};
+std::atomic<unsigned long long> g_d2d_async_bytes{0};
+std::atomic<unsigned long long> g_memset_calls{0};
+std::atomic<unsigned long long> g_memset_bytes{0};
+std::atomic<unsigned long long> g_synchronize_calls{0};
+std::atomic<unsigned long long> g_stream_synchronize_calls{0};
+std::atomic<unsigned long long> g_graph_launch_calls{0};
+
+void add_counter(std::atomic<unsigned long long> &counter,
+                 unsigned long long value = 1) {
+  counter.fetch_add(value, std::memory_order_relaxed);
+}
+
+void copy_cstr(char *dst, size_t dst_len, const char *src) {
+  if (dst_len == 0) {
+    return;
+  }
+  if (src == nullptr) {
+    dst[0] = '\0';
+    return;
+  }
+  strncpy(dst, src, dst_len - 1);
+  dst[dst_len - 1] = '\0';
+}
+
+void fill_loaded_library_path(const char *soname, const char *symbol,
+                              char *dst, size_t dst_len) {
+  if (dst_len == 0) {
+    return;
+  }
+  dst[0] = '\0';
+  void *handle = dlopen(soname, RTLD_LAZY | RTLD_NOLOAD);
+  if (handle == nullptr) {
+    handle = dlopen(soname, RTLD_LAZY);
+  }
+  if (handle == nullptr) {
+    return;
+  }
+  void *sym = dlsym(handle, symbol);
+  Dl_info info{};
+  if (sym != nullptr && dladdr(sym, &info) != 0 && info.dli_fname != nullptr) {
+    copy_cstr(dst, dst_len, info.dli_fname);
+  }
+}
 
 } // namespace
 
@@ -57,6 +112,7 @@ extern "C" int qwen36_cuda_stream_destroy(qwen36_cuda_stream_t stream) {
 }
 
 extern "C" int qwen36_cuda_stream_synchronize(qwen36_cuda_stream_t stream) {
+  add_counter(g_stream_synchronize_calls);
   return status(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)));
 }
 
@@ -112,6 +168,7 @@ extern "C" int qwen36_cuda_graph_exec_destroy(qwen36_cuda_graph_exec_t exec) {
 
 extern "C" int qwen36_cuda_graph_launch(qwen36_cuda_graph_exec_t exec,
                                         qwen36_cuda_stream_t stream) {
+  add_counter(g_graph_launch_calls);
   return status(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(exec),
                                 reinterpret_cast<cudaStream_t>(stream)));
 }
@@ -143,6 +200,7 @@ extern "C" int qwen36_cuda_malloc(qwen36_device_allocation_t *out,
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }
   void *device_ptr = nullptr;
+  add_counter(g_malloc_calls);
   cudaError_t err = cudaMalloc(&device_ptr, bytes);
   if (err != cudaSuccess) {
     if (getenv("QWEN36_DEBUG_CUDA_ALLOC") != nullptr) {
@@ -164,6 +222,7 @@ extern "C" int qwen36_cuda_free(qwen36_device_ptr_t device_ptr) {
   if (device_ptr.ptr == 0) {
     return QWEN36_STATUS_SUCCESS;
   }
+  add_counter(g_free_calls);
   return status(cudaFree(ptr(device_ptr)));
 }
 
@@ -172,6 +231,8 @@ extern "C" int qwen36_cuda_memcpy_h2d(qwen36_device_ptr_t dst,
   if (dst.ptr == 0 || src == nullptr || bytes == 0) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }
+  add_counter(g_h2d_calls);
+  add_counter(g_h2d_bytes, bytes);
   return status(cudaMemcpy(ptr(dst), src, bytes, cudaMemcpyHostToDevice));
 }
 
@@ -179,6 +240,18 @@ extern "C" int qwen36_cuda_memcpy_d2h(void *dst, qwen36_device_ptr_t src,
                                       size_t bytes) {
   if (dst == nullptr || src.ptr == 0 || bytes == 0) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  add_counter(g_d2h_calls);
+  add_counter(g_d2h_bytes, bytes);
+  cudaStream_t stream = qwen36_internal_active_stream();
+  if (stream != nullptr) {
+    cudaError_t err =
+        cudaMemcpyAsync(dst, ptr(src), bytes, cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) {
+      return status(err);
+    }
+    add_counter(g_stream_synchronize_calls);
+    return status(cudaStreamSynchronize(stream));
   }
   return status(cudaMemcpy(dst, ptr(src), bytes, cudaMemcpyDeviceToHost));
 }
@@ -188,7 +261,28 @@ extern "C" int qwen36_cuda_memcpy_d2d(qwen36_device_ptr_t dst,
   if (dst.ptr == 0 || src.ptr == 0 || bytes == 0) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }
+  add_counter(g_d2d_calls);
+  add_counter(g_d2d_bytes, bytes);
   return status(cudaMemcpy(ptr(dst), ptr(src), bytes, cudaMemcpyDeviceToDevice));
+}
+
+extern "C" int qwen36_cuda_memcpy_d2d_async(qwen36_device_ptr_t dst,
+                                            qwen36_device_ptr_t src,
+                                            size_t bytes) {
+  if (dst.ptr == 0 || src.ptr == 0 || bytes == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  cudaStream_t stream = qwen36_internal_active_stream();
+  if (stream == nullptr) {
+    add_counter(g_d2d_calls);
+    add_counter(g_d2d_bytes, bytes);
+    return status(cudaMemcpy(ptr(dst), ptr(src), bytes,
+                             cudaMemcpyDeviceToDevice));
+  }
+  add_counter(g_d2d_async_calls);
+  add_counter(g_d2d_async_bytes, bytes);
+  return status(cudaMemcpyAsync(ptr(dst), ptr(src), bytes,
+                                cudaMemcpyDeviceToDevice, stream));
 }
 
 extern "C" int qwen36_cuda_memset(qwen36_device_ptr_t dst, int value,
@@ -196,11 +290,115 @@ extern "C" int qwen36_cuda_memset(qwen36_device_ptr_t dst, int value,
   if (dst.ptr == 0 || bytes == 0) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }
+  add_counter(g_memset_calls);
+  add_counter(g_memset_bytes, bytes);
   return status(cudaMemset(ptr(dst), value, bytes));
 }
 
 extern "C" int qwen36_cuda_synchronize(void) {
+  add_counter(g_synchronize_calls);
   return status(cudaDeviceSynchronize());
+}
+
+extern "C" int
+qwen36_cuda_get_diagnostics(qwen36_cuda_diagnostics_t *out) {
+  if (out == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  memset(out, 0, sizeof(*out));
+
+  cudaError_t err = cudaDriverGetVersion(&out->driver_version);
+  if (err != cudaSuccess) {
+    out->last_cuda_error = static_cast<int>(err);
+    copy_cstr(out->last_cuda_error_name, sizeof(out->last_cuda_error_name),
+              cudaGetErrorName(err));
+    copy_cstr(out->last_cuda_error_string,
+              sizeof(out->last_cuda_error_string), cudaGetErrorString(err));
+  } else {
+    err = cudaRuntimeGetVersion(&out->runtime_version);
+    if (err != cudaSuccess) {
+      out->last_cuda_error = static_cast<int>(err);
+      copy_cstr(out->last_cuda_error_name, sizeof(out->last_cuda_error_name),
+                cudaGetErrorName(err));
+      copy_cstr(out->last_cuda_error_string,
+                sizeof(out->last_cuda_error_string), cudaGetErrorString(err));
+    }
+  }
+  err = cudaGetDeviceCount(&out->device_count);
+  if (err == cudaSuccess && out->device_count > 0) {
+    cudaGetDevice(&out->active_device);
+    cudaDeviceProp prop{};
+    err = cudaGetDeviceProperties(&prop, out->active_device);
+    if (err == cudaSuccess) {
+      out->sm_major = prop.major;
+      out->sm_minor = prop.minor;
+      out->multiprocessor_count = prop.multiProcessorCount;
+      out->total_global_mem = prop.totalGlobalMem;
+      copy_cstr(out->device_name, sizeof(out->device_name), prop.name);
+    }
+  }
+
+  fill_loaded_library_path("libcuda.so.1", "cuInit", out->libcuda_path,
+                           sizeof(out->libcuda_path));
+  Dl_info cudart_info{};
+  if (dladdr(reinterpret_cast<const void *>(&cudaRuntimeGetVersion),
+             &cudart_info) != 0 &&
+      cudart_info.dli_fname != nullptr) {
+    copy_cstr(out->cudart_path, sizeof(out->cudart_path),
+              cudart_info.dli_fname);
+  }
+
+  cudaError_t last = cudaPeekAtLastError();
+  if (last != cudaSuccess || out->last_cuda_error == 0) {
+    out->last_cuda_error = static_cast<int>(last);
+    copy_cstr(out->last_cuda_error_name, sizeof(out->last_cuda_error_name),
+              cudaGetErrorName(last));
+    copy_cstr(out->last_cuda_error_string, sizeof(out->last_cuda_error_string),
+              cudaGetErrorString(last));
+  }
+  return QWEN36_STATUS_SUCCESS;
+}
+
+extern "C" int qwen36_cuda_counters_reset(void) {
+  g_malloc_calls.store(0, std::memory_order_relaxed);
+  g_free_calls.store(0, std::memory_order_relaxed);
+  g_h2d_calls.store(0, std::memory_order_relaxed);
+  g_h2d_bytes.store(0, std::memory_order_relaxed);
+  g_d2h_calls.store(0, std::memory_order_relaxed);
+  g_d2h_bytes.store(0, std::memory_order_relaxed);
+  g_d2d_calls.store(0, std::memory_order_relaxed);
+  g_d2d_bytes.store(0, std::memory_order_relaxed);
+  g_d2d_async_calls.store(0, std::memory_order_relaxed);
+  g_d2d_async_bytes.store(0, std::memory_order_relaxed);
+  g_memset_calls.store(0, std::memory_order_relaxed);
+  g_memset_bytes.store(0, std::memory_order_relaxed);
+  g_synchronize_calls.store(0, std::memory_order_relaxed);
+  g_stream_synchronize_calls.store(0, std::memory_order_relaxed);
+  g_graph_launch_calls.store(0, std::memory_order_relaxed);
+  return QWEN36_STATUS_SUCCESS;
+}
+
+extern "C" int qwen36_cuda_counters_read(qwen36_cuda_counters_t *out) {
+  if (out == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  out->malloc_calls = g_malloc_calls.load(std::memory_order_relaxed);
+  out->free_calls = g_free_calls.load(std::memory_order_relaxed);
+  out->h2d_calls = g_h2d_calls.load(std::memory_order_relaxed);
+  out->h2d_bytes = g_h2d_bytes.load(std::memory_order_relaxed);
+  out->d2h_calls = g_d2h_calls.load(std::memory_order_relaxed);
+  out->d2h_bytes = g_d2h_bytes.load(std::memory_order_relaxed);
+  out->d2d_calls = g_d2d_calls.load(std::memory_order_relaxed);
+  out->d2d_bytes = g_d2d_bytes.load(std::memory_order_relaxed);
+  out->d2d_async_calls = g_d2d_async_calls.load(std::memory_order_relaxed);
+  out->d2d_async_bytes = g_d2d_async_bytes.load(std::memory_order_relaxed);
+  out->memset_calls = g_memset_calls.load(std::memory_order_relaxed);
+  out->memset_bytes = g_memset_bytes.load(std::memory_order_relaxed);
+  out->synchronize_calls = g_synchronize_calls.load(std::memory_order_relaxed);
+  out->stream_synchronize_calls =
+      g_stream_synchronize_calls.load(std::memory_order_relaxed);
+  out->graph_launch_calls = g_graph_launch_calls.load(std::memory_order_relaxed);
+  return QWEN36_STATUS_SUCCESS;
 }
 
 // Pin a memory window to the L2 cache via the active stream's access policy

@@ -16,6 +16,41 @@ typedef struct {
   size_t bytes;
 } qwen36_device_allocation_t;
 
+typedef struct {
+  int driver_version;
+  int runtime_version;
+  int device_count;
+  int active_device;
+  int sm_major;
+  int sm_minor;
+  int multiprocessor_count;
+  size_t total_global_mem;
+  char device_name[128];
+  char libcuda_path[512];
+  char cudart_path[512];
+  int last_cuda_error;
+  char last_cuda_error_name[64];
+  char last_cuda_error_string[256];
+} qwen36_cuda_diagnostics_t;
+
+typedef struct {
+  uint64_t malloc_calls;
+  uint64_t free_calls;
+  uint64_t h2d_calls;
+  uint64_t h2d_bytes;
+  uint64_t d2h_calls;
+  uint64_t d2h_bytes;
+  uint64_t d2d_calls;
+  uint64_t d2d_bytes;
+  uint64_t d2d_async_calls;
+  uint64_t d2d_async_bytes;
+  uint64_t memset_calls;
+  uint64_t memset_bytes;
+  uint64_t synchronize_calls;
+  uint64_t stream_synchronize_calls;
+  uint64_t graph_launch_calls;
+} qwen36_cuda_counters_t;
+
 enum {
   QWEN36_STATUS_SUCCESS = 0,
   QWEN36_STATUS_NULL_POINTER = 1,
@@ -386,8 +421,13 @@ int qwen36_cuda_memcpy_h2d(qwen36_device_ptr_t dst, const void *src,
 int qwen36_cuda_memcpy_d2h(void *dst, qwen36_device_ptr_t src, size_t bytes);
 int qwen36_cuda_memcpy_d2d(qwen36_device_ptr_t dst, qwen36_device_ptr_t src,
                            size_t bytes);
+int qwen36_cuda_memcpy_d2d_async(qwen36_device_ptr_t dst,
+                                 qwen36_device_ptr_t src, size_t bytes);
 int qwen36_cuda_memset(qwen36_device_ptr_t dst, int value, size_t bytes);
 int qwen36_cuda_synchronize(void);
+int qwen36_cuda_get_diagnostics(qwen36_cuda_diagnostics_t *out);
+int qwen36_cuda_counters_reset(void);
+int qwen36_cuda_counters_read(qwen36_cuda_counters_t *out);
 int qwen36_cuda_set_l2_access_window(qwen36_device_ptr_t base, size_t bytes,
                                       float hit_ratio);
 int qwen36_cuda_clear_l2_access_window(void);

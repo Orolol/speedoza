@@ -21,7 +21,9 @@ pub use backend::{DevicePtr, KernelBackend, NoCudaBackend};
 pub use deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape};
 #[cfg(feature = "cuda")]
 pub use memory::{
-    CudaDeviceBuffer, cuda_clear_l2_access_window, cuda_set_l2_access_window, cuda_synchronize,
+    CudaCounters, CudaDeviceBuffer, CudaDiagnostics, cuda_clear_l2_access_window,
+    cuda_counters_read, cuda_counters_reset, cuda_diagnostics, cuda_set_l2_access_window,
+    cuda_synchronize,
 };
 pub use nvfp4_gemm::{CublasLtFp4ScaleMode, Nvfp4GemmPlan, Nvfp4GemmSpec};
 pub use ops::{
