@@ -287,6 +287,15 @@ typedef struct {
   qwen36_device_ptr_t mirror_output_token_u32;
 } qwen36_sampling_spec_t;
 
+#define QWEN36_TOPK_MAX 8
+
+typedef struct {
+  size_t vocab_size;
+  size_t k;                                // 1..QWEN36_TOPK_MAX
+  qwen36_device_ptr_t logits_bf16;
+  qwen36_device_ptr_t output_token_u32;    // [k] u32, sorted desc by logit
+} qwen36_topk_argmax_spec_t;
+
 typedef struct {
   size_t rows;
   size_t vocab_size;
@@ -483,6 +492,7 @@ int qwen36_swiglu_nvfp4_quantize(
     const qwen36_swiglu_nvfp4_quantize_spec_t *spec);
 int qwen36_sample(const qwen36_sampling_spec_t *spec);
 int qwen36_sample_rows(const qwen36_sampling_rows_spec_t *spec);
+int qwen36_topk_argmax(const qwen36_topk_argmax_spec_t *spec);
 int qwen36_embedding_lookup(const qwen36_embedding_lookup_spec_t *spec);
 int qwen36_bf16_matvec(const qwen36_bf16_matvec_spec_t *spec);
 int qwen36_nvfp4_matvec(const qwen36_nvfp4_matvec_spec_t *spec);

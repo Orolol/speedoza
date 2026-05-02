@@ -842,6 +842,14 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct TopkArgmaxSpec {
+        pub vocab_size: usize,
+        pub k: usize,
+        pub logits_bf16: DevicePtr,
+        pub output_token_u32: DevicePtr,
+    }
+
+    #[repr(C)]
     pub struct EmbeddingLookupSpec {
         pub tokens: usize,
         pub hidden: usize,
@@ -1287,6 +1295,7 @@ mod ffi {
         pub fn qwen36_swiglu_nvfp4_quantize(spec: *const SwiGluNvfp4QuantizeSpec) -> i32;
         pub fn qwen36_sample(spec: *const SamplingSpec) -> i32;
         pub fn qwen36_sample_rows(spec: *const SamplingRowsSpec) -> i32;
+        pub fn qwen36_topk_argmax(spec: *const TopkArgmaxSpec) -> i32;
         pub fn qwen36_embedding_lookup(spec: *const EmbeddingLookupSpec) -> i32;
         pub fn qwen36_bf16_gemm(spec: *const Bf16GemmSpec) -> i32;
         pub fn qwen36_bf16_matvec(spec: *const Bf16MatVecSpec) -> i32;
