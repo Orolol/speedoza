@@ -5,6 +5,7 @@ use qwen36_fp4_kernels::{
     CudaDeviceBuffer, DevicePtr, Nvfp4RetileScalesSpec, cuda_synchronize, nvfp4_retile_scales,
 };
 use qwen36_fp4_loader::MappedModel;
+use qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES;
 
 use crate::state::RuntimeState;
 use crate::weights::{LayerWeights, LinearWeightBinding, ModelWeightsManifest};
@@ -537,6 +538,10 @@ pub struct GpuForwardBuffers {
     /// layout `[draft_input, next_token, verified_token, next_draft_token]`;
     /// the remaining slots are used by the MTP=2..4 graph fast path.
     pub mtp_verify_token_u32: CudaDeviceBuffer,
+    /// Up to `MTP_TREE_MAX_LEAVES` u32 leaf token IDs sampled by top-K from
+    /// the MTP head's last forward (Phase 1 tree-MTP path). Populated by
+    /// `queue_sample_topk_into` once per cycle when `tree_leaves > 1`.
+    pub leaf_tokens_u32: CudaDeviceBuffer,
     /// Per-q-head per-split scratch for split-KV decode attention. Sized
     /// for `n_splits = ceil(max_context / kSplitTimestepsPerBlock)`.
     /// Layout `[q_heads, n_splits, head_dim]` FP32. Keeping the partial
@@ -751,6 +756,7 @@ impl GpuForwardBuffers {
             mtp_logits: CudaDeviceBuffer::alloc(topology.vocab_size * 5 * 2)?,
             sampled_token_u32: CudaDeviceBuffer::alloc(4)?,
             mtp_verify_token_u32: CudaDeviceBuffer::alloc(64)?,
+            leaf_tokens_u32: CudaDeviceBuffer::alloc(MTP_TREE_MAX_LEAVES * 4)?,
             attn_partial_acc: CudaDeviceBuffer::alloc(attn_partial_acc_bytes.max(1))?,
             attn_partial_max: CudaDeviceBuffer::alloc(attn_partial_scalar_bytes.max(1))?,
             attn_partial_denom: CudaDeviceBuffer::alloc(attn_partial_scalar_bytes.max(1))?,
@@ -778,6 +784,7 @@ impl GpuForwardBuffers {
             self.mtp_logits.bytes(),
             self.sampled_token_u32.bytes(),
             self.mtp_verify_token_u32.bytes(),
+            self.leaf_tokens_u32.bytes(),
             self.attn_partial_acc.bytes(),
             self.attn_partial_max.bytes(),
             self.attn_partial_denom.bytes(),

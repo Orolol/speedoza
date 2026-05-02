@@ -348,6 +348,17 @@ impl<B: KernelBackend> Engine<B> {
         self.queue_sample_greedy_into_with_mirror(output_token_u32, DevicePtr::NULL)
     }
 
+    /// Queue a top-K argmax sample from the engine's current decode logits
+    /// buffer into `output_token_u32_kvec`. The output buffer must be at least
+    /// `k * 4` bytes. Used by the tree-MTP draft generation path.
+    #[cfg(feature = "cuda")]
+    fn queue_sample_topk_into(&self, output_token_u32_kvec: DevicePtr, k: usize) -> Result<()> {
+        use qwen36_fp4_kernels::sampling::topk_argmax_device;
+        let logits = self.cuda_forward()?.logits.ptr();
+        let vocab_size = self.topology.vocab_size;
+        topk_argmax_device(vocab_size, k, logits, output_token_u32_kvec)
+    }
+
     #[cfg(feature = "cuda")]
     fn queue_sample_greedy_into_with_mirror(
         &self,

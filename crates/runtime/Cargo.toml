@@ -17,6 +17,7 @@ cuda = ["qwen36-fp4-kernels/cuda", "qwen36-fp4-loader"]
 qwen36-fp4-core = { path = "../core" }
 qwen36-fp4-kernels = { path = "../kernels" }
 qwen36-fp4-loader = { path = "../loader", optional = true }
+qwen36-fp4-mtp = { path = "../mtp" }
 anyhow.workspace = true
 serde.workspace = true
 thiserror.workspace = true
