@@ -21,7 +21,7 @@ if [ -d "${CUTLASS_DIR}/include" ]; then
   EXTRA_SRC=(kernels-cuda/megakernel/nvfp4_matvec_sm120.cu)
 else
   echo "warn: ${CUTLASS_DIR} not found; building without Mirage megakernel" >&2
-  EXTRA_SRC=()
+  EXTRA_SRC=(kernels-cuda/megakernel/nvfp4_matvec_stub.cu)
 fi
 
 "${NVCC}" \
@@ -41,6 +41,7 @@ fi
   kernels-cuda/runtime.cu \
   "${EXTRA_SRC[@]}" \
   -lcublasLt \
+  -ldl \
   -o "${OUT_DIR}/libqwen36_fp4_kernels.so"
 
 echo "${OUT_DIR}/libqwen36_fp4_kernels.so"

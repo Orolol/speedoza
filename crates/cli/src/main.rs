@@ -70,6 +70,7 @@ enum Command {
         #[arg(long, value_enum, default_value = "fp8")]
         kv: KvArg,
     },
+    CudaDiag,
     Tokenize {
         #[arg(long)]
         model_dir: PathBuf,
@@ -189,6 +190,17 @@ fn main() -> Result<()> {
             let topology = ModelTopology::expected_qwen36_text_mtp();
             let budget = MemoryBudget::estimate(&topology, ctx, kv.into());
             println!("{}", serde_json::to_string_pretty(&budget)?);
+        }
+        Command::CudaDiag => {
+            #[cfg(feature = "cuda")]
+            {
+                let diagnostics = qwen36_fp4_runtime::cuda_diagnostics()?;
+                println!("{}", serde_json::to_string_pretty(&diagnostics)?);
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                anyhow::bail!("cuda-diag requires rebuilding qwen36 with --features cuda")
+            }
         }
         Command::Tokenize {
             model_dir,
@@ -821,6 +833,7 @@ fn run_bench(
     // graph capture would otherwise hide the per-section sync points the
     // profiler relies on.
     let profile_decode = std::env::var("QWEN36_PROFILE_DECODE_LAYERS").is_ok();
+    qwen36_fp4_runtime::cuda_counters_reset()?;
     let decode_start = Instant::now();
     engine.queue_sample_greedy()?;
     let mut generated = 1_usize;
@@ -842,6 +855,7 @@ fn run_bench(
         }
     }
     qwen36_fp4_runtime::cuda_synchronize()?;
+    let cuda_counters = qwen36_fp4_runtime::cuda_counters_read()?;
     let decode_seconds = decode_start.elapsed().as_secs_f64();
     let total_seconds = total_start.elapsed().as_secs_f64();
 
@@ -861,6 +875,7 @@ fn run_bench(
             "mtp_requested_speculative_tokens": mtp_schedule.requested_tokens,
             "mtp_auto_disabled": mtp_schedule.auto_disabled,
             "mtp_max_prompt_tokens": mtp_schedule.max_prompt_tokens,
+            "cuda_counters_decode": cuda_counters,
         }))?
     );
     Ok(())
@@ -876,9 +891,11 @@ fn run_bench_mtp_one(
     prefill_seconds: f64,
     mtp_schedule: MtpSchedule,
 ) -> Result<()> {
+    qwen36_fp4_runtime::cuda_counters_reset()?;
     let decode_start = Instant::now();
     if max_new_tokens == 0 {
         qwen36_fp4_runtime::cuda_synchronize()?;
+        let cuda_counters = qwen36_fp4_runtime::cuda_counters_read()?;
         let decode_seconds = decode_start.elapsed().as_secs_f64();
         let total_seconds = total_start.elapsed().as_secs_f64();
         println!(
@@ -902,11 +919,13 @@ fn run_bench_mtp_one(
                 "mtp_acceptance_rate": 0.0,
                 "main_decode_steps": 0,
                 "mtp_decode_steps": 0,
+                "cuda_counters_decode": cuda_counters,
             }))?
         );
         return Ok(());
     }
 
+    let setup_start = Instant::now();
     engine.queue_sample_greedy_to_current_token()?;
     qwen36_fp4_runtime::cuda_synchronize()?;
     let mut current_token = engine.read_current_token()?;
@@ -914,6 +933,7 @@ fn run_bench_mtp_one(
     engine.queue_sample_greedy()?;
     qwen36_fp4_runtime::cuda_synchronize()?;
     let mut draft_token = engine.read_sampled_token()?;
+    let mtp_setup_seconds = setup_start.elapsed().as_secs_f64();
 
     let mut generated = 0_usize;
     let mut emitted_tokens = Vec::new();
@@ -926,6 +946,7 @@ fn run_bench_mtp_one(
     // runs remain visible in the bench JSON.
     let rebuilds = 0_usize;
     let mut rollback_recoveries = 0_usize;
+    let mut mtp_verify_seconds = 0.0_f64;
 
     while generated < max_new_tokens {
         emitted_tokens.push(current_token);
@@ -937,12 +958,14 @@ fn run_bench_mtp_one(
         let remaining_after_current = max_new_tokens - generated;
         let need_next_token = remaining_after_current > 1;
         let need_next_draft = remaining_after_current > 2;
+        let verify_start = Instant::now();
         let verify = engine.verify_mtp_draft_two_tokens(
             current_token,
             draft_token,
             need_next_token,
             need_next_draft,
         )?;
+        mtp_verify_seconds += verify_start.elapsed().as_secs_f64();
         main_decode_steps += 1;
         if verify.accepted {
             accepted_draft_tokens += 1;
@@ -974,6 +997,7 @@ fn run_bench_mtp_one(
         }
     }
     qwen36_fp4_runtime::cuda_synchronize()?;
+    let cuda_counters = qwen36_fp4_runtime::cuda_counters_read()?;
     let decode_seconds = decode_start.elapsed().as_secs_f64();
     let total_seconds = total_start.elapsed().as_secs_f64();
     let evaluated_drafts = accepted_draft_tokens + rejected_draft_tokens;
@@ -1004,6 +1028,9 @@ fn run_bench_mtp_one(
             "mtp_decode_steps": mtp_decode_steps,
             "mtp_rollback_recoveries": rollback_recoveries,
             "mtp_rebuilds": rebuilds,
+            "mtp_setup_seconds": mtp_setup_seconds,
+            "mtp_verify_seconds": mtp_verify_seconds,
+            "cuda_counters_decode": cuda_counters,
         }))?
     );
     Ok(())
@@ -1019,9 +1046,11 @@ fn run_bench_mtp_multi(
     prefill_seconds: f64,
     mtp_schedule: MtpSchedule,
 ) -> Result<()> {
+    qwen36_fp4_runtime::cuda_counters_reset()?;
     let decode_start = Instant::now();
     if max_new_tokens == 0 {
         qwen36_fp4_runtime::cuda_synchronize()?;
+        let cuda_counters = qwen36_fp4_runtime::cuda_counters_read()?;
         let decode_seconds = decode_start.elapsed().as_secs_f64();
         let total_seconds = total_start.elapsed().as_secs_f64();
         println!(
@@ -1047,17 +1076,20 @@ fn run_bench_mtp_multi(
                 "mtp_decode_steps": 0,
                 "mtp_rollback_recoveries": 0,
                 "mtp_rebuilds": 0,
+                "cuda_counters_decode": cuda_counters,
             }))?
         );
         return Ok(());
     }
 
     let draft_window = mtp_schedule.effective_tokens;
+    let setup_start = Instant::now();
     engine.queue_sample_greedy_to_current_token()?;
     qwen36_fp4_runtime::cuda_synchronize()?;
     let mut current_token = engine.read_current_token()?;
     let mut draft_tokens =
         engine.prepare_mtp_drafts_from_sampled(&prompt_tokens, current_token, draft_window)?;
+    let mtp_setup_seconds = setup_start.elapsed().as_secs_f64();
 
     let mut generated = 0_usize;
     let mut accepted_draft_tokens = 0_usize;
@@ -1066,6 +1098,7 @@ fn run_bench_mtp_multi(
     let mut mtp_decode_steps = draft_tokens.len();
     let mut rollback_recoveries = 0_usize;
     let rebuilds = 0_usize;
+    let mut mtp_verify_seconds = 0.0_f64;
 
     while generated < max_new_tokens {
         generated += 1;
@@ -1079,12 +1112,14 @@ fn run_bench_mtp_multi(
         let remaining_after_current = max_new_tokens - generated;
         let verify_count = draft_tokens.len().min(remaining_after_current);
         let need_next_token_on_full_accept = remaining_after_current > verify_count;
+        let verify_start = Instant::now();
         let verify = engine.verify_mtp_draft_tokens(
             current_token,
             &draft_tokens[..verify_count],
             need_next_token_on_full_accept,
             draft_window,
         )?;
+        mtp_verify_seconds += verify_start.elapsed().as_secs_f64();
         main_decode_steps += 1;
         accepted_draft_tokens += verify.accepted_drafts;
         if verify.rejected {
@@ -1104,6 +1139,7 @@ fn run_bench_mtp_multi(
     }
 
     qwen36_fp4_runtime::cuda_synchronize()?;
+    let cuda_counters = qwen36_fp4_runtime::cuda_counters_read()?;
     let decode_seconds = decode_start.elapsed().as_secs_f64();
     let total_seconds = total_start.elapsed().as_secs_f64();
     let evaluated_drafts = accepted_draft_tokens + rejected_draft_tokens;
@@ -1134,6 +1170,9 @@ fn run_bench_mtp_multi(
             "mtp_decode_steps": mtp_decode_steps,
             "mtp_rollback_recoveries": rollback_recoveries,
             "mtp_rebuilds": rebuilds,
+            "mtp_setup_seconds": mtp_setup_seconds,
+            "mtp_verify_seconds": mtp_verify_seconds,
+            "cuda_counters_decode": cuda_counters,
         }))?
     );
     Ok(())

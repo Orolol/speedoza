@@ -14,6 +14,9 @@ pub use engine::{MtpMultiVerifyResult, MtpVerifyResult};
 pub use gpu::{GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers, GpuTensor, GpuWeightStore};
 pub use kv_cache::{KvCacheLayout, KvCachePlan};
 #[cfg(feature = "cuda")]
-pub use qwen36_fp4_kernels::{CudaBackend, cuda_synchronize};
+pub use qwen36_fp4_kernels::{
+    CudaBackend, CudaCounters, CudaDiagnostics, cuda_counters_read, cuda_counters_reset,
+    cuda_diagnostics, cuda_synchronize,
+};
 pub use state::{DeltaNetStatePlan, RuntimeState};
 pub use weights::{LayerWeights, LinearWeightBinding, ModelWeightsManifest};

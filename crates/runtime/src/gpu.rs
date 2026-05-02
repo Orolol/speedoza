@@ -136,12 +136,8 @@ pub struct LinearAttnInProjFusedStore {
     pub total_bytes: u64,
 }
 
-
 impl LinearAttnInProjFusedStore {
-    pub fn build(
-        weights: &GpuWeightStore,
-        manifest: &ModelWeightsManifest,
-    ) -> Result<Self> {
+    pub fn build(weights: &GpuWeightStore, manifest: &ModelWeightsManifest) -> Result<Self> {
         let mut layers: Vec<Option<LinearAttnInProjFused>> =
             Vec::with_capacity(manifest.layers.len());
         let mut total_bytes = 0_u64;
@@ -167,7 +163,12 @@ impl LinearAttnInProjFusedStore {
 fn unwrap_nvfp4<'a>(
     binding: &'a LinearWeightBinding,
     name: &str,
-) -> Result<(&'a TensorInfo, &'a TensorInfo, &'a TensorInfo, &'a TensorInfo)> {
+) -> Result<(
+    &'a TensorInfo,
+    &'a TensorInfo,
+    &'a TensorInfo,
+    &'a TensorInfo,
+)> {
     match binding {
         LinearWeightBinding::Nvfp4 {
             weight,
@@ -202,8 +203,7 @@ fn build_linear_attn_layer_fused(
         .collect::<Result<Vec<_>>>()?;
     let ts_ref = ts[0];
     let is_ref = is_[0];
-    if ts.iter().any(|v| (v - ts_ref).abs() > 1e-9)
-        || is_.iter().any(|v| (v - is_ref).abs() > 1e-9)
+    if ts.iter().any(|v| (v - ts_ref).abs() > 1e-9) || is_.iter().any(|v| (v - is_ref).abs() > 1e-9)
     {
         return Err(CoreError::Runtime(format!(
             "fused DeltaNet in_proj requires matching tensor_scale and input_scale across qkv/b/a/z; got tensor_scales={:?}, input_scales={:?}",
@@ -213,9 +213,9 @@ fn build_linear_attn_layer_fused(
 
     // Look up GPU buffers.
     let lookup = |info: &TensorInfo| -> Result<&GpuTensor> {
-        weights.tensor(&info.name).ok_or_else(|| {
-            CoreError::Runtime(format!("missing GPU buffer for {}", info.name))
-        })
+        weights
+            .tensor(&info.name)
+            .ok_or_else(|| CoreError::Runtime(format!("missing GPU buffer for {}", info.name)))
     };
     let qkv_w_buf = lookup(qkv_w)?;
     let b_w_buf = lookup(b_w)?;
@@ -248,16 +248,17 @@ fn build_linear_attn_layer_fused(
         .first()
         .copied()
         .ok_or_else(|| CoreError::Runtime("in_proj_z has empty shape".to_owned()))?;
-    let row_bytes = qkv_w.shape.get(1).copied().ok_or_else(|| {
-        CoreError::Runtime("in_proj_qkv shape missing inner dim".to_owned())
-    })?;
+    let row_bytes = qkv_w
+        .shape
+        .get(1)
+        .copied()
+        .ok_or_else(|| CoreError::Runtime("in_proj_qkv shape missing inner dim".to_owned()))?;
     if [b_w, a_w, z_w]
         .iter()
         .any(|t| t.shape.get(1).copied() != Some(row_bytes))
     {
         return Err(CoreError::Runtime(
-            "fused DeltaNet in_proj requires identical packed K bytes across qkv/b/a/z"
-                .to_owned(),
+            "fused DeltaNet in_proj requires identical packed K bytes across qkv/b/a/z".to_owned(),
         ));
     }
 
@@ -457,12 +458,9 @@ fn build_layer_pair(
         CoreError::Runtime(format!("missing GPU buffer for {}", u_block_scale.name))
     })?;
 
-    if g_w.buffer.bytes() != u_w.buffer.bytes()
-        || g_bs.buffer.bytes() != u_bs.buffer.bytes()
-    {
+    if g_w.buffer.bytes() != u_w.buffer.bytes() || g_bs.buffer.bytes() != u_bs.buffer.bytes() {
         return Err(CoreError::Runtime(
-            "fused MLP requires gate/up weights and block_scales of identical byte size"
-                .to_owned(),
+            "fused MLP requires gate/up weights and block_scales of identical byte size".to_owned(),
         ));
     }
     let weight_bytes = g_w.buffer.bytes();
