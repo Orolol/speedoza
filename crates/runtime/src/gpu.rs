@@ -491,7 +491,7 @@ pub struct GpuRuntimeBuffers {
     pub conv_history_checkpoint: CudaDeviceBuffer,
     /// Scratch buffer for the K/V slice of the speculative verify positions, packed as
     /// `[layer 0 K | layer 0 V | layer 1 K | layer 1 V | ... | MTP K | MTP V]`.
-    /// Sized for the maximum (4 tokens) chunk written by the MTP=3 verify path.
+    /// Sized for the maximum (5 tokens) chunk written by the MTP=4 verify path.
     pub mtp_kv_snapshot: CudaDeviceBuffer,
     /// Layout that lets the engine address each layer's slice inside
     /// `mtp_kv_snapshot` without recomputing offsets every call.
@@ -535,7 +535,7 @@ pub struct GpuForwardBuffers {
     pub sampled_token_u32: CudaDeviceBuffer,
     /// MTP verify graph token bundle. The first four u32s keep the MTP=1
     /// layout `[draft_input, next_token, verified_token, next_draft_token]`;
-    /// the remaining slots are used by the MTP=2/3 graph fast path.
+    /// the remaining slots are used by the MTP=2..4 graph fast path.
     pub mtp_verify_token_u32: CudaDeviceBuffer,
     /// Per-q-head per-split scratch for split-KV decode attention. Sized
     /// for `n_splits = ceil(max_context / kSplitTimestepsPerBlock)`.
@@ -634,7 +634,7 @@ impl GpuRuntimeBuffers {
 }
 
 impl MtpKvSnapshotLayout {
-    pub const VERIFY_TOKENS: usize = 4;
+    pub const VERIFY_TOKENS: usize = 5;
 
     fn new(topology: &ModelTopology, kv_cache: &crate::kv_cache::KvCachePlan) -> Result<Self> {
         if kv_cache.max_context == 0 {
@@ -748,7 +748,7 @@ impl GpuForwardBuffers {
             token_u32: CudaDeviceBuffer::alloc(4)?,
             position_i32: CudaDeviceBuffer::alloc(4)?,
             logits: CudaDeviceBuffer::alloc(topology.vocab_size * 2)?,
-            mtp_logits: CudaDeviceBuffer::alloc(topology.vocab_size * 4 * 2)?,
+            mtp_logits: CudaDeviceBuffer::alloc(topology.vocab_size * 5 * 2)?,
             sampled_token_u32: CudaDeviceBuffer::alloc(4)?,
             mtp_verify_token_u32: CudaDeviceBuffer::alloc(64)?,
             attn_partial_acc: CudaDeviceBuffer::alloc(attn_partial_acc_bytes.max(1))?,
