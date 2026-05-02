@@ -136,12 +136,16 @@ pub struct TreeDraft {
 }
 
 pub struct TreeVerifyResult {
-    /// committed_token + accepted chain tokens + accepted leaf (if any)
+    /// Full ordered list of tokens committed this cycle. Always satisfies
+    /// `committed.len() == accepted_chain + 1` and
+    /// `committed.last() == Some(next_token)`. When `accepted_leaf == Some(idx)`,
+    /// `committed.last() == leaf_tokens[idx]`. When the chain rejects at row j,
+    /// `committed = chain_tokens[0..j] + [verified[j]]` (length j+1).
     pub committed: Vec<u32>,
     pub accepted_chain: usize,        // 0..=chain_depth
     pub accepted_leaf: Option<usize>, // 0..K
     /// Verified token at the last accepted position; seed for next cycle's
-    /// last_token.
+    /// last_token. Equal to `committed.last()`.
     pub next_token: u32,
 }
 
