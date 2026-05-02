@@ -760,7 +760,10 @@ __global__ void attention_prefill_kernel(
     const __nv_bfloat16 *q, const __nv_bfloat16 *cache_k,
     const __nv_bfloat16 *cache_v, __nv_bfloat16 *output,
     size_t start_position, const int32_t *start_position_device, size_t tokens,
-    qwen36_attention_shape_t shape) {
+    qwen36_attention_shape_t shape,
+    const uint64_t *tree_ancestor_bitmap_u64,    // NULL = causal
+    size_t verify_chunk_rows                      // 0 = causal
+) {
   __shared__ float warp_sums[8];
   __shared__ float score_share;
   __shared__ size_t shared_start_position;
@@ -793,6 +796,24 @@ __global__ void attention_prefill_kernel(
   float denom = 0.0f;
 
   for (size_t t = 0; t <= position; ++t) {
+    // Tree mask: restrict intra-chunk visibility via the per-row ancestor
+    // bitmap. Positions before the chunk (cache prefix) remain fully visible.
+    // The gate is uniform across all threads in the block (t and token are
+    // block-uniform), so `continue` skips all threads identically — no
+    // __syncthreads() hazard.
+    if (tree_ancestor_bitmap_u64 != nullptr && verify_chunk_rows > 0) {
+      const size_t chunk_base = shared_start_position;
+      if (t >= chunk_base && t < chunk_base + verify_chunk_rows) {
+        const uint32_t row = static_cast<uint32_t>(token);
+        const uint32_t col = static_cast<uint32_t>(t - chunk_base);
+        if (row < verify_chunk_rows) {
+          const uint64_t mask = tree_ancestor_bitmap_u64[row];
+          if (!(mask & (1ULL << col))) {
+            continue;
+          }
+        }
+      }
+    }
     float local = active
                       ? q_val *
                             __bfloat162float(
@@ -853,6 +874,12 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }
 
+  // Tree mask is only supported by attention_prefill_kernel (the basic path).
+  // Routing to split or GQA kernels with a tree mask would silently ignore
+  // the mask, so guard against it here as a hard contract.
+  const bool tree_mask_present = spec->tree_ancestor_bitmap_u64.ptr != 0
+                               && spec->verify_chunk_rows > 0;
+
   const int threads = 256;
   const dim3 copy_grid(static_cast<unsigned int>(spec->shape.kv_heads),
                        static_cast<unsigned int>(spec->tokens));
@@ -868,6 +895,9 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
                                 spec->partial_max_f32.ptr != 0 &&
                                 spec->partial_denom_f32.ptr != 0;
   if (partials_present && spec->prefill_n_splits >= 2 && spec->tokens <= 2) {
+    if (tree_mask_present) {
+      return QWEN36_STATUS_NOT_IMPLEMENTED;
+    }
     const int split_timesteps_per_block =
         spec->split_timesteps_per_block == 0
             ? kDefaultSplitTimestepsPerBlock
@@ -938,6 +968,9 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
       q_per_kv <= static_cast<size_t>(kGqaMaxQPerKv) && q_per_kv > 1 &&
       spec->tokens >= kPrefillGqaMinTokens;
   if (gqa_eligible) {
+    if (tree_mask_present) {
+      return QWEN36_STATUS_NOT_IMPLEMENTED;
+    }
     unsigned int gqa_threads = static_cast<unsigned int>(spec->shape.head_dim);
     gqa_threads = (gqa_threads + 31u) & ~31u;
     if (gqa_threads == 0) {
@@ -967,7 +1000,11 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
       ptr<const __nv_bfloat16>(spec->kv_cache_v),
       ptr<__nv_bfloat16>(spec->output_bf16), spec->start_position,
       ptr<const int32_t>(spec->start_position_device_i32), spec->tokens,
-      spec->shape);
+      spec->shape,
+      spec->tree_ancestor_bitmap_u64.ptr != 0
+          ? ptr<const uint64_t>(spec->tree_ancestor_bitmap_u64)
+          : nullptr,
+      spec->verify_chunk_rows);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
