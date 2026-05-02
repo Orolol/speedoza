@@ -1,261 +1,352 @@
-# Tree-MTP Phase 1: Last-Position Top-K Acceptance
+# Tree-MTP Phase 1 (revised v3): Branched-Tail with Leaves IN Chunk
 
-**Date:** 2026-05-02 (revised same-day after design review)
+**Date:** 2026-05-02 (third revision after iterating with the user)
 **Branch:** `feat/perf-tree-mtp-stack`
 **Status:** Design — pending user approval
-**Phase:** 1 of 3 (Phase 2: tree-mask attention + per-branch DeltaNet for true multi-level branching, Phase 3: adaptive shape)
+**Depends on:** main HEAD `097e692` (PR #2: MTP4 + batched lm_head + sample_rows kernel)
+**Phase:** 1 of 3 (Phase 2: per-branch DeltaNet + multi-level branching, Phase 3: adaptive shape)
 
-> **Revision note.** An earlier draft of this design put the K leaves into
-> the verify chunk and required a tree-mask attention kernel + per-branch
-> DeltaNet replay + KV scratch slots. Re-reading §4 of that draft showed
-> that the leaves are only ever compared against `verified[D-1]` (the
-> model's argmax at the *last chain* row), and never against logits at the
-> leaves' own positions. The leaves therefore do not need to be in the
-> verify chunk at all. This revision drops the tree-mask kernel and the
-> per-branch state machinery; they are deferred to Phase 2 where true
-> multi-level branching needs them. Phase 1 keeps the same observable
-> behaviour and the same expected gain.
+> **Revision history.**
+> - **v1** (`56ed8dc`): full design with leaves in chunk + tree-mask attention + per-leaf DeltaNet replay.
+> - **v2** (`e27ad9b`): "simplified" design with leaves OUTSIDE chunk. Discovered mid-implementation
+>   that this design has zero token-per-cycle gain because the leaves predict the *same* position
+>   as `verified[chain_depth]`. Leaves outside the chunk give no extra commit.
+> - **v3** (this doc): back to v1's leaves-in-chunk approach, on top of PR #2's MTP4 baseline.
+>   Explicit measurement gate because the per-row DeltaNet cost may eat the per-cycle gain
+>   given the high baseline.
 
-## 1. Goal and non-goals
+## 1. Goal and economic context
 
-**Goal.** Increase decode throughput on `Qwen3.6-27B-Text-NVFP4-MTP` / RTX 5090 by raising the speculative-decoding acceptance length on prompts where the model is uncertain at the *last* speculative position. Today's chain MTP=3 commits `1 + accepted_chain` ≤ 4 tokens per cycle. By proposing **K candidates at the last position** (top-K from the MTP head's last output) instead of 1, and accepting the highest-prob leaf that matches the base model's argmax at that position, expected accepted length grows by up to +1 per cycle.
+**Goal.** Increase decode tokens per cycle by extending the verify chunk with K leaf candidates AT POSITIONS BEYOND THE CHAIN. When chain fully accepts AND a leaf matches `verified[chain_depth]`, we commit the leaf AND the next-position verified token, giving +2 commit count over chain MTP today.
 
-**Target gain.** +20-40 % over the current MTP=3 throughput (~86 → ~105-120 tok/s) on real prompts (not the full-accept gated bench). On the gated bench (full-accept on `hello` / `hello world`) the change should be neutral, since chain acceptance is already 1.0 and the model's argmax at the last chain row is already deterministic.
+**Baseline (post PR #2, main `097e692`):**
 
-**Non-goals (out of Phase 1).**
-- Multi-level tree branching (Phase 2).
-- Tree-mask attention kernel, per-branch DeltaNet recurrent state, KV scratch per branch (Phase 2 primitives).
-- Adaptive tree shape based on MTP head confidence (Phase 3).
-- Stochastic / non-greedy sampling. Phase 1 stays greedy.
-- Touching the prefill path. Only decode-side MTP draft generation + acceptance changes.
-- Any new CUDA Graph kind. The existing `MtpVerifyOne` / `MtpVerifyMulti` graphs are reused unchanged.
+| MTP | tokens/cycle (full accept) | tok/s | speedup vs MTP=3 |
+|-----|----|----|----|
+| 0 | 1 | ~45 | 0.4x |
+| 3 | 4 | 110 | 1.0x |
+| 4 | 5 | 117-120 | 1.07x |
+
+**Target (with tree-MTP=3, K=4) per acceptance regime:**
+
+| Regime | tokens/cycle | extra vs MTP=4 |
+|-----|----|----|
+| chain rejects at depth j (j < 3) | j + 1 | 0 |
+| chain fully accepts, no leaf match | 4 | -1 |
+| chain fully accepts, leaf match + verified-after-leaf | 6 | +1 |
+
+The +1 token in the best case has to OVERCOME the verify-chunk extension cost (1+chain+K = 8 rows for chain=3,K=4 vs MTP=4's 5 rows = 1.6x chunk size).
+
+**Risk-honest target:** ≥ +5% decode tok/s vs MTP=4 on a varied prompt set; otherwise the design ships as Phase 2 infrastructure with K=1 default (no perf gain delivered, infra ready for true multi-level branching).
 
 ## 2. Quality contract
 
 **Hard parity (regression gate, blocks merge):**
-- `chat --prompt "hello" --max-new-tokens 12` produces identical token streams for `--mtp-speculative-tokens` ∈ {0, 1, 2, 3} with **`--mtp-tree-leaves` ∈ {1, 2, 4}**.
+- `chat --prompt "hello" --max-new-tokens 12` produces identical token streams for `--mtp-speculative-tokens` ∈ {0, 1, 2, 3, 4} with `--mtp-tree-leaves` ∈ {1, 2, 4}.
 - `chat --prompt "hello world" --max-new-tokens 12` same.
 
-**Soft parity (acceptable, must not regress):**
-- The same envelope of 1-2 token drift on borderline prompts (`Write a short poem about cats.`, `Count from 1 to 5.`, `Write Python hello world`) that today's chunked-verify produces. Branching only changes which token is committed at the boundary, not the verify chunk's numerical path.
+**Soft parity:** same envelope of 1-2 token drift on borderline prompts that today's chunked verify produces. Tree-mask attention must not widen the envelope.
 
-**Op-level parity (kernel changes):**
-- The new `qwen36_topk_argmax` kernel must agree exactly with the CPU `topk_argmax` reference for K ∈ {1..8} on a fixed-seed random vocab.
-- No other kernels change.
+**Op-level parity:**
+- New `qwen36_attention_prefill` tree-mask path: cos sim ≥ 0.998 against a Python reference that builds the same per-row ancestor mask explicitly.
+- Per-leaf DeltaNet snapshot/restore: cos sim ≥ 0.998 at each leaf row's hidden state vs. a Python reference that snapshots and replays.
 
-## 3. The pivot: last-position top-K acceptance
-
-A general tree spec decoding scheme branches at every level. For our hybrid model that requires per-branch DeltaNet recurrent state for 48 of 64 layers (Phase 2 territory).
-
-**Phase 1 trades multi-level branching for zero kernel-graph surgery.** The chain verify chunk is unchanged. The MTP head's last forward (which today samples one greedy draft for next cycle's `last_token` seed) instead samples top-K candidates. After verify, we already have `verified[D-1]` — the model's greedy argmax at the last chain position. Acceptance walk:
+## 3. The branched-tail tree
 
 ```
-verified = [v_0, v_1, ..., v_{D-1}]   (one per chain row, sampled by today's verify graph)
-chain    = [c_1, c_2, ..., c_{D-1}]   (today's chain drafts)
-leaves   = [L_1, L_2, ..., L_K]       (NEW: top-K from MTP head's last output, K=1 = today's behaviour)
+                  current_token   (row 0, position P)
+                         │
+                  draft_chain_0   (row 1, position P+1)   ← chain_tokens[0]
+                         │
+                  draft_chain_1   (row 2, position P+2)   ← chain_tokens[1]
+                         │
+                  draft_chain_2   (row 3, position P+3)   ← chain_tokens[2]
+                       /│ │\
+                      / │ │ \
+                 leaf_0  ...  leaf_K-1                    ← K candidates, all at position P+chain_depth+1
+              (rows 4, 5, 6, 7)
+```
+
+Verify chunk row count: `1 + chain_depth + K`.
+
+**Position semantics:**
+- Rows 0..chain_depth occupy positions P..P+chain_depth (sequential chain).
+- All K leaf rows logically sit at position P + chain_depth + 1 (siblings competing for the same slot).
+- `verified[i]` (model argmax at row i) is the prediction for the position AFTER row i's input:
+  - `verified[0..chain_depth]` predicts positions P+1..P+chain_depth+1 (chain successors).
+  - `verified[chain_depth + 1 + j]` predicts position P+chain_depth+2 (after leaf j).
+
+**Why this gives +2 tokens per cycle when both accept:**
+1. Chain fully accepts → commit chain[0..chain_depth] at positions P+1..P+chain_depth.
+2. `verified[chain_depth]` predicts position P+chain_depth+1. If leaf_j == `verified[chain_depth]`, leaf_j is the correct token at P+chain_depth+1 → commit it.
+3. `verified[chain_depth + 1 + j]` (the accepted leaf's row output) predicts position P+chain_depth+2, conditioned on leaf_j being correct. Since leaf_j was just accepted, this prediction is valid → commit it as the cycle's `next_token`.
+4. Total: chain (chain_depth) + leaf (1) + verified-after-leaf (1) = chain_depth + 2 tokens.
+
+For chain_depth = 3, K = 4: up to 5 + 1 = 6 tokens per cycle on full accept + leaf accept.
+
+## 4. Acceptance walk
+
+```rust
+verified = [v_0, v_1, ..., v_{chain_depth}, v_{chain_depth+1}, ..., v_{chain_depth+K}]
 
 walk:
-  commit v_0
-  for i in 1..D-1:
-    if v_{i-1} == c_i:  commit c_i
-    else:               STOP, next_token = v_{i-1}, accepted_leaf = None
-  # Full chain accepted; leaf-level check uses the verify chunk's last sample.
+  // Chain (today's logic)
+  accepted_chain = 0
+  for i in 0..chain_depth:
+    if v_i == chain[i]:  accepted_chain = i + 1
+    else:
+      committed = chain[0..accepted_chain] + [v_i]
+      next_token = v_i
+      return TreeVerifyResult { committed, accepted_chain, accepted_leaf: None, next_token }
+
+  // Full chain accepted; check leaves
+  let chain_verified = v_{chain_depth}     // predicts position P+chain_depth+1
   for j in 0..K:
-    if leaves[j] == v_{D-1}:
-      commit leaves[j]
-      next_token = leaves[j]
-      accepted_leaf = j
-      return
-  # No leaf matched; commit v_{D-1} as today.
-  next_token = v_{D-1}
-  accepted_leaf = None
+    if leaves[j] == chain_verified:
+      let next_token = v_{chain_depth + 1 + j}
+      committed = chain[0..chain_depth] + [leaves[j]] + [next_token]
+      return TreeVerifyResult { committed, accepted_chain, accepted_leaf: Some(j), next_token }
+
+  // No leaf matched
+  committed = chain[0..chain_depth] + [chain_verified]
+  next_token = chain_verified
+  return TreeVerifyResult { committed, accepted_chain, accepted_leaf: None, next_token }
 ```
 
-Tokens per cycle:
-- Today (K=1): `1 + accepted_chain` ≤ `1 + D-1` = D
-- Phase 1 (K>1): `1 + accepted_chain + (leaf_accepted ? 1 : 0)` ≤ `D + 1`
+**Invariants** (enforced by `assert_committed_invariants` in tests):
+- `committed.last() == Some(next_token)` always.
+- `committed.len() == accepted_chain + 1 + (accepted_leaf.is_some() ? 1 : 0)`.
+- When `accepted_leaf.is_some()`: `committed[committed.len() - 2] == leaves[accepted_leaf.unwrap()]`.
 
-The +1 only fires on cycles where the chain fully accepts AND `v_{D-1}` lands in the K-best of the MTP head. Empirically this is the regime where today's MTP=3 stalls — the model is confident through the chain but the MTP head's top-1 doesn't match.
+**This differs from v2's invariant** — `committed.len()` can now be `accepted_chain + 2` when a leaf accepts, because the verified-after-leaf is also committed. The walk_tree_acceptance code already shipped (`8fb5931`) needs an update for this.
 
-**KV cache and DeltaNet state.** When a leaf is accepted, the leaf token becomes the next cycle's `last_token`. The next cycle's verify chunk includes that leaf at row 0, so the leaf's K/V and DeltaNet state are computed naturally on the next forward — no scratch buffers, no replay.
+## 5. CUDA changes
 
-**Why this is strictly simpler than the earlier draft.**
-- The verify chunk shape, kernels, and graph are unchanged.
-- No tree-mask attention. No `tree_ancestor_bitmap_u64`. No per-branch DeltaNet. No KV scratch slots.
-- The only new CUDA primitive is `qwen36_topk_argmax`. Everything else is host-side Rust.
+### 5.1 Tree-mask attention prefill (kernels-cuda/attention.cu)
 
-## 4. MTP head: top-K at the last position
+Three prefill kernels (`attention_prefill_kernel`, `attention_prefill_split_kernel`, `attention_prefill_gqa_kernel`) gain a per-row ancestor bitmap path. NULL bitmap → existing causal behaviour (zero regression on chain-only paths).
 
-Today the MTP head is recursive: each draft step samples greedy argmax from the head's logits and feeds it into the next step. Phase 1 keeps draft steps 1..D-1 as today (greedy chain) and changes only the last step (`draft_idx == D-1`):
-
-- Run the MTP head from the last accepted hidden state to produce logits (today's behaviour).
-- Sample **top-K argmax** from those logits → K leaf candidates, sorted by descending logit.
-- The top-1 leaf equals today's `next_draft_token`. The acceptance walk (§3) tries leaves in input order, so the top-1 is checked first — when K=1 (default), Phase 1 reduces to today's chain MTP exactly.
-
-Implementation: a new kernel `qwen36_topk_argmax` that takes BF16 logits `[V]` and produces K `u32` token IDs `[K]`. K is small (≤8 in Phase 1), single-block kernel sufficient.
-
-## 5. CUDA changes (kernels-cuda/)
-
-### 5.1 Top-K argmax kernel
-
-New entry in `ops.cu`:
+**API change** (`include/qwen36_fp4.h`):
 
 ```c
-typedef struct {
-  size_t vocab_size;
-  size_t k;                                // 1..8
-  qwen36_device_ptr_t logits_bf16;
-  qwen36_device_ptr_t output_token_u32;    // [k] u32, sorted desc by logit
-} qwen36_topk_argmax_spec_t;
+typedef struct qwen36_attention_prefill_spec_t {
+    // ... existing fields ...
 
-#define QWEN36_TOPK_MAX 8
-
-int qwen36_topk_argmax(const qwen36_topk_argmax_spec_t *spec);
+    /// Tree-mask bitmap. When non-NULL, row i of the verify chunk attends to
+    /// KV row j (within the same chunk) iff bit j of word i is set. KV positions
+    /// before `start_position` (cache prefix) remain fully visible regardless.
+    /// NULL → causal mask (existing behaviour).
+    qwen36_device_ptr_t tree_ancestor_bitmap_u64;
+    /// Verify-chunk row count (number of valid bitmap entries). 0 = causal.
+    /// Capped at 64 by the bitmap encoding.
+    size_t verify_chunk_rows;
+} qwen36_attention_prefill_spec_t;
 ```
 
-Single block, 512 threads. Each thread maintains a thread-local sorted top-K array in registers, scans `vocab_size` elements with stride 512, then a single-thread block-level merge of the per-thread arrays (BLOCK × K ≤ 4096 entries, cheap). Vocab is ~152k.
+Kernel modification: replace the existing causal gate
+```cpp
+if (kv_idx > q_idx) skip;
+```
+with
+```cpp
+const bool in_chunk = (kv_idx >= chunk_base) && (kv_idx < chunk_base + verify_chunk_rows);
+if (verify_chunk_rows > 0 && tree_ancestor_bitmap_u64 != nullptr && in_chunk) {
+  uint32_t row = q_idx - chunk_base;
+  uint32_t col = kv_idx - chunk_base;
+  if (row >= verify_chunk_rows) continue;
+  uint64_t mask = tree_ancestor_bitmap_u64[row];
+  if (!(mask & (1ULL << col))) continue;
+} else {
+  if (kv_idx > q_idx) continue;     // causal default
+}
+```
 
-**No other kernels change.** The existing `attention_prefill_kernel` family, `qwen36_deltanet_*`, `qwen36_swiglu_nvfp4_quantize`, etc., are untouched.
+`chunk_base` = `start_position` (the absolute position the chunk starts at).
 
-## 6. Runtime changes (crates/runtime/src/engine.rs)
+### 5.2 Per-leaf DeltaNet handling (host-orchestrated, no new kernel in Phase 1)
 
-### 6.1 No new constants
+DeltaNet is recurrent; the chunked DeltaNet kernel processes a chunk sequentially. For tree leaves all branching from the same parent state, processing them as a chain would corrupt the recurrent state.
 
-`MtpKvSnapshotLayout::VERIFY_TOKENS` stays at 4. `MTP_MAX_DRAFT_TOKENS` stays at 3. The verify chunk is unchanged.
+**Phase 1 approach:**
+
+1. Run `prefill_cuda_chunk(chain_depth + 1, ...)` for chain rows ONLY (rows 0..chain_depth). DeltaNet processes them as a normal chunk; conv_history and DeltaNet state advance correctly.
+2. Snapshot DeltaNet state + conv history per layer (extend existing `mtp_snapshot_state`).
+3. For each leaf j in 0..K:
+   - Restore DeltaNet/conv state to the chain-end snapshot.
+   - Run `prefill_cuda_chunk(1, ..., tree_mask=…)` for the leaf row.
+   - Snapshot the resulting DeltaNet/conv state into per-leaf scratch.
+4. Walk acceptance.
+5. Restore DeltaNet/conv to either the chain-end snapshot (if no leaf accepted) OR the accepted leaf's snapshot.
+
+**Cost:** K × per-layer DeltaNet single-token launch + K snapshot/restore round trips. With K=4, 48 DeltaNet layers, ~5 µs per layer launch in WSL2 ≈ 1 ms launches. Plus state copies. Estimated 2-4 ms per cycle of overhead — needs measurement (see §11).
+
+**Phase 2 alternative:** A new `qwen36_deltanet_decode_batched` kernel that takes K input tokens + 1 input state and produces K (state, output) pairs in parallel. Saves the launches. Out of scope for Phase 1.
+
+### 5.3 KV cache scratch slots per leaf
+
+Full attention layers write K/V to the cache at the leaf positions. Since all K leaves logically sit at position P+chain_depth+1, they'd overwrite each other if written to the same slot.
+
+**Approach:** write each leaf's K/V to a **separate scratch buffer per leaf per layer** (extend `MtpKvSnapshotLayout`). On acceptance, copy the accepted leaf's scratch K/V into the main cache at position P+chain_depth+1.
+
+`MtpKvSnapshotLayout::VERIFY_TOKENS` already at 5 (post PR #2). Bump to 13 to support chain=4 + K=8 = 13 verify rows.
+
+Memory cost per layer: K × 2 (K, V) × kv_heads × head_dim × bytes. For Qwen3.6: ~2 KB per leaf per layer × 16 full-attn layers × 8 leaves = ~256 KB scratch per cycle. Trivial.
+
+### 5.4 Top-K kernel: already shipped
+
+Already landed in commits `2b6535d` (CPU reference) through `eafd742` (Rust wrapper). Reused as-is.
+
+## 6. Runtime changes
+
+### 6.1 Constants
+
+```rust
+// crates/mtp/src/lib.rs (already landed: MTP_TREE_MAX_LEAVES = 8)
+
+// crates/runtime/src/gpu.rs
+impl MtpKvSnapshotLayout {
+    pub const VERIFY_TOKENS: usize = 13;        // bump from 5; chain=4 + K=8 = 13
+}
+```
 
 ### 6.2 New entry point
 
 ```rust
 pub struct TreeDraft {
-    /// Length = chain_depth (= D-1, today's MTP=N draft count). The first
-    /// chain draft follows last_token.
     pub chain_tokens: Vec<u32>,
-    /// Length = K. Top-K candidates from the MTP head's last forward,
-    /// sorted by descending logit. K=1 reproduces chain MTP exactly.
-    pub leaf_tokens: Vec<u32>,
+    pub leaf_tokens: Vec<u32>,        // length K, sorted desc by logit
 }
 
 pub struct TreeVerifyResult {
-    /// Full ordered list of tokens committed this cycle. Always satisfies
-    /// `committed.len() == accepted_chain + 1` and
-    /// `committed.last() == Some(next_token)`. When `accepted_leaf == Some(idx)`,
-    /// `committed.last() == leaf_tokens[idx]`. When the chain rejects at row j,
-    /// `committed = chain_tokens[0..j] + [verified[j]]` (length j+1).
     pub committed: Vec<u32>,
-    pub accepted_chain: usize,        // 0..=chain_depth
-    pub accepted_leaf: Option<usize>, // 0..K
-    /// Verified token at the last accepted position; seed for next cycle's
-    /// last_token. Equal to `committed.last()`.
-    pub next_token: u32,
+    pub accepted_chain: usize,
+    pub accepted_leaf: Option<usize>,
+    pub next_token: u32,               // == committed.last()
 }
 
-/// Drives one decode cycle using the existing chunked verify graph plus
-/// last-position top-K acceptance.
 pub fn verify_mtp_tree_draft(
     &mut self,
-    draft: &TreeDraft,
-    start_position: usize,
+    current_token: u32,
+    chain_tokens: &[u32],
+    leaf_tokens: &[u32],
+    next_draft_count: usize,
 ) -> Result<TreeVerifyResult>;
 ```
 
-The body is small (~50 lines):
-
-1. Run the existing `MtpVerifyMulti` (or `MtpVerifyOne` if chain_depth==1) verify graph for `draft.chain_tokens.len()` drafts. Today's call.
-2. Read `verified[0..=chain_depth]` from the existing `mtp_verify_token_u32` slots. Today's call.
-3. Walk the chain in pure Rust (existing logic).
-4. If chain fully accepted: scan `draft.leaf_tokens` for the first match against `verified[chain_depth]`. If found, commit it.
-5. Return `TreeVerifyResult`.
-
-No graph changes. No new CUDA kernels invoked beyond what today's path already runs (the top-K kernel is invoked separately during draft generation, not during verify).
-
-### 6.3 Draft generation extension
-
-Today's `generate_chain_drafts` returns `chain_tokens`. Add a sibling helper:
+### 6.3 New CUDA Graph variant
 
 ```rust
-fn generate_top_k_leaves(
-    &mut self,
-    last_chain_hidden: DevicePtr,
-    k: usize,
-) -> Result<Vec<u32>>;
+enum DecodeGraphKind {
+    Decode,
+    MtpDecodeOne,
+    MtpVerifyOne,
+    MtpVerifyMulti { drafts, assume_accept, batched_lm_head },
+    MtpVerifyTree { chain_depth: usize, leaf_count: usize, batched_lm_head: bool },  // NEW
+}
 ```
 
-Body: 1 MTP head forward (already done as part of the chain's last step today, hidden state is reusable) + 1 `qwen36_topk_argmax` launch + 1 D2H copy of K u32. When k == 1, return `[chain_tokens.last_top_1]` and skip the kernel.
+Capture sequence (mirrors `ensure_mtp_verify_graph_multi_tokens` but threads the tree bitmap and adds the per-leaf DeltaNet replays):
+1. Set tree-mask bitmap on `cuda_forward()?.tree_ancestor_bitmap_u64`.
+2. Chain chunk: `prefill_cuda_chunk(chain_depth + 1, ..., tree_mask=NULL)` — chain rows only.
+3. Snapshot DeltaNet/conv state.
+4. For each leaf j: restore + `prefill_cuda_chunk(1, ..., tree_mask=…)` for the leaf row. Snapshot per-leaf state.
+5. Run batched lm_head + sample_rows for verify[0..=chain_depth] AND verify[chain_depth+1..chain_depth+K+1].
+6. Run MTP head chunk for next-cycle drafts.
 
-### 6.4 Pure-Rust acceptance walk
-
-Implemented in `crates/mtp/src/lib.rs` so it can be unit-tested without a GPU:
+### 6.4 Tree ancestor bitmap (host-built once per cycle)
 
 ```rust
-pub fn walk_tree_acceptance(
-    verified: &[u32],
-    draft: &TreeDraft,
-) -> TreeVerifyResult;
+fn build_tree_bitmap(chain_depth: usize, leaf_count: usize) -> [u64; 13] {
+    let mut rows = [0u64; 13];
+    for i in 0..=chain_depth {
+        rows[i] = (1u64 << (i + 1)) - 1;          // causal triangle for chain
+    }
+    let chain_mask = (1u64 << (chain_depth + 1)) - 1;
+    for j in 0..leaf_count {
+        let row = chain_depth + 1 + j;
+        rows[row] = chain_mask | (1u64 << row);   // leaf attends to chain prefix + itself
+    }
+    rows
+}
 ```
 
-See §3 for the algorithm. Tests cover: chain rejects at root / mid / end-without-leaf-match / end-with-leaf-match / K=1 reproduces chain MTP.
+H2D copy of 104 bytes once per cycle.
 
 ## 7. CLI / config
 
-Extend `--mtp-speculative-tokens` semantics: keep the integer for chain depth, add `--mtp-tree-leaves <K>` (default 1 = current behaviour, no branching). Bench reports both `accepted_chain / chain_depth` and `leaf_accepted_rate` to make the tree gain measurable.
+`MtpConfig` already has `tree_leaves: usize` (default 1). Add the CLI flag and dispatch.
 
 ```bash
 qwen36 chat --mtp-speculative-tokens 3 --mtp-tree-leaves 4 ...
 qwen36 bench --mtp-speculative-tokens 3 --mtp-tree-leaves 4 ...
 ```
 
-`MtpConfig` gains a `tree_leaves: usize` field, defaulting to 1.
+Bench reports both `accepted_chain / chain_depth` and `leaf_accepted_rate` to make the tree gain measurable.
 
 ## 8. Testing strategy
 
-1. **Pure-Rust unit tests** for `topk_argmax` (CPU reference) and `walk_tree_acceptance` in `crates/mtp/src/lib.rs`. No GPU needed.
-2. **CUDA smoke** for `qwen36_topk_argmax`: K=4 on a 1024-vocab BF16 logits array with planted top-4. Compare device output against the planted indices.
-3. **Engine-level parity** (the gate): `chat --prompt "hello" --max-new-tokens 12` for `--mtp-tree-leaves` ∈ {1, 2, 4} against MTP=0 baseline and against today's `--mtp-tree-leaves 1` for each chain depth. Hard gate.
-4. **Bench**: `qwen36 bench --prompt-tokens 128 --max-new-tokens 32` for `--mtp-tree-leaves` ∈ {1, 2, 4, 8} on the existing reference prompt set + 5 borderline / open prompts. Median of 5 runs. Report decode tok/s + leaf-accept rate per K.
+1. **Pure-Rust unit tests** for v3 `walk_tree_acceptance` (extended for the +2 case) and `build_tree_bitmap`.
+2. **CUDA smoke** for tree-mask attention: hand-built 4-row bitmap, compare against CPU reference.
+3. **CUDA smoke** for top-K kernel (already shipped).
+4. **Engine-level parity** (the gate): `chat` parity matrix for `--mtp-tree-leaves` ∈ {1, 2, 4} × `--mtp-speculative-tokens` ∈ {0..4}.
+5. **Op-level parity** via `scripts/decode_parity.py` extended with `apply_tree_mask(scores, bitmap, chunk_base)`.
+6. **Bench** for K ∈ {1, 2, 4, 8} on varied prompts; pick K (or default to 1 if no K beats MTP=4 by ≥5%).
 
 ## 9. Parity harness
 
-No changes to `scripts/decode_parity.py`. The verify chunk path is unchanged, so the existing op-level parity gate covers Phase 1.
+`scripts/decode_parity.py` extended:
+- New env vars `QWEN36_PARITY_TREE_DEPTH`, `QWEN36_PARITY_TREE_LEAVES`.
+- Python reference builds the same ancestor bitmap and applies it to its causal-attention scores.
+- Asserts cos sim ≥ 0.998 on each verify-row hidden state.
 
 ## 10. Rollback / kill-switch
 
-`QWEN36_MTP_TREE_DISABLE=1` → forces `tree_leaves = 1` regardless of CLI, falling back to today's chain MTP. Mirror the existing `QWEN36_MTP_MULTI_GRAPH_DISABLE` env-var pattern. Bisecting tree numerical issues uses this env var.
+`QWEN36_MTP_TREE_DISABLE=1` → forces `tree_leaves = 1`, falls back to today's chain MTP.
 
 ## 11. Risks and mitigations
 
 | Risk | Likelihood | Mitigation |
 |--|--|--|
-| `qwen36_topk_argmax` kernel disagrees with CPU reference for some K | Low | Smoke + Rust-side unit comparison on multiple seeds |
-| MTP head's top-K matches `verified[D-1]` less often than estimated, gain < +20 % | Medium | Bench reports leaf-accept rate; if < 0.3 we revisit K and / or move to Phase 2 |
-| K=8 head latency dominates the gain on cycles where chain rejects early | Low | When chain rejects, the leaves were generated speculatively but never used — sunk cost ≈ 50 µs (top-K kernel + 1 MTP head forward, latter is reusable from chain). Re-bench with K=2 and K=4 if K=8 regresses |
-| Real-world acceptance gain is smaller than the +20-40 % estimate | Medium | Measure on a varied prompt set before claiming the win; report acceptance distribution, not just tok/s |
+| Tree-mask attention introduces drift > current chunked-verify envelope | Medium | Op-level parity gate (cos sim ≥ 0.998), hard gate on `hello` / `hello world` |
+| **Per-leaf DeltaNet replay overhead eats the leaf-accept gain** | **High** | **Measurement gate at P1.L: if K=4 doesn't beat K=1 by ≥5%, default to K=1 and ship infra only.** |
+| K leaves × 48 DeltaNet layer launches × WSL2 latency dominates cycle time | Medium-High | If P1.L shows this, schedule batched DeltaNet kernel as Phase 2 |
+| KV scratch + tree bitmap allocation grows VRAM | Low | <1 MB per cycle, trivial on 32 GB |
+| CUDA Graph capture cost grows (more nodes in tree-verify graph) | Low | Re-use captured graph across cycles; capture cost paid once |
+| Real-world acceptance gain < +5% target | Medium | Document negative result honestly; ship as Phase 2 prep |
 
-## 12. Phase 2 entry points (preserved by Phase 1)
+## 12. Phase 2 entry points (preserved)
 
-Phase 1 leaves the path open to Phase 2 (true multi-level tree branching). When we get there, these are the artefacts that need to land:
-
-- A `qwen36_attention_prefill` variant accepting a per-row ancestor bitmap (the tree-mask kernel originally drafted in this spec).
-- `MtpKvSnapshotLayout::VERIFY_TOKENS` bumped to handle multi-level tree row counts.
-- A batched / fan-out DeltaNet decode kernel (`qwen36_deltanet_update_tree`) consuming a parent-index array.
-- A new `MtpVerifyTree` graph kind, with KV scratch slots per branch.
-- An adaptive tree-shape generator (Phase 3) that calls into the Phase 2 kernels.
-
-Phase 1's `TreeDraft` / `TreeVerifyResult` types are forward-compatible with multi-level trees (the `chain_tokens` / `leaf_tokens` split generalises naturally to a flat `tokens` + `parents` representation when Phase 2 lands).
+- `qwen36_deltanet_decode_batched` kernel that fans K (state, output) pairs from one input state in a single launch.
+- Multi-level tree (branching at intermediate positions). Bitmap representation already supports arbitrary trees up to 64 rows.
+- `MtpVerifyTree` graph kind extends to multi-level via the same bitmap.
+- Adaptive tree-shape generator (Phase 3) calls into the same kernels.
 
 ## 13. Implementation phases (within Phase 1)
 
-Each phase is a separate PR / merge candidate, gated on its own parity check:
+**Already landed (commits `2b6535d` → `07bb12a`):**
+- P1.A — Top-K argmax kernel + Rust wrapper + smoke + tests
+- P1.B — `walk_tree_acceptance` + `TreeDraft` / `TreeVerifyResult` types + unit tests (v2 invariant — needs P1.F update)
+- P1.C — `leaf_tokens_u32` GPU buffer + `queue_sample_topk_into` engine helper
 
-1. **P1.1** — Top-K argmax kernel (CUDA + ABI + Rust wrapper + smoke + CPU reference + unit tests). No engine changes yet.
-2. **P1.2** — Engine-side `verify_mtp_tree_draft` + draft-generation extension + acceptance walk unit tests + CLI flag. Hard parity gate.
-3. **P1.3** — Bench matrix on RTX 5090 across K ∈ {1, 2, 4, 8} and a varied prompt set; pick default K; document results in `AGENT.md`.
+**Remaining:**
+- P1.D — Tree-mask attention prefill kernel (3 variants) + ABI + smoke + parity check
+- P1.E — Bump `MtpKvSnapshotLayout::VERIFY_TOKENS` to 13 + tree ancestor bitmap GPU buffer + KV scratch slots per leaf
+- P1.F — Update `walk_tree_acceptance` for v3 invariants (verified-after-leaf in committed)
+- P1.G — `verify_mtp_tree_draft` host-launched (no graph) + per-leaf DeltaNet/conv replay + acceptance walk wiring
+- P1.H — `MtpVerifyTree` graph capture + soft fallback to host launch
+- P1.I — `--mtp-tree-leaves` CLI flag + dispatch in chat/bench
+- P1.J — Hard parity gate matrix (chat output equality)
+- P1.K — Op-level parity via `decode_parity.py` extension
+- P1.L — Bench matrix on RTX 5090 + AGENT.md update + K decision
 
 ## 14. Success criteria
 
-Phase 1 is done when:
-
-- All hard parity gates pass (P1.2 onward).
-- `qwen36 bench --mtp-tree-leaves 4` shows ≥ +15 % decode tok/s over `--mtp-tree-leaves 1` on the varied prompt set (median of 5 runs).
-- `QWEN36_MTP_TREE_DISABLE=1` recovers the current behaviour bit-for-bit.
-- The single-prompt full-accept gated bench (`hello` / `hello world`) is unchanged within ±2 %.
+- All hard parity gates pass (P1.J).
+- Op-level parity ≥ 0.998 cos sim (P1.K).
+- Bench shows ≥ +5% decode tok/s for `--mtp-tree-leaves 4` over `--mtp-tree-leaves 1` on varied prompts (or honest negative documented in AGENT.md).
+- `QWEN36_MTP_TREE_DISABLE=1` recovers exact pre-Phase-1 behaviour bit-for-bit.
 - `cargo clippy --workspace --features qwen36-fp4-kernels/cuda -- -D warnings` and the existing CUDA test suite stay green.
+
+## 15. Phase 1 outcome (filled in after P1.L)
+
+_To be filled after bench measurements._
