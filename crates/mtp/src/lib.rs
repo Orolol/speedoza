@@ -228,10 +228,10 @@ pub struct TreeDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeVerifyResult {
-    /// Full ordered list of tokens this cycle commits to the output sequence.
-    /// Always satisfies `committed.len() == accepted_chain + 1` and
-    /// `committed.last() == Some(next_token)`. When `accepted_leaf` is
-    /// `Some(idx)`, `committed.last() == leaf_tokens[idx]`.
+    /// Full ordered list of tokens committed this cycle. Always satisfies
+    /// `committed.len() == accepted_chain + 1 + (accepted_leaf.is_some() ? 1 : 0)`
+    /// and `committed.last() == Some(next_token)`. When `accepted_leaf` is
+    /// `Some(idx)`, `committed[committed.len() - 2] == leaf_tokens[idx]`.
     pub committed: Vec<u32>,
     pub accepted_chain: usize,        // 0..=chain_depth
     pub accepted_leaf: Option<usize>, // 0..K
@@ -240,23 +240,30 @@ pub struct TreeVerifyResult {
     pub next_token: u32,
 }
 
-/// Walk a branched-tail tree given the model's argmax at each chain row.
+/// Walk a branched-tail tree given the model's argmax at each chunk row.
 ///
-/// `verified[i]` is the model's argmax at chain row `i`
-/// (i = 0..=chain_depth). The acceptance walk:
-/// - chain row i accepts `chain_tokens[i]` iff `verified[i] == chain_tokens[i]`
-/// - on the first reject, `next_token = verified[i]`
-/// - if the chain fully accepts, the leaves are scanned in input order against
-///   `verified[chain_depth]`; first match wins (top-K is sorted by descending
-///   logit, so the first match is the highest-prob leaf).
+/// `verified` length must be `1 + chain_depth + leaf_count`:
+/// - `verified[0..=chain_depth]` are chain row outputs.
+/// - `verified[chain_depth + 1 + j]` is the output of leaf row j (= the
+///   model's prediction one position past leaf j).
 ///
-/// `committed` always includes `next_token` at its end; the post-condition
-/// `committed.len() == accepted_chain + 1 && committed.last() == Some(&next_token)`
-/// holds in every case.
+/// Acceptance:
+/// - Chain row i accepts `chain_tokens[i]` iff `verified[i] == chain_tokens[i]`.
+/// - On the first chain reject, `next_token = verified[i]`.
+/// - If chain fully accepts, leaves are scanned in input order against
+///   `verified[chain_depth]`; first match wins. The accepted leaf's row output
+///   `verified[chain_depth + 1 + j]` becomes `next_token`.
+///
+/// Invariants:
+/// - `committed.len() == accepted_chain + 1 + (accepted_leaf.is_some() ? 1 : 0)`.
+/// - `committed.last() == Some(next_token)` always.
+/// - When `accepted_leaf == Some(idx)`: `committed[committed.len() - 2] ==
+///   leaf_tokens[idx]`.
 pub fn walk_tree_acceptance(verified: &[u32], draft: &TreeDraft) -> TreeVerifyResult {
     let chain_depth = draft.chain_tokens.len();
-    debug_assert!(verified.len() > chain_depth);
-    let mut committed = Vec::with_capacity(chain_depth + 1);
+    let leaf_count = draft.leaf_tokens.len();
+    debug_assert!(verified.len() >= 1 + chain_depth + leaf_count);
+    let mut committed = Vec::with_capacity(chain_depth + 2);
     let mut accepted_chain = 0;
     for (i, &candidate) in draft.chain_tokens.iter().enumerate() {
         if verified[i] == candidate {
@@ -277,16 +284,24 @@ pub fn walk_tree_acceptance(verified: &[u32], draft: &TreeDraft) -> TreeVerifyRe
         .leaf_tokens
         .iter()
         .position(|&leaf| leaf == chain_verified);
-    let next_token = match accepted_leaf {
-        Some(idx) => draft.leaf_tokens[idx],
-        None => chain_verified,
-    };
-    committed.push(next_token);
-    TreeVerifyResult {
-        committed,
-        accepted_chain,
-        accepted_leaf,
-        next_token,
+    if let Some(idx) = accepted_leaf {
+        let after_leaf = verified[chain_depth + 1 + idx];
+        committed.push(draft.leaf_tokens[idx]);
+        committed.push(after_leaf);
+        TreeVerifyResult {
+            committed,
+            accepted_chain,
+            accepted_leaf: Some(idx),
+            next_token: after_leaf,
+        }
+    } else {
+        committed.push(chain_verified);
+        TreeVerifyResult {
+            committed,
+            accepted_chain,
+            accepted_leaf: None,
+            next_token: chain_verified,
+        }
     }
 }
 
@@ -294,48 +309,57 @@ pub fn walk_tree_acceptance(verified: &[u32], draft: &TreeDraft) -> TreeVerifyRe
 mod tree_tests {
     use super::*;
 
-    fn assert_committed_invariants(result: &TreeVerifyResult) {
+    fn assert_committed_invariants(result: &TreeVerifyResult, draft: &TreeDraft) {
+        let expected_len =
+            result.accepted_chain + 1 + if result.accepted_leaf.is_some() { 1 } else { 0 };
         assert_eq!(
             result.committed.len(),
-            result.accepted_chain + 1,
-            "committed.len() must always equal accepted_chain + 1"
+            expected_len,
+            "committed.len() must equal accepted_chain + 1 + (leaf? 1 : 0)"
         );
         assert_eq!(
             result.committed.last().copied(),
             Some(result.next_token),
-            "committed.last() must always equal next_token"
+            "committed.last() must equal next_token"
         );
+        if let Some(idx) = result.accepted_leaf {
+            let n = result.committed.len();
+            assert_eq!(
+                result.committed[n - 2],
+                draft.leaf_tokens[idx],
+                "committed[len-2] must equal leaf_tokens[accepted_leaf]"
+            );
+        }
     }
 
     #[test]
-    fn k1_reduces_to_chain_mtp_full_accept() {
-        // K=1, chain accepts fully, no leaf match (leaf 999 != verified 50).
+    fn k1_chain_full_accept_leaf_match() {
+        let draft = TreeDraft {
+            chain_tokens: vec![10, 20, 30],
+            leaf_tokens: vec![50],
+        };
+        let verified = vec![10, 20, 30, 50, 99];
+        let r = walk_tree_acceptance(&verified, &draft);
+        assert_eq!(r.committed, vec![10, 20, 30, 50, 99]);
+        assert_eq!(r.accepted_chain, 3);
+        assert_eq!(r.accepted_leaf, Some(0));
+        assert_eq!(r.next_token, 99);
+        assert_committed_invariants(&r, &draft);
+    }
+
+    #[test]
+    fn k1_chain_full_accept_no_leaf_match() {
         let draft = TreeDraft {
             chain_tokens: vec![10, 20, 30],
             leaf_tokens: vec![999],
         };
-        let verified = vec![10, 20, 30, 50];
+        let verified = vec![10, 20, 30, 50, 0];
         let r = walk_tree_acceptance(&verified, &draft);
         assert_eq!(r.committed, vec![10, 20, 30, 50]);
         assert_eq!(r.accepted_chain, 3);
         assert_eq!(r.accepted_leaf, None);
         assert_eq!(r.next_token, 50);
-        assert_committed_invariants(&r);
-    }
-
-    #[test]
-    fn full_chain_no_leaf_match() {
-        let draft = TreeDraft {
-            chain_tokens: vec![10, 20, 30],
-            leaf_tokens: vec![100, 200],
-        };
-        let verified = vec![10, 20, 30, 999];
-        let r = walk_tree_acceptance(&verified, &draft);
-        assert_eq!(r.committed, vec![10, 20, 30, 999]);
-        assert_eq!(r.accepted_chain, 3);
-        assert_eq!(r.accepted_leaf, None);
-        assert_eq!(r.next_token, 999);
-        assert_committed_invariants(&r);
+        assert_committed_invariants(&r, &draft);
     }
 
     #[test]
@@ -344,45 +368,42 @@ mod tree_tests {
             chain_tokens: vec![10, 20, 30],
             leaf_tokens: vec![100, 200, 300],
         };
-        let verified = vec![10, 20, 30, 200];
+        let verified = vec![10, 20, 30, 200, 70, 71, 72];
         let r = walk_tree_acceptance(&verified, &draft);
-        assert_eq!(r.committed, vec![10, 20, 30, 200]);
+        assert_eq!(r.committed, vec![10, 20, 30, 200, 71]);
         assert_eq!(r.accepted_chain, 3);
         assert_eq!(r.accepted_leaf, Some(1));
-        assert_eq!(r.next_token, 200);
-        assert_committed_invariants(&r);
+        assert_eq!(r.next_token, 71);
+        assert_committed_invariants(&r, &draft);
     }
 
     #[test]
     fn full_chain_top_leaf_wins_over_lower_match() {
-        // Both leaf 0 and leaf 2 happen to equal verified — leaf 0 (top-1)
-        // must win.
         let draft = TreeDraft {
             chain_tokens: vec![10],
             leaf_tokens: vec![42, 100, 42],
         };
-        let verified = vec![10, 42];
+        let verified = vec![10, 42, 555, 666, 777];
         let r = walk_tree_acceptance(&verified, &draft);
-        assert_eq!(r.committed, vec![10, 42]);
-        assert_eq!(r.accepted_chain, 1);
         assert_eq!(r.accepted_leaf, Some(0));
-        assert_eq!(r.next_token, 42);
-        assert_committed_invariants(&r);
+        assert_eq!(r.committed, vec![10, 42, 555]);
+        assert_eq!(r.next_token, 555);
+        assert_committed_invariants(&r, &draft);
     }
 
     #[test]
     fn chain_rejects_at_first_mismatch() {
         let draft = TreeDraft {
             chain_tokens: vec![10, 20, 30],
-            leaf_tokens: vec![100],
+            leaf_tokens: vec![100, 200],
         };
-        let verified = vec![10, 99, 0, 0];
+        let verified = vec![10, 99, 0, 0, 0, 0];
         let r = walk_tree_acceptance(&verified, &draft);
         assert_eq!(r.committed, vec![10, 99]);
         assert_eq!(r.accepted_chain, 1);
         assert_eq!(r.accepted_leaf, None);
         assert_eq!(r.next_token, 99);
-        assert_committed_invariants(&r);
+        assert_committed_invariants(&r, &draft);
     }
 
     #[test]
@@ -391,13 +412,13 @@ mod tree_tests {
             chain_tokens: vec![10, 20],
             leaf_tokens: vec![999],
         };
-        let verified = vec![888, 0, 0];
+        let verified = vec![888, 0, 0, 0];
         let r = walk_tree_acceptance(&verified, &draft);
         assert_eq!(r.committed, vec![888]);
         assert_eq!(r.accepted_chain, 0);
         assert_eq!(r.accepted_leaf, None);
         assert_eq!(r.next_token, 888);
-        assert_committed_invariants(&r);
+        assert_committed_invariants(&r, &draft);
     }
 
     #[test]
@@ -406,13 +427,13 @@ mod tree_tests {
             chain_tokens: vec![],
             leaf_tokens: vec![55, 66],
         };
-        let verified = vec![66];
+        let verified = vec![66, 77, 88];
         let r = walk_tree_acceptance(&verified, &draft);
-        assert_eq!(r.committed, vec![66]);
+        assert_eq!(r.committed, vec![66, 88]);
         assert_eq!(r.accepted_chain, 0);
         assert_eq!(r.accepted_leaf, Some(1));
-        assert_eq!(r.next_token, 66);
-        assert_committed_invariants(&r);
+        assert_eq!(r.next_token, 88);
+        assert_committed_invariants(&r, &draft);
     }
 
     #[test]
@@ -421,12 +442,12 @@ mod tree_tests {
             chain_tokens: vec![],
             leaf_tokens: vec![55, 66],
         };
-        let verified = vec![999];
+        let verified = vec![999, 0, 0];
         let r = walk_tree_acceptance(&verified, &draft);
         assert_eq!(r.committed, vec![999]);
         assert_eq!(r.accepted_chain, 0);
         assert_eq!(r.accepted_leaf, None);
         assert_eq!(r.next_token, 999);
-        assert_committed_invariants(&r);
+        assert_committed_invariants(&r, &draft);
     }
 }
