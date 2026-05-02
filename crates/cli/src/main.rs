@@ -774,8 +774,8 @@ fn run_bench(
     token_text: String,
     mtp_speculative_tokens: usize,
 ) -> Result<()> {
-    if mtp_speculative_tokens > 3 {
-        anyhow::bail!("bench currently supports --mtp-speculative-tokens 0..=3");
+    if mtp_speculative_tokens > 4 {
+        anyhow::bail!("bench currently supports --mtp-speculative-tokens 0..=4");
     }
     let total_start = Instant::now();
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;

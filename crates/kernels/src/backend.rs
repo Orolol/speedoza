@@ -7,13 +7,12 @@ use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
     Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, Conv1dUpdateSpec,
     CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec,
-    Nvfp4QuantizeSpec,
-    Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec,
-    SigmoidGateSpec, SigmoidGateStridedSpec,
+    Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec,
+    RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
 };
 use crate::rmsnorm::RmsNormSpec;
 use crate::rope::PartialRopeSpec;
-use crate::sampling::SamplingSpec;
+use crate::sampling::{SamplingRowsSpec, SamplingSpec};
 use crate::swiglu::{SwiGluNvfp4QuantizeSpec, SwiGluSpec};
 use crate::turboquant::{TurboQuantAttentionSpec, TurboQuantEncodeSpec};
 
@@ -82,6 +81,10 @@ pub trait KernelBackend: Send + Sync {
 
     fn sample(&self, _spec: &SamplingSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("sample"))
+    }
+
+    fn sample_rows(&self, _spec: &SamplingRowsSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("sample_rows"))
     }
 
     fn embedding_lookup(&self, _spec: &EmbeddingLookupSpec) -> Result<()> {
@@ -259,6 +262,13 @@ impl KernelBackend for CudaBackend {
     fn sample(&self, spec: &SamplingSpec) -> Result<()> {
         let ffi_spec = ffi::SamplingSpec::from(spec);
         check("qwen36_sample", unsafe { ffi::qwen36_sample(&ffi_spec) })
+    }
+
+    fn sample_rows(&self, spec: &SamplingRowsSpec) -> Result<()> {
+        let ffi_spec = ffi::SamplingRowsSpec::from(spec);
+        check("qwen36_sample_rows", unsafe {
+            ffi::qwen36_sample_rows(&ffi_spec)
+        })
     }
 
     fn embedding_lookup(&self, spec: &EmbeddingLookupSpec) -> Result<()> {
@@ -809,6 +819,29 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct SamplingRowsSpec {
+        pub rows: usize,
+        pub vocab_size: usize,
+        pub logits_bf16: DevicePtr,
+        pub output_token_u32: DevicePtr,
+        pub mirror_last_output_token_u32: DevicePtr,
+        pub temperature: f32,
+    }
+
+    impl From<&crate::sampling::SamplingRowsSpec> for SamplingRowsSpec {
+        fn from(value: &crate::sampling::SamplingRowsSpec) -> Self {
+            Self {
+                rows: value.rows,
+                vocab_size: value.vocab_size,
+                logits_bf16: value.logits_bf16,
+                output_token_u32: value.output_token_u32,
+                mirror_last_output_token_u32: value.mirror_last_output_token_u32,
+                temperature: value.temperature,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct EmbeddingLookupSpec {
         pub tokens: usize,
         pub hidden: usize,
@@ -1253,6 +1286,7 @@ mod ffi {
         pub fn qwen36_swiglu(spec: *const SwiGluSpec) -> i32;
         pub fn qwen36_swiglu_nvfp4_quantize(spec: *const SwiGluNvfp4QuantizeSpec) -> i32;
         pub fn qwen36_sample(spec: *const SamplingSpec) -> i32;
+        pub fn qwen36_sample_rows(spec: *const SamplingRowsSpec) -> i32;
         pub fn qwen36_embedding_lookup(spec: *const EmbeddingLookupSpec) -> i32;
         pub fn qwen36_bf16_gemm(spec: *const Bf16GemmSpec) -> i32;
         pub fn qwen36_bf16_matvec(spec: *const Bf16MatVecSpec) -> i32;
@@ -1263,9 +1297,7 @@ mod ffi {
         pub fn qwen36_conv1d_update(spec: *const Conv1dUpdateSpec) -> i32;
         pub fn qwen36_conv1d_prefill(spec: *const Conv1dPrefillSpec) -> i32;
         pub fn qwen36_gdn_gate(spec: *const GdnGateSpec) -> i32;
-        pub fn qwen36_conv1d_gdn_gate_fused(
-            spec: *const Conv1dGdnGateFusedSpec,
-        ) -> i32;
+        pub fn qwen36_conv1d_gdn_gate_fused(spec: *const Conv1dGdnGateFusedSpec) -> i32;
         pub fn qwen36_sigmoid_gate(spec: *const SigmoidGateSpec) -> i32;
         pub fn qwen36_sigmoid_gate_strided(spec: *const SigmoidGateStridedSpec) -> i32;
         pub fn qwen36_q_proj_deinterleave(spec: *const QProjDeinterleaveSpec) -> i32;

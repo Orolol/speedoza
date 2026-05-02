@@ -590,6 +590,76 @@ __global__ void sample_argmax_kernel(const __nv_bfloat16 *logits,
   }
 }
 
+__global__ void sample_rows_argmax_kernel(const __nv_bfloat16 *logits,
+                                          uint32_t *output_tokens,
+                                          uint32_t *mirror_last_output_token,
+                                          size_t rows, size_t vocab_size,
+                                          float temperature) {
+  // Sized for the maximum CUDA block (1024 threads = 32 warps); the launch
+  // currently uses 256 threads (8 warps) but bumping the launch config must
+  // not silently corrupt the reduction.
+  __shared__ float warp_scores[32];
+  __shared__ uint32_t warp_indices[32];
+
+  const size_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const __nv_bfloat16 *row_logits = logits + row * vocab_size;
+
+  float best_score = -INFINITY;
+  uint32_t best_idx = 0;
+  const float temp = temperature > 0.0f ? temperature : 1.0f;
+  for (size_t idx = threadIdx.x; idx < vocab_size; idx += blockDim.x) {
+    const float score = __bfloat162float(row_logits[idx]) / temp;
+    const uint32_t token = static_cast<uint32_t>(idx);
+    if (better_score(score, token, best_score, best_idx)) {
+      best_score = score;
+      best_idx = token;
+    }
+  }
+
+  const unsigned warp_id = threadIdx.x >> 5;
+  const unsigned lane_id = threadIdx.x & 31;
+  const unsigned n_warps = (blockDim.x + 31) >> 5;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    const float candidate_score =
+        __shfl_down_sync(0xffffffff, best_score, offset);
+    const uint32_t candidate_idx =
+        __shfl_down_sync(0xffffffff, best_idx, offset);
+    if (better_score(candidate_score, candidate_idx, best_score, best_idx)) {
+      best_score = candidate_score;
+      best_idx = candidate_idx;
+    }
+  }
+  if (lane_id == 0) {
+    warp_scores[warp_id] = best_score;
+    warp_indices[warp_id] = best_idx;
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    best_score = lane_id < n_warps ? warp_scores[lane_id] : -INFINITY;
+    best_idx = lane_id < n_warps ? warp_indices[lane_id] : UINT32_MAX;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      const float candidate_score =
+          __shfl_down_sync(0xffffffff, best_score, offset);
+      const uint32_t candidate_idx =
+          __shfl_down_sync(0xffffffff, best_idx, offset);
+      if (better_score(candidate_score, candidate_idx, best_score, best_idx)) {
+        best_score = candidate_score;
+        best_idx = candidate_idx;
+      }
+    }
+    if (lane_id == 0) {
+      output_tokens[row] = best_idx;
+      if (mirror_last_output_token != nullptr && row + 1 == rows) {
+        *mirror_last_output_token = best_idx;
+      }
+    }
+  }
+}
+
 __global__ void embedding_lookup_kernel(const uint32_t *token_ids,
                                         const __nv_bfloat16 *embedding,
                                         __nv_bfloat16 *output, size_t tokens,
@@ -1591,6 +1661,26 @@ extern "C" int qwen36_sample(const qwen36_sampling_spec_t *spec) {
       ptr<uint32_t>(spec->output_token_u32),
       ptr<uint32_t>(spec->mirror_output_token_u32), spec->vocab_size,
       spec->temperature);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int qwen36_sample_rows(const qwen36_sampling_rows_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->rows == 0 || spec->vocab_size == 0 ||
+      spec->logits_bf16.ptr == 0 || spec->output_token_u32.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+
+  const int threads = 256;
+  sample_rows_argmax_kernel<<<static_cast<unsigned int>(spec->rows), threads,
+                              0, qwen36_internal_active_stream()>>>(
+      ptr<const __nv_bfloat16>(spec->logits_bf16),
+      ptr<uint32_t>(spec->output_token_u32),
+      ptr<uint32_t>(spec->mirror_last_output_token_u32), spec->rows,
+      spec->vocab_size, spec->temperature);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
