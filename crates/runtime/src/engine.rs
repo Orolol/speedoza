@@ -6,7 +6,8 @@ use qwen36_fp4_core::{CoreError, KvCacheDtype, ModelLayout, ModelTopology, Resul
 #[cfg(feature = "cuda")]
 use qwen36_fp4_kernels::{
     AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
-    Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode, CudaBackend,
+    Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode,
+    CudaBackend,
     DeltaNetDecodeSpec, DeltaNetShape, DevicePtr, EmbeddingLookupSpec, GdnGateSpec, Nvfp4GemmSpec,
     Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec, QProjDeinterleaveSpec,
     QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec, SamplingSpec,
@@ -38,6 +39,19 @@ const MTP_MAX_DRAFT_TOKENS: usize = 3;
 const MTP_GRAPH_BUNDLE_U32S: usize = 16;
 #[cfg(feature = "cuda")]
 const MTP_GRAPH_VERIFIED_BASE: usize = 4;
+// Slot layout in `mtp_verify_token_u32`:
+//   0..MTP_MAX_DRAFT_TOKENS-1   = input draft tokens (verify-time)
+//   MTP_MAX_DRAFT_TOKENS        = next_token (output)
+//   MTP_GRAPH_VERIFIED_BASE..+N = verified token outputs
+//   MTP_DRAFT_INPUT_SCRATCH_SLOT = scratch H2D slot for the first recursive
+//                                   draft input (one-shot).
+//   MTP_DRAFT_OUTPUT_BASE_SLOT.. = device slots accumulating recursive draft
+//                                   sample outputs across MTP_MAX_DRAFT_TOKENS
+//                                   iterations, batched into one D2H read.
+#[cfg(feature = "cuda")]
+const MTP_DRAFT_INPUT_SCRATCH_SLOT: usize = 7;
+#[cfg(feature = "cuda")]
+const MTP_DRAFT_OUTPUT_BASE_SLOT: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -1150,22 +1164,55 @@ impl<B: KernelBackend> Engine<B> {
         first_mtp_position: usize,
         draft_count: usize,
     ) -> Result<Vec<u32>> {
-        let mut drafts = Vec::with_capacity(draft_count);
-        let mut shifted_token = first_shifted_token;
+        if draft_count == 0 {
+            return Ok(Vec::new());
+        }
+        let forward = self.cuda_forward()?;
+        // Stage the first iteration's input token on device once. Subsequent
+        // iterations consume the previous sample's device slot directly, so the
+        // recursive loop never round-trips a token through host.
+        forward.mtp_verify_token_u32.copy_from_host_at(
+            MTP_DRAFT_INPUT_SCRATCH_SLOT * 4,
+            &first_shifted_token.to_ne_bytes(),
+        )?;
+
         let mut target_hidden = first_target_hidden_bf16;
         for draft_idx in 0..draft_count {
             let position = first_mtp_position.checked_add(draft_idx).ok_or_else(|| {
                 CoreError::Runtime("MTP recursive draft position overflow".to_owned())
             })?;
-            self.cuda_prefill()?
-                .token_u32
-                .copy_from_host(&shifted_token.to_ne_bytes())?;
-            self.run_mtp_prefill_chunk(1, position, DevicePtr::NULL, target_hidden, true)?;
-            self.queue_sample_greedy()?;
-            let draft = self.read_sampled_token()?;
-            drafts.push(draft);
-            shifted_token = draft;
+            let token_input_slot = if draft_idx == 0 {
+                MTP_DRAFT_INPUT_SCRATCH_SLOT
+            } else {
+                MTP_DRAFT_OUTPUT_BASE_SLOT + draft_idx - 1
+            };
+            let token_input_ptr = forward
+                .mtp_verify_token_u32
+                .ptr_at(token_input_slot * 4)?;
+            let sample_output_ptr = forward
+                .mtp_verify_token_u32
+                .ptr_at((MTP_DRAFT_OUTPUT_BASE_SLOT + draft_idx) * 4)?;
+            self.run_mtp_prefill_chunk_with_tokens(
+                1,
+                position,
+                DevicePtr::NULL,
+                target_hidden,
+                token_input_ptr,
+                true,
+            )?;
+            self.queue_sample_greedy_into(sample_output_ptr)?;
             target_hidden = self.cuda_prefill()?.normed.ptr();
+        }
+
+        // Single sync + batched D2H read of all sample slots.
+        self.synchronize_active_stream_for_host_read()?;
+        let mut bytes = vec![0_u8; draft_count * 4];
+        forward
+            .mtp_verify_token_u32
+            .copy_to_host_at(MTP_DRAFT_OUTPUT_BASE_SLOT * 4, &mut bytes)?;
+        let mut drafts = Vec::with_capacity(draft_count);
+        for chunk in bytes.chunks_exact(4) {
+            drafts.push(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         Ok(drafts)
     }
@@ -1201,9 +1248,16 @@ impl<B: KernelBackend> Engine<B> {
             target_hidden_bf16,
             true,
         )?;
-        self.queue_sample_greedy()?;
-        let first_draft = self.read_sampled_token()?;
-        let mut drafts = vec![first_draft];
+
+        // Sample the first draft directly into the device-side accumulator
+        // (no host sync). For draft_count > 1 the subsequent iterations chain
+        // their token input from the previous slot, so the host stays off the
+        // critical path until a single sync at the end.
+        let forward = self.cuda_forward()?;
+        let first_sample_ptr = forward
+            .mtp_verify_token_u32
+            .ptr_at(MTP_DRAFT_OUTPUT_BASE_SLOT * 4)?;
+        self.queue_sample_greedy_into(first_sample_ptr)?;
 
         if draft_count > 1 {
             let hidden = self.topology.hidden_size;
@@ -1211,12 +1265,37 @@ impl<B: KernelBackend> Engine<B> {
                 self.cuda_prefill()?.normed.ptr(),
                 (shifted_tokens.len() - 1) * hidden * 2,
             )?;
-            drafts.extend(self.generate_mtp_drafts_from_target(
-                first_draft,
-                last_hidden,
-                start_position + shifted_tokens.len(),
-                draft_count - 1,
-            )?);
+            let mut target_hidden = last_hidden;
+            for draft_idx in 1..draft_count {
+                let position = start_position + shifted_tokens.len() + draft_idx - 1;
+                let token_input_ptr = forward
+                    .mtp_verify_token_u32
+                    .ptr_at((MTP_DRAFT_OUTPUT_BASE_SLOT + draft_idx - 1) * 4)?;
+                let sample_output_ptr = forward
+                    .mtp_verify_token_u32
+                    .ptr_at((MTP_DRAFT_OUTPUT_BASE_SLOT + draft_idx) * 4)?;
+                self.run_mtp_prefill_chunk_with_tokens(
+                    1,
+                    position,
+                    DevicePtr::NULL,
+                    target_hidden,
+                    token_input_ptr,
+                    true,
+                )?;
+                self.queue_sample_greedy_into(sample_output_ptr)?;
+                target_hidden = self.cuda_prefill()?.normed.ptr();
+            }
+        }
+
+        // Single sync + batched D2H read of all draft slots.
+        self.synchronize_active_stream_for_host_read()?;
+        let mut bytes = vec![0_u8; draft_count * 4];
+        forward
+            .mtp_verify_token_u32
+            .copy_to_host_at(MTP_DRAFT_OUTPUT_BASE_SLOT * 4, &mut bytes)?;
+        let mut drafts = Vec::with_capacity(draft_count);
+        for chunk in bytes.chunks_exact(4) {
+            drafts.push(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         Ok(drafts)
     }
@@ -2725,21 +2804,18 @@ impl<B: KernelBackend> Engine<B> {
             CoreError::Runtime("fused DeltaNet z offset overflow".to_owned())
         })?;
 
-        self.backend.conv1d_update(&Conv1dUpdateSpec {
+        self.backend.conv1d_gdn_gate_fused(&Conv1dGdnGateFusedSpec {
             channels: qkv_dim,
             kernel_size: self.topology.linear_conv_kernel_dim,
-            input_bf16: forward.qkv.ptr(),
+            conv_input_bf16: forward.qkv.ptr(),
             conv_history_bf16: conv_history,
-            weight_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.conv1d_weight)?,
-            output_bf16: forward.aux.ptr(),
-        })?;
-        self.backend.gdn_gate(&GdnGateSpec {
-            rows: 1,
+            conv_weight_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.conv1d_weight)?,
+            conv_output_bf16: forward.aux.ptr(),
             heads: self.topology.linear_num_value_heads,
-            a_bf16: a_ptr,
-            b_bf16: b_ptr,
-            a_log_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.a_log)?,
-            dt_bias_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.dt_bias)?,
+            gdn_a_bf16: a_ptr,
+            gdn_b_bf16: b_ptr,
+            gdn_a_log_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.a_log)?,
+            gdn_dt_bias_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.dt_bias)?,
             gate_f32: forward.gate_f32.ptr(),
             beta_f32: forward.beta_f32.ptr(),
         })?;

@@ -122,6 +122,23 @@ pub struct GdnGateSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Conv1dGdnGateFusedSpec {
+    pub channels: usize,
+    pub kernel_size: usize,
+    pub conv_input_bf16: DevicePtr,
+    pub conv_history_bf16: DevicePtr,
+    pub conv_weight_bf16: DevicePtr,
+    pub conv_output_bf16: DevicePtr,
+    pub heads: usize,
+    pub gdn_a_bf16: DevicePtr,
+    pub gdn_b_bf16: DevicePtr,
+    pub gdn_a_log_bf16: DevicePtr,
+    pub gdn_dt_bias_bf16: DevicePtr,
+    pub gate_f32: DevicePtr,
+    pub beta_f32: DevicePtr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SigmoidGateSpec {
     pub elements: usize,
     pub gate_bf16: DevicePtr,

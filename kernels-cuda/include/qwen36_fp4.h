@@ -336,6 +336,24 @@ typedef struct {
 } qwen36_gdn_gate_spec_t;
 
 typedef struct {
+  // conv1d_update params (rows = 1).
+  size_t channels;
+  size_t kernel_size;
+  qwen36_device_ptr_t conv_input_bf16;
+  qwen36_device_ptr_t conv_history_bf16;
+  qwen36_device_ptr_t conv_weight_bf16;
+  qwen36_device_ptr_t conv_output_bf16;
+  // gdn_gate params (rows = 1, single-token decode).
+  size_t heads;
+  qwen36_device_ptr_t gdn_a_bf16;
+  qwen36_device_ptr_t gdn_b_bf16;
+  qwen36_device_ptr_t gdn_a_log_bf16;
+  qwen36_device_ptr_t gdn_dt_bias_bf16;
+  qwen36_device_ptr_t gate_f32;
+  qwen36_device_ptr_t beta_f32;
+} qwen36_conv1d_gdn_gate_fused_spec_t;
+
+typedef struct {
   size_t elements;
   qwen36_device_ptr_t gate_bf16;
   qwen36_device_ptr_t input_bf16;
@@ -424,6 +442,8 @@ int qwen36_nvfp4_retile_scales(const qwen36_nvfp4_retile_scales_spec_t *spec);
 int qwen36_conv1d_update(const qwen36_conv1d_update_spec_t *spec);
 int qwen36_conv1d_prefill(const qwen36_conv1d_prefill_spec_t *spec);
 int qwen36_gdn_gate(const qwen36_gdn_gate_spec_t *spec);
+int qwen36_conv1d_gdn_gate_fused(
+    const qwen36_conv1d_gdn_gate_fused_spec_t *spec);
 int qwen36_sigmoid_gate(const qwen36_sigmoid_gate_spec_t *spec);
 int qwen36_sigmoid_gate_strided(
     const qwen36_sigmoid_gate_strided_spec_t *spec);

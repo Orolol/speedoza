@@ -292,20 +292,64 @@ __global__ void rmsnorm_nvfp4_quantize_kernel(
     // overwritten residual storage.
     float residual_values[16];
     float weighted_values[16];
-    for (size_t offset = 0; offset < 16 && start + offset < hidden; ++offset) {
-      const size_t d = start + offset;
-      float value = __bfloat162float(input[d]);
-      if (residual != nullptr) {
-        value += __bfloat162float(residual[d]);
+    const size_t group_end = (start + 16 <= hidden) ? 16 : (hidden - start);
+    if (group_end == 16) {
+      // Vectorised pair I/O for full 16-element groups (the common case;
+      // hidden is a multiple of 16 for Qwen3.6). Halves global BF16
+      // transactions for input/residual/weight reads and output_bf16 writes.
+      const __nv_bfloat162 *input_pair =
+          reinterpret_cast<const __nv_bfloat162 *>(input + start);
+      const __nv_bfloat162 *residual_pair =
+          residual != nullptr
+              ? reinterpret_cast<const __nv_bfloat162 *>(residual + start)
+              : nullptr;
+      const __nv_bfloat162 *weight_pair =
+          reinterpret_cast<const __nv_bfloat162 *>(weight + start);
+      __nv_bfloat162 *output_pair =
+          output_bf16 != nullptr
+              ? reinterpret_cast<__nv_bfloat162 *>(output_bf16 + start)
+              : nullptr;
+      #pragma unroll
+      for (size_t p = 0; p < 8; ++p) {
+        const __nv_bfloat162 ip = input_pair[p];
+        float a = __low2float(ip);
+        float b = __high2float(ip);
+        if (residual_pair != nullptr) {
+          const __nv_bfloat162 rp = residual_pair[p];
+          a += __low2float(rp);
+          b += __high2float(rp);
+        }
+        const __nv_bfloat162 wp = weight_pair[p];
+        const float w0 = __low2float(wp);
+        const float w1 = __high2float(wp);
+        const float weighted0 = a * norm_scale * (1.0f + w0);
+        const float weighted1 = b * norm_scale * (1.0f + w1);
+        residual_values[p * 2] = a;
+        residual_values[p * 2 + 1] = b;
+        weighted_values[p * 2] = weighted0;
+        weighted_values[p * 2 + 1] = weighted1;
+        if (output_pair != nullptr) {
+          output_pair[p] = __floats2bfloat162_rn(weighted0, weighted1);
+        }
+        amax = fmaxf(amax, fmaxf(fabsf(weighted0), fabsf(weighted1)));
       }
-      const float weighted =
-          value * norm_scale * (1.0f + __bfloat162float(weight[d]));
-      residual_values[offset] = value;
-      weighted_values[offset] = weighted;
-      if (output_bf16 != nullptr) {
-        output_bf16[d] = __float2bfloat16(weighted);
+    } else {
+      // Boundary partial group (hidden not a multiple of 16).
+      for (size_t offset = 0; offset < group_end; ++offset) {
+        const size_t d = start + offset;
+        float value = __bfloat162float(input[d]);
+        if (residual != nullptr) {
+          value += __bfloat162float(residual[d]);
+        }
+        const float weighted =
+            value * norm_scale * (1.0f + __bfloat162float(weight[d]));
+        residual_values[offset] = value;
+        weighted_values[offset] = weighted;
+        if (output_bf16 != nullptr) {
+          output_bf16[d] = __float2bfloat16(weighted);
+        }
+        amax = fmaxf(amax, fabsf(weighted));
       }
-      amax = fmaxf(amax, fabsf(weighted));
     }
 
     const float scale_value =
@@ -326,9 +370,19 @@ __global__ void rmsnorm_nvfp4_quantize_kernel(
       }
       output_fp4[d / 2] = packed;
     }
-    for (size_t offset = 0; offset < 16 && start + offset < hidden; ++offset) {
-      if (residual_out != nullptr) {
-        residual_out[start + offset] = __float2bfloat16(residual_values[offset]);
+    if (residual_out != nullptr) {
+      if (group_end == 16) {
+        __nv_bfloat162 *resout_pair =
+            reinterpret_cast<__nv_bfloat162 *>(residual_out + start);
+        #pragma unroll
+        for (size_t p = 0; p < 8; ++p) {
+          resout_pair[p] = __floats2bfloat162_rn(residual_values[p * 2],
+                                                 residual_values[p * 2 + 1]);
+        }
+      } else {
+        for (size_t offset = 0; offset < group_end; ++offset) {
+          residual_out[start + offset] = __float2bfloat16(residual_values[offset]);
+        }
       }
     }
   }
@@ -909,6 +963,54 @@ __global__ void gdn_gate_kernel(const __nv_bfloat16 *a, const __nv_bfloat16 *b,
   }
 }
 
+// Fused conv1d_update + gdn_gate kernel for the DeltaNet decode path
+// (rows = 1). The two ops have no dataflow dependency — they read disjoint
+// slices of `forward.qkv` and write to different outputs — so we can dispatch
+// them within a single kernel launch by routing blocks based on blockIdx.x:
+// the first conv_blocks blocks handle conv1d_update; the trailing block(s)
+// handle gdn_gate. Saves one host launch + one launch overhead per DeltaNet
+// layer (×48 layers per token).
+__global__ void conv1d_update_gdn_gate_fused_kernel(
+    const __nv_bfloat16 *conv_input, __nv_bfloat16 *history,
+    const __nv_bfloat16 *conv_weight, __nv_bfloat16 *conv_output,
+    size_t channels, size_t kernel_size,
+    const __nv_bfloat16 *gdn_a, const __nv_bfloat16 *gdn_b,
+    const __nv_bfloat16 *gdn_a_log, const __nv_bfloat16 *gdn_dt_bias,
+    float *gdn_gate, float *gdn_beta, size_t gdn_heads,
+    unsigned int conv_blocks) {
+  if (blockIdx.x < conv_blocks) {
+    const size_t channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel < channels) {
+      __nv_bfloat16 *channel_history = history + channel * (kernel_size - 1);
+      const __nv_bfloat16 *channel_weight = conv_weight + channel * kernel_size;
+      float sum = __bfloat162float(conv_input[channel]) *
+                  __bfloat162float(channel_weight[kernel_size - 1]);
+      for (size_t k = 0; k + 1 < kernel_size; ++k) {
+        sum += __bfloat162float(channel_history[k]) *
+               __bfloat162float(channel_weight[k]);
+      }
+      for (size_t k = 0; k + 2 < kernel_size; ++k) {
+        channel_history[k] = channel_history[k + 1];
+      }
+      channel_history[kernel_size - 2] = conv_input[channel];
+      const float silu = sum / (1.0f + expf(-sum));
+      conv_output[channel] = __float2bfloat16(silu);
+    }
+  } else {
+    // Single trailing block runs gdn_gate work for rows=1.
+    // idx in [0, gdn_heads) — head index is idx itself when rows=1.
+    const size_t idx = threadIdx.x;
+    if (idx < gdn_heads) {
+      const float x = __bfloat162float(gdn_a[idx]) +
+                      __bfloat162float(gdn_dt_bias[idx]);
+      const float softplus = x <= 20.0f ? log1pf(expf(x)) : x;
+      gdn_gate[idx] = -expf(__bfloat162float(gdn_a_log[idx])) * softplus;
+      const float b_value = __bfloat162float(gdn_b[idx]);
+      gdn_beta[idx] = 1.0f / (1.0f + expf(-b_value));
+    }
+  }
+}
+
 __global__ void sigmoid_gate_kernel(const __nv_bfloat16 *gate,
                                     const __nv_bfloat16 *input,
                                     __nv_bfloat16 *output, size_t elements) {
@@ -1248,6 +1350,43 @@ extern "C" int qwen36_conv1d_prefill(const qwen36_conv1d_prefill_spec_t *spec) {
       ptr<const __nv_bfloat16>(spec->weight_bf16),
       ptr<__nv_bfloat16>(spec->output_bf16), spec->tokens, spec->channels,
       spec->kernel_size);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int qwen36_conv1d_gdn_gate_fused(
+    const qwen36_conv1d_gdn_gate_fused_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->channels == 0 || spec->kernel_size < 2 ||
+      spec->conv_input_bf16.ptr == 0 || spec->conv_history_bf16.ptr == 0 ||
+      spec->conv_weight_bf16.ptr == 0 || spec->conv_output_bf16.ptr == 0 ||
+      spec->heads == 0 || spec->gdn_a_bf16.ptr == 0 ||
+      spec->gdn_b_bf16.ptr == 0 || spec->gdn_a_log_bf16.ptr == 0 ||
+      spec->gdn_dt_bias_bf16.ptr == 0 || spec->gate_f32.ptr == 0 ||
+      spec->beta_f32.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const int threads = 256;
+  const unsigned int conv_blocks =
+      static_cast<unsigned int>((spec->channels + threads - 1) / threads);
+  // gdn_gate at rows=1 with up to MTP_MAX heads (~48 for Qwen3.6) fits inside
+  // one thread block. We always launch one extra block for it.
+  const unsigned int total_blocks = conv_blocks + 1;
+  conv1d_update_gdn_gate_fused_kernel<<<total_blocks, threads, 0,
+                                         qwen36_internal_active_stream()>>>(
+      ptr<const __nv_bfloat16>(spec->conv_input_bf16),
+      ptr<__nv_bfloat16>(spec->conv_history_bf16),
+      ptr<const __nv_bfloat16>(spec->conv_weight_bf16),
+      ptr<__nv_bfloat16>(spec->conv_output_bf16), spec->channels,
+      spec->kernel_size,
+      ptr<const __nv_bfloat16>(spec->gdn_a_bf16),
+      ptr<const __nv_bfloat16>(spec->gdn_b_bf16),
+      ptr<const __nv_bfloat16>(spec->gdn_a_log_bf16),
+      ptr<const __nv_bfloat16>(spec->gdn_dt_bias_bf16),
+      ptr<float>(spec->gate_f32), ptr<float>(spec->beta_f32), spec->heads,
+      conv_blocks);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }

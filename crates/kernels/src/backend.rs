@@ -5,8 +5,9 @@ use crate::attention::{AttentionDecodeSpec, AttentionPrefillSpec};
 use crate::deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec};
 use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
-    Bf16GemmSpec, Bf16MatVecSpec, Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec,
-    EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
+    Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, Conv1dUpdateSpec,
+    CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec,
+    Nvfp4QuantizeSpec,
     Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec,
     SigmoidGateSpec, SigmoidGateStridedSpec,
 };
@@ -121,6 +122,10 @@ pub trait KernelBackend: Send + Sync {
 
     fn gdn_gate(&self, _spec: &GdnGateSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("gdn_gate"))
+    }
+
+    fn conv1d_gdn_gate_fused(&self, _spec: &Conv1dGdnGateFusedSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("conv1d_gdn_gate_fused"))
     }
 
     fn sigmoid_gate(&self, _spec: &SigmoidGateSpec) -> Result<()> {
@@ -320,6 +325,13 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::GdnGateSpec::from(spec);
         check("qwen36_gdn_gate", unsafe {
             ffi::qwen36_gdn_gate(&ffi_spec)
+        })
+    }
+
+    fn conv1d_gdn_gate_fused(&self, spec: &Conv1dGdnGateFusedSpec) -> Result<()> {
+        let ffi_spec = ffi::Conv1dGdnGateFusedSpec::from(spec);
+        check("qwen36_conv1d_gdn_gate_fused", unsafe {
+            ffi::qwen36_conv1d_gdn_gate_fused(&ffi_spec)
         })
     }
 
@@ -1035,6 +1047,43 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct Conv1dGdnGateFusedSpec {
+        pub channels: usize,
+        pub kernel_size: usize,
+        pub conv_input_bf16: DevicePtr,
+        pub conv_history_bf16: DevicePtr,
+        pub conv_weight_bf16: DevicePtr,
+        pub conv_output_bf16: DevicePtr,
+        pub heads: usize,
+        pub gdn_a_bf16: DevicePtr,
+        pub gdn_b_bf16: DevicePtr,
+        pub gdn_a_log_bf16: DevicePtr,
+        pub gdn_dt_bias_bf16: DevicePtr,
+        pub gate_f32: DevicePtr,
+        pub beta_f32: DevicePtr,
+    }
+
+    impl From<&crate::ops::Conv1dGdnGateFusedSpec> for Conv1dGdnGateFusedSpec {
+        fn from(value: &crate::ops::Conv1dGdnGateFusedSpec) -> Self {
+            Self {
+                channels: value.channels,
+                kernel_size: value.kernel_size,
+                conv_input_bf16: value.conv_input_bf16,
+                conv_history_bf16: value.conv_history_bf16,
+                conv_weight_bf16: value.conv_weight_bf16,
+                conv_output_bf16: value.conv_output_bf16,
+                heads: value.heads,
+                gdn_a_bf16: value.gdn_a_bf16,
+                gdn_b_bf16: value.gdn_b_bf16,
+                gdn_a_log_bf16: value.gdn_a_log_bf16,
+                gdn_dt_bias_bf16: value.gdn_dt_bias_bf16,
+                gate_f32: value.gate_f32,
+                beta_f32: value.beta_f32,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct SigmoidGateSpec {
         pub elements: usize,
         pub gate_bf16: DevicePtr,
@@ -1216,6 +1265,9 @@ mod ffi {
         pub fn qwen36_conv1d_update(spec: *const Conv1dUpdateSpec) -> i32;
         pub fn qwen36_conv1d_prefill(spec: *const Conv1dPrefillSpec) -> i32;
         pub fn qwen36_gdn_gate(spec: *const GdnGateSpec) -> i32;
+        pub fn qwen36_conv1d_gdn_gate_fused(
+            spec: *const Conv1dGdnGateFusedSpec,
+        ) -> i32;
         pub fn qwen36_sigmoid_gate(spec: *const SigmoidGateSpec) -> i32;
         pub fn qwen36_sigmoid_gate_strided(spec: *const SigmoidGateStridedSpec) -> i32;
         pub fn qwen36_q_proj_deinterleave(spec: *const QProjDeinterleaveSpec) -> i32;
