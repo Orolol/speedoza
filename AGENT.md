@@ -127,6 +127,42 @@ Bench reference (RTX 5090, `--prompt-tokens 128 --max-new-tokens 32`, full-accep
 | 2 | 74.2  | 1.63× | 21/22  (acceptance 1.00) |
 | 3 | 86.3  | 1.90× | 24/24  (acceptance 1.00) |
 
+### 2026-05-02 — Re-bench after PR #2 merge (MTP4 + batched lm_head + sample_rows)
+
+WSL2, RTX 5090, model `Qwen3.6-27B-Text-NVFP4-MTP`, run on the
+`feat/perf-tree-mtp-stack` branch (no tree-MTP code wired up — these
+numbers are pure post-PR-#2 baseline). Median of 5 runs each.
+
+`--prompt-tokens 128 --max-new-tokens 128`:
+
+| MTP | decode tok/s | speedup | accepted_drafts / total_drafts |
+|--|--|--|--|
+| 0 | 41.6  | 1.00× | n/a |
+| 1 | 55.6  | 1.34× | 64 |
+| 2 | 73.4  | 1.77× | 85 |
+| 3 | 79.9  | 1.92× | 96 |
+| 4 | 98.3  | 2.36× | 102 |
+
+`--prompt-tokens 128 --max-new-tokens 32` (matches PR #2's reported setup):
+
+| MTP | decode tok/s | speedup | accepted_drafts |
+|--|--|--|--|
+| 0 | 34.3  | 1.00× | n/a |
+| 1 | 42.0  | 1.22× | 16 |
+| 2 | 41.0  | 1.20× | 21 |
+| 3 | 46.7  | 1.36× | 24 |
+| 4 | 55.1  | 1.61× | 25 |
+
+PR #2 reported MTP4 = 117-120 tok/s on the same `--prompt-tokens 128
+--max-new-tokens 32` setup; the numbers here are ~2x lower, attributed
+to WSL2 launch latency (`docs/AGENT.md` notes 1-3 µs per kernel launch
+penalty) and high run-to-run variance. The n=128 numbers are more
+amortised and therefore higher.
+
+`mtp_accepted_draft_tokens` is the cumulative count of accepted draft
+tokens across the run (not per-cycle). At MTP=4 / n=128: 102 accepted
+across ~25 cycles ≈ 4 drafts/cycle accepted = full-accept regime.
+
 The current numbers reflect four decode-side optimisations that landed in this branch:
 
 1. **Combined gate + up FP4 GEMM** (`MlpFusedStore` in `crates/runtime/src/gpu.rs`). Pre-concatenates the gate_proj and up_proj NVFP4 weights along the output dim once at engine init; the decode path emits a single `(M=2·intermediate, N=1)` cuBLASLt FP4 GEMM instead of two. Only valid when every layer's gate/up share `weight_scale_2` and `input_scale` (validated at build time and confirmed for every layer of the shipped Qwen3.6 NVFP4 checkpoint).
