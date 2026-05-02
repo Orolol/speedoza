@@ -3394,6 +3394,8 @@ impl<B: KernelBackend> Engine<B> {
             partial_denom_f32: self.cuda_forward()?.attn_partial_denom.ptr(),
             prefill_n_splits: self.decode_attention_n_splits(),
             split_timesteps_per_block: self.attention_split_timesteps_per_block(),
+            tree_ancestor_bitmap_u64: DevicePtr::NULL,
+            verify_chunk_rows: 0,
         })?;
         self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
             rows: tokens,
@@ -3863,6 +3865,8 @@ impl<B: KernelBackend> Engine<B> {
             partial_denom_f32: self.cuda_forward()?.attn_partial_denom.ptr(),
             prefill_n_splits: self.decode_attention_n_splits(),
             split_timesteps_per_block: self.attention_split_timesteps_per_block(),
+            tree_ancestor_bitmap_u64: DevicePtr::NULL,
+            verify_chunk_rows: 0,
         })?;
         if layer.layer_index == 3 {
             if let Ok(dir) = std::env::var("QWEN36_DEBUG_DUMP_DIR") {

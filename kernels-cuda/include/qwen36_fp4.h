@@ -134,6 +134,13 @@ typedef struct {
   size_t prefill_n_splits;
   // Timesteps covered by each split block. A value of 0 uses the CUDA default.
   size_t split_timesteps_per_block;
+  /// Tree-mask bitmap. When non-NULL, row i of the verify chunk attends to
+  /// KV row j (within the same chunk) iff bit j of word i is set. KV positions
+  /// before `start_position` (cache prefix) remain fully visible regardless.
+  /// NULL → causal mask (existing behaviour). Capped at 64 rows.
+  qwen36_device_ptr_t tree_ancestor_bitmap_u64;
+  /// Verify-chunk row count (number of valid bitmap entries). 0 = causal.
+  size_t verify_chunk_rows;
 } qwen36_attention_prefill_spec_t;
 
 typedef struct {

@@ -493,6 +493,8 @@ mod ffi {
         pub partial_denom_f32: DevicePtr,
         pub prefill_n_splits: usize,
         pub split_timesteps_per_block: usize,
+        pub tree_ancestor_bitmap_u64: DevicePtr,
+        pub verify_chunk_rows: usize,
     }
 
     impl From<&crate::attention::AttentionPrefillSpec> for AttentionPrefillSpec {
@@ -514,6 +516,8 @@ mod ffi {
                 partial_denom_f32: value.partial_denom_f32,
                 prefill_n_splits: value.prefill_n_splits,
                 split_timesteps_per_block: value.split_timesteps_per_block,
+                tree_ancestor_bitmap_u64: value.tree_ancestor_bitmap_u64,
+                verify_chunk_rows: value.verify_chunk_rows,
             }
         }
     }
