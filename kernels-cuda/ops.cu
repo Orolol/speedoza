@@ -595,8 +595,11 @@ __global__ void sample_rows_argmax_kernel(const __nv_bfloat16 *logits,
                                           uint32_t *mirror_last_output_token,
                                           size_t rows, size_t vocab_size,
                                           float temperature) {
-  __shared__ float warp_scores[8];
-  __shared__ uint32_t warp_indices[8];
+  // Sized for the maximum CUDA block (1024 threads = 32 warps); the launch
+  // currently uses 256 threads (8 warps) but bumping the launch config must
+  // not silently corrupt the reduction.
+  __shared__ float warp_scores[32];
+  __shared__ uint32_t warp_indices[32];
 
   const size_t row = blockIdx.x;
   if (row >= rows) {

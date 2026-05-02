@@ -164,7 +164,11 @@ enum DecodeGraphKind {
     Decode,
     MtpDecodeOne,
     MtpVerifyOne,
-    MtpVerifyMulti { drafts: usize, assume_accept: bool },
+    MtpVerifyMulti {
+        drafts: usize,
+        assume_accept: bool,
+        batched_lm_head: bool,
+    },
 }
 
 #[cfg(feature = "cuda")]
@@ -605,11 +609,13 @@ impl<B: KernelBackend> Engine<B> {
             )));
         }
         let assume_accept = mtp_assume_accept_enabled();
+        let batched_lm_head = mtp_batched_lm_head_enabled();
         if self.decode_graph.as_ref().is_some_and(|graph| {
             graph.kind
                 == (DecodeGraphKind::MtpVerifyMulti {
                     drafts: draft_count,
                     assume_accept,
+                    batched_lm_head,
                 })
         }) {
             return Ok(());
@@ -760,6 +766,7 @@ impl<B: KernelBackend> Engine<B> {
             kind: DecodeGraphKind::MtpVerifyMulti {
                 drafts: draft_count,
                 assume_accept,
+                batched_lm_head,
             },
             stream,
             exec,
@@ -777,6 +784,7 @@ impl<B: KernelBackend> Engine<B> {
             != (DecodeGraphKind::MtpVerifyMulti {
                 drafts: draft_count,
                 assume_accept: mtp_assume_accept_enabled(),
+                batched_lm_head: mtp_batched_lm_head_enabled(),
             })
         {
             return Err(CoreError::Runtime(
@@ -1719,6 +1727,7 @@ impl<B: KernelBackend> Engine<B> {
             self.activate_existing_graph_stream(DecodeGraphKind::MtpVerifyMulti {
                 drafts: draft_tokens.len(),
                 assume_accept: mtp_assume_accept_enabled(),
+                batched_lm_head: mtp_batched_lm_head_enabled(),
             });
         }
 
