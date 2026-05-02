@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "cuda")]
+use qwen36_fp4_core::{CoreError, Result};
+
+#[cfg(feature = "cuda")]
+use crate::backend;
 use crate::backend::DevicePtr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +52,32 @@ pub fn greedy_argmax(logits: &[f32]) -> Option<u32> {
         .enumerate()
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(idx, _)| idx as u32)
+}
+
+/// Maximum K supported by `topk_argmax_device`, mirrors the C-side
+/// `QWEN36_TOPK_MAX` define in `kernels-cuda/include/qwen36_fp4.h`.
+pub const TOPK_MAX: usize = 8;
+
+/// Launch `qwen36_topk_argmax` on the active stream. K must be 1..=TOPK_MAX.
+#[cfg(feature = "cuda")]
+pub fn topk_argmax_device(
+    vocab_size: usize,
+    k: usize,
+    logits_bf16: DevicePtr,
+    output_token_u32: DevicePtr,
+) -> Result<()> {
+    if vocab_size == 0 {
+        return Err(CoreError::Runtime(
+            "topk_argmax_device: vocab_size must be > 0".into(),
+        ));
+    }
+    if k == 0 || k > TOPK_MAX {
+        return Err(CoreError::Runtime(format!(
+            "topk_argmax_device: k must be 1..={TOPK_MAX}, got {k}"
+        )));
+    }
+    let rc = backend::topk_argmax_raw(vocab_size, k, logits_bf16, output_token_u32);
+    backend::check("qwen36_topk_argmax", rc)
 }
 
 #[cfg(test)]

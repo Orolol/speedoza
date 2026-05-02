@@ -390,12 +390,28 @@ pub fn nvfp4_retile_scales(spec: &Nvfp4RetileScalesSpec) -> Result<()> {
 }
 
 #[cfg(feature = "cuda")]
-fn check(kernel: &'static str, code: i32) -> Result<()> {
+pub(crate) fn check(kernel: &'static str, code: i32) -> Result<()> {
     if code == 0 {
         Ok(())
     } else {
         Err(CoreError::KernelLaunch { kernel, code })
     }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn topk_argmax_raw(
+    vocab_size: usize,
+    k: usize,
+    logits_bf16: DevicePtr,
+    output_token_u32: DevicePtr,
+) -> i32 {
+    let spec = ffi::TopkArgmaxSpec {
+        vocab_size,
+        k,
+        logits_bf16,
+        output_token_u32,
+    };
+    unsafe { ffi::qwen36_topk_argmax(&spec) }
 }
 
 /// Cached env-var lookup gating the CUTLASS-templated NVFP4 GEMM path.
