@@ -492,7 +492,7 @@ pub struct GpuRuntimeBuffers {
     pub conv_history_checkpoint: CudaDeviceBuffer,
     /// Scratch buffer for the K/V slice of the speculative verify positions, packed as
     /// `[layer 0 K | layer 0 V | layer 1 K | layer 1 V | ... | MTP K | MTP V]`.
-    /// Sized for the maximum (5 tokens) chunk written by the MTP=4 verify path.
+    /// Sized for the maximum (13 tokens) chunk written by tree-MTP: chain=4 + K=8 + 1 current.
     pub mtp_kv_snapshot: CudaDeviceBuffer,
     /// Layout that lets the engine address each layer's slice inside
     /// `mtp_kv_snapshot` without recomputing offsets every call.
@@ -542,6 +542,10 @@ pub struct GpuForwardBuffers {
     /// the MTP head's last forward (Phase 1 tree-MTP path). Populated by
     /// `queue_sample_topk_into` once per cycle when `tree_leaves > 1`.
     pub leaf_tokens_u32: CudaDeviceBuffer,
+    /// Per-row ancestor bitmap (one u64 per verify-chunk row) consumed by
+    /// `qwen36_attention_prefill` when running the tree-MTP verify chunk.
+    /// Sized for `MtpKvSnapshotLayout::VERIFY_TOKENS` rows × 8 bytes.
+    pub tree_ancestor_bitmap_u64: CudaDeviceBuffer,
     /// Per-q-head per-split scratch for split-KV decode attention. Sized
     /// for `n_splits = ceil(max_context / kSplitTimestepsPerBlock)`.
     /// Layout `[q_heads, n_splits, head_dim]` FP32. Keeping the partial
@@ -639,7 +643,7 @@ impl GpuRuntimeBuffers {
 }
 
 impl MtpKvSnapshotLayout {
-    pub const VERIFY_TOKENS: usize = 5;
+    pub const VERIFY_TOKENS: usize = 13; // bumped from 5: chain=4 + K=8 + 1 (current) = 13
 
     fn new(topology: &ModelTopology, kv_cache: &crate::kv_cache::KvCachePlan) -> Result<Self> {
         if kv_cache.max_context == 0 {
@@ -757,6 +761,9 @@ impl GpuForwardBuffers {
             sampled_token_u32: CudaDeviceBuffer::alloc(4)?,
             mtp_verify_token_u32: CudaDeviceBuffer::alloc(64)?,
             leaf_tokens_u32: CudaDeviceBuffer::alloc(MTP_TREE_MAX_LEAVES * 4)?,
+            tree_ancestor_bitmap_u64: CudaDeviceBuffer::alloc(
+                MtpKvSnapshotLayout::VERIFY_TOKENS * 8,
+            )?,
             attn_partial_acc: CudaDeviceBuffer::alloc(attn_partial_acc_bytes.max(1))?,
             attn_partial_max: CudaDeviceBuffer::alloc(attn_partial_scalar_bytes.max(1))?,
             attn_partial_denom: CudaDeviceBuffer::alloc(attn_partial_scalar_bytes.max(1))?,
@@ -785,6 +792,7 @@ impl GpuForwardBuffers {
             self.sampled_token_u32.bytes(),
             self.mtp_verify_token_u32.bytes(),
             self.leaf_tokens_u32.bytes(),
+            self.tree_ancestor_bitmap_u64.bytes(),
             self.attn_partial_acc.bytes(),
             self.attn_partial_max.bytes(),
             self.attn_partial_denom.bytes(),
