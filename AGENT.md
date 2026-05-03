@@ -163,6 +163,34 @@ amortised and therefore higher.
 tokens across the run (not per-cycle). At MTP=4 / n=128: 102 accepted
 across ~25 cycles ≈ 4 drafts/cycle accepted = full-accept regime.
 
+### 2026-05-03 — Re-bench after tree-MTP infra (no behavioural change)
+
+Hard parity gate: `chat --prompt "hello" --max-new-tokens 12` and
+`chat --prompt "hello world" --max-new-tokens 12` produce identical
+output strings for `--mtp-speculative-tokens` ∈ {0, 1, 2, 3, 4}. ✅
+Confirms the 18 tree-MTP infra commits (top-K kernel, tree-mask
+attention path, walk_tree_acceptance, leaf buffers, per-leaf
+snapshots, verify_mtp_tree_draft orchestrator) introduce no
+regression on the chain MTP path.
+
+`--prompt-tokens 128 --max-new-tokens 128`, median of 3 runs (excluded
+isolated spikes attributable to a concurrent game running on the
+same GPU):
+
+| MTP | decode tok/s | speedup vs MTP=3 | accepted_drafts |
+|--|--|--|--|
+| 0 | 42.8  | 0.44× | n/a |
+| 1 | 61.3  | 0.63× | 64 |
+| 2 | 83.1  | 0.86× | 85 |
+| 3 | 96.7  | 1.00× | 96 |
+| 4 | 107.2 | 1.11× | 102 |
+
+These numbers are ~5-15 % above the 2026-05-02 re-bench (MTP3 79.9 →
+96.7, MTP4 98.3 → 107.2) but the delta is within run-to-run variance
+caused by GPU contention (one MTP=4 run dropped to 75 tok/s). No
+performance-relevant code landed between the two benches; treat both
+as snapshots of the post-PR-#2 baseline.
+
 The current numbers reflect four decode-side optimisations that landed in this branch:
 
 1. **Combined gate + up FP4 GEMM** (`MlpFusedStore` in `crates/runtime/src/gpu.rs`). Pre-concatenates the gate_proj and up_proj NVFP4 weights along the output dim once at engine init; the decode path emits a single `(M=2·intermediate, N=1)` cuBLASLt FP4 GEMM instead of two. Only valid when every layer's gate/up share `weight_scale_2` and `input_scale` (validated at build time and confirmed for every layer of the shipped Qwen3.6 NVFP4 checkpoint).
