@@ -498,6 +498,14 @@ pub struct GpuRuntimeBuffers {
     /// `mtp_kv_snapshot` without recomputing offsets every call.
     pub mtp_kv_snapshot_layout: MtpKvSnapshotLayout,
     pub workspace: Option<CudaDeviceBuffer>,
+    /// Per-leaf checkpoints of `deltanet_state`, one per branched-tail tree
+    /// leaf candidate. Tree-MTP processes K leaves all branching from the
+    /// chain-end state; after each leaf is processed sequentially, its
+    /// resulting DeltaNet state is captured here for the eventual restore on
+    /// the accepted leaf. Sized for `MTP_TREE_MAX_LEAVES` slots.
+    pub deltanet_leaf_checkpoints: Vec<CudaDeviceBuffer>,
+    /// Per-leaf checkpoints of `conv_history`. See `deltanet_leaf_checkpoints`.
+    pub conv_history_leaf_checkpoints: Vec<CudaDeviceBuffer>,
 }
 
 /// Byte offsets into [`GpuRuntimeBuffers::mtp_kv_snapshot`] for each layer's
@@ -620,6 +628,17 @@ impl GpuRuntimeBuffers {
             } else {
                 Some(CudaDeviceBuffer::alloc(workspace_bytes)?)
             },
+            deltanet_leaf_checkpoints: (0..qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES)
+                .map(|_| {
+                    CudaDeviceBuffer::zeroed(usize_from_u64(
+                        state.deltanet.total_state_bytes,
+                        "DeltaNet state",
+                    )?)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            conv_history_leaf_checkpoints: (0..qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES)
+                .map(|_| CudaDeviceBuffer::zeroed(conv_history_bytes.max(1)))
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 
@@ -638,6 +657,19 @@ impl GpuRuntimeBuffers {
         if let Some(workspace) = &self.workspace {
             total += workspace.bytes() as u64;
         }
+        let leaf_deltanet_bytes: u64 = self
+            .deltanet_leaf_checkpoints
+            .iter()
+            .map(|b| b.bytes() as u64)
+            .sum();
+        let leaf_conv_bytes: u64 = self
+            .conv_history_leaf_checkpoints
+            .iter()
+            .map(|b| b.bytes() as u64)
+            .sum();
+        total = total
+            .saturating_add(leaf_deltanet_bytes)
+            .saturating_add(leaf_conv_bytes);
         total
     }
 }

@@ -1187,6 +1187,90 @@ impl<B: KernelBackend> Engine<B> {
         Ok(())
     }
 
+    /// Snapshot the current DeltaNet recurrent state + conv history into the
+    /// shared "chain end" checkpoint buffers (the existing `deltanet_checkpoint`
+    /// / `conv_history_checkpoint`). Used in tree-MTP to capture the state
+    /// after the chain rows have been processed, before per-leaf restore loop.
+    #[cfg(feature = "cuda")]
+    fn mtp_snapshot_to_chain_end(&self) -> Result<()> {
+        let runtime = self.cuda_runtime()?;
+        let deltanet_bytes = runtime.deltanet_state.bytes();
+        runtime
+            .deltanet_checkpoint
+            .copy_from_device(&runtime.deltanet_state, deltanet_bytes)?;
+        let conv_bytes = runtime.conv_history.bytes();
+        if conv_bytes > 0 {
+            runtime
+                .conv_history_checkpoint
+                .copy_from_device(&runtime.conv_history, conv_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Restore DeltaNet state + conv history from the chain-end snapshot.
+    #[cfg(feature = "cuda")]
+    fn mtp_restore_from_chain_end(&self) -> Result<()> {
+        let runtime = self.cuda_runtime()?;
+        let deltanet_bytes = runtime.deltanet_state.bytes();
+        runtime
+            .deltanet_state
+            .copy_from_device(&runtime.deltanet_checkpoint, deltanet_bytes)?;
+        let conv_bytes = runtime.conv_history.bytes();
+        if conv_bytes > 0 {
+            runtime
+                .conv_history
+                .copy_from_device(&runtime.conv_history_checkpoint, conv_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot the current DeltaNet state + conv history into per-leaf
+    /// checkpoint slot j. Used in tree-MTP after each leaf is processed.
+    #[cfg(feature = "cuda")]
+    fn mtp_snapshot_to_leaf(&self, leaf_idx: usize) -> Result<()> {
+        use qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES;
+        if leaf_idx >= MTP_TREE_MAX_LEAVES {
+            return Err(CoreError::Runtime(format!(
+                "mtp_snapshot_to_leaf: leaf_idx {leaf_idx} >= {MTP_TREE_MAX_LEAVES}"
+            )));
+        }
+        let runtime = self.cuda_runtime()?;
+        let leaf_deltanet = &runtime.deltanet_leaf_checkpoints[leaf_idx];
+        let leaf_conv = &runtime.conv_history_leaf_checkpoints[leaf_idx];
+        let deltanet_bytes = runtime.deltanet_state.bytes();
+        leaf_deltanet.copy_from_device(&runtime.deltanet_state, deltanet_bytes)?;
+        let conv_bytes = runtime.conv_history.bytes();
+        if conv_bytes > 0 {
+            leaf_conv.copy_from_device(&runtime.conv_history, conv_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Restore DeltaNet state + conv history from per-leaf checkpoint slot j.
+    #[cfg(feature = "cuda")]
+    fn mtp_restore_from_leaf(&self, leaf_idx: usize) -> Result<()> {
+        use qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES;
+        if leaf_idx >= MTP_TREE_MAX_LEAVES {
+            return Err(CoreError::Runtime(format!(
+                "mtp_restore_from_leaf: leaf_idx {leaf_idx} >= {MTP_TREE_MAX_LEAVES}"
+            )));
+        }
+        let runtime = self.cuda_runtime()?;
+        let leaf_deltanet = &runtime.deltanet_leaf_checkpoints[leaf_idx];
+        let leaf_conv = &runtime.conv_history_leaf_checkpoints[leaf_idx];
+        let deltanet_bytes = runtime.deltanet_state.bytes();
+        runtime
+            .deltanet_state
+            .copy_from_device(leaf_deltanet, deltanet_bytes)?;
+        let conv_bytes = runtime.conv_history.bytes();
+        if conv_bytes > 0 {
+            runtime
+                .conv_history
+                .copy_from_device(leaf_conv, conv_bytes)?;
+        }
+        Ok(())
+    }
+
     /// Copy the verify K/V slice at `start_position` between live caches and
     /// `mtp_kv_snapshot`. This is only needed when `QWEN36_MTP_SNAPSHOT_KV=1`;
     /// the default rollback path restores recurrent state, then reruns the
