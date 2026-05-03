@@ -72,6 +72,11 @@ fn mtp_batched_lm_head_enabled() -> bool {
     !cuda_env_bool("QWEN36_MTP_BATCH_LM_HEAD_DISABLE")
 }
 
+#[cfg(feature = "cuda")]
+fn mtp_tree_disable_enabled() -> bool {
+    cuda_env_bool("QWEN36_MTP_TREE_DISABLE")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     pub max_context: usize,
@@ -1970,6 +1975,176 @@ impl<B: KernelBackend> Engine<B> {
             rejected: false,
             next_token,
             next_draft_tokens,
+        })
+    }
+
+    /// Tree-MTP cycle entry point. Combines the existing chain MTP verify
+    /// chunk with K leaf candidates branching from the chain end. Each leaf
+    /// is processed via a single-token decode forward (`forward_token_cuda`)
+    /// after restoring DeltaNet/conv state to the chain-end snapshot, so all
+    /// K leaves are siblings (not chained). On acceptance of a leaf, the
+    /// verified-after-leaf token is also committed (gives +1 over today's
+    /// chain MTP).
+    ///
+    /// Falls back to chain MTP semantics when K = 1 (single leaf is just an
+    /// extended chain step).
+    #[cfg(feature = "cuda")]
+    pub fn verify_mtp_tree_draft(
+        &mut self,
+        current_token: u32,
+        chain_tokens: &[u32],
+        leaf_tokens: &[u32],
+        next_draft_count: usize,
+    ) -> Result<qwen36_fp4_mtp::TreeVerifyResult> {
+        use qwen36_fp4_mtp::{MTP_TREE_MAX_LEAVES, TreeDraft, walk_tree_acceptance};
+
+        if leaf_tokens.is_empty() {
+            return Err(CoreError::Runtime(
+                "tree leaf_tokens cannot be empty (use verify_mtp_draft_tokens for chain-only)"
+                    .into(),
+            ));
+        }
+        if leaf_tokens.len() > MTP_TREE_MAX_LEAVES {
+            return Err(CoreError::Runtime(format!(
+                "tree leaf_tokens.len() {} exceeds {MTP_TREE_MAX_LEAVES}",
+                leaf_tokens.len()
+            )));
+        }
+        if mtp_tree_disable_enabled() {
+            // Kill switch: degrade to chain MTP via verify_mtp_draft_tokens.
+            return self.verify_mtp_tree_draft_chain_fallback(
+                current_token,
+                chain_tokens,
+                leaf_tokens,
+                next_draft_count,
+            );
+        }
+
+        let chain_depth = chain_tokens.len();
+        let leaf_count = leaf_tokens.len();
+        let start_position = self.state.position;
+        let chain_verify_tokens = chain_depth + 1;
+        let total_positions_written = chain_verify_tokens + 1; // chain + leaf canonical slot
+
+        if start_position + total_positions_written > self.config.max_context {
+            return Err(CoreError::Runtime(format!(
+                "tree MTP at position {start_position} would exceed max_context {} (needs {total_positions_written})",
+                self.config.max_context
+            )));
+        }
+
+        // 1. Snapshot KV slice + DeltaNet/conv state for the entire region we'll touch.
+        //    The chain pass writes positions start_position..start_position+chain_depth.
+        //    Leaves all write to start_position+chain_depth+1 (canonical leaf slot).
+        self.mtp_snapshot_state(start_position, total_positions_written)?;
+
+        // 2. Run chain pass via the existing prefill_cuda_chunk.
+        let mut verify_input: Vec<u32> = Vec::with_capacity(chain_verify_tokens);
+        verify_input.push(current_token);
+        verify_input.extend_from_slice(chain_tokens);
+        self.write_prefill_tokens_and_position_count(
+            &verify_input,
+            start_position,
+            chain_verify_tokens,
+        )?;
+        self.prefill_cuda_chunk(chain_verify_tokens, start_position, DevicePtr::NULL, false)?;
+
+        // 3. Sample chain row outputs via final norm + batched lm_head + sample_rows.
+        //    This populates verified[0..=chain_depth].
+        self.final_norm_prefill_rows(chain_verify_tokens)?;
+        let mut verified: Vec<u32> = Vec::with_capacity(chain_verify_tokens + leaf_count);
+        for row in 0..chain_verify_tokens {
+            verified.push(self.sample_prefill_row_to_host(row)?);
+        }
+
+        // 4. Snapshot DeltaNet/conv state at chain end.
+        self.mtp_snapshot_to_chain_end()?;
+
+        // 5. Per-leaf forward via decode primitive.
+        let leaf_position = start_position + chain_depth + 1;
+        for &leaf_token in leaf_tokens {
+            self.mtp_restore_from_chain_end()?;
+            self.forward_token_cuda(leaf_token, leaf_position, true, true)?;
+            verified.push(self.sample_greedy()?);
+        }
+
+        // 6. Walk acceptance.
+        let draft = TreeDraft {
+            chain_tokens: chain_tokens.to_vec(),
+            leaf_tokens: leaf_tokens.to_vec(),
+        };
+        let result = walk_tree_acceptance(&verified, &draft);
+
+        // 7. Restore final state for the accepted path.
+        if let Some(accepted_leaf_idx) = result.accepted_leaf {
+            // Chain fully accepted + leaf accepted. Re-run the accepted leaf so
+            // its K/V is at the canonical slot and DeltaNet/conv state matches.
+            self.mtp_restore_from_chain_end()?;
+            self.forward_token_cuda(leaf_tokens[accepted_leaf_idx], leaf_position, false, true)?;
+            // After this forward: KV[leaf_position] = accepted leaf's K/V,
+            // DeltaNet/conv = "after leaf accepted_leaf_idx".
+            // state.position advances by chain_verify_tokens + 1 (chain N+1 slots + leaf slot).
+            self.state.advance(chain_depth + 2);
+        } else if result.accepted_chain == chain_depth {
+            // Full chain accept, no leaf. Restore chain-end state.
+            self.mtp_restore_from_chain_end()?;
+            // KV at leaf_position has last leaf's K/V (rejected, will be overwritten next cycle).
+            // state.position advances by chain_verify_tokens (chain wrote N+1 slots).
+            self.state.advance(chain_verify_tokens);
+        } else {
+            // Chain rejects at j < chain_depth. Use existing recovery path.
+            // recover_after_mtp_multi_reject internally:
+            //   - mtp_restore_state(start_position, verify_tokens)
+            //   - replays committed prefix [current_token, draft_tokens[..rejected_idx]]
+            //   - generates next-cycle drafts (we ignore those for tree path)
+            //   - advances state by committed_tokens = rejected_idx + 1
+            // We pass verify_tokens = total_positions_written so the snapshot restore covers everything we wrote.
+            let _ = self.recover_after_mtp_multi_reject(
+                current_token,
+                chain_tokens,
+                result.accepted_chain,
+                result.next_token,
+                start_position,
+                total_positions_written,
+                0, // next_draft_count = 0 (tree path doesn't use pre-computed drafts)
+            )?;
+            // recover_after_mtp_multi_reject already advances state.position. Don't re-advance.
+        }
+
+        let _ = next_draft_count; // tree path doesn't pre-compute next drafts in Phase 1
+        Ok(result)
+    }
+
+    /// Fallback when QWEN36_MTP_TREE_DISABLE=1: degrade to chain MTP using only
+    /// the top-1 leaf as next chain draft (effectively MTP=chain_depth+1 chain).
+    #[cfg(feature = "cuda")]
+    fn verify_mtp_tree_draft_chain_fallback(
+        &mut self,
+        current_token: u32,
+        chain_tokens: &[u32],
+        leaf_tokens: &[u32],
+        next_draft_count: usize,
+    ) -> Result<qwen36_fp4_mtp::TreeVerifyResult> {
+        use qwen36_fp4_mtp::TreeVerifyResult;
+
+        // When tree is disabled, just run the chain (drop leaves entirely).
+        // Construct a TreeVerifyResult that matches the chain-only behaviour.
+        let chain_result =
+            self.verify_mtp_draft_tokens(current_token, chain_tokens, true, next_draft_count)?;
+
+        let accepted_chain = chain_result.accepted_drafts;
+        let next_token = chain_result.next_token.unwrap_or(0);
+        let mut committed: Vec<u32> = Vec::with_capacity(accepted_chain + 1);
+        for chain_token in chain_tokens.iter().take(accepted_chain).copied() {
+            committed.push(chain_token);
+        }
+        committed.push(next_token);
+        let _ = leaf_tokens;
+        Ok(TreeVerifyResult {
+            committed,
+            accepted_chain,
+            accepted_leaf: None,
+            next_token,
         })
     }
 

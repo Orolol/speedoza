@@ -98,6 +98,8 @@ enum Command {
         max_new_tokens: usize,
         #[arg(long, default_value_t = 0)]
         mtp_speculative_tokens: usize,
+        #[arg(long, default_value_t = 1)]
+        mtp_tree_leaves: usize,
     },
     Bench {
         #[arg(long)]
@@ -110,6 +112,8 @@ enum Command {
         token_text: String,
         #[arg(long, default_value_t = 0)]
         mtp_speculative_tokens: usize,
+        #[arg(long, default_value_t = 1)]
+        mtp_tree_leaves: usize,
     },
     /// Dump the post-prefill logits (top-K, plus full vector to a binary file)
     /// so we can diff them against a reference forward pass for parity work.
@@ -247,8 +251,18 @@ fn main() -> Result<()> {
             prompt,
             max_new_tokens,
             mtp_speculative_tokens,
+            mtp_tree_leaves,
         } => {
-            run_chat(model_dir, prompt, max_new_tokens, mtp_speculative_tokens)?;
+            if mtp_tree_leaves == 0 || mtp_tree_leaves > 8 {
+                anyhow::bail!("--mtp-tree-leaves must be in 1..=8, got {mtp_tree_leaves}");
+            }
+            run_chat(
+                model_dir,
+                prompt,
+                max_new_tokens,
+                mtp_speculative_tokens,
+                mtp_tree_leaves,
+            )?;
         }
         Command::Bench {
             model_dir,
@@ -256,13 +270,18 @@ fn main() -> Result<()> {
             max_new_tokens,
             token_text,
             mtp_speculative_tokens,
+            mtp_tree_leaves,
         } => {
+            if mtp_tree_leaves == 0 || mtp_tree_leaves > 8 {
+                anyhow::bail!("--mtp-tree-leaves must be in 1..=8, got {mtp_tree_leaves}");
+            }
             run_bench(
                 model_dir,
                 prompt_tokens,
                 max_new_tokens,
                 token_text,
                 mtp_speculative_tokens,
+                mtp_tree_leaves,
             )?;
         }
         Command::DumpLogits {
@@ -332,6 +351,7 @@ fn run_chat(
     prompt: String,
     max_new_tokens: usize,
     mtp_speculative_tokens: usize,
+    mtp_tree_leaves: usize,
 ) -> Result<()> {
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
@@ -341,6 +361,7 @@ fn run_chat(
         content: prompt,
     }];
     let prompt_tokens = tokenizer.encode_chat(&messages, true)?;
+    let _ = mtp_tree_leaves; // stored in MtpConfig::tree_leaves; dispatch wired in P1.I
     let mtp_schedule = mtp_schedule(mtp_speculative_tokens, prompt_tokens.len());
     let config = EngineConfig {
         max_context: prompt_tokens.len().saturating_add(max_new_tokens).max(1),
@@ -773,10 +794,12 @@ fn run_bench(
     max_new_tokens: usize,
     token_text: String,
     mtp_speculative_tokens: usize,
+    mtp_tree_leaves: usize,
 ) -> Result<()> {
     if mtp_speculative_tokens > 4 {
         anyhow::bail!("bench currently supports --mtp-speculative-tokens 0..=4");
     }
+    let _ = mtp_tree_leaves; // stored in MtpConfig::tree_leaves; dispatch wired in P1.I
     let total_start = Instant::now();
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
@@ -1219,6 +1242,7 @@ fn run_chat(
     prompt: String,
     max_new_tokens: usize,
     mtp_speculative_tokens: usize,
+    mtp_tree_leaves: usize,
 ) -> Result<()> {
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
@@ -1232,7 +1256,7 @@ fn run_chat(
         ..EngineConfig::default()
     };
     let mut engine = Engine::no_cuda_with_weights(&layout, config)?;
-    let _ = max_new_tokens;
+    let _ = (max_new_tokens, mtp_tree_leaves);
     if let Err(err) = engine.prefill(&prompt_tokens) {
         bail!(
             "CUDA backend is not linked; prefill/decode cannot run with backend {}: {err}",
@@ -1249,6 +1273,7 @@ fn run_bench(
     _max_new_tokens: usize,
     _token_text: String,
     _mtp_speculative_tokens: usize,
+    _mtp_tree_leaves: usize,
 ) -> Result<()> {
     bail!("bench requires rebuilding qwen36 with --features cuda and the CUDA shared library")
 }
