@@ -89,7 +89,10 @@ fn cuda_env_workspace_bytes() -> usize {
 #[cfg(feature = "cuda")]
 fn cuda_prefill_capacity(max_context: usize) -> usize {
     cuda_env_usize("QWEN36_PREFILL_CAPACITY")
-        .unwrap_or_else(|| max_context.min(512))
+        .unwrap_or_else(|| {
+            let default_capacity = if max_context >= 8192 { 1024 } else { 512 };
+            max_context.min(default_capacity)
+        })
         .clamp(1, max_context.max(1))
 }
 
