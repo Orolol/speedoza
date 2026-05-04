@@ -269,10 +269,21 @@ extern "C" int qwen36_decode_nvfp4_gemv(
   }
 
 #if QWEN36_DECODE_GEMV_MMA
-  // MMA regime: N=1, M aligned to the m16 MMA tile (matches the warp's row
-  // stride), K aligned to the k64 inner-loop chunk. K%64 is tighter than
-  // the previous K%16 fallback — anything outside this returns
-  // NOT_IMPLEMENTED so cuBLASLt picks it up.
+  // BLOCKER: B3.1 MMA kernel passes the uniform-data smoke test
+  // (M=K=128, all weights/activations/scales = same value → layout
+  // bugs are masked because every (m,k) slot contributes the same
+  // amount) but produces gibberish on the chat parity gate at the
+  // real Qwen3.6-27B decode shapes. See
+  // docs/superpowers/notes/2026-05-04-direction-b-b3-1-parity.md.
+  //
+  // Soft-disabled until a heterogeneous regression smoke is added
+  // and the layout bisected. Returning NOT_IMPLEMENTED routes the
+  // dispatcher back to cuBLASLt, so QWEN36_DECODE_GEMV=1 is safe to
+  // set but a no-op for now. The kernel code below stays as a
+  // starting point for the bisect.
+  return QWEN36_STATUS_NOT_IMPLEMENTED;
+
+  // ---- unreachable until parity bisect lands ----
   if (spec->n != 1 || (spec->m % 16) != 0 || (spec->k % 64) != 0) {
     return QWEN36_STATUS_NOT_IMPLEMENTED;
   }
