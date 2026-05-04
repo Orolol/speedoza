@@ -102,7 +102,16 @@ The active optimization track is single-GPU RTX 5090 throughput for exactly `sak
 
 `QWEN36_DECODE_GEMV=1` (default OFF) routes the decode-time NVFP4 GEMMs at gemv shape (`n=1, m%16==0, k%64==0`) through a hand-rolled tensor-core kernel built on the SM_120a `mma.kind::mxf4nvf4.scale_vec::4X.m16n8k64` atom (`kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu`). Soft-fallback to cuBLASLt for any unsupported shape via the existing dispatch in `crates/kernels/src/backend.rs`. Build script defaults to `-arch=sm_120a` (mandatory for the FP4 block-scaled MMA PTX).
 
-Hard parity gate (Phase B3.1, commit `3fab622`): `chat --prompt "hello" / "hello world" --max-new-tokens 12 --mtp-speculative-tokens {0..4}` matches the cuBLASLt baseline byte-for-byte for all 10 combinations. No bench numbers yet — perf gains are the goal of B3.2+ (op-level parity sweep, persistent grid, TMA multicast). Plan in `docs/superpowers/plans/2026-05-04-direction-b-nvfp4-gemv-b3.md`.
+Hard parity gate (Phase B3.1, commit `3fab622`): `chat --prompt "hello" / "hello world" --max-new-tokens 12 --mtp-speculative-tokens {0..4}` matches the cuBLASLt baseline byte-for-byte for all 10 combinations.
+
+Bench (`bench --prompt-tokens 128 --max-new-tokens 128`, 2026-05-05, after B3.3.0 commit `c20fc6b` adds smem activation cache + coalesced SF loads):
+
+| Mode  | cuBLASLt | gemv (B3.3.0) | Δ |
+|-------|----------|---------------|---|
+| MTP=0 | 43.80 tok/s | 26.87 tok/s | -38.7% |
+| MTP=4 | 124.80 tok/s | 125.35 tok/s | +0.4% (parity, within noise) |
+
+The MTP=0 gap remains structural — scattered weight loads, no pipelining, no persistent grid, and 7/8 wasted MMA N-columns at N=1. Closing it needs B3.3.1 (LDSM for weights via `SM100_SU4_DU8x16_x4_LDSM_N`), B3.3.2 (cp.async double-buffering), and B3.3.3 (persistent grid). MTP=4 already at parity because per-call overhead amortizes across the 5 verified+main tokens per chain step. Plan in `docs/superpowers/plans/2026-05-04-direction-b-nvfp4-gemv-b3.md`.
 
 ### MTP speculative decoding
 
