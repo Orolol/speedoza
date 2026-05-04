@@ -173,8 +173,19 @@ impl KernelBackend for CudaBackend {
 
     fn nvfp4_gemm(&self, spec: &Nvfp4GemmSpec) -> Result<()> {
         let ffi_spec = ffi::Nvfp4GemmSpec::from(spec);
+        // Direction B decode-time gemv path. When enabled and the GEMM is
+        // gemv-shaped (n == 1) we try the hand-written kernel first; on
+        // QWEN36_STATUS_NOT_IMPLEMENTED we fall through to the existing
+        // megakernel / cuBLASLt routing. See the Direction B spec under
+        // `docs/superpowers/specs/2026-05-04-direction-b-nvfp4-gemv-design.md`.
+        if decode_gemv_enabled() && spec.n == 1 {
+            let code = unsafe { ffi::qwen36_decode_nvfp4_gemv(&ffi_spec) };
+            if code != 5 {
+                return check("qwen36_decode_nvfp4_gemv", code);
+            }
+        }
         // When the Mirage megakernel path is enabled (env var) we try the
-        // CUTLASS-templated NVFP4 GEMM first. The kernel is being built up
+        // CUTLASS-templated NVFP4 GEMM next. The kernel is being built up
         // shape-by-shape (`docs/mirage-megakernel.md`); on any unsupported
         // shape it returns QWEN36_STATUS_NOT_IMPLEMENTED, in which case we
         // transparently fall back to the cuBLASLt path. This keeps the
@@ -425,6 +436,22 @@ fn megakernel_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         matches!(
             std::env::var("QWEN36_USE_MEGAKERNEL_GEMM").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Cached env-var lookup gating the Direction B decode-time NVFP4 gemv path.
+/// Set `QWEN36_DECODE_GEMV=1` to opt in; the default (unset / 0) keeps the
+/// existing megakernel/cuBLASLt route active. Cached so the dispatch hot
+/// path does not re-parse the environment per GEMM call.
+#[cfg(feature = "cuda")]
+fn decode_gemv_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("QWEN36_DECODE_GEMV").ok().as_deref(),
             Some("1") | Some("true") | Some("yes") | Some("on")
         )
     })
@@ -1307,6 +1334,7 @@ mod ffi {
     unsafe extern "C" {
         pub fn qwen36_nvfp4_gemm(spec: *const Nvfp4GemmSpec) -> i32;
         pub fn qwen36_megakernel_nvfp4_gemm(spec: *const Nvfp4GemmSpec) -> i32;
+        pub fn qwen36_decode_nvfp4_gemv(spec: *const Nvfp4GemmSpec) -> i32;
         pub fn qwen36_attention_prefill(spec: *const AttentionPrefillSpec) -> i32;
         pub fn qwen36_deltanet_decode(spec: *const DeltaNetDecodeSpec) -> i32;
         pub fn qwen36_attention_decode(spec: *const AttentionDecodeSpec) -> i32;
