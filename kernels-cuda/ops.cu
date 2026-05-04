@@ -1684,3 +1684,112 @@ extern "C" int qwen36_sample_rows(const qwen36_sampling_rows_spec_t *spec) {
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
+
+// === Top-K argmax ============================================================
+// Single-block kernel. Each thread maintains a thread-local sorted top-K array
+// in registers (descending), scans `vocab_size` elements with stride
+// blockDim.x, then a single-thread block-level merge of the per-thread arrays
+// (BLOCK*K <= 4096, cheap) produces the final sorted top-K. K capped at 8.
+
+template <int K>
+__global__ void topk_argmax_kernel(
+    const __nv_bfloat16 *logits, size_t vocab_size, uint32_t *out) {
+  constexpr int BLOCK = 512;
+  __shared__ float s_vals[BLOCK * K];
+  __shared__ uint32_t s_idx[BLOCK * K];
+
+  float local_v[K];
+  uint32_t local_i[K];
+#pragma unroll
+  for (int j = 0; j < K; ++j) {
+    local_v[j] = -INFINITY;
+    local_i[j] = 0xFFFFFFFFu;
+  }
+
+  for (size_t i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+    float v = __bfloat162float(logits[i]);
+    if (v > local_v[K - 1]) {
+      int p = K - 1;
+      local_v[p] = v;
+      local_i[p] = static_cast<uint32_t>(i);
+      while (p > 0 && local_v[p] > local_v[p - 1]) {
+        float tv = local_v[p - 1];
+        uint32_t ti = local_i[p - 1];
+        local_v[p - 1] = local_v[p];
+        local_i[p - 1] = local_i[p];
+        local_v[p] = tv;
+        local_i[p] = ti;
+        --p;
+      }
+    }
+  }
+
+#pragma unroll
+  for (int j = 0; j < K; ++j) {
+    s_vals[j * BLOCK + threadIdx.x] = local_v[j];
+    s_idx[j * BLOCK + threadIdx.x]  = local_i[j];
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    float merged_v[K];
+    uint32_t merged_i[K];
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+      merged_v[j] = -INFINITY;
+      merged_i[j] = 0xFFFFFFFFu;
+    }
+    for (int t = 0; t < BLOCK; ++t) {
+      for (int j = 0; j < K; ++j) {
+        float v = s_vals[j * BLOCK + t];
+        if (v > merged_v[K - 1]) {
+          int p = K - 1;
+          merged_v[p] = v;
+          merged_i[p] = s_idx[j * BLOCK + t];
+          while (p > 0 && merged_v[p] > merged_v[p - 1]) {
+            float tv = merged_v[p - 1];
+            uint32_t ti = merged_i[p - 1];
+            merged_v[p - 1] = merged_v[p];
+            merged_i[p - 1] = merged_i[p];
+            merged_v[p] = tv;
+            merged_i[p] = ti;
+            --p;
+          }
+        }
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+      out[j] = merged_i[j];
+    }
+  }
+}
+
+extern "C" int qwen36_topk_argmax(const qwen36_topk_argmax_spec_t *spec) {
+  if (!spec || spec->logits_bf16.ptr == 0 || spec->output_token_u32.ptr == 0) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->vocab_size == 0 || spec->k == 0 || spec->k > QWEN36_TOPK_MAX) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  if (spec->k > spec->vocab_size) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const auto *logits =
+      reinterpret_cast<const __nv_bfloat16 *>(spec->logits_bf16.ptr);
+  auto *out = reinterpret_cast<uint32_t *>(spec->output_token_u32.ptr);
+  cudaStream_t stream = qwen36_internal_active_stream();
+  switch (spec->k) {
+    case 1: topk_argmax_kernel<1><<<1, 512, 0, stream>>>(logits, spec->vocab_size, out); break;
+    case 2: topk_argmax_kernel<2><<<1, 512, 0, stream>>>(logits, spec->vocab_size, out); break;
+    case 3: topk_argmax_kernel<3><<<1, 512, 0, stream>>>(logits, spec->vocab_size, out); break;
+    case 4: topk_argmax_kernel<4><<<1, 512, 0, stream>>>(logits, spec->vocab_size, out); break;
+    case 5: topk_argmax_kernel<5><<<1, 512, 0, stream>>>(logits, spec->vocab_size, out); break;
+    case 6: topk_argmax_kernel<6><<<1, 512, 0, stream>>>(logits, spec->vocab_size, out); break;
+    case 7: topk_argmax_kernel<7><<<1, 512, 0, stream>>>(logits, spec->vocab_size, out); break;
+    case 8: topk_argmax_kernel<8><<<1, 512, 0, stream>>>(logits, spec->vocab_size, out); break;
+    default: return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  cudaError_t err = cudaGetLastError();
+  return (err == cudaSuccess) ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}

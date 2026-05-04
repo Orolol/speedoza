@@ -73,6 +73,11 @@ fn mtp_batched_lm_head_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
+fn mtp_tree_disable_enabled() -> bool {
+    cuda_env_bool("QWEN36_MTP_TREE_DISABLE")
+}
+
+#[cfg(feature = "cuda")]
 fn cuda_env_workspace_bytes() -> usize {
     cuda_env_usize("QWEN36_CUDA_WORKSPACE_BYTES")
         .or_else(|| {
@@ -418,6 +423,17 @@ impl<B: KernelBackend> Engine<B> {
     #[cfg(feature = "cuda")]
     fn queue_sample_greedy_into(&self, output_token_u32: DevicePtr) -> Result<()> {
         self.queue_sample_greedy_into_with_mirror(output_token_u32, DevicePtr::NULL)
+    }
+
+    /// Queue a top-K argmax sample from the engine's current decode logits
+    /// buffer into `output_token_u32_kvec`. The output buffer must be at least
+    /// `k * 4` bytes. Used by the tree-MTP draft generation path.
+    #[cfg(feature = "cuda")]
+    fn queue_sample_topk_into(&self, output_token_u32_kvec: DevicePtr, k: usize) -> Result<()> {
+        use qwen36_fp4_kernels::sampling::topk_argmax_device;
+        let logits = self.cuda_forward()?.logits.ptr();
+        let vocab_size = self.topology.vocab_size;
+        topk_argmax_device(vocab_size, k, logits, output_token_u32_kvec)
     }
 
     #[cfg(feature = "cuda")]
@@ -1205,6 +1221,51 @@ impl<B: KernelBackend> Engine<B> {
         Ok(drafts)
     }
 
+    /// Like `prepare_mtp_drafts_from_sampled` but additionally returns K
+    /// top-K leaf candidates from the MTP head's LAST recursive step.
+    /// Used for tree-MTP: the chain (top-1 each step) drives the speculative
+    /// chain, while the leaves are alternative candidates for the last
+    /// position so `verify_mtp_tree_draft` can accept any of K matches.
+    #[cfg(feature = "cuda")]
+    pub fn prepare_mtp_drafts_with_leaves(
+        &self,
+        prompt_tokens: &[u32],
+        sampled_token: u32,
+        chain_depth: usize,
+        leaf_count: usize,
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        // Generate chain via the existing path.
+        let chain =
+            self.prepare_mtp_drafts_from_sampled(prompt_tokens, sampled_token, chain_depth)?;
+
+        if leaf_count <= 1 {
+            // K=1: the single leaf is the top-1 = chain.last().
+            let leaf = chain.last().copied().ok_or_else(|| {
+                CoreError::Runtime("prepare_mtp_drafts_with_leaves: chain empty".into())
+            })?;
+            return Ok((chain, vec![leaf]));
+        }
+
+        // After prepare_mtp_drafts_from_sampled returns, the forward logits
+        // buffer holds the LAST MTP head step's logits (the one that produced
+        // chain.last()). Sample top-K from those same logits to get the K leaf
+        // candidates. The top-1 leaf equals chain.last() — intentional.
+        let leaf_buf_ptr = self.cuda_forward()?.leaf_tokens_u32.ptr();
+        self.queue_sample_topk_into(leaf_buf_ptr, leaf_count)?;
+
+        // D2H read the K leaf token IDs.
+        let mut leaf_bytes = vec![0u8; leaf_count * 4];
+        self.cuda_forward()?
+            .leaf_tokens_u32
+            .copy_to_host(&mut leaf_bytes)?;
+        let leaves: Vec<u32> = leaf_bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+
+        Ok((chain, leaves))
+    }
+
     /// Snapshot the runtime state needed to roll back an MTP verify chunk if
     /// a draft is rejected. Captures DeltaNet recurrent state and the conv1d
     /// history buffer by default. K/V slices are intentionally skipped on the
@@ -1275,6 +1336,123 @@ impl<B: KernelBackend> Engine<B> {
         }
         if cuda_env_bool("QWEN36_MTP_SNAPSHOT_KV") {
             self.mtp_kv_slice_copy(start_position, token_count, /* save = */ false)?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot the current DeltaNet recurrent state + conv history into the
+    /// shared "chain end" checkpoint buffers (the existing `deltanet_checkpoint`
+    /// / `conv_history_checkpoint`). Used in tree-MTP to capture the state
+    /// after the chain rows have been processed, before per-leaf restore loop.
+    #[cfg(feature = "cuda")]
+    fn mtp_snapshot_to_chain_end(&self) -> Result<()> {
+        let runtime = self.cuda_runtime()?;
+        let deltanet_bytes = runtime.deltanet_state.bytes();
+        let deltanet_checkpoint = runtime.deltanet_checkpoint.as_ref().ok_or_else(|| {
+            CoreError::Runtime(
+                "tree-MTP chain-end snapshot requires DeltaNet checkpoint allocation".into(),
+            )
+        })?;
+        deltanet_checkpoint.copy_from_device(&runtime.deltanet_state, deltanet_bytes)?;
+        let conv_bytes = runtime.conv_history.bytes();
+        if conv_bytes > 0 {
+            let conv_history_checkpoint = runtime
+                .conv_history_checkpoint
+                .as_ref()
+                .ok_or_else(|| {
+                    CoreError::Runtime(
+                        "tree-MTP chain-end snapshot requires conv-history checkpoint allocation"
+                            .into(),
+                    )
+                })?;
+            conv_history_checkpoint.copy_from_device(&runtime.conv_history, conv_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Restore DeltaNet state + conv history from the chain-end snapshot.
+    #[cfg(feature = "cuda")]
+    fn mtp_restore_from_chain_end(&self) -> Result<()> {
+        let runtime = self.cuda_runtime()?;
+        let deltanet_bytes = runtime.deltanet_state.bytes();
+        let deltanet_checkpoint = runtime.deltanet_checkpoint.as_ref().ok_or_else(|| {
+            CoreError::Runtime(
+                "tree-MTP chain-end restore requires DeltaNet checkpoint allocation".into(),
+            )
+        })?;
+        runtime
+            .deltanet_state
+            .copy_from_device(deltanet_checkpoint, deltanet_bytes)?;
+        let conv_bytes = runtime.conv_history.bytes();
+        if conv_bytes > 0 {
+            let conv_history_checkpoint = runtime
+                .conv_history_checkpoint
+                .as_ref()
+                .ok_or_else(|| {
+                    CoreError::Runtime(
+                        "tree-MTP chain-end restore requires conv-history checkpoint allocation"
+                            .into(),
+                    )
+                })?;
+            runtime
+                .conv_history
+                .copy_from_device(conv_history_checkpoint, conv_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot the current DeltaNet state + conv history into per-leaf
+    /// checkpoint slot j. Reserved for Phase 2 batched-leaf tree-MTP path
+    /// where each leaf's resulting state is captured for a later restore on
+    /// the accepted leaf. Currently UNUSED by the Phase 1 α
+    /// `verify_mtp_tree_draft` (which restores from chain_end before each
+    /// leaf and re-runs the accepted leaf at the end). Allow `dead_code`
+    /// while we keep the infra for the upcoming batched path.
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    fn mtp_snapshot_to_leaf(&self, leaf_idx: usize) -> Result<()> {
+        use qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES;
+        if leaf_idx >= MTP_TREE_MAX_LEAVES {
+            return Err(CoreError::Runtime(format!(
+                "mtp_snapshot_to_leaf: leaf_idx {leaf_idx} >= {MTP_TREE_MAX_LEAVES}"
+            )));
+        }
+        let runtime = self.cuda_runtime()?;
+        let leaf_deltanet = &runtime.deltanet_leaf_checkpoints[leaf_idx];
+        let leaf_conv = &runtime.conv_history_leaf_checkpoints[leaf_idx];
+        let deltanet_bytes = runtime.deltanet_state.bytes();
+        leaf_deltanet.copy_from_device(&runtime.deltanet_state, deltanet_bytes)?;
+        let conv_bytes = runtime.conv_history.bytes();
+        if conv_bytes > 0 {
+            leaf_conv.copy_from_device(&runtime.conv_history, conv_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Restore DeltaNet state + conv history from per-leaf checkpoint slot j.
+    /// Reserved for Phase 2 batched-leaf tree-MTP. Currently UNUSED by α
+    /// (see `mtp_snapshot_to_leaf` doc-comment).
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    fn mtp_restore_from_leaf(&self, leaf_idx: usize) -> Result<()> {
+        use qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES;
+        if leaf_idx >= MTP_TREE_MAX_LEAVES {
+            return Err(CoreError::Runtime(format!(
+                "mtp_restore_from_leaf: leaf_idx {leaf_idx} >= {MTP_TREE_MAX_LEAVES}"
+            )));
+        }
+        let runtime = self.cuda_runtime()?;
+        let leaf_deltanet = &runtime.deltanet_leaf_checkpoints[leaf_idx];
+        let leaf_conv = &runtime.conv_history_leaf_checkpoints[leaf_idx];
+        let deltanet_bytes = runtime.deltanet_state.bytes();
+        runtime
+            .deltanet_state
+            .copy_from_device(leaf_deltanet, deltanet_bytes)?;
+        let conv_bytes = runtime.conv_history.bytes();
+        if conv_bytes > 0 {
+            runtime
+                .conv_history
+                .copy_from_device(leaf_conv, conv_bytes)?;
         }
         Ok(())
     }
@@ -1978,6 +2156,247 @@ impl<B: KernelBackend> Engine<B> {
             rejected: false,
             next_token,
             next_draft_tokens,
+        })
+    }
+
+    /// Tree-MTP cycle entry point. Combines the existing chain MTP verify
+    /// chunk with K leaf candidates branching from the chain end. Each leaf
+    /// is processed via a single-token decode forward (`forward_token_cuda`)
+    /// after restoring DeltaNet/conv state to the chain-end snapshot, so all
+    /// K leaves are siblings (not chained). On acceptance of a leaf, the
+    /// verified-after-leaf token is also committed (gives +1 over today's
+    /// chain MTP).
+    ///
+    /// Falls back to chain MTP semantics when K = 1 (single leaf is just an
+    /// extended chain step).
+    #[cfg(feature = "cuda")]
+    pub fn verify_mtp_tree_draft(
+        &mut self,
+        current_token: u32,
+        chain_tokens: &[u32],
+        leaf_tokens: &[u32],
+        next_draft_count: usize,
+    ) -> Result<qwen36_fp4_mtp::TreeVerifyResult> {
+        use qwen36_fp4_mtp::{MTP_TREE_MAX_LEAVES, TreeDraft, walk_tree_acceptance};
+
+        if leaf_tokens.is_empty() {
+            return Err(CoreError::Runtime(
+                "tree leaf_tokens cannot be empty (use verify_mtp_draft_tokens for chain-only)"
+                    .into(),
+            ));
+        }
+        if leaf_tokens.len() > MTP_TREE_MAX_LEAVES {
+            return Err(CoreError::Runtime(format!(
+                "tree leaf_tokens.len() {} exceeds {MTP_TREE_MAX_LEAVES}",
+                leaf_tokens.len()
+            )));
+        }
+        if mtp_tree_disable_enabled() {
+            // Kill switch: degrade to chain MTP via verify_mtp_draft_tokens.
+            return self.verify_mtp_tree_draft_chain_fallback(
+                current_token,
+                chain_tokens,
+                leaf_tokens,
+                next_draft_count,
+            );
+        }
+
+        let chain_depth = chain_tokens.len();
+        let leaf_count = leaf_tokens.len();
+        let start_position = self.state.position;
+        let chain_verify_tokens = chain_depth + 1;
+        let total_positions_written = chain_verify_tokens + 1; // chain + leaf canonical slot
+
+        if start_position + total_positions_written > self.config.max_context {
+            return Err(CoreError::Runtime(format!(
+                "tree MTP at position {start_position} would exceed max_context {} (needs {total_positions_written})",
+                self.config.max_context
+            )));
+        }
+
+        // 1. Snapshot KV slice + DeltaNet/conv state for the entire region we'll touch.
+        //    The chain pass writes positions start_position..start_position+chain_depth.
+        //    Leaves all write to start_position+chain_depth+1 (canonical leaf slot).
+        self.mtp_snapshot_state(start_position, total_positions_written)?;
+
+        // 2. Run chain pass via the existing prefill_cuda_chunk.
+        let mut verify_input: Vec<u32> = Vec::with_capacity(chain_verify_tokens);
+        verify_input.push(current_token);
+        verify_input.extend_from_slice(chain_tokens);
+        self.write_prefill_tokens_and_position_count(
+            &verify_input,
+            start_position,
+            chain_verify_tokens,
+        )?;
+        self.prefill_cuda_chunk(chain_verify_tokens, start_position, DevicePtr::NULL, false)?;
+
+        // 3. Sample chain row outputs via final norm + batched lm_head + sample_rows.
+        //    This populates verified[0..=chain_depth].
+        self.final_norm_prefill_rows(chain_verify_tokens)?;
+        let mut verified: Vec<u32> = Vec::with_capacity(chain_verify_tokens + leaf_count);
+        for row in 0..chain_verify_tokens {
+            verified.push(self.sample_prefill_row_to_host(row)?);
+        }
+
+        // 4. Snapshot DeltaNet/conv state at chain end.
+        self.mtp_snapshot_to_chain_end()?;
+
+        // 5. Per-leaf forward via decode primitive.
+        let leaf_position = start_position + chain_depth + 1;
+        for &leaf_token in leaf_tokens {
+            self.mtp_restore_from_chain_end()?;
+            self.forward_token_cuda(leaf_token, leaf_position, true, true)?;
+            verified.push(self.sample_greedy()?);
+        }
+
+        // 6. Walk acceptance.
+        let draft = TreeDraft {
+            chain_tokens: chain_tokens.to_vec(),
+            leaf_tokens: leaf_tokens.to_vec(),
+        };
+        let mut result = walk_tree_acceptance(&verified, &draft);
+
+        // Number of chain top-1 drafts to pre-compute for the next cycle. We
+        // mirror the chain MTP path which uses `chain_depth` recursive top-1
+        // steps. Caller's `next_draft_count` is currently ignored — kept in
+        // the signature for API stability but tree always pre-computes
+        // `chain_depth` drafts.
+        let _ = next_draft_count;
+        let next_chain_count = chain_depth;
+
+        // 7. Restore final state for the accepted path AND pre-compute next
+        //    cycle's chain drafts via generate_mtp_drafts_from_committed_prefill.
+        //    This mirrors what verify_mtp_draft_tokens does for chain MTP and
+        //    advances MTP head KV by the committed token count, so the next
+        //    tree cycle starts from a coherent MTP head state.
+        if let Some(accepted_leaf_idx) = result.accepted_leaf {
+            // Case A: full chain + leaf accept. Re-run the accepted leaf so its
+            // K/V lands at the canonical slot and DeltaNet/conv state matches
+            // "after leaf accepted_leaf_idx". forward.normed[0] then holds the
+            // leaf's hidden state.
+            self.mtp_restore_from_chain_end()?;
+            self.forward_token_cuda(leaf_tokens[accepted_leaf_idx], leaf_position, false, true)?;
+            // Copy forward.normed[0] into prefill.normed[chain_depth + 1] so
+            // target_hidden has hidden states for [chain rows 0..chain_depth,
+            // chain end, accepted_leaf]. The next-token row is appended by
+            // run_mtp_prefill_chunk itself when shifted_tokens.len() = chain+2.
+            let hidden_bytes = self.topology.hidden_size * 2; // BF16
+            let leaf_normed_src = self.cuda_forward()?.normed.ptr();
+            let dst_offset = (chain_depth + 1) * hidden_bytes;
+            self.cuda_prefill()?.normed.copy_from_device_ptr_at(
+                dst_offset,
+                leaf_normed_src,
+                hidden_bytes,
+            )?;
+
+            let mut shifted_tokens: Vec<u32> = chain_tokens.to_vec();
+            shifted_tokens.push(leaf_tokens[accepted_leaf_idx]);
+            shifted_tokens.push(result.next_token);
+            let target_hidden = self.cuda_prefill()?.normed.ptr();
+            result.next_chain_drafts = self.generate_mtp_drafts_from_committed_prefill(
+                &shifted_tokens,
+                start_position,
+                target_hidden,
+                next_chain_count,
+            )?;
+            self.state.advance(chain_depth + 2);
+        } else if result.accepted_chain == chain_depth {
+            // Case B: full chain accept, no leaf. The chain-end hidden state is
+            // already at prefill.normed[chain_depth], and result.next_token is
+            // verified[chain_depth]. shifted_tokens = chain + [next_token].
+            self.mtp_restore_from_chain_end()?;
+
+            let mut shifted_tokens: Vec<u32> = chain_tokens.to_vec();
+            shifted_tokens.push(result.next_token);
+            let target_hidden = self.cuda_prefill()?.normed.ptr();
+            result.next_chain_drafts = self.generate_mtp_drafts_from_committed_prefill(
+                &shifted_tokens,
+                start_position,
+                target_hidden,
+                next_chain_count,
+            )?;
+            self.state.advance(chain_verify_tokens);
+        } else {
+            // Case C: chain rejects at j < chain_depth. recover_after_mtp_multi_reject
+            // already calls generate_mtp_drafts_from_committed_prefill internally;
+            // capture its next_draft_tokens.
+            let recover = self.recover_after_mtp_multi_reject(
+                current_token,
+                chain_tokens,
+                result.accepted_chain,
+                result.next_token,
+                start_position,
+                total_positions_written,
+                next_chain_count,
+            )?;
+            result.next_chain_drafts = recover.next_draft_tokens;
+            // recover_after_mtp_multi_reject already advances state.position.
+        }
+
+        // Sample top-K leaves from forward.logits. The guard
+        // `!result.next_chain_drafts.is_empty()` is what keeps this safe:
+        // when generate_mtp_drafts_from_committed_prefill (or the recovery
+        // path that delegates to it) actually ran, it left forward.logits
+        // holding the LAST MTP head step's logits — exactly what we want
+        // for top-K leaf sampling. If next_chain_drafts is empty, that
+        // primitive was a no-op and forward.logits is stale (whichever
+        // unrelated kernel last wrote it), so skip sampling.
+        if leaf_count > 0 && !result.next_chain_drafts.is_empty() {
+            let leaf_buffer = self.cuda_forward()?.leaf_tokens_u32.ptr();
+            self.queue_sample_topk_into(leaf_buffer, leaf_count)?;
+            let mut leaf_bytes = vec![0u8; leaf_count * 4];
+            self.cuda_forward()?
+                .leaf_tokens_u32
+                .copy_to_host(&mut leaf_bytes)?;
+            result.next_leaf_drafts = leaf_bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+        }
+
+        Ok(result)
+    }
+
+    /// Fallback when QWEN36_MTP_TREE_DISABLE=1: degrade to chain MTP using only
+    /// the top-1 leaf as next chain draft (effectively MTP=chain_depth+1 chain).
+    #[cfg(feature = "cuda")]
+    fn verify_mtp_tree_draft_chain_fallback(
+        &mut self,
+        current_token: u32,
+        chain_tokens: &[u32],
+        leaf_tokens: &[u32],
+        next_draft_count: usize,
+    ) -> Result<qwen36_fp4_mtp::TreeVerifyResult> {
+        use qwen36_fp4_mtp::TreeVerifyResult;
+
+        // When tree is disabled, just run the chain (drop leaves entirely).
+        // Construct a TreeVerifyResult that matches the chain-only behaviour.
+        let chain_result =
+            self.verify_mtp_draft_tokens(current_token, chain_tokens, true, next_draft_count)?;
+
+        let accepted_chain = chain_result.accepted_drafts;
+        // Fail loudly rather than silently substituting token 0 (a real
+        // BOS-like token in Qwen vocab); a missing next_token here would mean
+        // the underlying chain MTP returned no result on a path where it
+        // promised one.
+        let next_token = chain_result.next_token.ok_or_else(|| {
+            CoreError::Runtime(
+                "tree-MTP kill-switch fallback: chain MTP returned no next_token".into(),
+            )
+        })?;
+        let mut committed: Vec<u32> = Vec::with_capacity(accepted_chain + 1);
+        for chain_token in chain_tokens.iter().take(accepted_chain).copied() {
+            committed.push(chain_token);
+        }
+        committed.push(next_token);
+        let _ = leaf_tokens;
+        Ok(TreeVerifyResult {
+            committed,
+            accepted_chain,
+            accepted_leaf: None,
+            next_token,
+            next_chain_drafts: chain_result.next_draft_tokens,
+            next_leaf_drafts: Vec::new(),
         })
     }
 
@@ -3531,6 +3950,8 @@ impl<B: KernelBackend> Engine<B> {
             } else {
                 self.attention_split_timesteps_per_block()
             },
+            tree_ancestor_bitmap_u64: DevicePtr::NULL,
+            verify_chunk_rows: 0,
         })?;
         self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
             rows: tokens,
@@ -4072,6 +4493,8 @@ impl<B: KernelBackend> Engine<B> {
             } else {
                 self.attention_split_timesteps_per_block()
             },
+            tree_ancestor_bitmap_u64: DevicePtr::NULL,
+            verify_chunk_rows: 0,
         })?;
         if layer.layer_index == 3 {
             if let Ok(dir) = std::env::var("QWEN36_DEBUG_DUMP_DIR") {

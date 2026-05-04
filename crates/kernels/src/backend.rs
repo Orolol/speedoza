@@ -390,12 +390,28 @@ pub fn nvfp4_retile_scales(spec: &Nvfp4RetileScalesSpec) -> Result<()> {
 }
 
 #[cfg(feature = "cuda")]
-fn check(kernel: &'static str, code: i32) -> Result<()> {
+pub(crate) fn check(kernel: &'static str, code: i32) -> Result<()> {
     if code == 0 {
         Ok(())
     } else {
         Err(CoreError::KernelLaunch { kernel, code })
     }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn topk_argmax_raw(
+    vocab_size: usize,
+    k: usize,
+    logits_bf16: DevicePtr,
+    output_token_u32: DevicePtr,
+) -> i32 {
+    let spec = ffi::TopkArgmaxSpec {
+        vocab_size,
+        k,
+        logits_bf16,
+        output_token_u32,
+    };
+    unsafe { ffi::qwen36_topk_argmax(&spec) }
 }
 
 /// Cached env-var lookup gating the CUTLASS-templated NVFP4 GEMM path.
@@ -478,6 +494,8 @@ mod ffi {
         pub partial_denom_f32: DevicePtr,
         pub prefill_n_splits: usize,
         pub split_timesteps_per_block: usize,
+        pub tree_ancestor_bitmap_u64: DevicePtr,
+        pub verify_chunk_rows: usize,
     }
 
     impl From<&crate::attention::AttentionPrefillSpec> for AttentionPrefillSpec {
@@ -500,6 +518,8 @@ mod ffi {
                 partial_denom_f32: value.partial_denom_f32,
                 prefill_n_splits: value.prefill_n_splits,
                 split_timesteps_per_block: value.split_timesteps_per_block,
+                tree_ancestor_bitmap_u64: value.tree_ancestor_bitmap_u64,
+                verify_chunk_rows: value.verify_chunk_rows,
             }
         }
     }
@@ -843,6 +863,14 @@ mod ffi {
                 temperature: value.temperature,
             }
         }
+    }
+
+    #[repr(C)]
+    pub struct TopkArgmaxSpec {
+        pub vocab_size: usize,
+        pub k: usize,
+        pub logits_bf16: DevicePtr,
+        pub output_token_u32: DevicePtr,
     }
 
     #[repr(C)]
@@ -1291,6 +1319,7 @@ mod ffi {
         pub fn qwen36_swiglu_nvfp4_quantize(spec: *const SwiGluNvfp4QuantizeSpec) -> i32;
         pub fn qwen36_sample(spec: *const SamplingSpec) -> i32;
         pub fn qwen36_sample_rows(spec: *const SamplingRowsSpec) -> i32;
+        pub fn qwen36_topk_argmax(spec: *const TopkArgmaxSpec) -> i32;
         pub fn qwen36_embedding_lookup(spec: *const EmbeddingLookupSpec) -> i32;
         pub fn qwen36_bf16_gemm(spec: *const Bf16GemmSpec) -> i32;
         pub fn qwen36_bf16_matvec(spec: *const Bf16MatVecSpec) -> i32;

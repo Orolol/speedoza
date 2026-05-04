@@ -6,6 +6,7 @@ use qwen36_fp4_kernels::{
     CudaDeviceBuffer, DevicePtr, Nvfp4RetileScalesSpec, cuda_synchronize, nvfp4_retile_scales,
 };
 use qwen36_fp4_loader::MappedModel;
+use qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES;
 
 use crate::state::RuntimeState;
 use crate::weights::{LayerWeights, LinearWeightBinding, ModelWeightsManifest};
@@ -492,12 +493,20 @@ pub struct GpuRuntimeBuffers {
     pub conv_history_checkpoint: Option<CudaDeviceBuffer>,
     /// Scratch buffer for the K/V slice of the speculative verify positions, packed as
     /// `[layer 0 K | layer 0 V | layer 1 K | layer 1 V | ... | MTP K | MTP V]`.
-    /// Sized for the maximum (5 tokens) chunk written by the MTP=4 verify path.
+    /// Sized for the maximum (13 tokens) chunk written by tree-MTP: chain=4 + K=8 + 1 current.
     pub mtp_kv_snapshot: Option<CudaDeviceBuffer>,
     /// Layout that lets the engine address each layer's slice inside
     /// `mtp_kv_snapshot` without recomputing offsets every call.
     pub mtp_kv_snapshot_layout: MtpKvSnapshotLayout,
     pub workspace: Option<CudaDeviceBuffer>,
+    /// Per-leaf checkpoints of `deltanet_state`, one per branched-tail tree
+    /// leaf candidate. Tree-MTP processes K leaves all branching from the
+    /// chain-end state; after each leaf is processed sequentially, its
+    /// resulting DeltaNet state is captured here for the eventual restore on
+    /// the accepted leaf. Sized for `MTP_TREE_MAX_LEAVES` slots.
+    pub deltanet_leaf_checkpoints: Vec<CudaDeviceBuffer>,
+    /// Per-leaf checkpoints of `conv_history`. See `deltanet_leaf_checkpoints`.
+    pub conv_history_leaf_checkpoints: Vec<CudaDeviceBuffer>,
 }
 
 /// Byte offsets into [`GpuRuntimeBuffers::mtp_kv_snapshot`] for each layer's
@@ -538,6 +547,14 @@ pub struct GpuForwardBuffers {
     /// layout `[draft_input, next_token, verified_token, next_draft_token]`;
     /// the remaining slots are used by the MTP=2..4 graph fast path.
     pub mtp_verify_token_u32: CudaDeviceBuffer,
+    /// Up to `MTP_TREE_MAX_LEAVES` u32 leaf token IDs sampled by top-K from
+    /// the MTP head's last forward (Phase 1 tree-MTP path). Populated by
+    /// `queue_sample_topk_into` once per cycle when `tree_leaves > 1`.
+    pub leaf_tokens_u32: CudaDeviceBuffer,
+    /// Per-row ancestor bitmap (one u64 per verify-chunk row) consumed by
+    /// `qwen36_attention_prefill` when running the tree-MTP verify chunk.
+    /// Sized for `MtpKvSnapshotLayout::VERIFY_TOKENS` rows × 8 bytes.
+    pub tree_ancestor_bitmap_u64: CudaDeviceBuffer,
     /// Per-q-head per-split scratch for split-KV decode attention. Sized
     /// for `n_splits = ceil(max_context / kSplitTimestepsPerBlock)`.
     /// Layout `[q_heads, n_splits, head_dim]` FP32. Keeping the partial
@@ -626,6 +643,18 @@ impl GpuRuntimeBuffers {
             } else {
                 Some(CudaDeviceBuffer::alloc(workspace_bytes)?)
             },
+            deltanet_leaf_checkpoints: (0..qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES)
+                .map(|_| {
+                    let bytes = usize_from_u64(state.deltanet.total_state_bytes, "DeltaNet state")?;
+                    // .max(1): models with no DeltaNet (full-attention-only)
+                    // would otherwise hit a zero-byte alloc rejection. Mirrors
+                    // the conv_history_leaf_checkpoints defense below.
+                    CudaDeviceBuffer::zeroed(bytes.max(1))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            conv_history_leaf_checkpoints: (0..qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES)
+                .map(|_| CudaDeviceBuffer::zeroed(conv_history_bytes.max(1)))
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 
@@ -649,12 +678,25 @@ impl GpuRuntimeBuffers {
         if let Some(workspace) = &self.workspace {
             total += workspace.bytes() as u64;
         }
+        let leaf_deltanet_bytes: u64 = self
+            .deltanet_leaf_checkpoints
+            .iter()
+            .map(|b| b.bytes() as u64)
+            .sum();
+        let leaf_conv_bytes: u64 = self
+            .conv_history_leaf_checkpoints
+            .iter()
+            .map(|b| b.bytes() as u64)
+            .sum();
+        total = total
+            .saturating_add(leaf_deltanet_bytes)
+            .saturating_add(leaf_conv_bytes);
         total
     }
 }
 
 impl MtpKvSnapshotLayout {
-    pub const VERIFY_TOKENS: usize = 5;
+    pub const VERIFY_TOKENS: usize = 13; // bumped from 5: chain=4 + K=8 + 1 (current) = 13
 
     fn new(topology: &ModelTopology, kv_cache: &crate::kv_cache::KvCachePlan) -> Result<Self> {
         if kv_cache.max_context == 0 {
@@ -775,6 +817,10 @@ impl GpuForwardBuffers {
             mtp_logits: CudaDeviceBuffer::alloc(topology.vocab_size * 5 * 2)?,
             sampled_token_u32: CudaDeviceBuffer::alloc(4)?,
             mtp_verify_token_u32: CudaDeviceBuffer::alloc(64)?,
+            leaf_tokens_u32: CudaDeviceBuffer::alloc(MTP_TREE_MAX_LEAVES * 4)?,
+            tree_ancestor_bitmap_u64: CudaDeviceBuffer::alloc(
+                MtpKvSnapshotLayout::VERIFY_TOKENS * 8,
+            )?,
             attn_partial_acc: CudaDeviceBuffer::alloc(attn_partial_acc_bytes.max(1))?,
             attn_partial_max: CudaDeviceBuffer::alloc(attn_partial_scalar_bytes.max(1))?,
             attn_partial_denom: CudaDeviceBuffer::alloc(attn_partial_scalar_bytes.max(1))?,
@@ -802,6 +848,8 @@ impl GpuForwardBuffers {
             self.mtp_logits.bytes(),
             self.sampled_token_u32.bytes(),
             self.mtp_verify_token_u32.bytes(),
+            self.leaf_tokens_u32.bytes(),
+            self.tree_ancestor_bitmap_u64.bytes(),
             self.attn_partial_acc.bytes(),
             self.attn_partial_max.bytes(),
             self.attn_partial_denom.bytes(),

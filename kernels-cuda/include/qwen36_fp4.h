@@ -136,6 +136,13 @@ typedef struct {
   size_t prefill_n_splits;
   // Timesteps covered by each split block. A value of 0 uses the CUDA default.
   size_t split_timesteps_per_block;
+  /// Tree-mask bitmap. When non-NULL, row i of the verify chunk attends to
+  /// KV row j (within the same chunk) iff bit j of word i is set. KV positions
+  /// before `start_position` (cache prefix) remain fully visible regardless.
+  /// NULL → causal mask (existing behaviour). Capped at 64 rows.
+  qwen36_device_ptr_t tree_ancestor_bitmap_u64;
+  /// Verify-chunk row count (number of valid bitmap entries). 0 = causal.
+  size_t verify_chunk_rows;
 } qwen36_attention_prefill_spec_t;
 
 typedef struct {
@@ -290,6 +297,15 @@ typedef struct {
   float repetition_penalty;
   qwen36_device_ptr_t mirror_output_token_u32;
 } qwen36_sampling_spec_t;
+
+#define QWEN36_TOPK_MAX 8
+
+typedef struct {
+  size_t vocab_size;
+  size_t k;                                // 1..QWEN36_TOPK_MAX
+  qwen36_device_ptr_t logits_bf16;
+  qwen36_device_ptr_t output_token_u32;    // [k] u32, sorted desc by logit
+} qwen36_topk_argmax_spec_t;
 
 typedef struct {
   size_t rows;
@@ -487,6 +503,7 @@ int qwen36_swiglu_nvfp4_quantize(
     const qwen36_swiglu_nvfp4_quantize_spec_t *spec);
 int qwen36_sample(const qwen36_sampling_spec_t *spec);
 int qwen36_sample_rows(const qwen36_sampling_rows_spec_t *spec);
+int qwen36_topk_argmax(const qwen36_topk_argmax_spec_t *spec);
 int qwen36_embedding_lookup(const qwen36_embedding_lookup_spec_t *spec);
 int qwen36_bf16_matvec(const qwen36_bf16_matvec_spec_t *spec);
 int qwen36_nvfp4_matvec(const qwen36_nvfp4_matvec_spec_t *spec);

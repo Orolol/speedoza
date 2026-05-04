@@ -27,6 +27,21 @@ struct MtpSchedule {
     auto_disabled: bool,
 }
 
+/// Extra `max_context` headroom needed when tree-MTP is active. Each tree
+/// cycle writes one more K/V slot than chain MTP (the canonical leaf slot
+/// past the chain), so a chunk that fits chain MTP exactly hits a
+/// "position N exceeds max_context M" error mid-generation under tree.
+/// 25% of `max_new_tokens` plus an 8-slot floor covers the worst case
+/// (chain_depth=3, all cycles full-accept + leaf-accept).
+#[cfg(feature = "cuda")]
+fn tree_max_context_overhead(mtp_tree_leaves: usize, max_new_tokens: usize) -> usize {
+    if mtp_tree_leaves > 1 {
+        max_new_tokens / 4 + 8
+    } else {
+        0
+    }
+}
+
 #[cfg(feature = "cuda")]
 fn mtp_schedule(requested_tokens: usize, prompt_tokens: usize) -> MtpSchedule {
     let max_prompt_tokens = std::env::var("QWEN36_MTP_MAX_PROMPT_TOKENS")
@@ -114,6 +129,8 @@ enum Command {
         max_new_tokens: usize,
         #[arg(long, default_value_t = 0)]
         mtp_speculative_tokens: usize,
+        #[arg(long, default_value_t = 1)]
+        mtp_tree_leaves: usize,
     },
     Bench {
         #[arg(long)]
@@ -126,6 +143,8 @@ enum Command {
         token_text: String,
         #[arg(long, default_value_t = 0)]
         mtp_speculative_tokens: usize,
+        #[arg(long, default_value_t = 1)]
+        mtp_tree_leaves: usize,
     },
     /// Dump the post-prefill logits (top-K, plus full vector to a binary file)
     /// so we can diff them against a reference forward pass for parity work.
@@ -263,8 +282,18 @@ fn main() -> Result<()> {
             prompt,
             max_new_tokens,
             mtp_speculative_tokens,
+            mtp_tree_leaves,
         } => {
-            run_chat(model_dir, prompt, max_new_tokens, mtp_speculative_tokens)?;
+            if mtp_tree_leaves == 0 || mtp_tree_leaves > 8 {
+                anyhow::bail!("--mtp-tree-leaves must be in 1..=8, got {mtp_tree_leaves}");
+            }
+            run_chat(
+                model_dir,
+                prompt,
+                max_new_tokens,
+                mtp_speculative_tokens,
+                mtp_tree_leaves,
+            )?;
         }
         Command::Bench {
             model_dir,
@@ -272,13 +301,18 @@ fn main() -> Result<()> {
             max_new_tokens,
             token_text,
             mtp_speculative_tokens,
+            mtp_tree_leaves,
         } => {
+            if mtp_tree_leaves == 0 || mtp_tree_leaves > 8 {
+                anyhow::bail!("--mtp-tree-leaves must be in 1..=8, got {mtp_tree_leaves}");
+            }
             run_bench(
                 model_dir,
                 prompt_tokens,
                 max_new_tokens,
                 token_text,
                 mtp_speculative_tokens,
+                mtp_tree_leaves,
             )?;
         }
         Command::DumpLogits {
@@ -348,6 +382,7 @@ fn run_chat(
     prompt: String,
     max_new_tokens: usize,
     mtp_speculative_tokens: usize,
+    mtp_tree_leaves: usize,
 ) -> Result<()> {
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
@@ -359,13 +394,29 @@ fn run_chat(
     let prompt_tokens = tokenizer.encode_chat(&messages, true)?;
     let mtp_schedule = mtp_schedule(mtp_speculative_tokens, prompt_tokens.len());
     let config = EngineConfig {
-        max_context: prompt_tokens.len().saturating_add(max_new_tokens).max(1),
+        max_context: prompt_tokens
+            .len()
+            .saturating_add(max_new_tokens)
+            .saturating_add(tree_max_context_overhead(mtp_tree_leaves, max_new_tokens))
+            .max(1),
         kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Bf16),
         mtp_speculative_tokens: mtp_schedule.effective_tokens,
         ..EngineConfig::default()
     };
     let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, config)?;
     engine.prefill(&prompt_tokens)?;
+
+    // Tree branch: takes precedence over chain MTP when K > 1 and MTP depth > 0.
+    if mtp_tree_leaves > 1 && mtp_schedule.effective_tokens > 0 {
+        return run_chat_mtp_tree(
+            &mut engine,
+            &tokenizer,
+            &prompt_tokens,
+            max_new_tokens,
+            mtp_schedule.effective_tokens,
+            mtp_tree_leaves,
+        );
+    }
 
     if mtp_schedule.effective_tokens > 0 {
         if mtp_schedule.effective_tokens > 1 {
@@ -558,6 +609,116 @@ fn run_chat_mtp_multi(
             } else {
                 0.0
             }
+        );
+    }
+    println!();
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_chat_mtp_tree(
+    engine: &mut Engine<qwen36_fp4_runtime::CudaBackend>,
+    tokenizer: &QwenTokenizer,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    chain_depth: usize,
+    leaf_count: usize,
+) -> Result<()> {
+    engine.queue_sample_greedy_to_current_token()?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+    let mut current_token = engine.read_current_token()?;
+    let (mut chain_tokens, mut leaf_tokens) = engine.prepare_mtp_drafts_with_leaves(
+        prompt_tokens,
+        current_token,
+        chain_depth,
+        leaf_count,
+    )?;
+
+    let mut generated = 0_usize;
+    let mut accepted_chain_total = 0_usize;
+    let mut accepted_leaf_cycles = 0_usize;
+    let mut full_chain_cycles = 0_usize;
+    let mut total_cycles = 0_usize;
+
+    while generated < max_new_tokens {
+        let text = tokenizer.decode(&[current_token], true)?;
+        print!("{text}");
+        io::stdout().flush()?;
+        generated += 1;
+        if current_token == 248044 || generated >= max_new_tokens {
+            break;
+        }
+        if chain_tokens.is_empty() {
+            anyhow::bail!("tree MTP: chain_tokens empty before generation completed");
+        }
+
+        let result = engine.verify_mtp_tree_draft(
+            current_token,
+            &chain_tokens,
+            &leaf_tokens,
+            chain_depth,
+        )?;
+        total_cycles += 1;
+        accepted_chain_total += result.accepted_chain;
+        if result.accepted_chain == chain_tokens.len() {
+            full_chain_cycles += 1;
+        }
+        if result.accepted_leaf.is_some() {
+            accepted_leaf_cycles += 1;
+        }
+
+        // Print committed tokens (all but the last, which becomes next current_token).
+        let mut stopped = false;
+        let n_committed = result.committed.len();
+        for token in result
+            .committed
+            .iter()
+            .take(n_committed.saturating_sub(1))
+            .copied()
+        {
+            let text = tokenizer.decode(&[token], true)?;
+            print!("{text}");
+            io::stdout().flush()?;
+            generated += 1;
+            if token == 248044 || generated >= max_new_tokens {
+                stopped = true;
+                break;
+            }
+        }
+        if stopped {
+            break;
+        }
+
+        current_token = result.next_token;
+        // Use pre-computed drafts from the result (mid-loop re-prefill via
+        // prepare_mtp_drafts_with_leaves would corrupt MTP head KV state).
+        chain_tokens = result.next_chain_drafts;
+        leaf_tokens = result.next_leaf_drafts;
+        if chain_tokens.is_empty() || leaf_tokens.is_empty() {
+            // Pre-computation skipped (e.g., near max_context). Stop and let
+            // caller decide; remaining tokens will be emitted on next launch.
+            break;
+        }
+    }
+
+    if std::env::var("QWEN36_MTP_STATS").is_ok() {
+        eprintln!(
+            "mtp_tree.stats cycles={total_cycles} accepted_chain_avg={:.2} full_chain_rate={:.4} leaf_accept_rate={:.4}",
+            if total_cycles > 0 {
+                accepted_chain_total as f64 / total_cycles as f64
+            } else {
+                0.0
+            },
+            if total_cycles > 0 {
+                full_chain_cycles as f64 / total_cycles as f64
+            } else {
+                0.0
+            },
+            if full_chain_cycles > 0 {
+                accepted_leaf_cycles as f64 / full_chain_cycles as f64
+            } else {
+                0.0
+            },
         );
     }
     println!();
@@ -789,6 +950,7 @@ fn run_bench(
     max_new_tokens: usize,
     token_text: String,
     mtp_speculative_tokens: usize,
+    mtp_tree_leaves: usize,
 ) -> Result<()> {
     if mtp_speculative_tokens > 4 {
         anyhow::bail!("bench currently supports --mtp-speculative-tokens 0..=4");
@@ -800,7 +962,11 @@ fn run_bench(
     let prompt_tokens = synthetic_prompt_tokens(&tokenizer, &token_text, prompt_token_count)?;
     let mtp_schedule = mtp_schedule(mtp_speculative_tokens, prompt_tokens.len());
     let config = EngineConfig {
-        max_context: prompt_tokens.len().saturating_add(max_new_tokens).max(1),
+        max_context: prompt_tokens
+            .len()
+            .saturating_add(max_new_tokens)
+            .saturating_add(tree_max_context_overhead(mtp_tree_leaves, max_new_tokens))
+            .max(1),
         kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Bf16),
         mtp_speculative_tokens: mtp_schedule.effective_tokens,
         ..EngineConfig::default()
@@ -813,6 +979,20 @@ fn run_bench(
     let prefill_start = Instant::now();
     engine.prefill(&prompt_tokens)?;
     let prefill_seconds = prefill_start.elapsed().as_secs_f64();
+
+    // Tree branch: takes precedence over chain MTP when K > 1 and MTP depth > 0.
+    if mtp_tree_leaves > 1 && mtp_schedule.effective_tokens > 0 {
+        return run_bench_mtp_tree(
+            engine,
+            prompt_tokens,
+            max_new_tokens,
+            total_start,
+            load_seconds,
+            prefill_seconds,
+            mtp_schedule,
+            mtp_tree_leaves,
+        );
+    }
 
     if mtp_schedule.effective_tokens == 1 {
         return run_bench_mtp_one(
@@ -1195,6 +1375,152 @@ fn run_bench_mtp_multi(
 }
 
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn run_bench_mtp_tree(
+    mut engine: Engine<qwen36_fp4_runtime::CudaBackend>,
+    prompt_tokens: Vec<u32>,
+    max_new_tokens: usize,
+    total_start: Instant,
+    load_seconds: f64,
+    prefill_seconds: f64,
+    mtp_schedule: MtpSchedule,
+    leaf_count: usize,
+) -> Result<()> {
+    qwen36_fp4_runtime::cuda_counters_reset()?;
+    let decode_start = Instant::now();
+    if max_new_tokens == 0 {
+        qwen36_fp4_runtime::cuda_synchronize()?;
+        let cuda_counters = qwen36_fp4_runtime::cuda_counters_read()?;
+        let decode_seconds = decode_start.elapsed().as_secs_f64();
+        let total_seconds = total_start.elapsed().as_secs_f64();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "backend": "cuda",
+                "prompt_tokens": prompt_tokens.len(),
+                "generated_tokens": 0,
+                "load_seconds": load_seconds,
+                "prefill_seconds": prefill_seconds,
+                "decode_seconds": decode_seconds,
+                "total_seconds": total_seconds,
+                "prefill_tokens_per_second": rate(prompt_tokens.len(), prefill_seconds),
+                "decode_tokens_per_second": 0.0,
+                "mtp_speculative_tokens": mtp_schedule.effective_tokens,
+                "mtp_requested_speculative_tokens": mtp_schedule.requested_tokens,
+                "mtp_auto_disabled": mtp_schedule.auto_disabled,
+                "mtp_max_prompt_tokens": mtp_schedule.max_prompt_tokens,
+                "mtp_tree_leaf_count": leaf_count,
+                "mtp_accepted_chain_total": 0,
+                "mtp_full_chain_cycles": 0,
+                "mtp_leaf_accept_rate": 0.0,
+                "cuda_counters_decode": cuda_counters,
+            }))?
+        );
+        return Ok(());
+    }
+
+    let chain_depth = mtp_schedule.effective_tokens;
+    let setup_start = Instant::now();
+    engine.queue_sample_greedy_to_current_token()?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+    let mut current_token = engine.read_current_token()?;
+    let (mut chain_tokens, mut leaf_tokens) = engine.prepare_mtp_drafts_with_leaves(
+        &prompt_tokens,
+        current_token,
+        chain_depth,
+        leaf_count,
+    )?;
+    let mtp_setup_seconds = setup_start.elapsed().as_secs_f64();
+
+    let mut generated = 0_usize;
+    let mut accepted_chain_total = 0_usize;
+    let mut accepted_leaf_cycles = 0_usize;
+    let mut full_chain_cycles = 0_usize;
+    let mut total_cycles = 0_usize;
+    let mut mtp_verify_seconds = 0.0_f64;
+
+    while generated < max_new_tokens {
+        generated += 1;
+        if generated >= max_new_tokens {
+            break;
+        }
+        if chain_tokens.is_empty() {
+            anyhow::bail!("tree MTP bench: chain_tokens empty before generation completed");
+        }
+
+        let verify_start = Instant::now();
+        let result = engine.verify_mtp_tree_draft(
+            current_token,
+            &chain_tokens,
+            &leaf_tokens,
+            chain_depth,
+        )?;
+        mtp_verify_seconds += verify_start.elapsed().as_secs_f64();
+
+        total_cycles += 1;
+        accepted_chain_total += result.accepted_chain;
+        if result.accepted_chain == chain_tokens.len() {
+            full_chain_cycles += 1;
+        }
+        if result.accepted_leaf.is_some() {
+            accepted_leaf_cycles += 1;
+        }
+
+        // Count committed tokens (excluding the last which is the seed for next cycle).
+        let committed_extra = result.committed.len().saturating_sub(1);
+        generated += committed_extra;
+        if generated >= max_new_tokens {
+            break;
+        }
+
+        current_token = result.next_token;
+        // Use pre-computed drafts from the result (mid-loop re-prefill via
+        // prepare_mtp_drafts_with_leaves would corrupt MTP head KV state).
+        chain_tokens = result.next_chain_drafts;
+        leaf_tokens = result.next_leaf_drafts;
+        if chain_tokens.is_empty() || leaf_tokens.is_empty() {
+            break;
+        }
+    }
+
+    qwen36_fp4_runtime::cuda_synchronize()?;
+    let cuda_counters = qwen36_fp4_runtime::cuda_counters_read()?;
+    let decode_seconds = decode_start.elapsed().as_secs_f64();
+    let total_seconds = total_start.elapsed().as_secs_f64();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "backend": "cuda",
+            "prompt_tokens": prompt_tokens.len(),
+            "generated_tokens": generated,
+            "load_seconds": load_seconds,
+            "prefill_seconds": prefill_seconds,
+            "decode_seconds": decode_seconds,
+            "total_seconds": total_seconds,
+            "prefill_tokens_per_second": rate(prompt_tokens.len(), prefill_seconds),
+            "decode_tokens_per_second": rate(generated, decode_seconds),
+            "mtp_speculative_tokens": mtp_schedule.effective_tokens,
+            "mtp_requested_speculative_tokens": mtp_schedule.requested_tokens,
+            "mtp_auto_disabled": mtp_schedule.auto_disabled,
+            "mtp_max_prompt_tokens": mtp_schedule.max_prompt_tokens,
+            "mtp_tree_leaf_count": leaf_count,
+            "mtp_tree_cycles": total_cycles,
+            "mtp_accepted_chain_total": accepted_chain_total,
+            "mtp_full_chain_cycles": full_chain_cycles,
+            "mtp_leaf_accept_rate": if full_chain_cycles > 0 {
+                accepted_leaf_cycles as f64 / full_chain_cycles as f64
+            } else {
+                0.0
+            },
+            "mtp_setup_seconds": mtp_setup_seconds,
+            "mtp_verify_seconds": mtp_verify_seconds,
+            "cuda_counters_decode": cuda_counters,
+        }))?
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn synthetic_prompt_tokens(
     tokenizer: &QwenTokenizer,
     token_text: &str,
@@ -1235,6 +1561,7 @@ fn run_chat(
     prompt: String,
     max_new_tokens: usize,
     mtp_speculative_tokens: usize,
+    mtp_tree_leaves: usize,
 ) -> Result<()> {
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
@@ -1248,7 +1575,7 @@ fn run_chat(
         ..EngineConfig::default()
     };
     let mut engine = Engine::no_cuda_with_weights(&layout, config)?;
-    let _ = max_new_tokens;
+    let _ = (max_new_tokens, mtp_tree_leaves);
     if let Err(err) = engine.prefill(&prompt_tokens) {
         bail!(
             "CUDA backend is not linked; prefill/decode cannot run with backend {}: {err}",
@@ -1265,6 +1592,7 @@ fn run_bench(
     _max_new_tokens: usize,
     _token_text: String,
     _mtp_speculative_tokens: usize,
+    _mtp_tree_leaves: usize,
 ) -> Result<()> {
     bail!("bench requires rebuilding qwen36 with --features cuda and the CUDA shared library")
 }

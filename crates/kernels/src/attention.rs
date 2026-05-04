@@ -57,6 +57,13 @@ pub struct AttentionPrefillSpec {
     /// Timesteps covered by each split block. When 0, the CUDA default is used.
     #[serde(default)]
     pub split_timesteps_per_block: usize,
+    /// Optional tree ancestor bitmap (one u64 per verify-chunk row). Use
+    /// `DevicePtr::NULL` to select the existing causal mask.
+    #[serde(default)]
+    pub tree_ancestor_bitmap_u64: DevicePtr,
+    /// Verify-chunk row count (number of valid bitmap entries). 0 = causal.
+    #[serde(default)]
+    pub verify_chunk_rows: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

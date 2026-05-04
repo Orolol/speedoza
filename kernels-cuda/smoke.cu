@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <math.h>
+#include <random>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -651,6 +652,145 @@ int main() {
   sigmoid_spec.output_bf16 = sigmoid_out;
   must_status(qwen36_sigmoid_gate(&sigmoid_spec), "sigmoid gate");
   expect_close(read_bf16(sigmoid_out, 1)[0], 1.0f, 0.02f, "sigmoid gate");
+
+  // Top-K argmax smoke: K=4 over a 1024-vocab BF16 logits array with
+  // planted top-4 at known indices.
+  {
+    constexpr size_t V = 1024;
+    std::mt19937 rng(0xC0FFEE);
+    std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+    std::vector<float> h_logits_f(V);
+    for (size_t i = 0; i < V; ++i) {
+      h_logits_f[i] = dist(rng);
+    }
+    const uint32_t expect[4] = {17, 200, 999, 42};
+    const float vals[4] = {10.0f, 9.5f, 9.0f, 8.5f};
+    for (int i = 0; i < 4; ++i) {
+      h_logits_f[expect[i]] = vals[i];
+    }
+
+    qwen36_device_ptr_t topk_logits = dev_alloc<__nv_bfloat16>(V);
+    qwen36_device_ptr_t topk_out = dev_alloc<uint32_t>(4);
+    copy_bf16(topk_logits, h_logits_f);
+
+    qwen36_topk_argmax_spec_t topk_spec{};
+    topk_spec.vocab_size = V;
+    topk_spec.k = 4;
+    topk_spec.logits_bf16 = topk_logits;
+    topk_spec.output_token_u32 = topk_out;
+    must_status(qwen36_topk_argmax(&topk_spec), "topk argmax");
+
+    std::vector<uint32_t> got = read_raw<uint32_t>(topk_out, 4);
+    for (int i = 0; i < 4; ++i) {
+      if (got[i] != expect[i]) {
+        fprintf(stderr, "topk smoke mismatch at %d: got %u want %u\n",
+                i, got[i], expect[i]);
+        exit(1);
+      }
+    }
+    dev_free<__nv_bfloat16>(topk_logits);
+    dev_free<uint32_t>(topk_out);
+    printf("topk smoke OK\n");
+  }
+
+  // Tree-mask attention prefill smoke: chunk=4 rows, q_heads=2, kv_heads=1,
+  // head_dim=8. All Q and K are zero (so Q·K = 0 → softmax is uniform over
+  // visible positions). V values are 1, 10, 100, 1000 at chunk rows 0..3.
+  // The bitmap restricts row 3 to attend to rows {0, 3} only (skipping 1, 2),
+  // so its output must be (V[0] + V[3]) / 2 = 500.5 instead of the causal
+  // average 277.75.
+  {
+    constexpr size_t CHUNK = 4;
+    constexpr size_t Q_HEADS = 2;
+    constexpr size_t KV_HEADS = 1;
+    constexpr size_t HEAD_DIM = 8;
+    qwen36_attention_shape_t tree_attn{};
+    tree_attn.q_heads = Q_HEADS;
+    tree_attn.kv_heads = KV_HEADS;
+    tree_attn.head_dim = HEAD_DIM;
+    tree_attn.rope_dims = 0;
+
+    const size_t q_total = CHUNK * Q_HEADS * HEAD_DIM;
+    const size_t kv_per_row = KV_HEADS * HEAD_DIM;
+    const size_t kv_total = CHUNK * kv_per_row;
+
+    qwen36_device_ptr_t tree_q = dev_alloc<__nv_bfloat16>(q_total);
+    qwen36_device_ptr_t tree_k = dev_alloc<__nv_bfloat16>(kv_total);
+    qwen36_device_ptr_t tree_v = dev_alloc<__nv_bfloat16>(kv_total);
+    qwen36_device_ptr_t tree_cache_k = dev_alloc<__nv_bfloat16>(kv_total);
+    qwen36_device_ptr_t tree_cache_v = dev_alloc<__nv_bfloat16>(kv_total);
+    qwen36_device_ptr_t tree_out = dev_alloc<__nv_bfloat16>(q_total);
+
+    // Q and K are zero (Q·K = 0 for all positions; softmax becomes uniform
+    // over visible positions).
+    copy_bf16(tree_q, std::vector<float>(q_total, 0.0f));
+    copy_bf16(tree_k, std::vector<float>(kv_total, 0.0f));
+    copy_bf16(tree_cache_k, std::vector<float>(kv_total, 0.0f));
+
+    // V[row r] = (1, 10, 100, 1000)[r] across all KV_HEADS * HEAD_DIM dims.
+    std::vector<float> v_host(kv_total, 0.0f);
+    const float v_per_row[CHUNK] = {1.0f, 10.0f, 100.0f, 1000.0f};
+    for (size_t r = 0; r < CHUNK; ++r) {
+      for (size_t d = 0; d < kv_per_row; ++d) {
+        v_host[r * kv_per_row + d] = v_per_row[r];
+      }
+    }
+    copy_bf16(tree_v, v_host);
+    copy_bf16(tree_cache_v, v_host);  // cache also pre-populated
+
+    // Bitmap: causal for rows 0..2, row 3 sees only {0, 3}.
+    std::vector<uint64_t> bitmap_host = {
+        0b0001ULL, 0b0011ULL, 0b0111ULL, 0b1001ULL,
+    };
+    qwen36_device_ptr_t tree_bitmap = dev_alloc<uint64_t>(CHUNK);
+    copy_raw<uint64_t>(tree_bitmap, bitmap_host);
+
+    qwen36_attention_prefill_spec_t tree_spec{};
+    tree_spec.start_position = 0;
+    tree_spec.tokens = CHUNK;
+    tree_spec.q_bf16 = tree_q;
+    tree_spec.k_bf16 = tree_k;
+    tree_spec.v_bf16 = tree_v;
+    tree_spec.kv_cache_k = tree_cache_k;
+    tree_spec.kv_cache_v = tree_cache_v;
+    tree_spec.output_bf16 = tree_out;
+    tree_spec.shape = tree_attn;
+    tree_spec.tree_ancestor_bitmap_u64 = tree_bitmap;
+    tree_spec.verify_chunk_rows = CHUNK;
+
+    must_status(qwen36_attention_prefill(&tree_spec),
+                "attention prefill tree-mask");
+
+    std::vector<float> tree_out_values = read_bf16(tree_out, q_total);
+    // Expected per row (uniform softmax over visible positions since Q·K = 0):
+    //   Row 0: V[0] = 1.0
+    //   Row 1: (V[0] + V[1]) / 2 = 5.5
+    //   Row 2: (V[0] + V[1] + V[2]) / 3 = 37.0
+    //   Row 3 (tree, sees {0,3}): (V[0] + V[3]) / 2 = 500.5
+    //     (causal would give (1+10+100+1000)/4 = 277.75 — distinguishable)
+    const float expected[CHUNK] = {1.0f, 5.5f, 37.0f, 500.5f};
+    for (size_t r = 0; r < CHUNK; ++r) {
+      for (size_t qh = 0; qh < Q_HEADS; ++qh) {
+        for (size_t d = 0; d < HEAD_DIM; ++d) {
+          const float got =
+              tree_out_values[(r * Q_HEADS + qh) * HEAD_DIM + d];
+          // BF16 has ~7 mantissa bits (~0.5% relative error). Use a wider
+          // tolerance for the large row-3 value (500.5 → tol ~5.0).
+          const float tol = expected[r] > 100.0f ? 5.0f : 0.5f;
+          expect_close(got, expected[r], tol, "attention prefill tree-mask");
+        }
+      }
+    }
+
+    dev_free<__nv_bfloat16>(tree_q);
+    dev_free<__nv_bfloat16>(tree_k);
+    dev_free<__nv_bfloat16>(tree_v);
+    dev_free<__nv_bfloat16>(tree_cache_k);
+    dev_free<__nv_bfloat16>(tree_cache_v);
+    dev_free<__nv_bfloat16>(tree_out);
+    dev_free<uint64_t>(tree_bitmap);
+    std::printf("attention prefill tree-mask smoke OK\n");
+  }
 
   dev_free<__nv_bfloat16>(q);
   dev_free<__nv_bfloat16>(k);
