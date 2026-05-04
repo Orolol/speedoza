@@ -31,9 +31,11 @@ pub struct AttentionPrefillSpec {
     pub v_bf16: DevicePtr,
     pub kv_cache_k: DevicePtr,
     pub kv_cache_v: DevicePtr,
+    #[serde(default)]
+    pub kv_cache_metadata: DevicePtr,
     pub output_bf16: DevicePtr,
     pub shape: AttentionShape,
-    /// 0 = BF16, 1 = FP8 E4M3.
+    /// 0 = BF16, 1 = FP8 E4M3, 2 = TurboQuant3, 3 = TurboQuant3.5.
     #[serde(default)]
     pub kv_cache_dtype: i32,
     /// When non-NULL, prefill reads the base cache position from this device
@@ -75,9 +77,11 @@ pub struct AttentionDecodeSpec {
     pub v_bf16: DevicePtr,
     pub kv_cache_k: DevicePtr,
     pub kv_cache_v: DevicePtr,
+    #[serde(default)]
+    pub kv_cache_metadata: DevicePtr,
     pub output_bf16: DevicePtr,
     pub shape: AttentionShape,
-    /// 0 = BF16, 1 = FP8 E4M3.
+    /// 0 = BF16, 1 = FP8 E4M3, 2 = TurboQuant3, 3 = TurboQuant3.5.
     #[serde(default)]
     pub kv_cache_dtype: i32,
     /// When non-NULL, the kernel reads the current position from this device

@@ -1054,16 +1054,6 @@ impl<B: KernelBackend> Engine<B> {
                 self.config.max_context
             )));
         }
-        if !matches!(
-            self.config.kv_cache_dtype,
-            KvCacheDtype::Bf16 | KvCacheDtype::Fp8
-        ) {
-            return Err(CoreError::Runtime(
-                "CUDA scheduler currently supports BF16 or FP8 KV cache; TurboQuant is not wired into full prefill/decode"
-                    .to_owned(),
-            ));
-        }
-
         let mut consumed = 0;
         while consumed < prompt_tokens.len() {
             let start_position = self.state.position;
@@ -1356,10 +1346,8 @@ impl<B: KernelBackend> Engine<B> {
         deltanet_checkpoint.copy_from_device(&runtime.deltanet_state, deltanet_bytes)?;
         let conv_bytes = runtime.conv_history.bytes();
         if conv_bytes > 0 {
-            let conv_history_checkpoint = runtime
-                .conv_history_checkpoint
-                .as_ref()
-                .ok_or_else(|| {
+            let conv_history_checkpoint =
+                runtime.conv_history_checkpoint.as_ref().ok_or_else(|| {
                     CoreError::Runtime(
                         "tree-MTP chain-end snapshot requires conv-history checkpoint allocation"
                             .into(),
@@ -1385,10 +1373,8 @@ impl<B: KernelBackend> Engine<B> {
             .copy_from_device(deltanet_checkpoint, deltanet_bytes)?;
         let conv_bytes = runtime.conv_history.bytes();
         if conv_bytes > 0 {
-            let conv_history_checkpoint = runtime
-                .conv_history_checkpoint
-                .as_ref()
-                .ok_or_else(|| {
+            let conv_history_checkpoint =
+                runtime.conv_history_checkpoint.as_ref().ok_or_else(|| {
                     CoreError::Runtime(
                         "tree-MTP chain-end restore requires conv-history checkpoint allocation"
                             .into(),
@@ -3183,16 +3169,6 @@ impl<B: KernelBackend> Engine<B> {
                 self.config.max_context
             )));
         }
-        if !matches!(
-            self.config.kv_cache_dtype,
-            KvCacheDtype::Bf16 | KvCacheDtype::Fp8
-        ) {
-            return Err(CoreError::Runtime(
-                "CUDA scheduler currently supports BF16 or FP8 KV cache; TurboQuant is not wired into full prefill/decode"
-                    .to_owned(),
-            ));
-        }
-
         let manifest = self
             .weights
             .as_ref()
@@ -3724,6 +3700,7 @@ impl<B: KernelBackend> Engine<B> {
             v_bf16: forward.aux2.ptr(),
             kv_cache_k: cache.ptr_at(layout.k_offset_bytes as usize)?,
             kv_cache_v: cache.ptr_at(layout.v_offset_bytes as usize)?,
+            kv_cache_metadata: cache.ptr_at(layout.metadata_offset_bytes as usize)?,
             output_bf16: forward.aux3.ptr(),
             shape: AttentionShape {
                 q_heads: self.topology.attention_num_heads,
@@ -3840,6 +3817,7 @@ impl<B: KernelBackend> Engine<B> {
             v_bf16: forward.aux2.ptr(),
             kv_cache_k,
             kv_cache_v,
+            kv_cache_metadata: DevicePtr::NULL,
             output_bf16: forward.aux3.ptr(),
             shape: AttentionShape {
                 q_heads: self.topology.attention_num_heads,
@@ -3931,6 +3909,7 @@ impl<B: KernelBackend> Engine<B> {
             v_bf16: prefill.aux2.ptr(),
             kv_cache_k,
             kv_cache_v,
+            kv_cache_metadata: DevicePtr::NULL,
             output_bf16: prefill.aux3.ptr(),
             shape: AttentionShape {
                 q_heads: self.topology.attention_num_heads,
@@ -4474,6 +4453,7 @@ impl<B: KernelBackend> Engine<B> {
             v_bf16: prefill.aux2.ptr(),
             kv_cache_k: cache.ptr_at(layout.k_offset_bytes as usize)?,
             kv_cache_v: cache.ptr_at(layout.v_offset_bytes as usize)?,
+            kv_cache_metadata: cache.ptr_at(layout.metadata_offset_bytes as usize)?,
             output_bf16: prefill.aux3.ptr(),
             shape: AttentionShape {
                 q_heads: self.topology.attention_num_heads,
@@ -5693,9 +5673,8 @@ impl<B: KernelBackend> Engine<B> {
         match dtype {
             KvCacheDtype::Bf16 => Ok(0),
             KvCacheDtype::Fp8 => Ok(1),
-            KvCacheDtype::TurboQuant3 | KvCacheDtype::TurboQuant35 => Err(CoreError::Runtime(
-                "TurboQuant KV cache is not wired into full CUDA prefill/decode yet".to_owned(),
-            )),
+            KvCacheDtype::TurboQuant3 => Ok(2),
+            KvCacheDtype::TurboQuant35 => Ok(3),
         }
     }
 
@@ -5985,6 +5964,19 @@ impl Engine<CudaBackend> {
         } else {
             0
         };
+        if include_mtp
+            && cuda_env_bool("QWEN36_MTP_SNAPSHOT_KV")
+            && engine
+                .state
+                .kv_cache
+                .layers
+                .iter()
+                .any(|layer| layer.metadata_bytes != 0 || layer.k_bytes != layer.v_bytes)
+        {
+            return Err(CoreError::Runtime(
+                "MTP KV snapshot is not implemented for TurboQuant KV layout".to_owned(),
+            ));
+        }
         let gpu_buffers = GpuRuntimeBuffers::allocate(
             &engine.state,
             cuda_env_workspace_bytes(),

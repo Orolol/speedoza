@@ -1,8 +1,9 @@
-# Direction B Phase B3.1 — parity blocker (RESOLVED)
+# Direction B Phase B3.1 — parity blocker (CLOSED)
 
 **Date:** 2026-05-04
 **Predecessor commit:** `a1f1dd9` (B3.1 MMA kernel landed, smoke green)
-**Status:** **Root cause identified by codex consult: tensor scales were applied twice.** Fix lands in commit after `3cf72e6`. Awaiting end-to-end chat-parity verification on a GPU-free window before declaring B3.1 closed.
+**Fix commit:** `3fab622` (re-enable + drop tensor-scale double-count)
+**Status:** **CLOSED.** Hard parity gate (spec §2): `chat hello / hello world × MTP {0..4}` matches cuBLASLt baseline byte-for-byte for all 10 combinations with `QWEN36_DECODE_GEMV=1`.
 
 ## Resolution (added 2026-05-04 after codex review)
 

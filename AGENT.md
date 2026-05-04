@@ -98,6 +98,12 @@ Remaining gap:
 
 The active optimization track is single-GPU RTX 5090 throughput for exactly `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP` and the shipped NVFP4/MTP quantization. No generic-model fallback is required; prefer explicit guards and hard errors when an assumption is model-specific.
 
+### Direction B decode_gemv (NVFP4 N=1 hand-rolled gemv)
+
+`QWEN36_DECODE_GEMV=1` (default OFF) routes the decode-time NVFP4 GEMMs at gemv shape (`n=1, m%16==0, k%64==0`) through a hand-rolled tensor-core kernel built on the SM_120a `mma.kind::mxf4nvf4.scale_vec::4X.m16n8k64` atom (`kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu`). Soft-fallback to cuBLASLt for any unsupported shape via the existing dispatch in `crates/kernels/src/backend.rs`. Build script defaults to `-arch=sm_120a` (mandatory for the FP4 block-scaled MMA PTX).
+
+Hard parity gate (Phase B3.1, commit `3fab622`): `chat --prompt "hello" / "hello world" --max-new-tokens 12 --mtp-speculative-tokens {0..4}` matches the cuBLASLt baseline byte-for-byte for all 10 combinations. No bench numbers yet — perf gains are the goal of B3.2+ (op-level parity sweep, persistent grid, TMA multicast). Plan in `docs/superpowers/plans/2026-05-04-direction-b-nvfp4-gemv-b3.md`.
+
 ### MTP speculative decoding
 
 - Runtime and CLI support `--mtp-speculative-tokens 0..=3`.
