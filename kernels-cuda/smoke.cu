@@ -598,13 +598,22 @@ int main() {
   expect_close(gemm_values[0], 132.0f, 4.0f, "nvfp4 gemm[0]");
   expect_close(gemm_values[gemm_m - 1], 132.0f, 4.0f, "nvfp4 gemm[last]");
 
-  // Direction B decode_gemv: kernel currently soft-disabled (returns
-  // NOT_IMPLEMENTED for every shape pending the B3 schedule rework — see
-  // docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md).
-  // The dispatcher must still see NOT_IMPLEMENTED (5) for both supported
-  // and unsupported shapes so it falls back to cuBLASLt cleanly.
+  // Direction B Phase B2 (Option C): hand-rolled NVFP4 gemv at N=1.
+  // Reuses the same planted weights/activation as the qwen36_nvfp4_gemm
+  // probe above; expected per-row output is the same value (~132).
+  qwen36_nvfp4_gemm_spec_t gemv_b2_spec = gemm_spec;
+  gemv_b2_spec.n = 1;
+  must_status(qwen36_decode_nvfp4_gemv(&gemv_b2_spec), "decode_gemv b2");
+  std::vector<float> gemv_b2_values = read_bf16(gemm_spec.c_bf16, gemm_m);
+  expect_close(gemv_b2_values[0], 132.0f, 4.0f, "decode_gemv b2[0]");
+  expect_close(gemv_b2_values[gemm_m - 1], 132.0f, 4.0f,
+               "decode_gemv b2[last]");
+
+  // B1 unsupported-shape probe stays as the soft-fallback regression
+  // gate: must still return NOT_IMPLEMENTED for shapes outside the
+  // supported regime so the dispatcher routes to cuBLASLt.
   qwen36_nvfp4_gemm_spec_t gemv_b1_spec = gemm_spec;
-  gemv_b1_spec.m = gemm_m + 1;  // deliberately not multiple of 128
+  gemv_b1_spec.m = gemm_m + 1;  // deliberately not multiple of 16
   gemv_b1_spec.n = 1;
   int gemv_b1_code = qwen36_decode_nvfp4_gemv(&gemv_b1_spec);
   if (gemv_b1_code != QWEN36_STATUS_NOT_IMPLEMENTED) {

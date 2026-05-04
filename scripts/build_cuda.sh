@@ -18,17 +18,13 @@ if [ -d "${CUTLASS_DIR}/include" ]; then
     --expt-relaxed-constexpr
     --extended-lambda
   )
-  EXTRA_SRC=(
-    kernels-cuda/megakernel/nvfp4_matvec_sm120.cu
-    kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu
-  )
+  EXTRA_SRC=(kernels-cuda/megakernel/nvfp4_matvec_sm120.cu)
 else
-  echo "warn: ${CUTLASS_DIR} not found; building without Mirage megakernel and decode_gemv" >&2
-  EXTRA_SRC=(
-    kernels-cuda/megakernel/nvfp4_matvec_stub.cu
-    kernels-cuda/decode_gemv/nvfp4_gemv_stub.cu
-  )
+  echo "warn: ${CUTLASS_DIR} not found; building without Mirage megakernel" >&2
+  EXTRA_SRC=(kernels-cuda/megakernel/nvfp4_matvec_stub.cu)
 fi
+# decode_gemv is pure CUDA (no CUTLASS dep), always compile the real one.
+EXTRA_SRC+=(kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu)
 
 "${NVCC}" \
   -std=c++17 \
