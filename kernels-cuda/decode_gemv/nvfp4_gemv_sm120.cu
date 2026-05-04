@@ -152,13 +152,42 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
   const unsigned lane = threadIdx.x & 31;
   const size_t m_base =
       static_cast<size_t>(blockIdx.x) * kRowsPerBlock + warp_id * kRowsPerWarp;
-  if (m_base >= M) {
-    return;
-  }
+  // NOTE: do NOT early-return here — every thread must reach the
+  // cooperative __syncthreads() below. The per-warp m_base >= M gate
+  // is applied after the smem load (see "tail rows" handling below).
 
   const size_t packed_cols = K / 2;       // bytes per fp4 row
   const size_t scale_cols = K / 16;       // scale groups per row
   const size_t sf_inner_dim = gemv_round_up(scale_cols, 4);
+
+  // ---- Optimization 2: cooperative load of the activation column into smem.
+  // The B operand is a single column of K packed fp4 (K/2 bytes). Today
+  // every warp re-reads its 8 bytes per K chunk via __ldg, so the same
+  // bytes are pulled from L2 4× per CTA (one per warp) and 4× per warp
+  // (one per active lane group). Hoisting into smem cuts that to one
+  // gmem read per byte, per CTA.
+  //
+  // The kernel is launched with dynamic shared memory of size K/2 bytes.
+  // The MMA gate guarantees K % 64 == 0, so K/2 is a multiple of 32 (in
+  // particular a multiple of 16) — the uint4 stride below covers the
+  // whole buffer with no tail.
+  extern __shared__ uint8_t smem_b_fp4[];
+  {
+    const size_t b_bytes = packed_cols;
+    const size_t b_vecs = b_bytes / 16;  // K/2 % 16 == 0 (K % 64 == 0)
+    const uint4 *b_fp4_vec = reinterpret_cast<const uint4 *>(b_fp4);
+    uint4 *smem_b_vec = reinterpret_cast<uint4 *>(smem_b_fp4);
+    for (size_t i = threadIdx.x; i < b_vecs; i += kThreadsPerBlock) {
+      smem_b_vec[i] = b_fp4_vec[i];
+    }
+  }
+  __syncthreads();
+
+  // Tail rows: in the last CTA, some warps may be past M. They've already
+  // contributed to the cooperative load; now skip the per-warp MMA work.
+  if (m_base >= M) {
+    return;
+  }
 
   // Lane decomposition for the operand layouts (canonical m16n8k* form).
   const unsigned t0 = lane & 3u;
@@ -210,28 +239,30 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
         *reinterpret_cast<const uint32_t *>(a_row1_ptr + a_byte_off_v1);
 
     // ---- B operand: 2 uint32. Single activation column at N=1. ----
-    uint32_t b0 = *reinterpret_cast<const uint32_t *>(b_fp4 + a_byte_off_v0);
-    uint32_t b1 = *reinterpret_cast<const uint32_t *>(b_fp4 + a_byte_off_v1);
+    // Reads from smem (cooperative load above); same bytes as gmem.
+    uint32_t b0 =
+        *reinterpret_cast<const uint32_t *>(smem_b_fp4 + a_byte_off_v0);
+    uint32_t b1 =
+        *reinterpret_cast<const uint32_t *>(smem_b_fp4 + a_byte_off_v1);
 
-    // ---- SFA: 4 e4m3 bytes packed into a uint32, k_group 0..3. ----
-    uint32_t sfa = 0;
-#pragma unroll
-    for (int g = 0; g < 4; ++g) {
-      const size_t off = gemv_vec16_scale_offset(
-          k_group_base + static_cast<size_t>(g), a_row_for_sf, sf_inner_dim);
-      const uint8_t b = a_scale[off];
-      sfa |= static_cast<uint32_t>(b) << (g * 8);
-    }
+    // ---- Optimization 1: SFA/SFB coalesced as one uint32 each. ----
+    // For fixed `outer` and varying g ∈ {0,1,2,3}, vec16_scale_offset
+    // returns base, base+1, base+2, base+3 (4 contiguous bytes), because
+    // k_group_base is a multiple of 4 so block_inner == k_group_base and
+    // tile_inner == g. The base address is 16-byte aligned within the
+    // scale buffer (tile_outer*16 + block_offset*128), so a uint32 load
+    // is well-aligned. Little-endian: byte at +0 → low 8 bits, matching
+    // the original `sfa |= b << (g*8)` pack order.
+    const size_t sfa_off =
+        gemv_vec16_scale_offset(k_group_base, a_row_for_sf, sf_inner_dim);
+    const uint32_t sfa =
+        *reinterpret_cast<const uint32_t *>(a_scale + sfa_off);
 
-    // ---- SFB: same packing; outer = 0 at N=1. ----
-    uint32_t sfb = 0;
-#pragma unroll
-    for (int g = 0; g < 4; ++g) {
-      const size_t off = gemv_vec16_scale_offset(
-          k_group_base + static_cast<size_t>(g), 0, sf_inner_dim);
-      const uint8_t b = b_scale[off];
-      sfb |= static_cast<uint32_t>(b) << (g * 8);
-    }
+    // SFB: outer = 0 at N=1.
+    const size_t sfb_off =
+        gemv_vec16_scale_offset(k_group_base, 0, sf_inner_dim);
+    const uint32_t sfb =
+        *reinterpret_cast<const uint32_t *>(b_scale + sfb_off);
 
     mma_mxf4nvf4_4x_m16n8k64(acc0, acc1, acc2, acc3,
                              a0, a1, a2, a3,
@@ -288,7 +319,11 @@ extern "C" int qwen36_decode_nvfp4_gemv(
                   1);
 
   cudaStream_t stream = qwen36_internal_active_stream();
-  nvfp4_gemv_mma_kernel<<<grid, block, 0, stream>>>(
+  // Dynamic smem holds the activation column (K/2 packed-fp4 bytes).
+  // Default per-block smem cap on SM_120 is 48 KiB; K up to ~96k would
+  // fit, far above any realistic decode K (max here ~17408 → 8704 B).
+  const size_t smem_bytes = K / 2;
+  nvfp4_gemv_mma_kernel<<<grid, block, smem_bytes, stream>>>(
       as_device_ptr<const uint8_t>(spec->a_fp4),
       as_device_ptr<const uint8_t>(spec->a_scale),
       as_device_ptr<const float>(spec->a_scale_2),
