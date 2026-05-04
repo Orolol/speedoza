@@ -1,8 +1,43 @@
-# Direction B Phase B3.1 — parity blocker
+# Direction B Phase B3.1 — parity blocker (RESOLVED)
 
 **Date:** 2026-05-04
 **Predecessor commit:** `a1f1dd9` (B3.1 MMA kernel landed, smoke green)
-**Status:** B3.1 MMA path soft-disabled in the entry point; `QWEN36_DECODE_GEMV=1` falls back to cuBLASLt unchanged. Kernel code retained for bisect.
+**Status:** **Root cause identified by codex consult: tensor scales were applied twice.** Fix lands in commit after `3cf72e6`. Awaiting end-to-end chat-parity verification on a GPU-free window before declaring B3.1 closed.
+
+## Resolution (added 2026-05-04 after codex review)
+
+The runtime caller in `crates/runtime/src/engine.rs` already pre-folds both per-tensor scales into `spec->alpha` before invoking the kernel:
+
+```rust
+// engine.rs:4677-4678 (and parallel sites at 4734, 4810, 4925, 5397, 5451)
+let alpha = self.tensor_scalar_f32(weights, qkv_tensor_scale)?
+          * self.tensor_scalar_f32(weights, quantized.input_scale)?;
+```
+
+cuBLASLt at `kernels-cuda/nvfp4_gemm.cu:380` consumes only that pre-baked `alpha` and never dereferences `a_scale_2` / `b_scale_2` for the multiply (those device pointers are unused on the cuBLASLt path).
+
+Our gemv kernel was loading `a_scale_2` / `b_scale_2`, multiplying them in *again* on top of `alpha`, effectively squaring the per-tensor scales. With realistic per-channel scales like `a_ts ≈ 1/8` and `b_ts ≈ 1/4`, the output is ~`1/1024`× too small — pure gibberish.
+
+The uniform smoke missed it because both tensor scales resolve to 1.0 in that setup (`a_scale_2` is null → 1.0; `b_scale_2 == 1.0` is asserted by the test). `1.0² == 1.0`, no observable error. None of the original ranked hypotheses (SF byte order, A register swap, fp4 shift, scale-offset edge case, B broadcast) was the actual bug.
+
+## The fix
+
+`kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu` epilogue:
+
+```cpp
+// Before:
+const float scale = alpha * a_ts * b_ts;
+output[row_lo] = __float2bfloat16(acc0 * scale);
+
+// After:
+output[row_lo] = __float2bfloat16(acc0 * alpha);
+```
+
+Also dropped the `__ldg(a_tensor_scale)` / `__ldg(b_tensor_scale)` loads at the top of the kernel; the kernel parameters stay (ABI-stable, ignored). Soft-disable removed; the entry point now launches the MMA kernel for `n==1 && m%16==0 && k%64==0`.
+
+## Lesson
+
+Layout bugs aren't the only thing uniform smoke misses — **value-scaling bugs are equally invisible at unit-magnitude inputs**. Any future kernel-validation harness should plant tensor scales ≠ 1.0 on at least one of the two operands, in addition to heterogeneous per-element values.
 
 ## Symptom
 

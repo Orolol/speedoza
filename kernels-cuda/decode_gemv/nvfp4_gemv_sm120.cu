@@ -172,10 +172,15 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
 
   // SFB at N=1: outer is always 0, no n-decomposition needed.
 
-  const float a_ts =
-      (a_tensor_scale == nullptr) ? 1.0f : __ldg(a_tensor_scale);
-  const float b_ts =
-      (b_tensor_scale == nullptr) ? 1.0f : __ldg(b_tensor_scale);
+  // Tensor scales (a_scale_2, b_scale_2) are NOT applied here — the
+  // runtime caller (engine.rs) already folds them into `spec->alpha`
+  // before invoking the kernel, mirroring the cuBLASLt contract
+  // (nvfp4_gemm.cu:380 only passes `alpha`, never dereferences
+  // a_scale_2/b_scale_2). Multiplying by them again would square the
+  // tensor-scale factor — the bug that produced gibberish on real
+  // model weights despite the uniform-data smoke passing.
+  (void)a_tensor_scale;
+  (void)b_tensor_scale;
 
   // Row pointers for the two A sub-tiles owned by this lane.
   const size_t a_row0 = m_base + t1;        // for A[0], A[2]
@@ -236,16 +241,16 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
   }
 
   // Epilogue: lanes with t0==0 hold the n=0 column. D[0] is row t1,
-  // D[2] is row t1+8. Apply tensor scales + alpha and store as bf16.
+  // D[2] is row t1+8. Apply only `alpha` — the runtime has already
+  // folded the per-tensor scales into it (see comment above).
   if (t0 == 0u) {
-    const float scale = alpha * a_ts * b_ts;
     const size_t row_lo = m_base + t1;
     const size_t row_hi = m_base + t1 + 8u;
     if (row_lo < M) {
-      output[row_lo] = __float2bfloat16(acc0 * scale);
+      output[row_lo] = __float2bfloat16(acc0 * alpha);
     }
     if (row_hi < M) {
-      output[row_hi] = __float2bfloat16(acc2 * scale);
+      output[row_hi] = __float2bfloat16(acc2 * alpha);
     }
   }
 }
@@ -269,21 +274,9 @@ extern "C" int qwen36_decode_nvfp4_gemv(
   }
 
 #if QWEN36_DECODE_GEMV_MMA
-  // BLOCKER: B3.1 MMA kernel passes the uniform-data smoke test
-  // (M=K=128, all weights/activations/scales = same value → layout
-  // bugs are masked because every (m,k) slot contributes the same
-  // amount) but produces gibberish on the chat parity gate at the
-  // real Qwen3.6-27B decode shapes. See
-  // docs/superpowers/notes/2026-05-04-direction-b-b3-1-parity.md.
-  //
-  // Soft-disabled until a heterogeneous regression smoke is added
-  // and the layout bisected. Returning NOT_IMPLEMENTED routes the
-  // dispatcher back to cuBLASLt, so QWEN36_DECODE_GEMV=1 is safe to
-  // set but a no-op for now. The kernel code below stays as a
-  // starting point for the bisect.
-  return QWEN36_STATUS_NOT_IMPLEMENTED;
-
-  // ---- unreachable until parity bisect lands ----
+  // MMA regime: N=1, M aligned to the m16 MMA tile, K aligned to the
+  // k64 inner-loop chunk. Anything outside this returns
+  // NOT_IMPLEMENTED so cuBLASLt picks it up.
   if (spec->n != 1 || (spec->m % 16) != 0 || (spec->k % 64) != 0) {
     return QWEN36_STATUS_NOT_IMPLEMENTED;
   }
