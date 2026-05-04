@@ -2118,45 +2118,100 @@ impl<B: KernelBackend> Engine<B> {
             chain_tokens: chain_tokens.to_vec(),
             leaf_tokens: leaf_tokens.to_vec(),
         };
-        let result = walk_tree_acceptance(&verified, &draft);
+        let mut result = walk_tree_acceptance(&verified, &draft);
 
-        // 7. Restore final state for the accepted path.
+        // Number of chain top-1 drafts to pre-compute for the next cycle. We
+        // mirror the chain MTP path which uses `chain_depth` recursive top-1
+        // steps. Caller's `next_draft_count` is currently ignored — kept in
+        // the signature for API stability but tree always pre-computes
+        // `chain_depth` drafts.
+        let _ = next_draft_count;
+        let next_chain_count = chain_depth;
+
+        // 7. Restore final state for the accepted path AND pre-compute next
+        //    cycle's chain drafts via generate_mtp_drafts_from_committed_prefill.
+        //    This mirrors what verify_mtp_draft_tokens does for chain MTP and
+        //    advances MTP head KV by the committed token count, so the next
+        //    tree cycle starts from a coherent MTP head state.
         if let Some(accepted_leaf_idx) = result.accepted_leaf {
-            // Chain fully accepted + leaf accepted. Re-run the accepted leaf so
-            // its K/V is at the canonical slot and DeltaNet/conv state matches.
+            // Case A: full chain + leaf accept. Re-run the accepted leaf so its
+            // K/V lands at the canonical slot and DeltaNet/conv state matches
+            // "after leaf accepted_leaf_idx". forward.normed[0] then holds the
+            // leaf's hidden state.
             self.mtp_restore_from_chain_end()?;
             self.forward_token_cuda(leaf_tokens[accepted_leaf_idx], leaf_position, false, true)?;
-            // After this forward: KV[leaf_position] = accepted leaf's K/V,
-            // DeltaNet/conv = "after leaf accepted_leaf_idx".
-            // state.position advances by chain_verify_tokens + 1 (chain N+1 slots + leaf slot).
+            // Copy forward.normed[0] into prefill.normed[chain_depth + 1] so
+            // target_hidden has hidden states for [chain rows 0..chain_depth,
+            // chain end, accepted_leaf]. The next-token row is appended by
+            // run_mtp_prefill_chunk itself when shifted_tokens.len() = chain+2.
+            let hidden_bytes = self.topology.hidden_size * 2; // BF16
+            let leaf_normed_src = self.cuda_forward()?.normed.ptr();
+            let dst_offset = (chain_depth + 1) * hidden_bytes;
+            self.cuda_prefill()?.normed.copy_from_device_ptr_at(
+                dst_offset,
+                leaf_normed_src,
+                hidden_bytes,
+            )?;
+
+            let mut shifted_tokens: Vec<u32> = chain_tokens.to_vec();
+            shifted_tokens.push(leaf_tokens[accepted_leaf_idx]);
+            shifted_tokens.push(result.next_token);
+            let target_hidden = self.cuda_prefill()?.normed.ptr();
+            result.next_chain_drafts = self.generate_mtp_drafts_from_committed_prefill(
+                &shifted_tokens,
+                start_position,
+                target_hidden,
+                next_chain_count,
+            )?;
             self.state.advance(chain_depth + 2);
         } else if result.accepted_chain == chain_depth {
-            // Full chain accept, no leaf. Restore chain-end state.
+            // Case B: full chain accept, no leaf. The chain-end hidden state is
+            // already at prefill.normed[chain_depth], and result.next_token is
+            // verified[chain_depth]. shifted_tokens = chain + [next_token].
             self.mtp_restore_from_chain_end()?;
-            // KV at leaf_position has last leaf's K/V (rejected, will be overwritten next cycle).
-            // state.position advances by chain_verify_tokens (chain wrote N+1 slots).
+
+            let mut shifted_tokens: Vec<u32> = chain_tokens.to_vec();
+            shifted_tokens.push(result.next_token);
+            let target_hidden = self.cuda_prefill()?.normed.ptr();
+            result.next_chain_drafts = self.generate_mtp_drafts_from_committed_prefill(
+                &shifted_tokens,
+                start_position,
+                target_hidden,
+                next_chain_count,
+            )?;
             self.state.advance(chain_verify_tokens);
         } else {
-            // Chain rejects at j < chain_depth. Use existing recovery path.
-            // recover_after_mtp_multi_reject internally:
-            //   - mtp_restore_state(start_position, verify_tokens)
-            //   - replays committed prefix [current_token, draft_tokens[..rejected_idx]]
-            //   - generates next-cycle drafts (we ignore those for tree path)
-            //   - advances state by committed_tokens = rejected_idx + 1
-            // We pass verify_tokens = total_positions_written so the snapshot restore covers everything we wrote.
-            let _ = self.recover_after_mtp_multi_reject(
+            // Case C: chain rejects at j < chain_depth. recover_after_mtp_multi_reject
+            // already calls generate_mtp_drafts_from_committed_prefill internally;
+            // capture its next_draft_tokens.
+            let recover = self.recover_after_mtp_multi_reject(
                 current_token,
                 chain_tokens,
                 result.accepted_chain,
                 result.next_token,
                 start_position,
                 total_positions_written,
-                0, // next_draft_count = 0 (tree path doesn't use pre-computed drafts)
+                next_chain_count,
             )?;
-            // recover_after_mtp_multi_reject already advances state.position. Don't re-advance.
+            result.next_chain_drafts = recover.next_draft_tokens;
+            // recover_after_mtp_multi_reject already advances state.position.
         }
 
-        let _ = next_draft_count; // tree path doesn't pre-compute next drafts in Phase 1
+        // Sample top-K leaves from forward.logits which now holds the LAST MTP
+        // head step's logits (the one that produced result.next_chain_drafts.last()).
+        if leaf_count > 0 && !result.next_chain_drafts.is_empty() {
+            let leaf_buffer = self.cuda_forward()?.leaf_tokens_u32.ptr();
+            self.queue_sample_topk_into(leaf_buffer, leaf_count)?;
+            let mut leaf_bytes = vec![0u8; leaf_count * 4];
+            self.cuda_forward()?
+                .leaf_tokens_u32
+                .copy_to_host(&mut leaf_bytes)?;
+            result.next_leaf_drafts = leaf_bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+        }
+
         Ok(result)
     }
 
@@ -2190,6 +2245,8 @@ impl<B: KernelBackend> Engine<B> {
             accepted_chain,
             accepted_leaf: None,
             next_token,
+            next_chain_drafts: chain_result.next_draft_tokens,
+            next_leaf_drafts: Vec::new(),
         })
     }
 

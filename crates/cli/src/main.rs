@@ -621,7 +621,7 @@ fn run_chat_mtp_tree(
             current_token,
             &chain_tokens,
             &leaf_tokens,
-            0, // next_draft_count: regenerate fresh each cycle
+            chain_depth,
         )?;
         total_cycles += 1;
         accepted_chain_total += result.accepted_chain;
@@ -655,15 +655,15 @@ fn run_chat_mtp_tree(
         }
 
         current_token = result.next_token;
-        // Regenerate chain + leaves for next cycle.
-        let (next_chain, next_leaves) = engine.prepare_mtp_drafts_with_leaves(
-            prompt_tokens,
-            current_token,
-            chain_depth,
-            leaf_count,
-        )?;
-        chain_tokens = next_chain;
-        leaf_tokens = next_leaves;
+        // Use pre-computed drafts from the result (mid-loop re-prefill via
+        // prepare_mtp_drafts_with_leaves would corrupt MTP head KV state).
+        chain_tokens = result.next_chain_drafts;
+        leaf_tokens = result.next_leaf_drafts;
+        if chain_tokens.is_empty() || leaf_tokens.is_empty() {
+            // Pre-computation skipped (e.g., near max_context). Stop and let
+            // caller decide; remaining tokens will be emitted on next launch.
+            break;
+        }
     }
 
     if std::env::var("QWEN36_MTP_STATS").is_ok() {
@@ -1414,7 +1414,7 @@ fn run_bench_mtp_tree(
             current_token,
             &chain_tokens,
             &leaf_tokens,
-            0, // next_draft_count: regenerate fresh each cycle
+            chain_depth,
         )?;
         mtp_verify_seconds += verify_start.elapsed().as_secs_f64();
 
@@ -1435,14 +1435,13 @@ fn run_bench_mtp_tree(
         }
 
         current_token = result.next_token;
-        let (next_chain, next_leaves) = engine.prepare_mtp_drafts_with_leaves(
-            &prompt_tokens,
-            current_token,
-            chain_depth,
-            leaf_count,
-        )?;
-        chain_tokens = next_chain;
-        leaf_tokens = next_leaves;
+        // Use pre-computed drafts from the result (mid-loop re-prefill via
+        // prepare_mtp_drafts_with_leaves would corrupt MTP head KV state).
+        chain_tokens = result.next_chain_drafts;
+        leaf_tokens = result.next_leaf_drafts;
+        if chain_tokens.is_empty() || leaf_tokens.is_empty() {
+            break;
+        }
     }
 
     qwen36_fp4_runtime::cuda_synchronize()?;

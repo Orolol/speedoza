@@ -238,6 +238,15 @@ pub struct TreeVerifyResult {
     /// Verified token at the last accepted position; seed for next cycle's
     /// `last_token`.
     pub next_token: u32,
+    /// Pre-computed chain drafts for the next cycle. Length =
+    /// `chain_depth` (matches the chain_tokens length passed in).
+    /// Empty when verify_mtp_tree_draft was called with chain_depth=0
+    /// or when MTP next-draft generation was skipped.
+    pub next_chain_drafts: Vec<u32>,
+    /// Pre-computed leaf drafts for the next cycle (top-K from MTP head's
+    /// last step). Length = `leaf_count` (matches the leaf_tokens length
+    /// passed in).
+    pub next_leaf_drafts: Vec<u32>,
 }
 
 /// Walk a branched-tail tree given the model's argmax at each chunk row.
@@ -276,6 +285,8 @@ pub fn walk_tree_acceptance(verified: &[u32], draft: &TreeDraft) -> TreeVerifyRe
                 accepted_chain,
                 accepted_leaf: None,
                 next_token: verified[i],
+                next_chain_drafts: Vec::new(),
+                next_leaf_drafts: Vec::new(),
             };
         }
     }
@@ -293,6 +304,8 @@ pub fn walk_tree_acceptance(verified: &[u32], draft: &TreeDraft) -> TreeVerifyRe
             accepted_chain,
             accepted_leaf: Some(idx),
             next_token: after_leaf,
+            next_chain_drafts: Vec::new(),
+            next_leaf_drafts: Vec::new(),
         }
     } else {
         committed.push(chain_verified);
@@ -301,6 +314,8 @@ pub fn walk_tree_acceptance(verified: &[u32], draft: &TreeDraft) -> TreeVerifyRe
             accepted_chain,
             accepted_leaf: None,
             next_token: chain_verified,
+            next_chain_drafts: Vec::new(),
+            next_leaf_drafts: Vec::new(),
         }
     }
 }
