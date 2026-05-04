@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::mem::size_of;
 
 use qwen36_fp4_core::{CoreError, ModelTopology, Result, TensorDtype, TensorInfo, TensorRole};
 use qwen36_fp4_kernels::{
@@ -485,15 +486,15 @@ pub struct GpuRuntimeBuffers {
     pub kv_cache: Option<CudaDeviceBuffer>,
     pub mtp_kv_cache: Option<CudaDeviceBuffer>,
     pub deltanet_state: CudaDeviceBuffer,
-    pub deltanet_checkpoint: CudaDeviceBuffer,
+    pub deltanet_checkpoint: Option<CudaDeviceBuffer>,
     pub conv_history: CudaDeviceBuffer,
     /// Snapshot of `conv_history` taken before an MTP verify chunk so we can
     /// roll back the linear-attention conv1d state on draft rejection.
-    pub conv_history_checkpoint: CudaDeviceBuffer,
+    pub conv_history_checkpoint: Option<CudaDeviceBuffer>,
     /// Scratch buffer for the K/V slice of the speculative verify positions, packed as
     /// `[layer 0 K | layer 0 V | layer 1 K | layer 1 V | ... | MTP K | MTP V]`.
     /// Sized for the maximum (13 tokens) chunk written by tree-MTP: chain=4 + K=8 + 1 current.
-    pub mtp_kv_snapshot: CudaDeviceBuffer,
+    pub mtp_kv_snapshot: Option<CudaDeviceBuffer>,
     /// Layout that lets the engine address each layer's slice inside
     /// `mtp_kv_snapshot` without recomputing offsets every call.
     pub mtp_kv_snapshot_layout: MtpKvSnapshotLayout,
@@ -509,11 +510,11 @@ pub struct GpuRuntimeBuffers {
 }
 
 /// Byte offsets into [`GpuRuntimeBuffers::mtp_kv_snapshot`] for each layer's
-/// K and V slice for the MTP verify positions. All slices are
-/// `slice_bytes` long (= VERIFY_TOKENS × kv_heads × head_dim × bytes_per_value).
+/// K and V slice for the MTP verify positions.
 #[derive(Debug, Clone)]
 pub struct MtpKvSnapshotLayout {
-    pub slice_bytes: usize,
+    pub main_slice_bytes: usize,
+    pub mtp_slice_bytes: usize,
     /// Offsets for the 16 main attention layers (in attention_layer_index order).
     pub main_k_offsets: Vec<usize>,
     pub main_v_offsets: Vec<usize>,
@@ -603,6 +604,8 @@ impl GpuRuntimeBuffers {
         workspace_bytes: usize,
         mtp_kv_cache_bytes: u64,
         topology: &ModelTopology,
+        allocate_recurrent_checkpoints: bool,
+        allocate_kv_snapshot: bool,
     ) -> Result<Self> {
         let conv_history_bytes =
             usize_from_u64(state.deltanet.conv_history_bytes, "DeltaNet conv history")?;
@@ -615,13 +618,25 @@ impl GpuRuntimeBuffers {
                 state.deltanet.total_state_bytes,
                 "DeltaNet state",
             )?)?,
-            deltanet_checkpoint: CudaDeviceBuffer::zeroed(usize_from_u64(
-                state.deltanet.checkpoint_bytes,
-                "DeltaNet checkpoint",
-            )?)?,
+            deltanet_checkpoint: if allocate_recurrent_checkpoints {
+                Some(CudaDeviceBuffer::zeroed(usize_from_u64(
+                    state.deltanet.checkpoint_bytes,
+                    "DeltaNet checkpoint",
+                )?)?)
+            } else {
+                None
+            },
             conv_history: CudaDeviceBuffer::zeroed(conv_history_bytes)?,
-            conv_history_checkpoint: CudaDeviceBuffer::zeroed(conv_history_bytes.max(1))?,
-            mtp_kv_snapshot: CudaDeviceBuffer::zeroed(snapshot_bytes)?,
+            conv_history_checkpoint: if allocate_recurrent_checkpoints {
+                Some(CudaDeviceBuffer::zeroed(conv_history_bytes.max(1))?)
+            } else {
+                None
+            },
+            mtp_kv_snapshot: if allocate_kv_snapshot {
+                Some(CudaDeviceBuffer::zeroed(snapshot_bytes)?)
+            } else {
+                None
+            },
             mtp_kv_snapshot_layout: snapshot_layout,
             workspace: if workspace_bytes == 0 {
                 None
@@ -644,11 +659,16 @@ impl GpuRuntimeBuffers {
     }
 
     pub fn total_bytes(&self) -> u64 {
-        let mut total = self.deltanet_state.bytes() as u64
-            + self.deltanet_checkpoint.bytes() as u64
-            + self.conv_history.bytes() as u64
-            + self.conv_history_checkpoint.bytes() as u64
-            + self.mtp_kv_snapshot.bytes() as u64;
+        let mut total = self.deltanet_state.bytes() as u64 + self.conv_history.bytes() as u64;
+        if let Some(deltanet_checkpoint) = &self.deltanet_checkpoint {
+            total += deltanet_checkpoint.bytes() as u64;
+        }
+        if let Some(conv_history_checkpoint) = &self.conv_history_checkpoint {
+            total += conv_history_checkpoint.bytes() as u64;
+        }
+        if let Some(mtp_kv_snapshot) = &self.mtp_kv_snapshot {
+            total += mtp_kv_snapshot.bytes() as u64;
+        }
         if let Some(kv_cache) = &self.kv_cache {
             total += kv_cache.bytes() as u64;
         }
@@ -713,29 +733,33 @@ impl MtpKvSnapshotLayout {
         }
         let row_bytes = usize::try_from(plane_bytes / kv_cache.max_context as u64)
             .map_err(|_| CoreError::Runtime("KV cache row size overflows usize".to_owned()))?;
-        let slice_bytes = row_bytes * Self::VERIFY_TOKENS;
+        let main_slice_bytes = row_bytes * Self::VERIFY_TOKENS;
+        let mtp_row_bytes =
+            topology.attention_num_kv_heads * topology.attention_head_dim * size_of::<u16>();
+        let mtp_slice_bytes = mtp_row_bytes * Self::VERIFY_TOKENS;
 
         let mut main_k_offsets = Vec::with_capacity(attention_layers);
         let mut main_v_offsets = Vec::with_capacity(attention_layers);
         let mut cursor = 0_usize;
         for _ in 0..attention_layers {
             main_k_offsets.push(cursor);
-            cursor += slice_bytes;
+            cursor += main_slice_bytes;
             main_v_offsets.push(cursor);
-            cursor += slice_bytes;
+            cursor += main_slice_bytes;
         }
         let (mtp_k_offset, mtp_v_offset) = if topology.mtp_num_hidden_layers > 0 {
             let k = cursor;
-            cursor += slice_bytes;
+            cursor += mtp_slice_bytes;
             let v = cursor;
-            cursor += slice_bytes;
+            cursor += mtp_slice_bytes;
             (Some(k), Some(v))
         } else {
             (None, None)
         };
         let _ = cursor;
         Ok(Self {
-            slice_bytes,
+            main_slice_bytes,
+            mtp_slice_bytes,
             main_k_offsets,
             main_v_offsets,
             mtp_k_offset,
@@ -744,9 +768,9 @@ impl MtpKvSnapshotLayout {
     }
 
     pub fn total_bytes(&self) -> usize {
-        let main = (self.main_k_offsets.len() + self.main_v_offsets.len()) * self.slice_bytes;
+        let main = (self.main_k_offsets.len() + self.main_v_offsets.len()) * self.main_slice_bytes;
         let mtp = (self.mtp_k_offset.is_some() as usize + self.mtp_v_offset.is_some() as usize)
-            * self.slice_bytes;
+            * self.mtp_slice_bytes;
         main + mtp
     }
 }
@@ -837,16 +861,23 @@ impl GpuForwardBuffers {
 }
 
 impl GpuPrefillBuffers {
-    pub fn allocate(topology: &ModelTopology, capacity: usize) -> Result<Self> {
+    pub fn allocate(
+        topology: &ModelTopology,
+        capacity: usize,
+        fused_mlp_prefill: bool,
+    ) -> Result<Self> {
         let capacity = capacity.max(1);
         let hidden_bytes = capacity * topology.hidden_size * 2;
-        let wide_bf16_values = topology
+        let mut wide_bf16_values = topology
             .intermediate_size
             .max(topology.hidden_size)
             .max(topology.linear_attention_qkv_dim())
             .max(topology.linear_attention_value_dim())
             .max(topology.full_attention_q_dim_with_gate())
             .max(topology.full_attention_q_dim());
+        if fused_mlp_prefill {
+            wide_bf16_values = wide_bf16_values.max(2 * topology.intermediate_size);
+        }
         let wide_bytes = capacity * wide_bf16_values * 2;
         let activation_fp4_bytes = capacity * wide_bf16_values.div_ceil(2);
         let activation_scale_bytes = vec16_scale_bytes(wide_bf16_values, capacity);

@@ -33,6 +33,9 @@ pub struct AttentionPrefillSpec {
     pub kv_cache_v: DevicePtr,
     pub output_bf16: DevicePtr,
     pub shape: AttentionShape,
+    /// 0 = BF16, 1 = FP8 E4M3.
+    #[serde(default)]
+    pub kv_cache_dtype: i32,
     /// When non-NULL, prefill reads the base cache position from this device
     /// `int32_t` instead of `start_position`. This lets a captured graph replay
     /// across advancing positions.
@@ -74,6 +77,9 @@ pub struct AttentionDecodeSpec {
     pub kv_cache_v: DevicePtr,
     pub output_bf16: DevicePtr,
     pub shape: AttentionShape,
+    /// 0 = BF16, 1 = FP8 E4M3.
+    #[serde(default)]
+    pub kv_cache_dtype: i32,
     /// When non-NULL, the kernel reads the current position from this device
     /// `int32_t` instead of `position`. Used by graph-captured decode so a
     /// single recording can be replayed across iterations.
