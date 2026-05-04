@@ -42,6 +42,22 @@ fn mtp_schedule(requested_tokens: usize, prompt_tokens: usize) -> MtpSchedule {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn cuda_kv_cache_dtype(default: KvCacheDtype) -> KvCacheDtype {
+    match std::env::var("QWEN36_KV_CACHE_DTYPE")
+        .ok()
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("bf16") => KvCacheDtype::Bf16,
+        Some("fp8") => KvCacheDtype::Fp8,
+        Some("turboquant3" | "tq3") => KvCacheDtype::TurboQuant3,
+        Some("turboquant35" | "turboquant3.5" | "tq35" | "tq3.5") => KvCacheDtype::TurboQuant35,
+        _ => default,
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "qwen36")]
 #[command(about = "Qwen3.6-27B Text NVFP4 MTP single-stream runtime")]
@@ -344,7 +360,7 @@ fn run_chat(
     let mtp_schedule = mtp_schedule(mtp_speculative_tokens, prompt_tokens.len());
     let config = EngineConfig {
         max_context: prompt_tokens.len().saturating_add(max_new_tokens).max(1),
-        kv_cache_dtype: KvCacheDtype::Bf16,
+        kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Bf16),
         mtp_speculative_tokens: mtp_schedule.effective_tokens,
         ..EngineConfig::default()
     };
@@ -586,7 +602,7 @@ fn run_dump_logits(
             .unwrap_or_else(|| prompt_tokens.len().max(1))
             .max(prompt_tokens.len())
             .max(1),
-        kv_cache_dtype: KvCacheDtype::Bf16,
+        kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Bf16),
         ..EngineConfig::default()
     };
     let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, config)?;
@@ -694,7 +710,7 @@ fn run_dump_decode(
             .unwrap_or_else(|| prompt_tokens.len().saturating_add(1))
             .max(prompt_tokens.len().saturating_add(1))
             .max(1),
-        kv_cache_dtype: KvCacheDtype::Bf16,
+        kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Bf16),
         ..EngineConfig::default()
     };
     let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, config)?;
@@ -785,7 +801,7 @@ fn run_bench(
     let mtp_schedule = mtp_schedule(mtp_speculative_tokens, prompt_tokens.len());
     let config = EngineConfig {
         max_context: prompt_tokens.len().saturating_add(max_new_tokens).max(1),
-        kv_cache_dtype: KvCacheDtype::Bf16,
+        kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Bf16),
         mtp_speculative_tokens: mtp_schedule.effective_tokens,
         ..EngineConfig::default()
     };
@@ -1259,6 +1275,7 @@ fn gpu_load(model_dir: PathBuf, max_context: usize) -> Result<()> {
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
     let config = EngineConfig {
         max_context,
+        kv_cache_dtype: cuda_kv_cache_dtype(EngineConfig::default().kv_cache_dtype),
         ..EngineConfig::default()
     };
     let engine = Engine::cuda_with_mapped_weights(&mapped_model, config)?;
@@ -1268,6 +1285,9 @@ fn gpu_load(model_dir: PathBuf, max_context: usize) -> Result<()> {
     let gpu_buffer_bytes = engine
         .gpu_buffer_bytes()
         .ok_or_else(|| anyhow::anyhow!("CUDA engine did not expose runtime buffers"))?;
+    let gpu_memory_report = engine
+        .gpu_memory_report()
+        .ok_or_else(|| anyhow::anyhow!("CUDA engine did not expose detailed memory report"))?;
 
     println!(
         "{}",
@@ -1279,6 +1299,7 @@ fn gpu_load(model_dir: PathBuf, max_context: usize) -> Result<()> {
             "gpu_weight_gib": bytes_to_gib(gpu_weight_bytes),
             "gpu_runtime_buffer_bytes": gpu_buffer_bytes,
             "gpu_runtime_buffer_gib": bytes_to_gib(gpu_buffer_bytes),
+            "gpu_memory_report": gpu_memory_report,
         }))?
     );
     Ok(())

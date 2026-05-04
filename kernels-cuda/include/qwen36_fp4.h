@@ -117,6 +117,8 @@ typedef struct {
   qwen36_device_ptr_t kv_cache_v;
   qwen36_device_ptr_t output_bf16;
   qwen36_attention_shape_t shape;
+  // 0 = BF16, 1 = FP8 E4M3.
+  int kv_cache_dtype;
   // When non-zero, prefill reads the base cache position from this device
   // pointer (int32) instead of `start_position`. Used by graph-captured MTP
   // verification where the host can no longer pass advancing scalar args.
@@ -146,6 +148,8 @@ typedef struct {
   qwen36_device_ptr_t kv_cache_v;
   qwen36_device_ptr_t output_bf16;
   qwen36_attention_shape_t shape;
+  // 0 = BF16, 1 = FP8 E4M3.
+  int kv_cache_dtype;
   // When non-zero, the kernel reads the current position from this device
   // pointer (int32, big enough to express the full max_context). This lets
   // CUDA-Graph captures stay valid across decode steps without re-recording.

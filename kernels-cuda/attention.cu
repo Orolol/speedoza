@@ -11,9 +11,96 @@ template <typename T> T *ptr(qwen36_device_ptr_t value) {
   return reinterpret_cast<T *>(static_cast<uintptr_t>(value.ptr));
 }
 
+constexpr int kKvCacheBf16 = 0;
+constexpr int kKvCacheFp8 = 1;
+
+__device__ float decode_e4m3(uint8_t code) {
+  const float sign = (code & 0x80) ? -1.0f : 1.0f;
+  const int exponent = (code >> 3) & 0x0f;
+  const int mantissa = code & 0x07;
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      return sign * 0.0f;
+    }
+    return sign * ldexpf(static_cast<float>(mantissa) / 8.0f, -6);
+  }
+  if (exponent == 0x0f && mantissa == 0x07) {
+    return sign * 448.0f;
+  }
+  return sign * ldexpf(1.0f + static_cast<float>(mantissa) / 8.0f,
+                       exponent - 7);
+}
+
+__device__ uint8_t encode_e4m3(float value) {
+  if (value == 0.0f || !isfinite(value)) {
+    return 0;
+  }
+  const bool negative = value < 0.0f;
+  float abs_value = fabsf(value);
+  if (abs_value >= 448.0f) {
+    return static_cast<uint8_t>((negative ? 0x80 : 0x00) | 0x7e);
+  }
+
+  constexpr float kMinNormal = 0x1p-6f;
+  constexpr float kSubnormalStep = 0x1p-9f;
+  constexpr float kNormalBoundary = (7.0f * kSubnormalStep + kMinNormal) * 0.5f;
+  uint8_t code = 0;
+  if (abs_value < kMinNormal) {
+    if (abs_value >= kNormalBoundary) {
+      code = 0x08;
+    } else {
+      int mantissa = static_cast<int>(floorf(abs_value / kSubnormalStep + 0.5f));
+      if (mantissa <= 0) {
+        code = 0;
+      } else {
+        code = static_cast<uint8_t>(mantissa);
+      }
+    }
+  } else {
+    int exponent = 0;
+    float frac = frexpf(abs_value, &exponent);
+    // frexp returns abs_value = frac * 2^exponent with frac in [0.5, 1).
+    const int exponent_field = exponent + 6;
+    float mantissa_f = (frac * 2.0f - 1.0f) * 8.0f;
+    int mantissa = static_cast<int>(floorf(mantissa_f + 0.5f));
+    int adjusted_exponent = exponent_field;
+    if (mantissa >= 8) {
+      mantissa = 0;
+      adjusted_exponent += 1;
+    }
+    if (adjusted_exponent >= 15) {
+      adjusted_exponent = 15;
+      mantissa = min(mantissa, 6);
+    }
+    code = static_cast<uint8_t>((adjusted_exponent << 3) | mantissa);
+  }
+  return static_cast<uint8_t>((negative ? 0x80 : 0x00) | code);
+}
+
+__device__ __forceinline__ float load_cache_value(const void *cache,
+                                                  int kv_cache_dtype,
+                                                  size_t index) {
+  if (kv_cache_dtype == kKvCacheFp8) {
+    return decode_e4m3(reinterpret_cast<const uint8_t *>(cache)[index]);
+  }
+  return __bfloat162float(reinterpret_cast<const __nv_bfloat16 *>(cache)[index]);
+}
+
+__device__ __forceinline__ void store_cache_value(void *cache,
+                                                  int kv_cache_dtype,
+                                                  size_t index,
+                                                  __nv_bfloat16 value) {
+  if (kv_cache_dtype == kKvCacheFp8) {
+    reinterpret_cast<uint8_t *>(cache)[index] =
+        encode_e4m3(__bfloat162float(value));
+  } else {
+    reinterpret_cast<__nv_bfloat16 *>(cache)[index] = value;
+  }
+}
+
 __global__ void copy_kv_prefill_kernel(
-    const __nv_bfloat16 *k, const __nv_bfloat16 *v, __nv_bfloat16 *cache_k,
-    __nv_bfloat16 *cache_v, size_t start_position, size_t tokens,
+    const __nv_bfloat16 *k, const __nv_bfloat16 *v, void *cache_k,
+    void *cache_v, int kv_cache_dtype, size_t start_position, size_t tokens,
     const int32_t *start_position_device, size_t kv_heads, size_t head_dim) {
   __shared__ size_t shared_start_position;
   const size_t kvh = blockIdx.x;
@@ -31,8 +118,8 @@ __global__ void copy_kv_prefill_kernel(
     const size_t src = (token * kv_heads + kvh) * head_dim + d;
     const size_t dst =
         ((shared_start_position + token) * kv_heads + kvh) * head_dim + d;
-    cache_k[dst] = k[src];
-    cache_v[dst] = v[src];
+    store_cache_value(cache_k, kv_cache_dtype, dst, k[src]);
+    store_cache_value(cache_v, kv_cache_dtype, dst, v[src]);
   }
 }
 
@@ -46,7 +133,8 @@ __global__ void copy_kv_prefill_kernel(
 // reused across decode steps without re-recording.
 __global__ void attention_decode_kernel(
     const __nv_bfloat16 *q, const __nv_bfloat16 *k_new,
-    const __nv_bfloat16 *v_new, __nv_bfloat16 *cache_k, __nv_bfloat16 *cache_v,
+    const __nv_bfloat16 *v_new, void *cache_k, void *cache_v,
+    int kv_cache_dtype,
     __nv_bfloat16 *output, size_t position_scalar,
     const int32_t *position_device, qwen36_attention_shape_t shape) {
   __shared__ float warp_sums[8];
@@ -91,10 +179,11 @@ __global__ void attention_decode_kernel(
     float local = 0.0f;
     if (active) {
       const float kv = is_new ? k_new_val
-                              : __bfloat162float(cache_k[(t * shape.kv_heads +
-                                                          kvh) *
-                                                             shape.head_dim +
-                                                         d]);
+                              : load_cache_value(
+                                    cache_k, kv_cache_dtype,
+                                    (t * shape.kv_heads + kvh) *
+                                            shape.head_dim +
+                                        d);
       local = q_val * kv;
     }
 
@@ -124,10 +213,11 @@ __global__ void attention_decode_kernel(
     const float score_scale = expf(score - new_max);
     if (active) {
       const float vv = is_new ? v_new_val
-                              : __bfloat162float(cache_v[(t * shape.kv_heads +
-                                                          kvh) *
-                                                             shape.head_dim +
-                                                         d]);
+                              : load_cache_value(
+                                    cache_v, kv_cache_dtype,
+                                    (t * shape.kv_heads + kvh) *
+                                            shape.head_dim +
+                                        d);
       acc = acc * old_scale + score_scale * vv;
     }
     denom = denom * old_scale + score_scale;
@@ -140,8 +230,10 @@ __global__ void attention_decode_kernel(
     if (qh % q_per_kv == 0) {
       const size_t cache_off =
           (position * shape.kv_heads + kvh) * shape.head_dim + d;
-      cache_k[cache_off] = k_new[kvh * shape.head_dim + d];
-      cache_v[cache_off] = v_new[kvh * shape.head_dim + d];
+      store_cache_value(cache_k, kv_cache_dtype, cache_off,
+                        k_new[kvh * shape.head_dim + d]);
+      store_cache_value(cache_v, kv_cache_dtype, cache_off,
+                        v_new[kvh * shape.head_dim + d]);
     }
   }
 }
@@ -171,7 +263,8 @@ constexpr int kMinSplitTimestepsPerBlock = 64;
 
 __global__ void attention_decode_split_kernel(
     const __nv_bfloat16 *q, const __nv_bfloat16 *k_new,
-    const __nv_bfloat16 *v_new, __nv_bfloat16 *cache_k, __nv_bfloat16 *cache_v,
+    const __nv_bfloat16 *v_new, void *cache_k, void *cache_v,
+    int kv_cache_dtype,
     float *partial_acc, float *partial_max, float *partial_denom,
     size_t position_scalar, const int32_t *position_device,
     qwen36_attention_shape_t shape, int n_splits,
@@ -236,10 +329,11 @@ __global__ void attention_decode_split_kernel(
     float local = 0.0f;
     if (active) {
       const float kv = is_new ? k_new_val
-                              : __bfloat162float(cache_k[(t * shape.kv_heads +
-                                                          kvh) *
-                                                             shape.head_dim +
-                                                         d]);
+                              : load_cache_value(
+                                    cache_k, kv_cache_dtype,
+                                    (t * shape.kv_heads + kvh) *
+                                            shape.head_dim +
+                                        d);
       local = q_val * kv;
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -267,10 +361,11 @@ __global__ void attention_decode_split_kernel(
     const float score_scale = expf(score - new_max);
     if (active) {
       const float vv = is_new ? v_new_val
-                              : __bfloat162float(cache_v[(t * shape.kv_heads +
-                                                          kvh) *
-                                                             shape.head_dim +
-                                                         d]);
+                              : load_cache_value(
+                                    cache_v, kv_cache_dtype,
+                                    (t * shape.kv_heads + kvh) *
+                                            shape.head_dim +
+                                        d);
       acc = acc * old_scale + score_scale * vv;
     }
     denom = denom * old_scale + score_scale;
@@ -292,15 +387,17 @@ __global__ void attention_decode_split_kernel(
       (qh % q_per_kv == 0)) {
     const size_t cache_off =
         (position * shape.kv_heads + kvh) * shape.head_dim + d;
-    cache_k[cache_off] = k_new[kvh * head_dim + d];
-    cache_v[cache_off] = v_new[kvh * head_dim + d];
+    store_cache_value(cache_k, kv_cache_dtype, cache_off,
+                      k_new[kvh * head_dim + d]);
+    store_cache_value(cache_v, kv_cache_dtype, cache_off,
+                      v_new[kvh * head_dim + d]);
   }
 }
 
 __global__ void attention_decode_split_gqa_kernel(
     const __nv_bfloat16 *q, const __nv_bfloat16 *k_new,
-    const __nv_bfloat16 *v_new, __nv_bfloat16 *cache_k,
-    __nv_bfloat16 *cache_v, float *partial_acc, float *partial_max,
+    const __nv_bfloat16 *v_new, void *cache_k,
+    void *cache_v, int kv_cache_dtype, float *partial_acc, float *partial_max,
     float *partial_denom, size_t position_scalar,
     const int32_t *position_device, qwen36_attention_shape_t shape,
     int n_splits, int split_timesteps_per_block) {
@@ -388,9 +485,9 @@ __global__ void attention_decode_split_gqa_kernel(
     if (tile_active) {
       kv_sram[threadIdx.x] =
           is_new ? k_new_val
-                 : __bfloat162float(
-                       cache_k[(t * shape.kv_heads + kvh) * head_dim +
-                               threadIdx.x]);
+                 : load_cache_value(
+                       cache_k, kv_cache_dtype,
+                       (t * shape.kv_heads + kvh) * head_dim + threadIdx.x);
     }
     __syncthreads();
 
@@ -428,9 +525,9 @@ __global__ void attention_decode_split_gqa_kernel(
     if (tile_active) {
       kv_sram[threadIdx.x] =
           is_new ? v_new_val
-                 : __bfloat162float(
-                       cache_v[(t * shape.kv_heads + kvh) * head_dim +
-                               threadIdx.x]);
+                 : load_cache_value(
+                       cache_v, kv_cache_dtype,
+                       (t * shape.kv_heads + kvh) * head_dim + threadIdx.x);
     }
     __syncthreads();
 
@@ -464,8 +561,10 @@ __global__ void attention_decode_split_gqa_kernel(
   if (t_start <= position && position < t_end && tile_active) {
     const size_t cache_off =
         (position * shape.kv_heads + kvh) * head_dim + threadIdx.x;
-    cache_k[cache_off] = k_new[kvh * head_dim + threadIdx.x];
-    cache_v[cache_off] = v_new[kvh * head_dim + threadIdx.x];
+    store_cache_value(cache_k, kv_cache_dtype, cache_off,
+                      k_new[kvh * head_dim + threadIdx.x]);
+    store_cache_value(cache_v, kv_cache_dtype, cache_off,
+                      v_new[kvh * head_dim + threadIdx.x]);
   }
 }
 
@@ -513,8 +612,8 @@ __global__ void attention_decode_reduce_kernel(
 }
 
 __global__ void attention_prefill_split_kernel(
-    const __nv_bfloat16 *q, const __nv_bfloat16 *cache_k,
-    const __nv_bfloat16 *cache_v, float *partial_acc, float *partial_max,
+    const __nv_bfloat16 *q, const void *cache_k,
+    const void *cache_v, int kv_cache_dtype, float *partial_acc, float *partial_max,
     float *partial_denom, size_t start_position_scalar,
     const int32_t *start_position_device, size_t token,
     qwen36_attention_shape_t shape, int n_splits,
@@ -573,8 +672,8 @@ __global__ void attention_prefill_split_kernel(
   for (size_t t = t_start; t < t_end; ++t) {
     float local = 0.0f;
     if (active) {
-      const float kv = __bfloat162float(
-          cache_k[(t * shape.kv_heads + kvh) * head_dim + d]);
+      const float kv = load_cache_value(
+          cache_k, kv_cache_dtype, (t * shape.kv_heads + kvh) * head_dim + d);
       local = q_val * kv;
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -601,8 +700,8 @@ __global__ void attention_prefill_split_kernel(
         isinf(max_score) && max_score < 0.0f ? 0.0f : expf(max_score - new_max);
     const float score_scale = expf(score - new_max);
     if (active) {
-      const float vv = __bfloat162float(
-          cache_v[(t * shape.kv_heads + kvh) * head_dim + d]);
+      const float vv = load_cache_value(
+          cache_v, kv_cache_dtype, (t * shape.kv_heads + kvh) * head_dim + d);
       acc = acc * old_scale + score_scale * vv;
     }
     denom = denom * old_scale + score_scale;
@@ -629,8 +728,8 @@ __global__ void attention_prefill_split_kernel(
 // keeps using the per-q-head kernel because batch=1 decode only has 4
 // kv-heads to dispatch and would starve the GPU.
 __global__ void attention_prefill_gqa_kernel(
-    const __nv_bfloat16 *q, const __nv_bfloat16 *cache_k,
-    const __nv_bfloat16 *cache_v, __nv_bfloat16 *output,
+    const __nv_bfloat16 *q, const void *cache_k,
+    const void *cache_v, int kv_cache_dtype, __nv_bfloat16 *output,
     size_t start_position, const int32_t *start_position_device, size_t tokens,
     qwen36_attention_shape_t shape) {
   __shared__ size_t shared_start_position;
@@ -690,8 +789,9 @@ __global__ void attention_prefill_gqa_kernel(
 
   for (size_t t = 0; t <= position; ++t) {
     if (tile_active) {
-      kv_sram[threadIdx.x] = __bfloat162float(
-          cache_k[(t * shape.kv_heads + kvh) * head_dim + threadIdx.x]);
+      kv_sram[threadIdx.x] = load_cache_value(
+          cache_k, kv_cache_dtype,
+          (t * shape.kv_heads + kvh) * head_dim + threadIdx.x);
     }
     __syncthreads();
 
@@ -727,8 +827,9 @@ __global__ void attention_prefill_gqa_kernel(
     __syncthreads();
 
     if (tile_active) {
-      kv_sram[threadIdx.x] = __bfloat162float(
-          cache_v[(t * shape.kv_heads + kvh) * head_dim + threadIdx.x]);
+      kv_sram[threadIdx.x] = load_cache_value(
+          cache_v, kv_cache_dtype,
+          (t * shape.kv_heads + kvh) * head_dim + threadIdx.x);
     }
     __syncthreads();
 
@@ -757,8 +858,8 @@ __global__ void attention_prefill_gqa_kernel(
 }
 
 __global__ void attention_prefill_kernel(
-    const __nv_bfloat16 *q, const __nv_bfloat16 *cache_k,
-    const __nv_bfloat16 *cache_v, __nv_bfloat16 *output,
+    const __nv_bfloat16 *q, const void *cache_k,
+    const void *cache_v, int kv_cache_dtype, __nv_bfloat16 *output,
     size_t start_position, const int32_t *start_position_device, size_t tokens,
     qwen36_attention_shape_t shape) {
   __shared__ float warp_sums[8];
@@ -795,10 +896,10 @@ __global__ void attention_prefill_kernel(
   for (size_t t = 0; t <= position; ++t) {
     float local = active
                       ? q_val *
-                            __bfloat162float(
-                                cache_k[(t * shape.kv_heads + kvh) *
-                                            shape.head_dim +
-                                        d])
+                            load_cache_value(cache_k, kv_cache_dtype,
+                                             (t * shape.kv_heads + kvh) *
+                                                     shape.head_dim +
+                                                 d)
                       : 0.0f;
     for (int offset = 16; offset > 0; offset >>= 1) {
       local += __shfl_xor_sync(0xffffffff, local, offset);
@@ -824,8 +925,9 @@ __global__ void attention_prefill_kernel(
         isinf(max_score) && max_score < 0.0f ? 0.0f : expf(max_score - new_max);
     const float score_scale = expf(score - new_max);
     if (active) {
-      const float vv = __bfloat162float(
-          cache_v[(t * shape.kv_heads + kvh) * shape.head_dim + d]);
+      const float vv = load_cache_value(
+          cache_v, kv_cache_dtype,
+          (t * shape.kv_heads + kvh) * shape.head_dim + d);
       acc = acc * old_scale + score_scale * vv;
     }
     denom = denom * old_scale + score_scale;
@@ -849,7 +951,9 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
       spec->kv_cache_v.ptr == 0 || spec->output_bf16.ptr == 0 ||
       spec->shape.q_heads == 0 || spec->shape.kv_heads == 0 ||
       spec->shape.head_dim == 0 || spec->shape.head_dim > 256 ||
-      spec->shape.q_heads % spec->shape.kv_heads != 0) {
+      spec->shape.q_heads % spec->shape.kv_heads != 0 ||
+      (spec->kv_cache_dtype != kKvCacheBf16 &&
+       spec->kv_cache_dtype != kKvCacheFp8)) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }
 
@@ -859,10 +963,10 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
   copy_kv_prefill_kernel<<<copy_grid, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->k_bf16),
       ptr<const __nv_bfloat16>(spec->v_bf16),
-      ptr<__nv_bfloat16>(spec->kv_cache_k),
-      ptr<__nv_bfloat16>(spec->kv_cache_v), spec->start_position,
-      spec->tokens, ptr<const int32_t>(spec->start_position_device_i32),
-      spec->shape.kv_heads, spec->shape.head_dim);
+      ptr<void>(spec->kv_cache_k), ptr<void>(spec->kv_cache_v),
+      spec->kv_cache_dtype, spec->start_position, spec->tokens,
+      ptr<const int32_t>(spec->start_position_device_i32), spec->shape.kv_heads,
+      spec->shape.head_dim);
 
   const bool partials_present = spec->partial_acc_f32.ptr != 0 &&
                                 spec->partial_max_f32.ptr != 0 &&
@@ -889,8 +993,8 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
       attention_prefill_split_kernel<<<split_grid, split_threads, 0,
                                        qwen36_internal_active_stream()>>>(
           ptr<const __nv_bfloat16>(spec->q_bf16),
-          ptr<const __nv_bfloat16>(spec->kv_cache_k),
-          ptr<const __nv_bfloat16>(spec->kv_cache_v),
+          ptr<const void>(spec->kv_cache_k),
+          ptr<const void>(spec->kv_cache_v), spec->kv_cache_dtype,
           ptr<float>(spec->partial_acc_f32),
           ptr<float>(spec->partial_max_f32),
           ptr<float>(spec->partial_denom_f32), spec->start_position,
@@ -950,9 +1054,8 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
     attention_prefill_gqa_kernel<<<gqa_grid, gqa_threads, 0,
                                    qwen36_internal_active_stream()>>>(
         ptr<const __nv_bfloat16>(spec->q_bf16),
-        ptr<const __nv_bfloat16>(spec->kv_cache_k),
-        ptr<const __nv_bfloat16>(spec->kv_cache_v),
-        ptr<__nv_bfloat16>(spec->output_bf16), spec->start_position,
+        ptr<const void>(spec->kv_cache_k), ptr<const void>(spec->kv_cache_v),
+        spec->kv_cache_dtype, ptr<__nv_bfloat16>(spec->output_bf16), spec->start_position,
         ptr<const int32_t>(spec->start_position_device_i32), spec->tokens,
         spec->shape);
     cudaError_t err = cudaGetLastError();
@@ -963,9 +1066,8 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
                        static_cast<unsigned int>(spec->tokens));
   attention_prefill_kernel<<<attn_grid, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->q_bf16),
-      ptr<const __nv_bfloat16>(spec->kv_cache_k),
-      ptr<const __nv_bfloat16>(spec->kv_cache_v),
-      ptr<__nv_bfloat16>(spec->output_bf16), spec->start_position,
+      ptr<const void>(spec->kv_cache_k), ptr<const void>(spec->kv_cache_v),
+      spec->kv_cache_dtype, ptr<__nv_bfloat16>(spec->output_bf16), spec->start_position,
       ptr<const int32_t>(spec->start_position_device_i32), spec->tokens,
       spec->shape);
   cudaError_t err = cudaGetLastError();
@@ -982,7 +1084,9 @@ qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec) {
       spec->kv_cache_v.ptr == 0 || spec->output_bf16.ptr == 0 ||
       spec->shape.q_heads == 0 || spec->shape.kv_heads == 0 ||
       spec->shape.head_dim == 0 || spec->shape.head_dim > 256 ||
-      spec->shape.q_heads % spec->shape.kv_heads != 0) {
+      spec->shape.q_heads % spec->shape.kv_heads != 0 ||
+      (spec->kv_cache_dtype != kKvCacheBf16 &&
+       spec->kv_cache_dtype != kKvCacheFp8)) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }
 
@@ -1027,8 +1131,8 @@ qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec) {
           ptr<const __nv_bfloat16>(spec->q_bf16),
           ptr<const __nv_bfloat16>(spec->k_bf16),
           ptr<const __nv_bfloat16>(spec->v_bf16),
-          ptr<__nv_bfloat16>(spec->kv_cache_k),
-          ptr<__nv_bfloat16>(spec->kv_cache_v),
+          ptr<void>(spec->kv_cache_k), ptr<void>(spec->kv_cache_v),
+          spec->kv_cache_dtype,
           ptr<float>(spec->partial_acc_f32),
           ptr<float>(spec->partial_max_f32),
           ptr<float>(spec->partial_denom_f32), spec->position,
@@ -1042,8 +1146,8 @@ qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec) {
           ptr<const __nv_bfloat16>(spec->q_bf16),
           ptr<const __nv_bfloat16>(spec->k_bf16),
           ptr<const __nv_bfloat16>(spec->v_bf16),
-          ptr<__nv_bfloat16>(spec->kv_cache_k),
-          ptr<__nv_bfloat16>(spec->kv_cache_v),
+          ptr<void>(spec->kv_cache_k), ptr<void>(spec->kv_cache_v),
+          spec->kv_cache_dtype,
           ptr<float>(spec->partial_acc_f32),
           ptr<float>(spec->partial_max_f32),
           ptr<float>(spec->partial_denom_f32), spec->position,
@@ -1076,9 +1180,8 @@ qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec) {
       ptr<const __nv_bfloat16>(spec->q_bf16),
       ptr<const __nv_bfloat16>(spec->k_bf16),
       ptr<const __nv_bfloat16>(spec->v_bf16),
-      ptr<__nv_bfloat16>(spec->kv_cache_k),
-      ptr<__nv_bfloat16>(spec->kv_cache_v),
-      ptr<__nv_bfloat16>(spec->output_bf16), spec->position,
+      ptr<void>(spec->kv_cache_k), ptr<void>(spec->kv_cache_v),
+      spec->kv_cache_dtype, ptr<__nv_bfloat16>(spec->output_bf16), spec->position,
       ptr<const int32_t>(spec->position_device_i32), spec->shape);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;

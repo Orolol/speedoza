@@ -72,6 +72,49 @@ fn mtp_batched_lm_head_enabled() -> bool {
     !cuda_env_bool("QWEN36_MTP_BATCH_LM_HEAD_DISABLE")
 }
 
+#[cfg(feature = "cuda")]
+fn cuda_env_workspace_bytes() -> usize {
+    cuda_env_usize("QWEN36_CUDA_WORKSPACE_BYTES")
+        .or_else(|| {
+            cuda_env_usize("QWEN36_CUDA_WORKSPACE_MIB").and_then(|mib| mib.checked_mul(1024 * 1024))
+        })
+        .unwrap_or(256 * 1024 * 1024)
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_prefill_capacity(max_context: usize) -> usize {
+    cuda_env_usize("QWEN36_PREFILL_CAPACITY")
+        .unwrap_or_else(|| max_context.min(512))
+        .clamp(1, max_context.max(1))
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_long_context_mode_enabled() -> bool {
+    cuda_env_bool("QWEN36_LONG_CONTEXT_MODE")
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_mlp_fused_enabled() -> bool {
+    !cuda_long_context_mode_enabled() && !cuda_env_bool("QWEN36_DISABLE_MLP_FUSED")
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_linear_attn_fused_enabled() -> bool {
+    !cuda_long_context_mode_enabled() && !cuda_env_bool("QWEN36_DISABLE_LINEAR_ATTN_FUSED")
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_prefill_fused_mlp_enabled() -> bool {
+    cuda_mlp_fused_enabled() && cuda_env_bool("QWEN36_PREFILL_FUSED_MLP")
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_prefill_fused_linear_attn_enabled() -> bool {
+    cuda_linear_attn_fused_enabled()
+        && cuda_env_bool("QWEN36_PREFILL_FUSED_LINEAR_ATTN")
+        && !cuda_env_bool("QWEN36_PREFILL_FUSED_LINEAR_ATTN_DISABLE")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     pub max_context: usize,
@@ -97,6 +140,35 @@ impl Default for EngineConfig {
 pub struct ForwardOutput {
     pub logits_device_ptr: u64,
     pub produced_tokens: usize,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuMemoryItem {
+    pub name: String,
+    pub bytes: u64,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuMemoryGroup {
+    pub total_bytes: u64,
+    pub items: Vec<GpuMemoryItem>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuMemoryReport {
+    pub total_reported_bytes: u64,
+    pub weights: GpuMemoryGroup,
+    pub runtime: GpuMemoryGroup,
+    pub forward: GpuMemoryGroup,
+    pub prefill: GpuMemoryGroup,
+    pub fused: GpuMemoryGroup,
+    pub max_context: usize,
+    pub prefill_capacity: usize,
+    pub kv_cache_dtype: KvCacheDtype,
+    pub mtp_speculative_tokens: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -939,8 +1011,13 @@ impl<B: KernelBackend> Engine<B> {
             mtp_kv_cache.memset(0)?;
         }
         runtime.deltanet_state.memset(0)?;
-        runtime.deltanet_checkpoint.memset(0)?;
+        if let Some(deltanet_checkpoint) = &runtime.deltanet_checkpoint {
+            deltanet_checkpoint.memset(0)?;
+        }
         runtime.conv_history.memset(0)?;
+        if let Some(conv_history_checkpoint) = &runtime.conv_history_checkpoint {
+            conv_history_checkpoint.memset(0)?;
+        }
         self.state.position = 0;
         self.state.accepted_tokens = 0;
         Ok(())
@@ -961,9 +1038,13 @@ impl<B: KernelBackend> Engine<B> {
                 self.config.max_context
             )));
         }
-        if self.config.kv_cache_dtype != KvCacheDtype::Bf16 {
+        if !matches!(
+            self.config.kv_cache_dtype,
+            KvCacheDtype::Bf16 | KvCacheDtype::Fp8
+        ) {
             return Err(CoreError::Runtime(
-                "reference CUDA scheduler currently requires BF16 KV cache".to_owned(),
+                "CUDA scheduler currently supports BF16 or FP8 KV cache; TurboQuant is not wired into full prefill/decode"
+                    .to_owned(),
             ));
         }
 
@@ -1133,14 +1214,23 @@ impl<B: KernelBackend> Engine<B> {
         let runtime = self.cuda_runtime()?;
         if mtp_recurrent_snapshot_enabled() {
             let deltanet_bytes = runtime.deltanet_state.bytes();
-            runtime
-                .deltanet_checkpoint
-                .copy_from_device(&runtime.deltanet_state, deltanet_bytes)?;
+            let deltanet_checkpoint = runtime.deltanet_checkpoint.as_ref().ok_or_else(|| {
+                CoreError::Runtime(
+                    "MTP recurrent snapshot requested but DeltaNet checkpoint was not allocated"
+                        .to_owned(),
+                )
+            })?;
+            deltanet_checkpoint.copy_from_device(&runtime.deltanet_state, deltanet_bytes)?;
             let conv_bytes = runtime.conv_history.bytes();
             if conv_bytes > 0 {
-                runtime
-                    .conv_history_checkpoint
-                    .copy_from_device(&runtime.conv_history, conv_bytes)?;
+                let conv_history_checkpoint =
+                    runtime.conv_history_checkpoint.as_ref().ok_or_else(|| {
+                        CoreError::Runtime(
+                            "MTP recurrent snapshot requested but conv-history checkpoint was not allocated"
+                                .to_owned(),
+                        )
+                    })?;
+                conv_history_checkpoint.copy_from_device(&runtime.conv_history, conv_bytes)?;
             }
         }
         if cuda_env_bool("QWEN36_MTP_SNAPSHOT_KV") {
@@ -1161,14 +1251,27 @@ impl<B: KernelBackend> Engine<B> {
         }
         let runtime = self.cuda_runtime()?;
         let deltanet_bytes = runtime.deltanet_state.bytes();
+        let deltanet_checkpoint = runtime.deltanet_checkpoint.as_ref().ok_or_else(|| {
+            CoreError::Runtime(
+                "MTP recurrent restore requested but DeltaNet checkpoint was not allocated"
+                    .to_owned(),
+            )
+        })?;
         runtime
             .deltanet_state
-            .copy_from_device(&runtime.deltanet_checkpoint, deltanet_bytes)?;
+            .copy_from_device(deltanet_checkpoint, deltanet_bytes)?;
         let conv_bytes = runtime.conv_history.bytes();
         if conv_bytes > 0 {
+            let conv_history_checkpoint =
+                runtime.conv_history_checkpoint.as_ref().ok_or_else(|| {
+                    CoreError::Runtime(
+                    "MTP recurrent restore requested but conv-history checkpoint was not allocated"
+                        .to_owned(),
+                )
+                })?;
             runtime
                 .conv_history
-                .copy_from_device(&runtime.conv_history_checkpoint, conv_bytes)?;
+                .copy_from_device(conv_history_checkpoint, conv_bytes)?;
         }
         if cuda_env_bool("QWEN36_MTP_SNAPSHOT_KV") {
             self.mtp_kv_slice_copy(start_position, token_count, /* save = */ false)?;
@@ -1195,13 +1298,18 @@ impl<B: KernelBackend> Engine<B> {
             )));
         }
         let runtime = self.cuda_runtime()?;
+        let mtp_kv_snapshot = runtime.mtp_kv_snapshot.as_ref().ok_or_else(|| {
+            CoreError::Runtime(
+                "MTP KV snapshot requested but snapshot buffer was not allocated".to_owned(),
+            )
+        })?;
         let layout = &runtime.mtp_kv_snapshot_layout;
-        let row_bytes = layout.slice_bytes / MtpKvSnapshotLayout::VERIFY_TOKENS;
-        let slice_bytes = row_bytes
+        let main_row_bytes = layout.main_slice_bytes / MtpKvSnapshotLayout::VERIFY_TOKENS;
+        let main_slice_bytes = main_row_bytes
             .checked_mul(token_count)
             .ok_or_else(|| CoreError::Runtime("MTP KV slice size overflow".to_owned()))?;
-        let position_offset = start_position
-            .checked_mul(row_bytes)
+        let main_position_offset = start_position
+            .checked_mul(main_row_bytes)
             .ok_or_else(|| CoreError::Runtime("MTP KV slice offset overflow".to_owned()))?;
 
         if let Some(kv_cache) = &runtime.kv_cache {
@@ -1209,29 +1317,21 @@ impl<B: KernelBackend> Engine<B> {
                 let snapshot_k = layout.main_k_offsets[idx];
                 let snapshot_v = layout.main_v_offsets[idx];
                 let live_k = (layer.k_offset_bytes as usize)
-                    .checked_add(position_offset)
+                    .checked_add(main_position_offset)
                     .ok_or_else(|| CoreError::Runtime("KV K offset overflow".to_owned()))?;
                 let live_v = (layer.v_offset_bytes as usize)
-                    .checked_add(position_offset)
+                    .checked_add(main_position_offset)
                     .ok_or_else(|| CoreError::Runtime("KV V offset overflow".to_owned()))?;
                 if save {
                     let src_k = kv_cache.ptr_at(live_k)?;
                     let src_v = kv_cache.ptr_at(live_v)?;
-                    runtime.mtp_kv_snapshot.copy_from_device_ptr_at(
-                        snapshot_k,
-                        src_k,
-                        slice_bytes,
-                    )?;
-                    runtime.mtp_kv_snapshot.copy_from_device_ptr_at(
-                        snapshot_v,
-                        src_v,
-                        slice_bytes,
-                    )?;
+                    mtp_kv_snapshot.copy_from_device_ptr_at(snapshot_k, src_k, main_slice_bytes)?;
+                    mtp_kv_snapshot.copy_from_device_ptr_at(snapshot_v, src_v, main_slice_bytes)?;
                 } else {
-                    let src_k = runtime.mtp_kv_snapshot.ptr_at(snapshot_k)?;
-                    let src_v = runtime.mtp_kv_snapshot.ptr_at(snapshot_v)?;
-                    kv_cache.copy_from_device_ptr_at(live_k, src_k, slice_bytes)?;
-                    kv_cache.copy_from_device_ptr_at(live_v, src_v, slice_bytes)?;
+                    let src_k = mtp_kv_snapshot.ptr_at(snapshot_k)?;
+                    let src_v = mtp_kv_snapshot.ptr_at(snapshot_v)?;
+                    kv_cache.copy_from_device_ptr_at(live_k, src_k, main_slice_bytes)?;
+                    kv_cache.copy_from_device_ptr_at(live_v, src_v, main_slice_bytes)?;
                 }
             }
         }
@@ -1241,25 +1341,28 @@ impl<B: KernelBackend> Engine<B> {
             layout.mtp_k_offset,
             layout.mtp_v_offset,
         ) {
+            let mtp_row_bytes = layout.mtp_slice_bytes / MtpKvSnapshotLayout::VERIFY_TOKENS;
+            let mtp_slice_bytes = mtp_row_bytes
+                .checked_mul(token_count)
+                .ok_or_else(|| CoreError::Runtime("MTP KV slice size overflow".to_owned()))?;
+            let mtp_position_offset = start_position
+                .checked_mul(mtp_row_bytes)
+                .ok_or_else(|| CoreError::Runtime("MTP KV slice offset overflow".to_owned()))?;
             let plane_bytes = self.mtp_kv_cache_plane_bytes()?;
-            let live_k = position_offset;
+            let live_k = mtp_position_offset;
             let live_v = plane_bytes
-                .checked_add(position_offset)
+                .checked_add(mtp_position_offset)
                 .ok_or_else(|| CoreError::Runtime("MTP V plane offset overflow".to_owned()))?;
             if save {
                 let src_k = mtp_kv_cache.ptr_at(live_k)?;
                 let src_v = mtp_kv_cache.ptr_at(live_v)?;
-                runtime
-                    .mtp_kv_snapshot
-                    .copy_from_device_ptr_at(mtp_k_off, src_k, slice_bytes)?;
-                runtime
-                    .mtp_kv_snapshot
-                    .copy_from_device_ptr_at(mtp_v_off, src_v, slice_bytes)?;
+                mtp_kv_snapshot.copy_from_device_ptr_at(mtp_k_off, src_k, mtp_slice_bytes)?;
+                mtp_kv_snapshot.copy_from_device_ptr_at(mtp_v_off, src_v, mtp_slice_bytes)?;
             } else {
-                let src_k = runtime.mtp_kv_snapshot.ptr_at(mtp_k_off)?;
-                let src_v = runtime.mtp_kv_snapshot.ptr_at(mtp_v_off)?;
-                mtp_kv_cache.copy_from_device_ptr_at(live_k, src_k, slice_bytes)?;
-                mtp_kv_cache.copy_from_device_ptr_at(live_v, src_v, slice_bytes)?;
+                let src_k = mtp_kv_snapshot.ptr_at(mtp_k_off)?;
+                let src_v = mtp_kv_snapshot.ptr_at(mtp_v_off)?;
+                mtp_kv_cache.copy_from_device_ptr_at(live_k, src_k, mtp_slice_bytes)?;
+                mtp_kv_cache.copy_from_device_ptr_at(live_v, src_v, mtp_slice_bytes)?;
             }
         }
         Ok(())
@@ -2661,9 +2764,13 @@ impl<B: KernelBackend> Engine<B> {
                 self.config.max_context
             )));
         }
-        if self.config.kv_cache_dtype != KvCacheDtype::Bf16 {
+        if !matches!(
+            self.config.kv_cache_dtype,
+            KvCacheDtype::Bf16 | KvCacheDtype::Fp8
+        ) {
             return Err(CoreError::Runtime(
-                "reference CUDA scheduler currently requires BF16 KV cache".to_owned(),
+                "CUDA scheduler currently supports BF16 or FP8 KV cache; TurboQuant is not wired into full prefill/decode"
+                    .to_owned(),
             ));
         }
 
@@ -2987,42 +3094,65 @@ impl<B: KernelBackend> Engine<B> {
             .deltanet_state
             .ptr_at(layer_ordinal * self.state.deltanet.state_bytes_per_layer as usize)?;
 
-        // Combined qkv+b+a+z GEMM. Output layout in `forward.qkv` (BF16):
-        //   [qkv: qkv_dim] [b padded: 128] [a padded: 128] [z: value_dim].
-        // The 80-row pad after b and a sits at FP4 weight 0 so the GEMM
-        // emits zeros there — the engine simply does not read those slots.
-        let fused = self.linear_attn_in_proj_fused_layer(layer.layer_index)?;
-        let quantized = match prequantized_normed {
-            Some(q) => q,
-            None => {
-                let q = self.linear_attn_in_proj_quant(layer)?;
-                self.quantize_nvfp4_activation(forward.normed.ptr(), q)?;
-                q
-            }
-        };
-        self.run_linear_attn_in_proj_fused_gemm(layer, fused, quantized, forward.qkv.ptr())?;
+        let (conv_input_ptr, b_ptr, a_ptr, z_ptr) = if let Some(fused) =
+            self.linear_attn_in_proj_fused_layer_opt(layer.layer_index)
+        {
+            // Combined qkv+b+a+z GEMM. Output layout in `forward.qkv` (BF16):
+            //   [qkv: qkv_dim] [b padded: 128] [a padded: 128] [z: value_dim].
+            // The 80-row pad after b and a sits at FP4 weight 0 so the GEMM
+            // emits zeros there — the engine simply does not read those slots.
+            let quantized = match prequantized_normed {
+                Some(q) => q,
+                None => {
+                    let q = self.linear_attn_in_proj_quant(layer)?;
+                    self.quantize_nvfp4_activation(forward.normed.ptr(), q)?;
+                    q
+                }
+            };
+            self.run_linear_attn_in_proj_fused_gemm(layer, fused, quantized, forward.qkv.ptr())?;
 
-        let b_ptr = forward
-            .qkv
-            .ptr()
-            .offset_bytes(fused.b_offset * 2)
-            .ok_or_else(|| CoreError::Runtime("fused DeltaNet b offset overflow".to_owned()))?;
-        let a_ptr = forward
-            .qkv
-            .ptr()
-            .offset_bytes(fused.a_offset * 2)
-            .ok_or_else(|| CoreError::Runtime("fused DeltaNet a offset overflow".to_owned()))?;
-        let z_ptr = forward
-            .qkv
-            .ptr()
-            .offset_bytes(fused.z_offset * 2)
-            .ok_or_else(|| CoreError::Runtime("fused DeltaNet z offset overflow".to_owned()))?;
+            let b_ptr = forward
+                .qkv
+                .ptr()
+                .offset_bytes(fused.b_offset * 2)
+                .ok_or_else(|| CoreError::Runtime("fused DeltaNet b offset overflow".to_owned()))?;
+            let a_ptr = forward
+                .qkv
+                .ptr()
+                .offset_bytes(fused.a_offset * 2)
+                .ok_or_else(|| CoreError::Runtime("fused DeltaNet a offset overflow".to_owned()))?;
+            let z_ptr = forward
+                .qkv
+                .ptr()
+                .offset_bytes(fused.z_offset * 2)
+                .ok_or_else(|| CoreError::Runtime("fused DeltaNet z offset overflow".to_owned()))?;
+            (forward.qkv.ptr(), b_ptr, a_ptr, z_ptr)
+        } else {
+            let in_proj_linears = [
+                (&layer.in_proj_qkv, forward.qkv.ptr()),
+                (&layer.in_proj_b, forward.aux2.ptr()),
+                (&layer.in_proj_a, forward.aux3.ptr()),
+            ];
+            if let Some(quantized) = prequantized_normed {
+                for &(binding, output) in &in_proj_linears {
+                    self.linear_with_quantized_nvfp4(binding, output, quantized)?;
+                }
+            } else {
+                self.linears_same_input(forward.normed.ptr(), &in_proj_linears)?;
+            }
+            (
+                forward.qkv.ptr(),
+                forward.aux2.ptr(),
+                forward.aux3.ptr(),
+                forward.qkv.ptr(),
+            )
+        };
 
         self.backend
             .conv1d_gdn_gate_fused(&Conv1dGdnGateFusedSpec {
                 channels: qkv_dim,
                 kernel_size: self.topology.linear_conv_kernel_dim,
-                conv_input_bf16: forward.qkv.ptr(),
+                conv_input_bf16: conv_input_ptr,
                 conv_history_bf16: conv_history,
                 conv_weight_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.conv1d_weight)?,
                 conv_output_bf16: forward.aux.ptr(),
@@ -3059,7 +3189,17 @@ impl<B: KernelBackend> Engine<B> {
             update_scale: 1.0,
             qk_l2norm: true,
         })?;
-        // z was emitted by the combined GEMM at `z_offset` inside `forward.qkv`.
+        if self
+            .linear_attn_in_proj_fused_layer_opt(layer.layer_index)
+            .is_none()
+        {
+            if let Some(quantized) = prequantized_normed {
+                self.linear_with_quantized_nvfp4(&layer.in_proj_z, forward.qkv.ptr(), quantized)?;
+            } else {
+                self.linear(&layer.in_proj_z, forward.normed.ptr(), forward.qkv.ptr())?;
+            }
+        }
+        // `z_ptr` is either the fused-GEMM slice or the fallback z projection.
         self.rmsnorm_direct_weight(
             self.topology.linear_num_value_heads,
             self.topology.linear_value_head_dim,
@@ -3172,6 +3312,7 @@ impl<B: KernelBackend> Engine<B> {
                 head_dim: self.topology.attention_head_dim,
                 rope_dims: self.topology.attention_rope_dims(),
             },
+            kv_cache_dtype: Self::attention_kv_cache_dtype_code(self.config.kv_cache_dtype)?,
             position_device_i32,
             partial_acc_f32: forward.attn_partial_acc.ptr(),
             partial_max_f32: forward.attn_partial_max.ptr(),
@@ -3287,6 +3428,7 @@ impl<B: KernelBackend> Engine<B> {
                 head_dim: self.topology.attention_head_dim,
                 rope_dims: self.topology.attention_rope_dims(),
             },
+            kv_cache_dtype: Self::attention_kv_cache_dtype_code(KvCacheDtype::Bf16)?,
             position_device_i32,
             partial_acc_f32: forward.attn_partial_acc.ptr(),
             partial_max_f32: forward.attn_partial_max.ptr(),
@@ -3377,12 +3519,18 @@ impl<B: KernelBackend> Engine<B> {
                 head_dim: self.topology.attention_head_dim,
                 rope_dims: self.topology.attention_rope_dims(),
             },
+            kv_cache_dtype: Self::attention_kv_cache_dtype_code(KvCacheDtype::Bf16)?,
             start_position_device_i32,
             partial_acc_f32: self.cuda_forward()?.attn_partial_acc.ptr(),
             partial_max_f32: self.cuda_forward()?.attn_partial_max.ptr(),
             partial_denom_f32: self.cuda_forward()?.attn_partial_denom.ptr(),
-            prefill_n_splits: self.decode_attention_n_splits(),
-            split_timesteps_per_block: self.attention_split_timesteps_per_block(),
+            prefill_n_splits: self
+                .prefill_attention_n_splits(start_position + tokens, start_position_device_i32),
+            split_timesteps_per_block: if start_position_device_i32 == DevicePtr::NULL {
+                self.attention_split_timesteps_per_block_for(start_position + tokens)
+            } else {
+                self.attention_split_timesteps_per_block()
+            },
         })?;
         self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
             rows: tokens,
@@ -3502,7 +3650,55 @@ impl<B: KernelBackend> Engine<B> {
             Some(quantized) => Some(quantized),
             None => Self::common_nvfp4_quant(&in_proj_linears)?,
         };
-        if let Some(quantized) = shared_in_proj {
+        let fused_prefill = if cuda_prefill_fused_linear_attn_enabled() {
+            self.linear_attn_in_proj_fused_layer_opt(layer.layer_index)
+        } else {
+            None
+        };
+        let mut used_fused_in_proj = false;
+        if let (Some(fused), Some(quantized)) = (fused_prefill, shared_in_proj) {
+            if prequantized_normed.is_none() {
+                self.quantize_nvfp4_activation_rows(
+                    prefill.normed.ptr(),
+                    tokens,
+                    quantized,
+                    prefill,
+                )?;
+            }
+            self.run_linear_attn_in_proj_fused_gemm_rows(
+                layer,
+                fused,
+                quantized,
+                prefill.qkv.ptr(),
+                tokens,
+                prefill,
+            )?;
+            self.backend.copy_strided_rows(&CopyStridedRowsSpec {
+                rows: tokens,
+                values: qkv_dim,
+                input_stride: fused.combined_out_features,
+                output_stride: qkv_dim,
+                input_bf16: prefill.qkv.ptr(),
+                output_bf16: prefill.block_out.ptr(),
+            })?;
+            self.backend.copy_strided_rows(&CopyStridedRowsSpec {
+                rows: tokens,
+                values: self.topology.linear_num_value_heads,
+                input_stride: fused.combined_out_features,
+                output_stride: self.topology.linear_num_value_heads,
+                input_bf16: Self::ptr_offset(prefill.qkv.ptr(), fused.b_offset * 2)?,
+                output_bf16: prefill.aux2.ptr(),
+            })?;
+            self.backend.copy_strided_rows(&CopyStridedRowsSpec {
+                rows: tokens,
+                values: self.topology.linear_num_value_heads,
+                input_stride: fused.combined_out_features,
+                output_stride: self.topology.linear_num_value_heads,
+                input_bf16: Self::ptr_offset(prefill.qkv.ptr(), fused.a_offset * 2)?,
+                output_bf16: prefill.aux3.ptr(),
+            })?;
+            used_fused_in_proj = true;
+        } else if let Some(quantized) = shared_in_proj {
             if prequantized_normed.is_none() {
                 self.quantize_nvfp4_activation_rows(
                     prefill.normed.ptr(),
@@ -3529,7 +3725,11 @@ impl<B: KernelBackend> Engine<B> {
                 self.dump_buffer_to_disk(
                     &dir,
                     "layer0_qkv_raw.bf16",
-                    prefill.qkv.ptr(),
+                    if used_fused_in_proj {
+                        prefill.block_out.ptr()
+                    } else {
+                        prefill.qkv.ptr()
+                    },
                     tokens * qkv_dim,
                 )?;
                 self.dump_buffer_to_disk(
@@ -3551,7 +3751,11 @@ impl<B: KernelBackend> Engine<B> {
             tokens,
             channels: qkv_dim,
             kernel_size: self.topology.linear_conv_kernel_dim,
-            input_bf16: prefill.qkv.ptr(),
+            input_bf16: if used_fused_in_proj {
+                prefill.block_out.ptr()
+            } else {
+                prefill.qkv.ptr()
+            },
             conv_history_bf16: conv_history,
             weight_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.conv1d_weight)?,
             output_bf16: prefill.aux.ptr(),
@@ -3629,7 +3833,20 @@ impl<B: KernelBackend> Engine<B> {
             }
         }
 
-        if let Some(quantized) = shared_in_proj {
+        let z_bf16 = if used_fused_in_proj {
+            let fused = fused_prefill.ok_or_else(|| {
+                CoreError::Runtime("fused DeltaNet prefill state was lost".to_owned())
+            })?;
+            self.backend.copy_strided_rows(&CopyStridedRowsSpec {
+                rows: tokens,
+                values: value_dim,
+                input_stride: fused.combined_out_features,
+                output_stride: value_dim,
+                input_bf16: Self::ptr_offset(prefill.qkv.ptr(), fused.z_offset * 2)?,
+                output_bf16: prefill.block_out.ptr(),
+            })?;
+            prefill.block_out.ptr()
+        } else if let Some(quantized) = shared_in_proj {
             self.linear_with_quantized_nvfp4_rows(
                 &layer.in_proj_z,
                 prefill.qkv.ptr(),
@@ -3637,6 +3854,7 @@ impl<B: KernelBackend> Engine<B> {
                 quantized,
                 prefill,
             )?;
+            prefill.qkv.ptr()
         } else {
             self.linear_rows(
                 &layer.in_proj_z,
@@ -3645,15 +3863,11 @@ impl<B: KernelBackend> Engine<B> {
                 tokens,
                 prefill,
             )?;
-        }
+            prefill.qkv.ptr()
+        };
         if layer.layer_index == 0 {
             if let Ok(dir) = std::env::var("QWEN36_DEBUG_DUMP_DIR") {
-                self.dump_buffer_to_disk(
-                    &dir,
-                    "layer0_z.bf16",
-                    prefill.qkv.ptr(),
-                    tokens * value_dim,
-                )?;
+                self.dump_buffer_to_disk(&dir, "layer0_z.bf16", z_bf16, tokens * value_dim)?;
             }
         }
         self.rmsnorm_direct_weight(
@@ -3668,7 +3882,7 @@ impl<B: KernelBackend> Engine<B> {
         self.backend.swiglu(&SwiGluSpec {
             rows: tokens,
             intermediate: value_dim,
-            gate_bf16: prefill.qkv.ptr(),
+            gate_bf16: z_bf16,
             up_bf16: prefill.aux2.ptr(),
             output_bf16: prefill.aux3.ptr(),
         })?;
@@ -3846,12 +4060,18 @@ impl<B: KernelBackend> Engine<B> {
                 head_dim: self.topology.attention_head_dim,
                 rope_dims: self.topology.attention_rope_dims(),
             },
+            kv_cache_dtype: Self::attention_kv_cache_dtype_code(self.config.kv_cache_dtype)?,
             start_position_device_i32,
             partial_acc_f32: self.cuda_forward()?.attn_partial_acc.ptr(),
             partial_max_f32: self.cuda_forward()?.attn_partial_max.ptr(),
             partial_denom_f32: self.cuda_forward()?.attn_partial_denom.ptr(),
-            prefill_n_splits: self.decode_attention_n_splits(),
-            split_timesteps_per_block: self.attention_split_timesteps_per_block(),
+            prefill_n_splits: self
+                .prefill_attention_n_splits(start_position + tokens, start_position_device_i32),
+            split_timesteps_per_block: if start_position_device_i32 == DevicePtr::NULL {
+                self.attention_split_timesteps_per_block_for(start_position + tokens)
+            } else {
+                self.attention_split_timesteps_per_block()
+            },
         })?;
         if layer.layer_index == 3 {
             if let Ok(dir) = std::env::var("QWEN36_DEBUG_DUMP_DIR") {
@@ -3908,8 +4128,28 @@ impl<B: KernelBackend> Engine<B> {
             LayerWeights::LinearAttention(layer) => layer.layer_index,
             LayerWeights::FullAttention(layer) => layer.layer_index,
         };
-        let fused = self.mlp_fused_main(layer_idx)?;
-        self.run_mlp_fused_combined_gemm(common, fused, forward, None)
+        if let Some(fused) = self.mlp_fused_main_opt(layer_idx) {
+            return self.run_mlp_fused_combined_gemm(common, fused, forward, None);
+        }
+        self.linears_same_input(
+            forward.normed.ptr(),
+            &[
+                (&common.mlp_gate_proj, forward.aux.ptr()),
+                (&common.mlp_up_proj, forward.aux2.ptr()),
+            ],
+        )?;
+        self.backend.swiglu(&SwiGluSpec {
+            rows: 1,
+            intermediate: self.topology.intermediate_size,
+            gate_bf16: forward.aux.ptr(),
+            up_bf16: forward.aux2.ptr(),
+            output_bf16: forward.aux3.ptr(),
+        })?;
+        self.linear(
+            &common.mlp_down_proj,
+            forward.aux3.ptr(),
+            forward.hidden.ptr(),
+        )
     }
 
     #[cfg(feature = "cuda")]
@@ -3924,37 +4164,40 @@ impl<B: KernelBackend> Engine<B> {
             LayerWeights::LinearAttention(layer) => layer.layer_index,
             LayerWeights::FullAttention(layer) => layer.layer_index,
         };
-        let fused = self.mlp_fused_main(layer_idx)?;
-        self.run_mlp_fused_combined_gemm(common, fused, forward, Some(quantized))
-    }
-
-    #[cfg(feature = "cuda")]
-    fn mlp_fused_main(&self, layer_idx: usize) -> Result<&MlpFusedLayer> {
-        let store = self
-            .mlp_fused
-            .as_ref()
-            .ok_or_else(|| CoreError::Runtime("MLP fused store not initialised".to_owned()))?;
-        store.layers.get(layer_idx).ok_or_else(|| {
-            CoreError::Runtime(format!(
-                "MLP fused store missing main layer index {layer_idx}"
-            ))
-        })
-    }
-
-    #[cfg(feature = "cuda")]
-    fn linear_attn_in_proj_fused_layer(&self, layer_idx: usize) -> Result<&LinearAttnInProjFused> {
-        let store = self.linear_attn_in_proj_fused.as_ref().ok_or_else(|| {
-            CoreError::Runtime("DeltaNet in_proj fused store not initialised".to_owned())
+        if let Some(fused) = self.mlp_fused_main_opt(layer_idx) {
+            return self.run_mlp_fused_combined_gemm(common, fused, forward, Some(quantized));
+        }
+        self.linear_with_quantized_nvfp4(&common.mlp_gate_proj, forward.aux.ptr(), quantized)?;
+        self.linear_with_quantized_nvfp4(&common.mlp_up_proj, forward.aux2.ptr(), quantized)?;
+        self.backend.swiglu(&SwiGluSpec {
+            rows: 1,
+            intermediate: self.topology.intermediate_size,
+            gate_bf16: forward.aux.ptr(),
+            up_bf16: forward.aux2.ptr(),
+            output_bf16: forward.aux3.ptr(),
         })?;
-        store
+        self.linear(
+            &common.mlp_down_proj,
+            forward.aux3.ptr(),
+            forward.hidden.ptr(),
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn mlp_fused_main_opt(&self, layer_idx: usize) -> Option<&MlpFusedLayer> {
+        self.mlp_fused.as_ref()?.layers.get(layer_idx)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn linear_attn_in_proj_fused_layer_opt(
+        &self,
+        layer_idx: usize,
+    ) -> Option<&LinearAttnInProjFused> {
+        self.linear_attn_in_proj_fused
+            .as_ref()?
             .layers
             .get(layer_idx)
             .and_then(|entry| entry.as_ref())
-            .ok_or_else(|| {
-                CoreError::Runtime(format!(
-                    "DeltaNet in_proj fused store missing layer index {layer_idx}"
-                ))
-            })
     }
 
     #[cfg(feature = "cuda")]
@@ -4030,6 +4273,63 @@ impl<B: KernelBackend> Engine<B> {
             CoreError::Runtime(format!(
                 "fused DeltaNet in_proj GEMM failed (m={}, n=1, k={}): {err}",
                 fused.combined_out_features, quantized.in_features
+            ))
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_linear_attn_in_proj_fused_gemm_rows(
+        &self,
+        layer: &LinearAttentionLayerWeights,
+        fused: &LinearAttnInProjFused,
+        quantized: Nvfp4ActivationQuant<'_>,
+        output: DevicePtr,
+        rows: usize,
+        prefill: &GpuPrefillBuffers,
+    ) -> Result<()> {
+        let weights = self.cuda_weights()?;
+        let runtime = self.cuda_runtime()?;
+        let LinearWeightBinding::Nvfp4 {
+            tensor_scale: qkv_tensor_scale,
+            ..
+        } = &layer.in_proj_qkv
+        else {
+            return Err(CoreError::Runtime(
+                "fused DeltaNet in_proj requires NVFP4 in_proj_qkv".to_owned(),
+            ));
+        };
+        let workspace = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.ptr())
+            .unwrap_or(DevicePtr::NULL);
+        let workspace_bytes = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.bytes())
+            .unwrap_or(0);
+        let alpha = self.tensor_scalar_f32(weights, qkv_tensor_scale)?
+            * self.tensor_scalar_f32(weights, quantized.input_scale)?;
+        let gemm_spec = Nvfp4GemmSpec {
+            m: fused.combined_out_features,
+            n: rows,
+            k: quantized.in_features,
+            a_fp4: fused.combined_weight.ptr(),
+            a_scale: fused.combined_block_scale.ptr(),
+            a_scale_2: self.tensor_ptr(weights, qkv_tensor_scale)?,
+            b_fp4: prefill.activation_fp4.ptr(),
+            b_scale: prefill.activation_scale.ptr(),
+            b_scale_2: prefill.activation_scale_2.ptr(),
+            c_bf16: output,
+            workspace,
+            workspace_bytes,
+            alpha,
+            scale_mode: CublasLtFp4ScaleMode::Vec16Ue4m3,
+        };
+        self.backend.nvfp4_gemm(&gemm_spec).map_err(|err| {
+            CoreError::Runtime(format!(
+                "fused DeltaNet in_proj prefill GEMM failed (m={}, n={}, k={}): {err}",
+                fused.combined_out_features, rows, quantized.in_features
             ))
         })
     }
@@ -4154,6 +4454,103 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn run_mlp_fused_combined_gemm_rows(
+        &self,
+        common: &CommonLayerWeights,
+        fused: &MlpFusedLayer,
+        prefill: &GpuPrefillBuffers,
+        rows: usize,
+        pre_quantized: Option<Nvfp4ActivationQuant<'_>>,
+    ) -> Result<()> {
+        let weights = self.cuda_weights()?;
+        let runtime = self.cuda_runtime()?;
+        let intermediate = self.topology.intermediate_size;
+        let LinearWeightBinding::Nvfp4 {
+            weight: gate_weight,
+            tensor_scale: gate_tensor_scale,
+            input_scale: gate_input_scale,
+            ..
+        } = &common.mlp_gate_proj
+        else {
+            return Err(CoreError::Runtime(
+                "fused MLP prefill path requires NVFP4 gate_proj".to_owned(),
+            ));
+        };
+        let in_features = Self::nvfp4_in_features(gate_weight)?;
+        let quantized = match pre_quantized {
+            Some(q) => q,
+            None => {
+                let q = Nvfp4ActivationQuant {
+                    in_features,
+                    input_scale: gate_input_scale,
+                };
+                self.quantize_nvfp4_activation_rows(prefill.normed.ptr(), rows, q, prefill)?;
+                q
+            }
+        };
+
+        let workspace = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.ptr())
+            .unwrap_or(DevicePtr::NULL);
+        let workspace_bytes = runtime
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.bytes())
+            .unwrap_or(0);
+        let alpha = self.tensor_scalar_f32(weights, gate_tensor_scale)?
+            * self.tensor_scalar_f32(weights, quantized.input_scale)?;
+        self.backend.nvfp4_gemm(&Nvfp4GemmSpec {
+            m: fused.out_features,
+            n: rows,
+            k: quantized.in_features,
+            a_fp4: fused.combined_weight.ptr(),
+            a_scale: fused.combined_block_scale.ptr(),
+            a_scale_2: self.tensor_ptr(weights, gate_tensor_scale)?,
+            b_fp4: prefill.activation_fp4.ptr(),
+            b_scale: prefill.activation_scale.ptr(),
+            b_scale_2: prefill.activation_scale_2.ptr(),
+            c_bf16: prefill.block_out.ptr(),
+            workspace,
+            workspace_bytes,
+            alpha,
+            scale_mode: CublasLtFp4ScaleMode::Vec16Ue4m3,
+        })?;
+
+        self.backend.copy_strided_rows(&CopyStridedRowsSpec {
+            rows,
+            values: intermediate,
+            input_stride: 2 * intermediate,
+            output_stride: intermediate,
+            input_bf16: prefill.block_out.ptr(),
+            output_bf16: prefill.aux.ptr(),
+        })?;
+        self.backend.copy_strided_rows(&CopyStridedRowsSpec {
+            rows,
+            values: intermediate,
+            input_stride: 2 * intermediate,
+            output_stride: intermediate,
+            input_bf16: Self::ptr_offset(prefill.block_out.ptr(), intermediate * 2)?,
+            output_bf16: prefill.aux2.ptr(),
+        })?;
+        self.backend.swiglu(&SwiGluSpec {
+            rows,
+            intermediate,
+            gate_bf16: prefill.aux.ptr(),
+            up_bf16: prefill.aux2.ptr(),
+            output_bf16: prefill.aux3.ptr(),
+        })?;
+        self.linear_rows(
+            &common.mlp_down_proj,
+            prefill.aux3.ptr(),
+            prefill.hidden.ptr(),
+            rows,
+            prefill,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
     fn run_mlp_prefill(
         &self,
         layer: &LayerWeights,
@@ -4161,6 +4558,17 @@ impl<B: KernelBackend> Engine<B> {
         tokens: usize,
     ) -> Result<()> {
         let common = layer_common(layer);
+        let layer_idx = match layer {
+            LayerWeights::LinearAttention(layer) => layer.layer_index,
+            LayerWeights::FullAttention(layer) => layer.layer_index,
+        };
+        if cuda_prefill_fused_mlp_enabled()
+            && prefill.block_out.bytes() >= tokens * 2 * self.topology.intermediate_size * 2
+        {
+            if let Some(fused) = self.mlp_fused_main_opt(layer_idx) {
+                return self.run_mlp_fused_combined_gemm_rows(common, fused, prefill, tokens, None);
+            }
+        }
         self.linears_same_input_rows(
             prefill.normed.ptr(),
             &[
@@ -4195,6 +4603,23 @@ impl<B: KernelBackend> Engine<B> {
         quantized: Nvfp4ActivationQuant<'_>,
     ) -> Result<()> {
         let common = layer_common(layer);
+        let layer_idx = match layer {
+            LayerWeights::LinearAttention(layer) => layer.layer_index,
+            LayerWeights::FullAttention(layer) => layer.layer_index,
+        };
+        if cuda_prefill_fused_mlp_enabled()
+            && prefill.block_out.bytes() >= tokens * 2 * self.topology.intermediate_size * 2
+        {
+            if let Some(fused) = self.mlp_fused_main_opt(layer_idx) {
+                return self.run_mlp_fused_combined_gemm_rows(
+                    common,
+                    fused,
+                    prefill,
+                    tokens,
+                    Some(quantized),
+                );
+            }
+        }
         self.linear_with_quantized_nvfp4_rows(
             &common.mlp_gate_proj,
             prefill.aux.ptr(),
@@ -4840,18 +5265,34 @@ impl<B: KernelBackend> Engine<B> {
             .ok_or_else(|| CoreError::Runtime("CUDA pointer offset overflow".to_owned()))
     }
 
+    #[cfg(feature = "cuda")]
+    fn attention_kv_cache_dtype_code(dtype: KvCacheDtype) -> Result<i32> {
+        match dtype {
+            KvCacheDtype::Bf16 => Ok(0),
+            KvCacheDtype::Fp8 => Ok(1),
+            KvCacheDtype::TurboQuant3 | KvCacheDtype::TurboQuant35 => Err(CoreError::Runtime(
+                "TurboQuant KV cache is not wired into full CUDA prefill/decode yet".to_owned(),
+            )),
+        }
+    }
+
     /// Pick the split tile size for full-attention decode/prefill. 512 keeps
     /// launch/reduce overhead down at short contexts; 128 starts paying off
     /// around 1K context for MTP short-chunk attention; 64 exposes more
     /// T-axis parallelism once the graph shape reaches ~2K context on the 5090.
     #[cfg(feature = "cuda")]
     fn attention_split_timesteps_per_block(&self) -> usize {
+        self.attention_split_timesteps_per_block_for(self.config.max_context)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn attention_split_timesteps_per_block_for(&self, context: usize) -> usize {
         if let Some(value) = cuda_env_usize("QWEN36_ATTENTION_SPLIT_TIMESTEPS") {
             return value.max(ATTN_MIN_SPLIT_TIMESTEPS_PER_BLOCK);
         }
-        if self.config.max_context >= 2048 {
+        if context >= 2048 {
             ATTN_MIN_SPLIT_TIMESTEPS_PER_BLOCK
-        } else if self.config.max_context >= 1024 {
+        } else if context >= 1024 {
             128
         } else {
             512
@@ -4876,6 +5317,25 @@ impl<B: KernelBackend> Engine<B> {
             .config
             .max_context
             .div_ceil(self.attention_split_timesteps_per_block());
+        if n_splits >= 2 { n_splits } else { 0 }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn prefill_attention_n_splits(
+        &self,
+        context: usize,
+        start_position_device_i32: DevicePtr,
+    ) -> usize {
+        if start_position_device_i32 != DevicePtr::NULL {
+            return self.decode_attention_n_splits();
+        }
+        if cuda_env_bool("QWEN36_ATTENTION_SPLIT_DISABLE") {
+            return 0;
+        }
+        if let Some(value) = cuda_env_usize("QWEN36_PREFILL_ATTENTION_N_SPLITS") {
+            return value;
+        }
+        let n_splits = context.div_ceil(self.attention_split_timesteps_per_block_for(context));
         if n_splits >= 2 { n_splits } else { 0 }
     }
 
@@ -5104,23 +5564,39 @@ impl Engine<CudaBackend> {
         };
         let gpu_buffers = GpuRuntimeBuffers::allocate(
             &engine.state,
-            256 * 1024 * 1024,
+            cuda_env_workspace_bytes(),
             mtp_kv_cache_bytes,
             &engine.topology,
+            include_mtp && mtp_recurrent_snapshot_enabled(),
+            include_mtp && cuda_env_bool("QWEN36_MTP_SNAPSHOT_KV"),
         )?;
         let gpu_forward = GpuForwardBuffers::allocate(&engine.topology, engine.config.max_context)?;
-        let prefill_capacity = engine.config.max_context.min(512).max(1);
-        let gpu_prefill = GpuPrefillBuffers::allocate(&engine.topology, prefill_capacity)?;
-        let mlp_fused =
-            MlpFusedStore::build(&gpu_weights, &manifest, engine.topology.intermediate_size)?;
-        let linear_attn_in_proj_fused = LinearAttnInProjFusedStore::build(&gpu_weights, &manifest)?;
+        let prefill_capacity = cuda_prefill_capacity(engine.config.max_context);
+        let fused_mlp_prefill = cuda_prefill_fused_mlp_enabled() && cuda_mlp_fused_enabled();
+        let gpu_prefill =
+            GpuPrefillBuffers::allocate(&engine.topology, prefill_capacity, fused_mlp_prefill)?;
+        let mlp_fused = if cuda_mlp_fused_enabled() || cuda_prefill_fused_mlp_enabled() {
+            Some(MlpFusedStore::build(
+                &gpu_weights,
+                &manifest,
+                engine.topology.intermediate_size,
+            )?)
+        } else {
+            None
+        };
+        let linear_attn_in_proj_fused =
+            if cuda_linear_attn_fused_enabled() || cuda_prefill_fused_linear_attn_enabled() {
+                Some(LinearAttnInProjFusedStore::build(&gpu_weights, &manifest)?)
+            } else {
+                None
+            };
         engine.weights = Some(manifest);
         engine.gpu_weights = Some(gpu_weights);
         engine.gpu_buffers = Some(gpu_buffers);
         engine.gpu_forward = Some(gpu_forward);
         engine.gpu_prefill = Some(gpu_prefill);
-        engine.mlp_fused = Some(mlp_fused);
-        engine.linear_attn_in_proj_fused = Some(linear_attn_in_proj_fused);
+        engine.mlp_fused = mlp_fused;
+        engine.linear_attn_in_proj_fused = linear_attn_in_proj_fused;
         Ok(engine)
     }
 
@@ -5136,5 +5612,172 @@ impl Engine<CudaBackend> {
                 + self.gpu_forward.as_ref()?.total_bytes()
                 + self.gpu_prefill.as_ref()?.total_bytes(),
         )
+    }
+
+    pub fn gpu_memory_report(&self) -> Option<GpuMemoryReport> {
+        fn item(name: &str, bytes: u64) -> GpuMemoryItem {
+            GpuMemoryItem {
+                name: name.to_owned(),
+                bytes,
+            }
+        }
+        fn group(items: Vec<GpuMemoryItem>) -> GpuMemoryGroup {
+            let total_bytes = items.iter().map(|item| item.bytes).sum();
+            GpuMemoryGroup { total_bytes, items }
+        }
+
+        let weights = self.gpu_weights.as_ref()?;
+        let runtime = self.gpu_buffers.as_ref()?;
+        let forward = self.gpu_forward.as_ref()?;
+        let prefill = self.gpu_prefill.as_ref()?;
+
+        let weights_group = group(vec![item("uploaded_model_tensors", weights.total_bytes())]);
+
+        let runtime_group = group(vec![
+            item(
+                "kv_cache",
+                runtime
+                    .kv_cache
+                    .as_ref()
+                    .map(|buffer| buffer.bytes() as u64)
+                    .unwrap_or(0),
+            ),
+            item(
+                "mtp_kv_cache",
+                runtime
+                    .mtp_kv_cache
+                    .as_ref()
+                    .map(|buffer| buffer.bytes() as u64)
+                    .unwrap_or(0),
+            ),
+            item("deltanet_state", runtime.deltanet_state.bytes() as u64),
+            item(
+                "deltanet_checkpoint",
+                runtime
+                    .deltanet_checkpoint
+                    .as_ref()
+                    .map(|buffer| buffer.bytes() as u64)
+                    .unwrap_or(0),
+            ),
+            item("conv_history", runtime.conv_history.bytes() as u64),
+            item(
+                "conv_history_checkpoint",
+                runtime
+                    .conv_history_checkpoint
+                    .as_ref()
+                    .map(|buffer| buffer.bytes() as u64)
+                    .unwrap_or(0),
+            ),
+            item(
+                "mtp_kv_snapshot",
+                runtime
+                    .mtp_kv_snapshot
+                    .as_ref()
+                    .map(|buffer| buffer.bytes() as u64)
+                    .unwrap_or(0),
+            ),
+            item(
+                "workspace",
+                runtime
+                    .workspace
+                    .as_ref()
+                    .map(|buffer| buffer.bytes() as u64)
+                    .unwrap_or(0),
+            ),
+        ]);
+
+        let forward_group = group(vec![
+            item("hidden", forward.hidden.bytes() as u64),
+            item("residual", forward.residual.bytes() as u64),
+            item("normed", forward.normed.bytes() as u64),
+            item("block_out", forward.block_out.bytes() as u64),
+            item("qkv", forward.qkv.bytes() as u64),
+            item("aux", forward.aux.bytes() as u64),
+            item("aux2", forward.aux2.bytes() as u64),
+            item("aux3", forward.aux3.bytes() as u64),
+            item("gate_f32", forward.gate_f32.bytes() as u64),
+            item("beta_f32", forward.beta_f32.bytes() as u64),
+            item("activation_fp4", forward.activation_fp4.bytes() as u64),
+            item("activation_scale", forward.activation_scale.bytes() as u64),
+            item(
+                "activation_scale_2",
+                forward.activation_scale_2.bytes() as u64,
+            ),
+            item("token_u32", forward.token_u32.bytes() as u64),
+            item("position_i32", forward.position_i32.bytes() as u64),
+            item("logits", forward.logits.bytes() as u64),
+            item("mtp_logits", forward.mtp_logits.bytes() as u64),
+            item(
+                "sampled_token_u32",
+                forward.sampled_token_u32.bytes() as u64,
+            ),
+            item(
+                "mtp_verify_token_u32",
+                forward.mtp_verify_token_u32.bytes() as u64,
+            ),
+            item("attn_partial_acc", forward.attn_partial_acc.bytes() as u64),
+            item("attn_partial_max", forward.attn_partial_max.bytes() as u64),
+            item(
+                "attn_partial_denom",
+                forward.attn_partial_denom.bytes() as u64,
+            ),
+        ]);
+
+        let prefill_group = group(vec![
+            item("hidden", prefill.hidden.bytes() as u64),
+            item("residual", prefill.residual.bytes() as u64),
+            item("normed", prefill.normed.bytes() as u64),
+            item("block_out", prefill.block_out.bytes() as u64),
+            item("qkv", prefill.qkv.bytes() as u64),
+            item("aux", prefill.aux.bytes() as u64),
+            item("aux2", prefill.aux2.bytes() as u64),
+            item("aux3", prefill.aux3.bytes() as u64),
+            item("gate_f32", prefill.gate_f32.bytes() as u64),
+            item("beta_f32", prefill.beta_f32.bytes() as u64),
+            item("activation_fp4", prefill.activation_fp4.bytes() as u64),
+            item("activation_scale", prefill.activation_scale.bytes() as u64),
+            item(
+                "activation_scale_2",
+                prefill.activation_scale_2.bytes() as u64,
+            ),
+            item("token_u32", prefill.token_u32.bytes() as u64),
+            item("position_i32", prefill.position_i32.bytes() as u64),
+        ]);
+
+        let fused_group = group(vec![
+            item(
+                "mlp_fused_store",
+                self.mlp_fused
+                    .as_ref()
+                    .map(|store| store.total_bytes)
+                    .unwrap_or(0),
+            ),
+            item(
+                "linear_attn_in_proj_fused_store",
+                self.linear_attn_in_proj_fused
+                    .as_ref()
+                    .map(|store| store.total_bytes)
+                    .unwrap_or(0),
+            ),
+        ]);
+
+        let total_reported_bytes = weights_group.total_bytes
+            + runtime_group.total_bytes
+            + forward_group.total_bytes
+            + prefill_group.total_bytes
+            + fused_group.total_bytes;
+
+        Some(GpuMemoryReport {
+            total_reported_bytes,
+            weights: weights_group,
+            runtime: runtime_group,
+            forward: forward_group,
+            prefill: prefill_group,
+            fused: fused_group,
+            max_context: self.config.max_context,
+            prefill_capacity: prefill.capacity,
+            kv_cache_dtype: self.config.kv_cache_dtype,
+            mtp_speculative_tokens: self.config.mtp_speculative_tokens,
+        })
     }
 }

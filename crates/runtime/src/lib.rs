@@ -9,7 +9,9 @@ pub mod weights;
 pub use cuda_graph::{CudaGraphBucket, CudaGraphPlan};
 pub use engine::{Engine, EngineConfig, ForwardOutput};
 #[cfg(feature = "cuda")]
-pub use engine::{MtpMultiVerifyResult, MtpVerifyResult};
+pub use engine::{
+    GpuMemoryGroup, GpuMemoryItem, GpuMemoryReport, MtpMultiVerifyResult, MtpVerifyResult,
+};
 #[cfg(feature = "cuda")]
 pub use gpu::{GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers, GpuTensor, GpuWeightStore};
 pub use kv_cache::{KvCacheLayout, KvCachePlan};
