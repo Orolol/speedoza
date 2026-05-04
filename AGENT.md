@@ -191,6 +191,51 @@ caused by GPU contention (one MTP=4 run dropped to 75 tok/s). No
 performance-relevant code landed between the two benches; treat both
 as snapshots of the post-PR-#2 baseline.
 
+### 2026-05-04 — Tree-MTP α (P1.I) bench: NEGATIVE result
+
+Tree-MTP K>1 dispatch is fully wired: chat parity gate ✅ for K ∈ {1, 2,
+4} on `hello` / `hello world` (identical token streams to chain MTP=3).
+But the bench shows tree-MTP K>1 is dramatically slower than chain MTP
+on this hardware/architecture:
+
+| MTP | K | tok/s | leaf_accept_rate |
+|--|--|--|--|
+| 3 | 1 (chain fallback) | 110 | n/a |
+| 3 | 2 | 41 | 0.00 |
+| 3 | 4 | 27 | 0.00 |
+| 4 | 1 (chain fallback) | 123 | n/a |
+| 4 | 2 | 49 | 0.00 |
+
+**Root cause:** tree-MTP processes K leaves via single-token
+`forward_token_cuda` calls (one per leaf, full 64-layer forward each).
+At ~25 ms per single-token decode in WSL2, K=2 adds ~50 ms / cycle and
+K=4 adds ~100 ms / cycle. Chain MTP cycle is ~10 ms total. Per-cycle
+overhead dominates the +1 token gain by ~10×.
+
+**leaf_accept_rate = 0** is partly an artefact of the bench prompt (a
+synthetic "x" repeated 128 tokens — MTP head's top-K disagrees with
+the base model's argmax for the next position). Real prompts would
+show non-zero leaf accept, but the per-cycle overhead would still
+swamp the gain at this architecture.
+
+**Path to make tree-MTP profitable** — Phase 2 work:
+
+1. Batched leaf forward: process all K leaves through the model in ONE
+   chunk pass. Requires (a) tree-mask attention (already implemented in
+   `attention_prefill_kernel`, P1.D) PROPERLY USED in a custom
+   `prefill_cuda_chunk_tree` variant; (b) batched DeltaNet kernel that
+   fans K (state, output) pairs from one input state in a single launch.
+   This collapses the K × 25 ms cost to ~1 × 30 ms (~3 ms / leaf vs
+   25 ms / leaf today).
+2. Or: drop tree-MTP for this hardware and pivot to a different
+   optimisation track (NVFP4 gemv kernel for batch=1, PDL chains, etc.)
+
+**Phase 1 outcome:** infrastructure complete (top-K kernel, tree-mask
+attention path, walk_tree_acceptance v3, leaf buffers, per-leaf
+snapshots, verify_mtp_tree_draft α with MTP head KV advance + next-
+cycle pre-compute) and parity-validated. The infra stays useful for
+Phase 2; the perf gain is deferred to that scope.
+
 The current numbers reflect four decode-side optimisations that landed in this branch:
 
 1. **Combined gate + up FP4 GEMM** (`MlpFusedStore` in `crates/runtime/src/gpu.rs`). Pre-concatenates the gate_proj and up_proj NVFP4 weights along the output dim once at engine init; the decode path emits a single `(M=2·intermediate, N=1)` cuBLASLt FP4 GEMM instead of two. Only valid when every layer's gate/up share `weight_scale_2` and `input_scale` (validated at build time and confirmed for every layer of the shipped Qwen3.6 NVFP4 checkpoint).

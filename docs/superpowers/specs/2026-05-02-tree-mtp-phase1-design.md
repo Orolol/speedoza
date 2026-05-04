@@ -347,6 +347,83 @@ Bench reports both `accepted_chain / chain_depth` and `leaf_accepted_rate` to ma
 - `QWEN36_MTP_TREE_DISABLE=1` recovers exact pre-Phase-1 behaviour bit-for-bit.
 - `cargo clippy --workspace --features qwen36-fp4-kernels/cuda -- -D warnings` and the existing CUDA test suite stay green.
 
-## 15. Phase 1 outcome (filled in after P1.L)
+## 15. Phase 1 outcome (2026-05-04)
 
-_To be filled after bench measurements._
+**Infrastructure: complete and parity-validated ✅**
+
+All Phase 1 sub-tasks landed (P1.A → P1.L on `feat/perf-tree-mtp-stack`,
+~22 commits ahead of `main`):
+
+- P1.A — Top-K argmax CUDA kernel + Rust wrapper + smoke + tests.
+- P1.B — `walk_tree_acceptance` v3 + `TreeDraft`/`TreeVerifyResult`
+  types + 8 unit tests with shared `assert_committed_invariants`.
+- P1.C — Leaf token GPU buffer + `queue_sample_topk_into` engine helper.
+- P1.D — Tree-mask path in `attention_prefill_kernel` (ABI ext + kernel
+  + smoke for hand-built 4-row bitmap).
+- P1.E — `MtpKvSnapshotLayout::VERIFY_TOKENS` 5 → 13, tree ancestor
+  bitmap GPU buffer.
+- P1.F — `walk_tree_acceptance` v3 invariant fix (verified-after-leaf
+  in committed; `committed.last() == next_token` always).
+- P1.G — Per-leaf DeltaNet/conv snapshot buffers + 4 helpers,
+  `verify_mtp_tree_draft` host-launched orchestrator.
+- P1.I (revised α) — MTP head KV state advance + next-cycle pre-compute
+  (pre-cycle drafts via `generate_mtp_drafts_from_committed_prefill`,
+  leaf hidden-state D2D copy from `forward.normed` to
+  `prefill.normed[chain_depth+1]` before MTP advance).
+- P1.J — Hard parity gate ✅ (chat hello / hello world × MTP {0..4}
+  identical token streams).
+- P1.K — Skipped (parity validated end-to-end via P1.J).
+
+**Parity gate: ✅ PASS** for K ∈ {1, 2, 4} on `hello` / `hello world`,
+chain MTP=3 baseline.
+
+**Performance: NEGATIVE result.** Tree-MTP K>1 dispatch is dramatically
+slower than chain MTP on this hardware:
+
+| MTP | K | tok/s |
+|--|--|--|
+| 3 | 1 | 110 (chain fallback) |
+| 3 | 2 | 41 |
+| 3 | 4 | 27 |
+| 4 | 1 | 123 (chain fallback) |
+| 4 | 2 | 49 |
+
+**Root cause** (matches the analysis dismissed as "option β" in the
+P1.G design discussion): each leaf is processed via a single-token
+`forward_token_cuda` (~25 ms full 64-layer forward in WSL2). K=2 adds
+~50 ms / cycle, K=4 adds ~100 ms / cycle, swamping the chain MTP cycle
+time of ~10 ms.
+
+**leaf_accept_rate = 0** on the synthetic bench prompt ("x" repeated
+128 tokens) because MTP head's top-K disagrees with the base model's
+argmax for the next position. Real prompts would show non-zero leaf
+accept, but the per-cycle overhead would still swamp any gain at this
+architecture.
+
+**Path to make tree-MTP profitable** — Phase 2 work:
+
+1. **Batched leaf forward** in a single chunk pass. Use the tree-mask
+   `attention_prefill_kernel` (already implemented in P1.D) inside a
+   custom `prefill_cuda_chunk_tree` variant that processes chain + all
+   K leaves as one (1 + chain + K)-row chunk. For full-attention layers
+   the tree mask handles per-leaf isolation. For DeltaNet layers, add a
+   batched `qwen36_deltanet_decode_tree` kernel that fans K (state,
+   output) pairs from one input state in a single launch.
+2. With (1), leaf cost collapses from K × 25 ms to ~1 × 30 ms (one
+   chunk pass for all K leaves, ~3 ms / leaf). At K=4 that's ~10 ms
+   extra per cycle vs the +1 token gain, finally net positive.
+3. The current `verify_mtp_tree_draft` α implementation can be dropped
+   in favour of the proper batched path. The MTP head KV advance logic
+   (next_chain_drafts / next_leaf_drafts pre-compute) carries over.
+
+**Recommendation:** ship Phase 1 to `main` as infrastructure, kill the
+tree dispatch by leaving `--mtp-tree-leaves` defaulted to 1 (chain
+fallback). Schedule Phase 2 as a separate work item once batched
+DeltaNet kernel design is ready.
+
+If user opts to pivot away from tree-MTP entirely: the top-K kernel +
+walk_tree_acceptance v3 + leaf buffers / snapshots remain useful
+infrastructure for any speculative-decoding extension, including
+EAGLE-2-style multi-level trees. The wasted work is the
+`verify_mtp_tree_draft` orchestrator (~200 lines in engine.rs) — easy
+to rip out if needed.
