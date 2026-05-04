@@ -362,8 +362,21 @@ fn run_chat(
     }];
     let prompt_tokens = tokenizer.encode_chat(&messages, true)?;
     let mtp_schedule = mtp_schedule(mtp_speculative_tokens, prompt_tokens.len());
+    // Tree-MTP needs ~1 extra K/V slot per cycle (canonical leaf slot beyond
+    // the chain). At chain_depth=3 each cycle uses chain_depth + 2 = 5 slots
+    // vs chain MTP's chain_depth + 1 = 4. Add a 25% headroom to max_context
+    // when tree mode is active to avoid running out before max_new_tokens.
+    let tree_context_overhead = if mtp_tree_leaves > 1 {
+        max_new_tokens / 4 + 8
+    } else {
+        0
+    };
     let config = EngineConfig {
-        max_context: prompt_tokens.len().saturating_add(max_new_tokens).max(1),
+        max_context: prompt_tokens
+            .len()
+            .saturating_add(max_new_tokens)
+            .saturating_add(tree_context_overhead)
+            .max(1),
         kv_cache_dtype: KvCacheDtype::Bf16,
         mtp_speculative_tokens: mtp_schedule.effective_tokens,
         ..EngineConfig::default()
@@ -926,8 +939,17 @@ fn run_bench(
     let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
     let prompt_tokens = synthetic_prompt_tokens(&tokenizer, &token_text, prompt_token_count)?;
     let mtp_schedule = mtp_schedule(mtp_speculative_tokens, prompt_tokens.len());
+    let tree_context_overhead = if mtp_tree_leaves > 1 {
+        max_new_tokens / 4 + 8
+    } else {
+        0
+    };
     let config = EngineConfig {
-        max_context: prompt_tokens.len().saturating_add(max_new_tokens).max(1),
+        max_context: prompt_tokens
+            .len()
+            .saturating_add(max_new_tokens)
+            .saturating_add(tree_context_overhead)
+            .max(1),
         kv_cache_dtype: KvCacheDtype::Bf16,
         mtp_speculative_tokens: mtp_schedule.effective_tokens,
         ..EngineConfig::default()
