@@ -1275,8 +1275,14 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     /// Snapshot the current DeltaNet state + conv history into per-leaf
-    /// checkpoint slot j. Used in tree-MTP after each leaf is processed.
+    /// checkpoint slot j. Reserved for Phase 2 batched-leaf tree-MTP path
+    /// where each leaf's resulting state is captured for a later restore on
+    /// the accepted leaf. Currently UNUSED by the Phase 1 α
+    /// `verify_mtp_tree_draft` (which restores from chain_end before each
+    /// leaf and re-runs the accepted leaf at the end). Allow `dead_code`
+    /// while we keep the infra for the upcoming batched path.
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     fn mtp_snapshot_to_leaf(&self, leaf_idx: usize) -> Result<()> {
         use qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES;
         if leaf_idx >= MTP_TREE_MAX_LEAVES {
@@ -1297,7 +1303,10 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     /// Restore DeltaNet state + conv history from per-leaf checkpoint slot j.
+    /// Reserved for Phase 2 batched-leaf tree-MTP. Currently UNUSED by α
+    /// (see `mtp_snapshot_to_leaf` doc-comment).
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
     fn mtp_restore_from_leaf(&self, leaf_idx: usize) -> Result<()> {
         use qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES;
         if leaf_idx >= MTP_TREE_MAX_LEAVES {
@@ -2197,8 +2206,14 @@ impl<B: KernelBackend> Engine<B> {
             // recover_after_mtp_multi_reject already advances state.position.
         }
 
-        // Sample top-K leaves from forward.logits which now holds the LAST MTP
-        // head step's logits (the one that produced result.next_chain_drafts.last()).
+        // Sample top-K leaves from forward.logits. The guard
+        // `!result.next_chain_drafts.is_empty()` is what keeps this safe:
+        // when generate_mtp_drafts_from_committed_prefill (or the recovery
+        // path that delegates to it) actually ran, it left forward.logits
+        // holding the LAST MTP head step's logits — exactly what we want
+        // for top-K leaf sampling. If next_chain_drafts is empty, that
+        // primitive was a no-op and forward.logits is stale (whichever
+        // unrelated kernel last wrote it), so skip sampling.
         if leaf_count > 0 && !result.next_chain_drafts.is_empty() {
             let leaf_buffer = self.cuda_forward()?.leaf_tokens_u32.ptr();
             self.queue_sample_topk_into(leaf_buffer, leaf_count)?;
@@ -2233,7 +2248,15 @@ impl<B: KernelBackend> Engine<B> {
             self.verify_mtp_draft_tokens(current_token, chain_tokens, true, next_draft_count)?;
 
         let accepted_chain = chain_result.accepted_drafts;
-        let next_token = chain_result.next_token.unwrap_or(0);
+        // Fail loudly rather than silently substituting token 0 (a real
+        // BOS-like token in Qwen vocab); a missing next_token here would mean
+        // the underlying chain MTP returned no result on a path where it
+        // promised one.
+        let next_token = chain_result.next_token.ok_or_else(|| {
+            CoreError::Runtime(
+                "tree-MTP kill-switch fallback: chain MTP returned no next_token".into(),
+            )
+        })?;
         let mut committed: Vec<u32> = Vec::with_capacity(accepted_chain + 1);
         for chain_token in chain_tokens.iter().take(accepted_chain).copied() {
             committed.push(chain_token);

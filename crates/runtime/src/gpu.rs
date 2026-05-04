@@ -630,10 +630,11 @@ impl GpuRuntimeBuffers {
             },
             deltanet_leaf_checkpoints: (0..qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES)
                 .map(|_| {
-                    CudaDeviceBuffer::zeroed(usize_from_u64(
-                        state.deltanet.total_state_bytes,
-                        "DeltaNet state",
-                    )?)
+                    let bytes = usize_from_u64(state.deltanet.total_state_bytes, "DeltaNet state")?;
+                    // .max(1): models with no DeltaNet (full-attention-only)
+                    // would otherwise hit a zero-byte alloc rejection. Mirrors
+                    // the conv_history_leaf_checkpoints defense below.
+                    CudaDeviceBuffer::zeroed(bytes.max(1))
                 })
                 .collect::<Result<Vec<_>>>()?,
             conv_history_leaf_checkpoints: (0..qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES)
