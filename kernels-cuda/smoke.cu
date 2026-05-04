@@ -598,6 +598,23 @@ int main() {
   expect_close(gemm_values[0], 132.0f, 4.0f, "nvfp4 gemm[0]");
   expect_close(gemm_values[gemm_m - 1], 132.0f, 4.0f, "nvfp4 gemm[last]");
 
+  // Direction B Phase B1 smoke: the decode_gemv entry point must exist,
+  // accept a well-formed spec, and return NOT_IMPLEMENTED (5) so the Rust
+  // dispatcher falls back. When the kernel body lands (Phase B2) the test
+  // for the supported shape regime moves below; this case stays as the
+  // unsupported-shape probe.
+  qwen36_nvfp4_gemm_spec_t gemv_b1_spec = gemm_spec;
+  gemv_b1_spec.m = gemm_m + 1;  // deliberately not multiple of 128
+  gemv_b1_spec.n = 1;
+  int gemv_b1_code = qwen36_decode_nvfp4_gemv(&gemv_b1_spec);
+  if (gemv_b1_code != QWEN36_STATUS_NOT_IMPLEMENTED) {
+    fprintf(stderr,
+            "decode_gemv B1 expected NOT_IMPLEMENTED (5) for unsupported "
+            "shape, got %d\n",
+            gemv_b1_code);
+    return 1;
+  }
+
   qwen36_device_ptr_t conv_input = dev_alloc<__nv_bfloat16>(1);
   qwen36_device_ptr_t conv_history = dev_alloc<__nv_bfloat16>(3);
   qwen36_device_ptr_t conv_weight = dev_alloc<__nv_bfloat16>(4);
