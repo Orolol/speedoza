@@ -1140,6 +1140,51 @@ impl<B: KernelBackend> Engine<B> {
         Ok(drafts)
     }
 
+    /// Like `prepare_mtp_drafts_from_sampled` but additionally returns K
+    /// top-K leaf candidates from the MTP head's LAST recursive step.
+    /// Used for tree-MTP: the chain (top-1 each step) drives the speculative
+    /// chain, while the leaves are alternative candidates for the last
+    /// position so `verify_mtp_tree_draft` can accept any of K matches.
+    #[cfg(feature = "cuda")]
+    pub fn prepare_mtp_drafts_with_leaves(
+        &self,
+        prompt_tokens: &[u32],
+        sampled_token: u32,
+        chain_depth: usize,
+        leaf_count: usize,
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        // Generate chain via the existing path.
+        let chain =
+            self.prepare_mtp_drafts_from_sampled(prompt_tokens, sampled_token, chain_depth)?;
+
+        if leaf_count <= 1 {
+            // K=1: the single leaf is the top-1 = chain.last().
+            let leaf = chain.last().copied().ok_or_else(|| {
+                CoreError::Runtime("prepare_mtp_drafts_with_leaves: chain empty".into())
+            })?;
+            return Ok((chain, vec![leaf]));
+        }
+
+        // After prepare_mtp_drafts_from_sampled returns, the forward logits
+        // buffer holds the LAST MTP head step's logits (the one that produced
+        // chain.last()). Sample top-K from those same logits to get the K leaf
+        // candidates. The top-1 leaf equals chain.last() — intentional.
+        let leaf_buf_ptr = self.cuda_forward()?.leaf_tokens_u32.ptr();
+        self.queue_sample_topk_into(leaf_buf_ptr, leaf_count)?;
+
+        // D2H read the K leaf token IDs.
+        let mut leaf_bytes = vec![0u8; leaf_count * 4];
+        self.cuda_forward()?
+            .leaf_tokens_u32
+            .copy_to_host(&mut leaf_bytes)?;
+        let leaves: Vec<u32> = leaf_bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+
+        Ok((chain, leaves))
+    }
+
     /// Snapshot the runtime state needed to roll back an MTP verify chunk if
     /// a draft is rejected. Captures DeltaNet recurrent state and the conv1d
     /// history buffer by default. K/V slices are intentionally skipped on the
