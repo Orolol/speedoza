@@ -598,6 +598,20 @@ int main() {
   expect_close(gemm_values[0], 132.0f, 4.0f, "nvfp4 gemm[0]");
   expect_close(gemm_values[gemm_m - 1], 132.0f, 4.0f, "nvfp4 gemm[last]");
 
+  // Direction B Phase B2 smoke: gemv-shaped (n=1) call against the same
+  // planted-weight tensors used by the qwen36_nvfp4_gemm probe above.
+  // The expected per-row output is the same value (132.0) since the
+  // activation column is identical to the n=0 column of the GEMM input.
+  qwen36_nvfp4_gemm_spec_t gemv_b2_spec = gemm_spec;
+  gemv_b2_spec.n = 1;
+  must_status(qwen36_decode_nvfp4_gemv(&gemv_b2_spec), "decode_gemv b2");
+  // The planted output tensor was overwritten by the gemv call; re-read
+  // and validate the first / last rows.
+  std::vector<float> gemv_b2_values = read_bf16(gemm_spec.c_bf16, gemm_m);
+  expect_close(gemv_b2_values[0], 132.0f, 4.0f, "decode_gemv b2[0]");
+  expect_close(gemv_b2_values[gemm_m - 1], 132.0f, 4.0f,
+               "decode_gemv b2[last]");
+
   // Direction B Phase B1 smoke: the decode_gemv entry point must exist,
   // accept a well-formed spec, and return NOT_IMPLEMENTED (5) so the Rust
   // dispatcher falls back. When the kernel body lands (Phase B2) the test
