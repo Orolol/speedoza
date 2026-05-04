@@ -4,7 +4,7 @@ set -euo pipefail
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 NVCC="${NVCC:-${CUDA_HOME}/bin/nvcc}"
 OUT_DIR="${OUT_DIR:-target/cuda}"
-SM="${QWEN36_FP4_SM:-120}"
+SM="${QWEN36_FP4_SM:-120a}"
 
 mkdir -p "${OUT_DIR}"
 
