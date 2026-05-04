@@ -20,6 +20,11 @@
 
 #include <cutlass/cutlass.h>
 #include <cutlass/version.h>
+// `<cutlass/cutlass.h>` does NOT transitively pull in arch/config.h, so the
+// CUTLASS_ARCH_MMA_SM12x_SUPPORTED macros stay undefined and the #if below
+// silently falls through to the NOT_IMPLEMENTED branch. Include it
+// explicitly so the SM120 path is actually compiled.
+#include <cutlass/arch/config.h>
 
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) ||                                \
     defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
@@ -56,12 +61,16 @@ using ElementAccumulator = float;
 using ArchTag = cutlass::arch::Sm120;
 using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 
-// Phase B2 tile shape: 128×8×128. N=8 is the smallest supported by the
-// SM120 FP4 MMA atom (m16n8k64); we mask the unused N=1..7 in the
-// epilogue. This minimises padding waste vs. the megakernel's 128×128×128
-// (which is ~16× over-allocated on N at N=1). Persistent grid + warp
-// specialisation land in Phase B3.
-using ThreadBlockShape = cute::Shape<cute::_128, cute::_8, cute::_128>;
+// Phase B2 tile shape: 128×128×128. The Direction B spec calls for a
+// narrower N tile (e.g. 128×8×128) to match the FP4 MMA atom's natural
+// N=8 — but the SM120 BlockScaledMma builder + cooperative scheduler
+// statically rejects N<128 ("Invalid tile shape N." +
+// "EPI_TILE_N must divide CTA_N"). Phase B3 will switch to a different
+// schedule (warp-specialised non-cooperative or a hand-rolled persistent
+// kernel) that admits a smaller N tile; until then we use the same
+// baseline tile as the Mirage megakernel and rely on CUTLASS's epilogue
+// masking for N=1.
+using ThreadBlockShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
 using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
 
 using CollectiveEpilogue =
@@ -124,6 +133,17 @@ extern "C" int qwen36_decode_nvfp4_gemv(
   if (spec->n != 1 || (spec->m % 128) != 0 || (spec->k % 128) != 0) {
     return QWEN36_STATUS_NOT_IMPLEMENTED;
   }
+  // BLOCKER: see docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md
+  // The CUTLASS SM120 BlockScaled cooperative scheduler cannot serve N=1:
+  //   - TMA requires output stride alignment that N=1 violates (run-time
+  //     assertion `(gmem_prob_stride[1] & 0b1111) == 0` in
+  //     cute/atom/copy_traits_sm90_tma.hpp).
+  //   - Cluster builder rejects N<128 ("Invalid tile shape N." +
+  //     "EPI_TILE_N must divide CTA_N") so we cannot use a smaller N tile.
+  // Until B3 swaps in a non-TMA / smaller-N schedule (or a hand-rolled
+  // kernel), this path stays soft-disabled so the dispatcher routes to
+  // cuBLASLt unchanged.
+  return QWEN36_STATUS_NOT_IMPLEMENTED;
 
   using namespace cute;
 
