@@ -488,6 +488,14 @@ int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 // kernel does not yet specialise; the Rust dispatcher then falls back
 // to the cuBLASLt path. See `docs/mirage-megakernel.md`.
 int qwen36_megakernel_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
+// Direction B decode-time NVFP4 gemv: hand-written kernel optimised for the
+// (M, N=1, K) shapes that dominate decode. Reuses `qwen36_nvfp4_gemm_spec_t`.
+// Returns QWEN36_STATUS_NOT_IMPLEMENTED (5) for shapes outside the supported
+// set (M%128==0, K%128==0, N==1); the Rust dispatcher falls back to the
+// existing megakernel/cuBLASLt path on that code, mirroring the Mirage
+// pattern. Gated by `QWEN36_DECODE_GEMV=1`. See
+// `docs/superpowers/specs/2026-05-04-direction-b-nvfp4-gemv-design.md`.
+int qwen36_decode_nvfp4_gemv(const qwen36_nvfp4_gemm_spec_t *spec);
 int qwen36_bf16_gemm(const qwen36_bf16_gemm_spec_t *spec);
 int qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec);
 int qwen36_deltanet_decode(const qwen36_deltanet_decode_spec_t *spec);
