@@ -152,9 +152,10 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
   const unsigned lane = threadIdx.x & 31;
   const size_t m_base =
       static_cast<size_t>(blockIdx.x) * kRowsPerBlock + warp_id * kRowsPerWarp;
-  // NOTE: do NOT early-return here — every thread must reach the
-  // cooperative __syncthreads() below. The per-warp m_base >= M gate
-  // is applied after the smem load (see "tail rows" handling below).
+  // NOTE: do NOT early-return for `m_base >= M` — every thread must reach
+  // every __syncthreads() in this kernel (cooperative B load + per-K-chunk
+  // cooperative A-tile load). Tail rows are zero-filled in the cooperative
+  // A load and discarded by the epilogue bound checks.
 
   const size_t packed_cols = K / 2;       // bytes per fp4 row
   const size_t scale_cols = K / 16;       // scale groups per row
@@ -167,11 +168,16 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
   // (one per active lane group). Hoisting into smem cuts that to one
   // gmem read per byte, per CTA.
   //
-  // The kernel is launched with dynamic shared memory of size K/2 bytes.
+  // The kernel is launched with dynamic shared memory of size
+  // K/2 + 2048 bytes:
+  //   - K/2 bytes for the activation column (B operand).
+  //   - 2048 bytes for the per-K-chunk A-operand tile (64 rows × 32 bytes).
   // The MMA gate guarantees K % 64 == 0, so K/2 is a multiple of 32 (in
   // particular a multiple of 16) — the uint4 stride below covers the
   // whole buffer with no tail.
-  extern __shared__ uint8_t smem_b_fp4[];
+  extern __shared__ uint8_t smem[];
+  uint8_t *smem_b_fp4 = smem;            // K/2 bytes
+  uint8_t *smem_a_tile = smem + K / 2;   // 2048 bytes (64 rows × 32 bytes)
   {
     const size_t b_bytes = packed_cols;
     const size_t b_vecs = b_bytes / 16;  // K/2 % 16 == 0 (K % 64 == 0)
@@ -183,12 +189,6 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
   }
   __syncthreads();
 
-  // Tail rows: in the last CTA, some warps may be past M. They've already
-  // contributed to the cooperative load; now skip the per-warp MMA work.
-  if (m_base >= M) {
-    return;
-  }
-
   // Lane decomposition for the operand layouts (canonical m16n8k* form).
   const unsigned t0 = lane & 3u;
   const unsigned t1 = lane >> 2;
@@ -197,7 +197,15 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
   const unsigned t0_sf_a = lane & 1u;
   const unsigned t2_sf_a = lane >> 2;
   const unsigned m_row_sf = 8u * t0_sf_a + t2_sf_a;
-  const size_t a_row_for_sf = m_base + m_row_sf;
+  // Clamp to the last valid row for tail warps (m_base >= M). Such warps
+  // still participate in the cooperative A-tile sync below, so they must
+  // execute the K loop; we route their SFA read to a safe row to avoid
+  // OOB gmem fetches. Their MMA output is discarded by the epilogue
+  // bound check (`row_lo < M` / `row_hi < M`), and their A-tile rows are
+  // zero-filled by the cooperative load below.
+  const size_t a_row_for_sf_raw = m_base + m_row_sf;
+  const size_t a_row_for_sf =
+      a_row_for_sf_raw < M ? a_row_for_sf_raw : (M - 1);
 
   // SFB at N=1: outer is always 0, no n-decomposition needed.
 
@@ -211,39 +219,76 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
   (void)a_tensor_scale;
   (void)b_tensor_scale;
 
-  // Row pointers for the two A sub-tiles owned by this lane.
-  const size_t a_row0 = m_base + t1;        // for A[0], A[2]
-  const size_t a_row1 = m_base + t1 + 8u;   // for A[1], A[3]
-  const uint8_t *a_row0_ptr = a_fp4 + a_row0 * packed_cols;
-  const uint8_t *a_row1_ptr = a_fp4 + a_row1 * packed_cols;
+  // ---- Per-lane smem row pointers into the A-tile (64 rows × 32 B). ----
+  // Tile is row-major: row r occupies bytes [r*32, r*32+32).
+  // Lane L's two A sub-rows are at warp-local rows (warp_id*16 + t1) and
+  // (warp_id*16 + t1 + 8). Byte offsets within row: 4*t0 (v0) and
+  // 4*t0 + 16 (v1) — same per-lane mapping as the previous gmem path.
+  const uint8_t *smem_a_row0 =
+      smem_a_tile + (warp_id * 16u + t1) * 32u;
+  const uint8_t *smem_a_row1 =
+      smem_a_tile + (warp_id * 16u + t1 + 8u) * 32u;
+  const unsigned a_off_v0 = 4u * t0;        // bytes within row, v1=0
+  const unsigned a_off_v1 = 4u * t0 + 16u;  // bytes within row, v1=1
 
   float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
 
   // K chunk index stride is fixed: 4 scale groups per chunk.
   const size_t k_chunks = K / kKPerMma;
 
+  // Cooperative A-tile load mapping (computed once outside the loop):
+  // 128 threads cover the 64-row × 32-byte tile as 128 × uint4 (16 B each).
+  //   row_in_tile = tid / 2,  byte_off_in_row = (tid % 2) * 16
+  const unsigned tid = threadIdx.x;
+  const unsigned a_load_row_in_tile = tid >> 1;
+  const unsigned a_load_byte_off = (tid & 1u) << 4;  // 0 or 16
+  const size_t a_load_global_row =
+      static_cast<size_t>(blockIdx.x) * kRowsPerBlock + a_load_row_in_tile;
+  const bool a_load_row_valid = a_load_global_row < M;
+  const uint8_t *a_load_row_ptr =
+      a_load_row_valid ? (a_fp4 + a_load_global_row * packed_cols) : nullptr;
+
   for (size_t kc = 0; kc < k_chunks; ++kc) {
     const size_t k_byte_base = kc * (kKPerMma / 2);  // 32 bytes per chunk
     const size_t k_group_base = kc * 4;              // 4 scale groups / chunk
 
+    // ---- Cooperative gmem→smem stage of the A tile for this K chunk. ----
+    // Each thread loads one uint4 (16 bytes). Tail rows (global_row >= M)
+    // are zero-filled so subsequent MMA reads see benign data. The sync
+    // below is mandatory: lanes read smem rows owned by other warps.
+    {
+      uint4 chunk;
+      if (a_load_row_valid) {
+        chunk = *reinterpret_cast<const uint4 *>(
+            a_load_row_ptr + k_byte_base + a_load_byte_off);
+      } else {
+        chunk = make_uint4(0u, 0u, 0u, 0u);
+      }
+      *reinterpret_cast<uint4 *>(smem_a_tile + tid * 16u) = chunk;
+    }
+    __syncthreads();
+
     // ---- A operand: 4 uint32, each = 4 bytes = 8 fp4 elements. ----
-    const size_t a_byte_off_v0 = k_byte_base + 4u * t0;        // v1=0
-    const size_t a_byte_off_v1 = k_byte_base + 4u * t0 + 16u;  // v1=1
+    // Now sourced from the smem tile staged above. Same bytes that the
+    // previous gmem path produced — the per-lane register layout fed
+    // into the MMA is byte-identical to B3.3.0.
     uint32_t a0 =
-        *reinterpret_cast<const uint32_t *>(a_row0_ptr + a_byte_off_v0);
+        *reinterpret_cast<const uint32_t *>(smem_a_row0 + a_off_v0);
     uint32_t a1 =
-        *reinterpret_cast<const uint32_t *>(a_row1_ptr + a_byte_off_v0);
+        *reinterpret_cast<const uint32_t *>(smem_a_row1 + a_off_v0);
     uint32_t a2 =
-        *reinterpret_cast<const uint32_t *>(a_row0_ptr + a_byte_off_v1);
+        *reinterpret_cast<const uint32_t *>(smem_a_row0 + a_off_v1);
     uint32_t a3 =
-        *reinterpret_cast<const uint32_t *>(a_row1_ptr + a_byte_off_v1);
+        *reinterpret_cast<const uint32_t *>(smem_a_row1 + a_off_v1);
 
     // ---- B operand: 2 uint32. Single activation column at N=1. ----
     // Reads from smem (cooperative load above); same bytes as gmem.
+    const size_t b_byte_off_v0 = k_byte_base + 4u * t0;
+    const size_t b_byte_off_v1 = k_byte_base + 4u * t0 + 16u;
     uint32_t b0 =
-        *reinterpret_cast<const uint32_t *>(smem_b_fp4 + a_byte_off_v0);
+        *reinterpret_cast<const uint32_t *>(smem_b_fp4 + b_byte_off_v0);
     uint32_t b1 =
-        *reinterpret_cast<const uint32_t *>(smem_b_fp4 + a_byte_off_v1);
+        *reinterpret_cast<const uint32_t *>(smem_b_fp4 + b_byte_off_v1);
 
     // ---- Optimization 1: SFA/SFB coalesced as one uint32 each. ----
     // For fixed `outer` and varying g ∈ {0,1,2,3}, vec16_scale_offset
@@ -269,6 +314,9 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
                              b0, b1,
                              acc0, acc1, acc2, acc3,
                              sfa, sfb);
+
+    // Sync before the next iteration's cooperative load reuses smem_a_tile.
+    __syncthreads();
   }
 
   // Epilogue: lanes with t0==0 hold the n=0 column. D[0] is row t1,
@@ -319,10 +367,13 @@ extern "C" int qwen36_decode_nvfp4_gemv(
                   1);
 
   cudaStream_t stream = qwen36_internal_active_stream();
-  // Dynamic smem holds the activation column (K/2 packed-fp4 bytes).
-  // Default per-block smem cap on SM_120 is 48 KiB; K up to ~96k would
-  // fit, far above any realistic decode K (max here ~17408 → 8704 B).
-  const size_t smem_bytes = K / 2;
+  // Dynamic smem layout:
+  //   - K/2 bytes for the activation column (B operand).
+  //   - 2048 bytes for the per-K-chunk A-operand staging tile
+  //     (kRowsPerBlock = 64 rows × 32 bytes = 2048 B).
+  // Default per-block smem cap on SM_120 is 48 KiB. At K=17408 this
+  // totals 8704 + 2048 = 10752 B, far below the cap.
+  const size_t smem_bytes = K / 2 + 2048;
   nvfp4_gemv_mma_kernel<<<grid, block, smem_bytes, stream>>>(
       as_device_ptr<const uint8_t>(spec->a_fp4),
       as_device_ptr<const uint8_t>(spec->a_scale),
