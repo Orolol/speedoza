@@ -100,18 +100,29 @@ The active optimization track is single-GPU RTX 5090 throughput for exactly `sak
 
 ### Direction B decode_gemv (NVFP4 N=1 hand-rolled gemv)
 
-`QWEN36_DECODE_GEMV=1` (default OFF) routes the decode-time NVFP4 GEMMs at gemv shape (`n=1, m%16==0, k%64==0`) through a hand-rolled tensor-core kernel built on the SM_120a `mma.kind::mxf4nvf4.scale_vec::4X.m16n8k64` atom (`kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu`). Soft-fallback to cuBLASLt for any unsupported shape via the existing dispatch in `crates/kernels/src/backend.rs`. Build script defaults to `-arch=sm_120a` (mandatory for the FP4 block-scaled MMA PTX).
+`QWEN36_DECODE_GEMV=1` (default OFF) routes the decode-time NVFP4 GEMMs at gemv shape through a hand-rolled tensor-core kernel built on the SM_120a `mma.kind::mxf4nvf4.scale_vec::4X.m16n8k64` atom (`kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu`). Soft-fallback to cuBLASLt for any unsupported shape via the existing dispatch in `crates/kernels/src/backend.rs`. Build script defaults to `-arch=sm_120a` (mandatory for the FP4 block-scaled MMA PTX).
 
-Hard parity gate (Phase B3.1, commit `3fab622`): `chat --prompt "hello" / "hello world" --max-new-tokens 12 --mtp-speculative-tokens {0..4}` matches the cuBLASLt baseline byte-for-byte for all 10 combinations.
+Supported regime (B3.4 split-K): `n==1 && m%16==0 && k%256==0`. The k%256 constraint comes from K being sharded into 4 equal pieces (one per warp), each a multiple of the kKPerMma=64 inner-loop chunk. Realistic decode K values (5120, 8192, 17408) all satisfy.
 
-Bench (`bench --prompt-tokens 128 --max-new-tokens 128`, 2026-05-05, after B3.3.0 commit `c20fc6b` adds smem activation cache + coalesced SF loads):
+Hard parity gate: `chat --prompt "hello" / "hello world" --max-new-tokens 12 --mtp-speculative-tokens {0..4}` matches the cuBLASLt baseline byte-for-byte for all 10 combinations (re-verified after B3.4 split-K, commit `502bab2`).
 
-| Mode  | cuBLASLt | gemv (B3.3.0) | Δ |
-|-------|----------|---------------|---|
-| MTP=0 | 43.80 tok/s | 26.87 tok/s | -38.7% |
-| MTP=4 | 124.80 tok/s | 125.35 tok/s | +0.4% (parity, within noise) |
+Bench (`bench --prompt-tokens 128 --max-new-tokens 128`, 2026-05-05):
 
-The MTP=0 gap remains structural — scattered weight loads, no pipelining, no persistent grid, and 7/8 wasted MMA N-columns at N=1. Closing it needs B3.3.1 (LDSM for weights via `SM100_SU4_DU8x16_x4_LDSM_N`), B3.3.2 (cp.async double-buffering), and B3.3.3 (persistent grid). MTP=4 already at parity because per-call overhead amortizes across the 5 verified+main tokens per chain step. Plan in `docs/superpowers/plans/2026-05-04-direction-b-nvfp4-gemv-b3.md`.
+| Mode  | cuBLASLt | gemv (B3.4) | Δ |
+|-------|----------|-------------|---|
+| MTP=0 | 42.19 tok/s | 35.59 tok/s | **-15.6%** |
+| MTP=4 | 78.34 tok/s | 82.40 tok/s | **+5.2% (gemv wins)** |
+
+Optimization stack (each layer reduced the MTP=0 gap):
+- B3.1 (`a1f1dd9`): naive FP4 MMA atom — gap was -48%
+- B3.3.0 (`c20fc6b`): smem activation cache + coalesced SF loads — gap was -38.7%
+- B3.3.1 step 1 (`063ed4b`): cooperative gmem→smem weight staging
+- B3.3.2 (`2bb78b5`): cp.async double-buffering — gap was -34%
+- B3.4 (`502bab2`): intra-CTA split-K (4 warps cooperate on the same m16 tile, different K shards) — **gap is now -15.6%**
+
+The split-K was the biggest single win: it took occupancy at M=5120 from 3% to 12% (4× more CTAs at the same warps/CTA). MTP=4 crossed parity because per-call latency now competes with cuBLASLt and the speculative chunks (which use cuBLASLt anyway via soft-fallback) hide what's left.
+
+LDSM for weights (`SM100_SU4_DU8x16_x4_LDSM_N` sub-byte LDSM) was investigated and is a blocker for the k64 mxf4nvf4 atom — CUTLASS only pairs the sub-byte LDSM with the k32 f8f6f4 path (`docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md` +B3.3.1 step 2 investigation in commit `502bab2`'s parent thread). Plain `SM75_U32x4_LDSM_N` would consolidate 4 ld.shared.u32 → 1 ldmatrix per warp but offers limited gain since smem reads aren't the current bottleneck. Plan in `docs/superpowers/plans/2026-05-04-direction-b-nvfp4-gemv-b3.md`.
 
 ### MTP speculative decoding
 
