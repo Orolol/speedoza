@@ -105,7 +105,7 @@ __host__ __device__ size_t gemv_vec16_scale_offset(size_t inner, size_t outer,
 // MMA-driven kernel. B3.4 split-K: each CTA owns ONE m16 tile (16 rows);
 // the 8 warps cooperate on the SAME 16 rows but different K shards.
 // Inner loop walks each warp's K-shard in chunks of 64.
-constexpr int kWarpsPerBlock = 8;
+constexpr int kWarpsPerBlock = 16;
 constexpr int kRowsPerWarp = 16;
 constexpr int kRowsPerBlock = kRowsPerWarp;  // 16 — one m16 MMA tile / CTA
 constexpr int kThreadsPerBlock = kWarpsPerBlock * 32;          // 256

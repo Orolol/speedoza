@@ -106,21 +106,25 @@ Supported regime (B3.4 split-K): `n==1 && m%16==0 && k%256==0`. The k%256 constr
 
 Hard parity gate: `chat --prompt "hello" / "hello world" --max-new-tokens 12 --mtp-speculative-tokens {0..4}` matches the cuBLASLt baseline byte-for-byte for all 10 combinations (re-verified after B3.4 split-K, commit `502bab2`).
 
-Bench (`bench --prompt-tokens 128 --max-new-tokens 128`, 2026-05-05):
+Bench (`bench --prompt-tokens 128 --max-new-tokens 128`, 2026-05-05, B3.6 with 16 warps/CTA, median of 3 warm runs after first-run JIT/cache warm-up):
 
-| Mode  | cuBLASLt | gemv (B3.4) | Δ |
+| Mode  | cuBLASLt | gemv (B3.6) | Δ |
 |-------|----------|-------------|---|
-| MTP=0 | 42.19 tok/s | 35.59 tok/s | **-15.6%** |
-| MTP=4 | 78.34 tok/s | 82.40 tok/s | **+5.2% (gemv wins)** |
+| MTP=0 | ~42.5 tok/s | **~49.0 tok/s** | **+15%** (gemv wins) |
+| MTP=4 | ~70 tok/s   | **~96 tok/s**   | **+37%** (gemv wins big) |
 
-Optimization stack (each layer reduced the MTP=0 gap):
+Note: the MTP=4 baseline varies day to day (78–125 observed across sessions due to GPU clocks/thermals); the relative speedup vs same-day cuBLASLt is the stable metric. First-run after kernel rebuild is unreliable (warm-up: kernel JIT + L2 fill); always discard run 1.
+
+Optimization stack:
 - B3.1 (`a1f1dd9`): naive FP4 MMA atom — gap was -48%
-- B3.3.0 (`c20fc6b`): smem activation cache + coalesced SF loads — gap was -38.7%
-- B3.3.1 step 1 (`063ed4b`): cooperative gmem→smem weight staging
-- B3.3.2 (`2bb78b5`): cp.async double-buffering — gap was -34%
-- B3.4 (`502bab2`): intra-CTA split-K (4 warps cooperate on the same m16 tile, different K shards) — **gap is now -15.6%**
+- B3.3.0 (`c20fc6b`): smem activation cache + coalesced SF loads — gap -38.7%
+- B3.3.1 step 1 (`063ed4b`): cooperative gmem→smem weight staging (regressed to -36.7%, scaffolding)
+- B3.3.2 (`2bb78b5`): cp.async double-buffering — gap -34%
+- B3.4 (`502bab2`): intra-CTA split-K with 4 warps/CTA — gap -15.6%
+- B3.5 (`7af83f7`): bump to 8 warps/CTA (split-K factor 8) — gap -9.6%
+- B3.6 (HEAD): 16 warps/CTA, 512 threads/CTA — **gemv now BEATS cuBLASLt** (+15% MTP=0, +37% MTP=4)
 
-The split-K was the biggest single win: it took occupancy at M=5120 from 3% to 12% (4× more CTAs at the same warps/CTA). MTP=4 crossed parity because per-call latency now competes with cuBLASLt and the speculative chunks (which use cuBLASLt anyway via soft-fallback) hide what's left.
+The split-K + warp-widening combo was the structural fix. Each doubling of warps/CTA doubled the achieved warps/SM at low-M shapes, climbing from 3% → 12% → 23% → ~47% occupancy. cp.async pipelining hides memory latency across the now-many in-flight warps.
 
 LDSM for weights (`SM100_SU4_DU8x16_x4_LDSM_N` sub-byte LDSM) was investigated and is a blocker for the k64 mxf4nvf4 atom — CUTLASS only pairs the sub-byte LDSM with the k32 f8f6f4 path (`docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md` +B3.3.1 step 2 investigation in commit `502bab2`'s parent thread). Plain `SM75_U32x4_LDSM_N` would consolidate 4 ld.shared.u32 → 1 ldmatrix per warp but offers limited gain since smem reads aren't the current bottleneck. Plan in `docs/superpowers/plans/2026-05-04-direction-b-nvfp4-gemv-b3.md`.
 
