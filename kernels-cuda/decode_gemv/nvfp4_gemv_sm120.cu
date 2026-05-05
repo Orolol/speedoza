@@ -6,17 +6,18 @@
 // CollectiveBuilder rejects narrow-N tiles at N=1 (see Phase B2 notes), so
 // we drop down to the atom and stage register tiles by hand.
 //
-// CTA layout (B3.4: intra-CTA split-K)
-//   - 4 warps / CTA, 128 threads. Each CTA owns ONE m16 MMA tile (16 rows);
-//     all 4 warps cooperate on the SAME 16 output rows but DIFFERENT K
-//     shards. This multiplies parallelism for low-M shapes by 4× compared
-//     to the previous "1 warp = 1 m16 tile" layout (4× more CTAs, same
-//     warps/CTA → 4× more SM-resident warps before saturation).
-//   - blockDim.x = 128, gridDim.x = ceil(M / 16). Each block emits 16 rows.
+// CTA layout (B3.4: intra-CTA split-K, widened to 8 warps)
+//   - 8 warps / CTA, 256 threads. Each CTA owns ONE m16 MMA tile (16 rows);
+//     all 8 warps cooperate on the SAME 16 output rows but DIFFERENT K
+//     shards. This multiplies parallelism for low-M shapes by 8× compared
+//     to the original "1 warp = 1 m16 tile" layout, doubling the
+//     SM-resident warp count vs the 4-warp variant to better hide
+//     cp.async latency.
+//   - blockDim.x = 256, gridDim.x = ceil(M / 16). Each block emits 16 rows.
 //   - For k_chunk in [warp_id*K_per_warp/64, (warp_id+1)*K_per_warp/64),
 //     every warp issues one MMA accumulating into its private 4-register
 //     float accumulator, then a final cross-warp reduction in smem sums
-//     the 4 partial dot products and writes the n=0 column to gmem.
+//     the 8 partial dot products and writes the n=0 column to gmem.
 //
 // Operand staging (lane L ∈ [0,32))
 //   t0 = L & 3, t1 = L >> 2.
@@ -37,8 +38,8 @@
 // Scale layout: identical vec16_scale_offset swizzle as the cuBLASLt and
 // CUTLASS paths so we can read SFA/SFB straight from the same buffers.
 //
-// Soft regime: n==1 && m%16==0 && k%256==0. The k%256 constraint comes
-// from split-K: K is sharded into 4 equal pieces (one per warp), each of
+// Soft regime: n==1 && m%16==0 && k%512==0. The k%512 constraint comes
+// from split-K: K is sharded into 8 equal pieces (one per warp), each of
 // which must be a multiple of the kKPerMma=64 inner-loop chunk. For
 // shapes the MMA cannot service we return QWEN36_STATUS_NOT_IMPLEMENTED
 // so the dispatcher routes to cuBLASLt. Active env var:
@@ -102,14 +103,14 @@ __host__ __device__ size_t gemv_vec16_scale_offset(size_t inner, size_t outer,
 }
 
 // MMA-driven kernel. B3.4 split-K: each CTA owns ONE m16 tile (16 rows);
-// the 4 warps cooperate on the SAME 16 rows but different K shards.
+// the 8 warps cooperate on the SAME 16 rows but different K shards.
 // Inner loop walks each warp's K-shard in chunks of 64.
-constexpr int kWarpsPerBlock = 4;
+constexpr int kWarpsPerBlock = 8;
 constexpr int kRowsPerWarp = 16;
 constexpr int kRowsPerBlock = kRowsPerWarp;  // 16 — one m16 MMA tile / CTA
-constexpr int kThreadsPerBlock = kWarpsPerBlock * 32;          // 128
+constexpr int kThreadsPerBlock = kWarpsPerBlock * 32;          // 256
 constexpr int kKPerMma = 64;
-constexpr int kKShardChunkAlign = kWarpsPerBlock * kKPerMma;   // 256
+constexpr int kKShardChunkAlign = kWarpsPerBlock * kKPerMma;   // 512
 
 // ---- cp.async helpers (sm_80+; available on sm_120). ----
 // `cg` (cache global, bypass L1) is the right choice for streaming the A
@@ -195,7 +196,7 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
                       size_t M, size_t K) {
   const unsigned warp_id = threadIdx.x >> 5;
   const unsigned lane = threadIdx.x & 31;
-  // B3.4: all 4 warps in the CTA share the same m16 tile (split-K).
+  // B3.4: all kWarpsPerBlock warps in the CTA share the same m16 tile (split-K).
   const size_t m_base = static_cast<size_t>(blockIdx.x) * kRowsPerBlock;
   // NOTE: do NOT early-return for `m_base >= M` — every thread must reach
   // every __syncthreads() in this kernel (cooperative B load + final
@@ -207,42 +208,43 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
   const size_t sf_inner_dim = gemv_round_up(scale_cols, 4);
 
   // ---- Cooperative load of the activation column into smem (CTA-shared).
-  // The B operand is a single column of K packed fp4 (K/2 bytes). All 4
+  // The B operand is a single column of K packed fp4 (K/2 bytes). All 8
   // warps share the same buffer; each warp will read only the bytes for
   // its K-shard during the MMA loop.
   //
   // The kernel is launched with dynamic shared memory of size
-  // K/2 + 4096 + 512 bytes (B3.4 split-K layout):
+  // K/2 + 8192 + 1024 bytes (B3.4 split-K, 8-warp layout):
   //   - K/2 bytes for the activation column (B operand, CTA-shared).
-  //   - 4096 bytes for the per-warp DOUBLE-BUFFERED A-operand tile
-  //     (4 warps × 2 buffers × 16 rows × 32 bytes = 4 × 2 × 512 = 4096 B).
+  //   - 8192 bytes for the per-warp DOUBLE-BUFFERED A-operand tile
+  //     (8 warps × 2 buffers × 16 rows × 32 bytes = 8 × 2 × 512 = 8192 B).
   //     Each warp owns its own buffer pair since all warps process the
   //     SAME 16 rows but different K chunks at any given moment — staging
   //     per-warp avoids cross-warp synchronization in the inner loop.
-  //   - 512 bytes for the final cross-warp reduction scratch
-  //     (2 halves × 16 rows × 4 warps × 4 bytes).
+  //   - 1024 bytes for the final cross-warp reduction scratch
+  //     (2 halves × 16 rows × 8 warps × 4 bytes).
   //
-  // The MMA gate guarantees K % 256 == 0, so K/2 is a multiple of 128
+  // The MMA gate guarantees K % 512 == 0, so K/2 is a multiple of 256
   // (in particular a multiple of 16) — the uint4 stride below covers the
   // whole buffer with no tail.
   constexpr unsigned kATilePerWarpBytes = kRowsPerBlock * 32u;        // 512
   constexpr unsigned kATileBufBytes =
-      kWarpsPerBlock * 2u * kATilePerWarpBytes;                       // 4096
+      kWarpsPerBlock * 2u * kATilePerWarpBytes;                       // 8192
   extern __shared__ uint8_t smem[];
   uint8_t *smem_b_fp4 = smem;                                          // K/2 B
-  uint8_t *smem_a_base = smem + K / 2;                                 // 4096 B
+  uint8_t *smem_a_base = smem + K / 2;                                 // 8192 B
   // Per-warp double buffer: smem_a_buf[w][b] points to a 512-byte tile.
   // Layout: [warp0_buf0 | warp0_buf1 | warp1_buf0 | warp1_buf1 | ...].
   uint8_t *const smem_a_buf_w0 = smem_a_base + warp_id * (2u * kATilePerWarpBytes);
   uint8_t *smem_a_buf[2] = {smem_a_buf_w0,
                             smem_a_buf_w0 + kATilePerWarpBytes};
   // Reduction scratch follows the A tile region.
-  // reduction[hi/lo][row_in_tile][warp] → laid out as [2][16][4] floats.
+  // reduction[hi/lo][row_in_tile][warp] → laid out as
+  // [2][16][kWarpsPerBlock] floats.
   float *smem_reduction =
       reinterpret_cast<float *>(smem_a_base + kATileBufBytes);
   {
     const size_t b_bytes = packed_cols;
-    const size_t b_vecs = b_bytes / 16;  // K/2 % 16 == 0 (K % 256 == 0)
+    const size_t b_vecs = b_bytes / 16;  // K/2 % 16 == 0 (K % 512 == 0)
     const uint4 *b_fp4_vec = reinterpret_cast<const uint4 *>(b_fp4);
     uint4 *smem_b_vec = reinterpret_cast<uint4 *>(smem_b_fp4);
     for (size_t i = threadIdx.x; i < b_vecs; i += kThreadsPerBlock) {
@@ -292,12 +294,14 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
 
   float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
 
-  // ---- B3.4 split-K: each warp owns K_per_warp = K/4 elements. ----
+  // ---- B3.4 split-K: each warp owns K_per_warp = K/kWarpsPerBlock. ----
   // K_per_warp is a multiple of kKPerMma=64 (entry-point gate enforces
-  // K % 256 == 0), so each warp processes k_chunks_per_warp = K/256
-  // chunks of 64 elements, starting at warp_id * k_chunks_per_warp.
-  const size_t k_chunks_total = K / kKPerMma;            // K/64
-  const size_t k_chunks_per_warp = k_chunks_total >> 2;  // K/256
+  // K % kKShardChunkAlign == 0), so each warp processes
+  // k_chunks_per_warp = K / (kWarpsPerBlock*64) chunks of 64 elements,
+  // starting at warp_id * k_chunks_per_warp.
+  const size_t k_chunks_total = K / kKPerMma;                 // K/64
+  const size_t k_chunks_per_warp =
+      k_chunks_total / static_cast<size_t>(kWarpsPerBlock);   // K/512
   const size_t kc_warp_start =
       static_cast<size_t>(warp_id) * k_chunks_per_warp;
 
@@ -318,7 +322,7 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
   // NEXT chunk into the other buffer, then waits for the CURRENT one.
   // Synchronization is per-WARP via __syncwarp() — we deliberately do
   // NOT use __syncthreads() inside the inner loop, because that would
-  // force the 4 warps to march in lockstep and defeat the split-K
+  // force the 8 warps to march in lockstep and defeat the split-K
   // parallelism (each warp's buffer is private to that warp's lanes).
   auto issue_chunk_async = [&](size_t kc_global, uint8_t *dst_buf) {
     const size_t k_byte_base = kc_global * (kKPerMma / 2);  // 32 B per chunk
@@ -407,27 +411,31 @@ nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
   }
 
   // ---- Cross-warp reduction (split-K finalization). Each warp now holds
-  // its private partial sum for the same 16 output rows. We sum the 4
-  // warp partials in smem and let warp 0 emit the result.
+  // its private partial sum for the same 16 output rows. We sum the
+  // kWarpsPerBlock warp partials in smem and let warp 0 emit the result.
   //
   // Lane decomposition: lanes with t0==0 hold the n=0 column.
   //   acc0 holds row t1 (m=0..7), acc2 holds row t1+8 (m=8..15).
-  // Indexing: smem_reduction[hi*16*4 + row*4 + warp].
+  // Indexing: smem_reduction[hi*16*kWarpsPerBlock + row*kWarpsPerBlock
+  //                          + warp].
+  constexpr unsigned kRedRowStride = static_cast<unsigned>(kWarpsPerBlock);
+  constexpr unsigned kRedHalfStride = 16u * kRedRowStride;
   if (t0 == 0u) {
-    smem_reduction[0u * 16u * 4u + t1 * 4u + warp_id] = acc0;
-    smem_reduction[1u * 16u * 4u + t1 * 4u + warp_id] = acc2;
+    smem_reduction[0u * kRedHalfStride + t1 * kRedRowStride + warp_id] = acc0;
+    smem_reduction[1u * kRedHalfStride + t1 * kRedRowStride + warp_id] = acc2;
   }
   __syncthreads();  // the ONLY __syncthreads() after activation cache load.
 
   if (warp_id == 0u && t0 == 0u) {
-    const float sum_lo = smem_reduction[0u * 16u * 4u + t1 * 4u + 0u] +
-                         smem_reduction[0u * 16u * 4u + t1 * 4u + 1u] +
-                         smem_reduction[0u * 16u * 4u + t1 * 4u + 2u] +
-                         smem_reduction[0u * 16u * 4u + t1 * 4u + 3u];
-    const float sum_hi = smem_reduction[1u * 16u * 4u + t1 * 4u + 0u] +
-                         smem_reduction[1u * 16u * 4u + t1 * 4u + 1u] +
-                         smem_reduction[1u * 16u * 4u + t1 * 4u + 2u] +
-                         smem_reduction[1u * 16u * 4u + t1 * 4u + 3u];
+    float sum_lo = 0.f;
+    float sum_hi = 0.f;
+    #pragma unroll
+    for (int w = 0; w < kWarpsPerBlock; ++w) {
+      sum_lo += smem_reduction[0u * kRedHalfStride + t1 * kRedRowStride +
+                               static_cast<unsigned>(w)];
+      sum_hi += smem_reduction[1u * kRedHalfStride + t1 * kRedRowStride +
+                               static_cast<unsigned>(w)];
+    }
     const size_t row_lo = m_base + t1;
     const size_t row_hi = m_base + t1 + 8u;
     if (row_lo < M) {
@@ -459,7 +467,7 @@ extern "C" int qwen36_decode_nvfp4_gemv(
 
 #if QWEN36_DECODE_GEMV_MMA
   // MMA regime: N=1, M aligned to the m16 MMA tile, K aligned to the
-  // split-K chunk (4 warps × kKPerMma=64 = 256 elements). Anything
+  // split-K chunk (8 warps × kKPerMma=64 = 512 elements). Anything
   // outside this returns NOT_IMPLEMENTED so cuBLASLt picks it up.
   if (spec->n != 1 || (spec->m % 16) != 0 ||
       (spec->k % static_cast<size_t>(kKShardChunkAlign)) != 0) {
@@ -473,17 +481,25 @@ extern "C" int qwen36_decode_nvfp4_gemv(
                   1);
 
   cudaStream_t stream = qwen36_internal_active_stream();
-  // Dynamic smem layout (B3.4 split-K):
+  // Dynamic smem layout (B3.4 split-K, 8-warp variant):
   //   - K/2 bytes for the activation column (B operand, CTA-shared).
-  //   - 4096 bytes for the per-warp DOUBLE-BUFFERED A-operand staging
-  //     tile (4 warps × 2 buffers × kRowsPerBlock=16 rows × 32 B
-  //     = 4 × 2 × 512 = 4096 B). Per-warp staging is required because
+  //   - 8192 bytes for the per-warp DOUBLE-BUFFERED A-operand staging
+  //     tile (8 warps × 2 buffers × kRowsPerBlock=16 rows × 32 B
+  //     = 8 × 2 × 512 = 8192 B). Per-warp staging is required because
   //     each warp consumes a different K shard at any given moment.
-  //   - 512 bytes for cross-warp reduction scratch
-  //     (2 halves × 16 rows × 4 warps × 4 bytes).
+  //   - 1024 bytes for cross-warp reduction scratch
+  //     (2 halves × 16 rows × 8 warps × 4 bytes).
   // Default per-block smem cap on SM_120 is 48 KiB. At K=17408 this
-  // totals 8704 + 4096 + 512 = 13312 B, far below the cap.
-  const size_t smem_bytes = K / 2 + 4096 + 512;
+  // totals 8704 + 8192 + 1024 = 17920 B, far below the cap.
+  // Parameterized: K/2 + (kWarpsPerBlock * 2 * 512)
+  //                    + (2 * kRowsPerBlock * kWarpsPerBlock * 4)
+  //              = K/2 + 9216 at kWarpsPerBlock=8.
+  const size_t smem_bytes =
+      K / 2 +
+      static_cast<size_t>(kWarpsPerBlock) * 2u *
+          (static_cast<size_t>(kRowsPerBlock) * 32u) +
+      2u * static_cast<size_t>(kRowsPerBlock) *
+          static_cast<size_t>(kWarpsPerBlock) * sizeof(float);
   nvfp4_gemv_mma_kernel<<<grid, block, smem_bytes, stream>>>(
       as_device_ptr<const uint8_t>(spec->a_fp4),
       as_device_ptr<const uint8_t>(spec->a_scale),
