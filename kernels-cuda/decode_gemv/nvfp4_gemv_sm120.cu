@@ -195,14 +195,19 @@ __device__ __forceinline__ void mma_mxf4nvf4_4x_m16n8k64(
 // Templated kernel. Two specializations are emitted (kWarpsPerBlockTpl =
 // 16 and 8). The kernel is declared at namespace scope so explicit
 // instantiation can force the symbols into the .so.
+// Tensor scales (a_scale_2, b_scale_2) intentionally NOT in the kernel
+// signature: the runtime caller (engine.rs) already folds them into
+// `spec->alpha` before invoking the kernel, mirroring the cuBLASLt
+// contract (nvfp4_gemm.cu only passes `alpha`, never dereferences
+// a_scale_2/b_scale_2). Multiplying by them inside the kernel would
+// square the tensor-scale factor and produce silent gibberish on real
+// model weights.
 template <int kWarpsPerBlockTpl>
 __global__ void __launch_bounds__(kWarpsPerBlockTpl * 32)
 nvfp4_gemv_mma_kernel_tpl(const uint8_t *__restrict__ a_fp4,
                           const uint8_t *__restrict__ a_scale,
-                          const float *__restrict__ a_tensor_scale,
                           const uint8_t *__restrict__ b_fp4,
                           const uint8_t *__restrict__ b_scale,
-                          const float *__restrict__ b_tensor_scale,
                           float alpha,
                           __nv_bfloat16 *__restrict__ output,
                           size_t M, size_t K) {
@@ -289,16 +294,6 @@ nvfp4_gemv_mma_kernel_tpl(const uint8_t *__restrict__ a_fp4,
       a_row_for_sf_raw < M ? a_row_for_sf_raw : (M - 1);
 
   // SFB at N=1: outer is always 0, no n-decomposition needed.
-
-  // Tensor scales (a_scale_2, b_scale_2) are NOT applied here — the
-  // runtime caller (engine.rs) already folds them into `spec->alpha`
-  // before invoking the kernel, mirroring the cuBLASLt contract
-  // (nvfp4_gemm.cu:380 only passes `alpha`, never dereferences
-  // a_scale_2/b_scale_2). Multiplying by them again would square the
-  // tensor-scale factor — the bug that produced gibberish on real
-  // model weights despite the uniform-data smoke passing.
-  (void)a_tensor_scale;
-  (void)b_tensor_scale;
 
   // ---- Per-lane smem row offsets into the per-warp A-tile (16 rows × 32 B).
   // Tile is row-major: row r occupies bytes [r*32, r*32+32). All warps
@@ -466,13 +461,13 @@ nvfp4_gemv_mma_kernel_tpl(const uint8_t *__restrict__ a_fp4,
 
 // Explicit instantiations — force both specialization symbols into the .so.
 template __global__ void
-nvfp4_gemv_mma_kernel_tpl<16>(const uint8_t *, const uint8_t *, const float *,
-                              const uint8_t *, const uint8_t *, const float *,
-                              float, __nv_bfloat16 *, size_t, size_t);
+nvfp4_gemv_mma_kernel_tpl<16>(const uint8_t *, const uint8_t *, const uint8_t *,
+                              const uint8_t *, float, __nv_bfloat16 *, size_t,
+                              size_t);
 template __global__ void
-nvfp4_gemv_mma_kernel_tpl<8>(const uint8_t *, const uint8_t *, const float *,
-                             const uint8_t *, const uint8_t *, const float *,
-                             float, __nv_bfloat16 *, size_t, size_t);
+nvfp4_gemv_mma_kernel_tpl<8>(const uint8_t *, const uint8_t *, const uint8_t *,
+                             const uint8_t *, float, __nv_bfloat16 *, size_t,
+                             size_t);
 
 namespace {
 
@@ -541,20 +536,16 @@ extern "C" int qwen36_decode_nvfp4_gemv(
     nvfp4_gemv_mma_kernel_tpl<16><<<grid, block, smem_bytes, stream>>>(
         as_device_ptr<const uint8_t>(spec->a_fp4),
         as_device_ptr<const uint8_t>(spec->a_scale),
-        as_device_ptr<const float>(spec->a_scale_2),
         as_device_ptr<const uint8_t>(spec->b_fp4),
-        as_device_ptr<const uint8_t>(spec->b_scale),
-        as_device_ptr<const float>(spec->b_scale_2), spec->alpha,
+        as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
         as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K);
   } else {
     const dim3 block(8u * 32u, 1, 1);
     nvfp4_gemv_mma_kernel_tpl<8><<<grid, block, smem_bytes, stream>>>(
         as_device_ptr<const uint8_t>(spec->a_fp4),
         as_device_ptr<const uint8_t>(spec->a_scale),
-        as_device_ptr<const float>(spec->a_scale_2),
         as_device_ptr<const uint8_t>(spec->b_fp4),
-        as_device_ptr<const uint8_t>(spec->b_scale),
-        as_device_ptr<const float>(spec->b_scale_2), spec->alpha,
+        as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
         as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K);
   }
 

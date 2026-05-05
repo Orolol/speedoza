@@ -100,38 +100,31 @@ The active optimization track is single-GPU RTX 5090 throughput for exactly `sak
 
 ### Direction B decode_gemv (NVFP4 N=1 hand-rolled gemv) — **default ON**
 
-The decode-time NVFP4 GEMMs at gemv shape are routed through a hand-rolled tensor-core kernel built on the SM_120a `mma.kind::mxf4nvf4.scale_vec::4X.m16n8k64` atom (`kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu`). Soft-fallback to cuBLASLt for any unsupported shape via the existing dispatch in `crates/kernels/src/backend.rs`. Build script defaults to `-arch=sm_120a` (mandatory for the FP4 block-scaled MMA PTX).
+Decode-time NVFP4 GEMMs at gemv shape are routed through a hand-rolled tensor-core kernel built on the SM_120a `mma.kind::mxf4nvf4.scale_vec::4X.m16n8k64` atom (`kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu`). Soft-fallback to cuBLASLt for any unsupported shape via the existing dispatch in `crates/kernels/src/backend.rs`. Build script must use `-arch=sm_120a` (mandatory for the FP4 block-scaled MMA PTX).
 
-**The path is enabled by default.** Two opt-out env vars (kill switches; either disables):
+**Enabled by default.** Two opt-out env vars (kill switches, either disables):
 - `QWEN36_DECODE_GEMV_DISABLE=1` (preferred name)
 - `QWEN36_DECODE_GEMV=0` (back-compat with the original opt-in flag)
 
-Supported regime (B3.7 adaptive): `n==1 && m%16==0 && (k%1024==0 OR k%512==0)`. The entry point picks 16 warps/CTA when K%1024==0 (preferred path, more occupancy) or 8 warps/CTA when K%512==0 only (fallback). Anything else returns NOT_IMPLEMENTED. This covers all realistic decode K values: 5120/8192/17408 → 16-warp path; 3584 (out_proj for linear-attention layers) → 8-warp path. Two kernel instantiations are compiled into the .so.
+Supported regime: `n==1 && m%16==0 && (k%1024==0 OR k%512==0)`. The entry point picks 16 warps/CTA when K%1024==0 (preferred path, ~47% occupancy at M=5120) or 8 warps/CTA when K%512==0 only (fallback for K=3584 out_proj on linear-attention layers). Anything outside that returns NOT_IMPLEMENTED. Two template instantiations compiled into the .so.
 
-Hard parity gate: `chat --prompt "hello" / "hello world" --max-new-tokens 12 --mtp-speculative-tokens {0..4}` matches the cuBLASLt baseline byte-for-byte for all 10 combinations (re-verified after B3.4 split-K, commit `502bab2`).
+Bench (`bench --prompt-tokens 128 --max-new-tokens 128`, average of 3 warm runs, 2026-05-05):
 
-Bench (`bench --prompt-tokens 128 --max-new-tokens 128`, 2026-05-05, B3.7 adaptive 8/16-warp dispatch, average of 3 warm runs):
+| Mode  | cuBLASLt | gemv  | Δ |
+|-------|----------|-------|---|
+| MTP=0 | 43.5 tok/s | **49.85 tok/s** | **+14.5%** |
+| MTP=4 | 95.4 tok/s | **99.3 tok/s**  | **+4.1%**  |
 
-| Mode  | cuBLASLt | gemv (B3.7) | Δ |
-|-------|----------|-------------|---|
-| MTP=0 | 43.5 tok/s | **49.85 tok/s** | **+14.5%** (gemv wins) |
-| MTP=4 | 95.4 tok/s | **99.3 tok/s**  | **+4.1%** (gemv wins) |
+Hard parity gate: `chat --prompt "hello" / "hello world" --max-new-tokens 12 --mtp-speculative-tokens {0..4}` matches the cuBLASLt baseline byte-for-byte for all 10 combinations.
 
-Note: baselines vary day to day (MTP=4 baseline observed at 70-125 across sessions due to GPU clocks/thermals); the relative speedup vs same-day cuBLASLt is the stable metric. First-run after kernel rebuild is unreliable (warm-up: kernel JIT + L2 fill); always discard run 1.
+**Important runtime contract:** the kernel does NOT apply `a_scale_2`/`b_scale_2` (the per-tensor scales). The runtime caller in `crates/runtime/src/engine.rs` pre-folds them into `spec->alpha`, mirroring the cuBLASLt contract (`kernels-cuda/nvfp4_gemm.cu` only passes `alpha` and never dereferences `a_scale_2`/`b_scale_2`). A kernel that multiplies the per-tensor scales again on top of `alpha` produces gibberish on real model weights despite uniform-data smoke passing — this happened during B3.1 development and was caught only by end-to-end chat parity. Treat any future hand-rolled GEMM kernel the same way.
 
-Optimization stack:
-- B3.1 (`a1f1dd9`): naive FP4 MMA atom — gap was -48%
-- B3.3.0 (`c20fc6b`): smem activation cache + coalesced SF loads — gap -38.7%
-- B3.3.1 step 1 (`063ed4b`): cooperative gmem→smem weight staging (scaffolding)
-- B3.3.2 (`2bb78b5`): cp.async double-buffering — gap -34%
-- B3.4 (`502bab2`): intra-CTA split-K with 4 warps/CTA — gap -15.6%
-- B3.5 (`7af83f7`): bump to 8 warps/CTA (split-K factor 8) — gap -9.6%
-- B3.6 (`83c35a8`): 16 warps/CTA, 512 threads/CTA — gemv crosses parity
-- B3.7 (`314da21`): adaptive 8/16-warp template dispatch — **gemv wins +14.5% MTP=0, +4.1% MTP=4**, plus adds K=3584 shape coverage
+**Notes on what was tried and didn't ship:**
+- Sub-byte LDSM (`SM100_SU4_DU8x16_x4_LDSM_N`, `b4x16_p64`) is a blocker for the k64 mxf4nvf4 atom — CUTLASS only binds it to the k32 f8f6f4 path. Plain `SM75_U32x4_LDSM_N` would consolidate 4 `ld.shared.u32` → 1 `ldmatrix` but offers limited gain (smem reads aren't the bottleneck). See `docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md` for the full investigation.
+- TMA multicast (B4 in original spec) projected at <2% gain after setup overhead — activation reads are tiny (~5% of gmem traffic).
+- Persistent grid doesn't help when each gemv call is independent; launch overhead is already amortized.
 
-The split-K + warp-widening combo was the structural fix. Each doubling of warps/CTA doubled the achieved warps/SM at low-M shapes, climbing from 3% → 12% → 23% → ~47% occupancy. cp.async pipelining hides memory latency across the now-many in-flight warps. Adaptive dispatch picks the right warp count per K alignment without losing perf.
-
-LDSM for weights (`SM100_SU4_DU8x16_x4_LDSM_N` sub-byte LDSM) was investigated and is a blocker for the k64 mxf4nvf4 atom — CUTLASS only pairs the sub-byte LDSM with the k32 f8f6f4 path (`docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md` +B3.3.1 step 2 investigation in commit `502bab2`'s parent thread). Plain `SM75_U32x4_LDSM_N` would consolidate 4 ld.shared.u32 → 1 ldmatrix per warp but offers limited gain since smem reads aren't the current bottleneck. Plan in `docs/superpowers/plans/2026-05-04-direction-b-nvfp4-gemv-b3.md`.
+Full optimization history in commit log: `git log -- kernels-cuda/decode_gemv/`. Archived plans at `docs/superpowers/plans/archive/`.
 
 ### MTP speculative decoding
 
@@ -295,7 +288,9 @@ Memory cost of the fused stores: ~5.7 GB for `MlpFusedStore` + ~2.3 GB for `Line
 - *Persistent / specialised DeltaNet recurrent kernel*: the existing decode kernel is rated 5/5, but a multi-layer persistent kernel that holds state in TMEM and avoids per-layer launches could shave more. Major rewrite.
 - *Native Linux re-bench*: WSL2 adds 1–3 µs per kernel launch; with ~30 cudaGraphLaunches/sec of decode + sync points, expected delta is ~5–10 % free. Zero engineering effort and the highest-ROI experiment to run before any further CUDA work.
 
-### Mirage megakernel branch (`feat/mirage-megakernel`)
+### Mirage megakernel branch (`feat/mirage-megakernel`) — **dead code, kept for reference**
+
+> **WARNING:** the file `kernels-cuda/megakernel/nvfp4_matvec_sm120.cu` does not actually run its CUTLASS path. It guards the SM120 body with `#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)` but never includes `<cutlass/arch/config.h>` (the header that defines the macro). So the `#if` evaluates to false at preprocessing and the function returns `NOT_IMPLEMENTED` for every shape, falling back to cuBLASLt silently. The parity claims below were never actually testing the megakernel — they were testing cuBLASLt twice. Discovered 2026-05-04 during Direction B development; documented in `docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md`. Direction B uses a hand-rolled gemv kernel (`kernels-cuda/decode_gemv/`) with verified parity instead. The megakernel scaffolding is left in place because the existing dispatch wiring + CUTLASS dependency are reusable for any future CUTLASS-based experiment, but **do not trust the "validated parity" claim below without re-running the gate.**
 
 Long-running side branch that lays a CUTLASS-based substrate for the
 NVFP4 GEMMs without committing to perf gains on `codex/numerical-parity-guardrails`.
