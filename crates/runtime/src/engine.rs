@@ -49,10 +49,19 @@ fn cuda_env_usize(name: &str) -> Option<usize> {
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_env_bool(name: &str) -> bool {
+fn cuda_env_bool_value(name: &str) -> Option<bool> {
     std::env::var(name)
         .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .and_then(|value| match value.as_str() {
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => Some(true),
+            "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => Some(false),
+            _ => None,
+        })
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_env_bool(name: &str) -> bool {
+    cuda_env_bool_value(name).unwrap_or(false)
 }
 
 #[cfg(feature = "cuda")]
@@ -94,29 +103,39 @@ fn cuda_prefill_capacity(max_context: usize) -> usize {
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_long_context_mode_enabled() -> bool {
-    cuda_env_bool("QWEN36_LONG_CONTEXT_MODE")
+const CUDA_LONG_CONTEXT_AUTO_MIN_CONTEXT: usize = 8192;
+
+#[cfg(feature = "cuda")]
+fn cuda_long_context_auto_min_context() -> usize {
+    cuda_env_usize("QWEN36_LONG_CONTEXT_AUTO_MIN_CONTEXT")
+        .unwrap_or(CUDA_LONG_CONTEXT_AUTO_MIN_CONTEXT)
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_mlp_fused_enabled() -> bool {
-    !cuda_long_context_mode_enabled() && !cuda_env_bool("QWEN36_DISABLE_MLP_FUSED")
+fn cuda_long_context_mode_enabled(max_context: usize) -> bool {
+    cuda_env_bool_value("QWEN36_LONG_CONTEXT_MODE")
+        .unwrap_or_else(|| max_context >= cuda_long_context_auto_min_context())
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_linear_attn_fused_enabled() -> bool {
-    !cuda_long_context_mode_enabled() && !cuda_env_bool("QWEN36_DISABLE_LINEAR_ATTN_FUSED")
+fn cuda_mlp_fused_enabled(max_context: usize) -> bool {
+    !cuda_long_context_mode_enabled(max_context) && !cuda_env_bool("QWEN36_DISABLE_MLP_FUSED")
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_prefill_fused_mlp_enabled() -> bool {
-    cuda_mlp_fused_enabled() && cuda_env_bool("QWEN36_PREFILL_FUSED_MLP")
+fn cuda_linear_attn_fused_enabled(max_context: usize) -> bool {
+    !cuda_long_context_mode_enabled(max_context)
+        && !cuda_env_bool("QWEN36_DISABLE_LINEAR_ATTN_FUSED")
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_prefill_fused_linear_attn_enabled() -> bool {
-    cuda_linear_attn_fused_enabled()
-        && cuda_env_bool("QWEN36_PREFILL_FUSED_LINEAR_ATTN")
+fn cuda_prefill_fused_mlp_enabled(max_context: usize) -> bool {
+    cuda_mlp_fused_enabled(max_context) && cuda_env_bool("QWEN36_PREFILL_FUSED_MLP")
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_prefill_fused_linear_attn_enabled(max_context: usize) -> bool {
+    cuda_linear_attn_fused_enabled(max_context)
         && !cuda_env_bool("QWEN36_PREFILL_FUSED_LINEAR_ATTN_DISABLE")
 }
 
@@ -174,6 +193,11 @@ pub struct GpuMemoryReport {
     pub prefill_capacity: usize,
     pub kv_cache_dtype: KvCacheDtype,
     pub mtp_speculative_tokens: usize,
+    pub long_context_mode: bool,
+    pub long_context_auto_min_context: usize,
+    pub mlp_fused_enabled: bool,
+    pub linear_attn_fused_enabled: bool,
+    pub prefill_fused_linear_attn_enabled: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -2741,6 +2765,18 @@ impl<B: KernelBackend> Engine<B> {
         let runtime = self.cuda_runtime()?;
         let prefill = self.cuda_prefill()?;
 
+        let profile_prefill = std::env::var("QWEN36_PROFILE_PREFILL_CHUNKS").is_ok()
+            && start_position_device_i32 == DevicePtr::NULL;
+        let chunk_profile_start = profile_prefill.then(std::time::Instant::now);
+        let mut prof_embed_ms = 0.0_f64;
+        let mut prof_input_norm_quant_ms = 0.0_f64;
+        let mut prof_linear_attn_ms = 0.0_f64;
+        let mut prof_full_attn_ms = 0.0_f64;
+        let mut prof_post_norm_quant_ms = 0.0_f64;
+        let mut prof_mlp_ms = 0.0_f64;
+        let mut prof_logits_ms = 0.0_f64;
+
+        let embed_start = profile_prefill.then(std::time::Instant::now);
         self.backend.embedding_lookup(&EmbeddingLookupSpec {
             tokens,
             hidden: self.topology.hidden_size,
@@ -2749,6 +2785,10 @@ impl<B: KernelBackend> Engine<B> {
             embedding_bf16: self.tensor_ptr(weights, &manifest.embed_tokens)?,
             output_bf16: prefill.hidden.ptr(),
         })?;
+        if let Some(embed_start) = embed_start {
+            qwen36_fp4_kernels::cuda_synchronize()?;
+            prof_embed_ms += embed_start.elapsed().as_secs_f64() * 1000.0;
+        }
 
         let trace_layers = std::env::var("QWEN36_DEBUG_LAYER_TRACE").is_ok();
         let dump_dir = std::env::var("QWEN36_DEBUG_DUMP_DIR").ok();
@@ -2776,6 +2816,7 @@ impl<B: KernelBackend> Engine<B> {
             } else {
                 DevicePtr::NULL
             };
+            let input_norm_start = profile_prefill.then(std::time::Instant::now);
             self.rmsnorm(
                 tokens,
                 self.topology.hidden_size,
@@ -2814,7 +2855,13 @@ impl<B: KernelBackend> Engine<B> {
             } else {
                 None
             };
+            if let Some(input_norm_start) = input_norm_start {
+                qwen36_fp4_kernels::cuda_synchronize()?;
+                prof_input_norm_quant_ms += input_norm_start.elapsed().as_secs_f64() * 1000.0;
+            }
 
+            let attn_start = profile_prefill.then(std::time::Instant::now);
+            let is_linear_attn = matches!(layer, LayerWeights::LinearAttention(_));
             match layer {
                 LayerWeights::LinearAttention(layer) => self.run_linear_attention_layer_prefill(
                     layer,
@@ -2832,6 +2879,15 @@ impl<B: KernelBackend> Engine<B> {
                     start_position_device_i32,
                     quantized_normed,
                 )?,
+            }
+            if let Some(attn_start) = attn_start {
+                qwen36_fp4_kernels::cuda_synchronize()?;
+                let elapsed_ms = attn_start.elapsed().as_secs_f64() * 1000.0;
+                if is_linear_attn {
+                    prof_linear_attn_ms += elapsed_ms;
+                } else {
+                    prof_full_attn_ms += elapsed_ms;
+                }
             }
 
             if trace_layers {
@@ -2884,6 +2940,8 @@ impl<B: KernelBackend> Engine<B> {
                 (&common.mlp_gate_proj, DevicePtr::NULL),
                 (&common.mlp_up_proj, DevicePtr::NULL),
             ];
+            let mlp_quantized = Self::common_nvfp4_quant(&mlp_input_linears)?;
+            let post_norm_start = profile_prefill.then(std::time::Instant::now);
             self.rmsnorm(
                 tokens,
                 self.topology.hidden_size,
@@ -2909,16 +2967,28 @@ impl<B: KernelBackend> Engine<B> {
                     )?;
                 }
             }
-            if let Some(quantized) = Self::common_nvfp4_quant(&mlp_input_linears)? {
+            if let Some(quantized) = mlp_quantized {
                 self.quantize_nvfp4_activation_rows(
                     prefill.normed.ptr(),
                     tokens,
                     quantized,
                     prefill,
                 )?;
+            }
+            if let Some(post_norm_start) = post_norm_start {
+                qwen36_fp4_kernels::cuda_synchronize()?;
+                prof_post_norm_quant_ms += post_norm_start.elapsed().as_secs_f64() * 1000.0;
+            }
+
+            let mlp_start = profile_prefill.then(std::time::Instant::now);
+            if let Some(quantized) = mlp_quantized {
                 self.run_mlp_with_quantized_input_prefill(layer, prefill, tokens, quantized)?;
             } else {
                 self.run_mlp_prefill(layer, prefill, tokens)?;
+            }
+            if let Some(mlp_start) = mlp_start {
+                qwen36_fp4_kernels::cuda_synchronize()?;
+                prof_mlp_ms += mlp_start.elapsed().as_secs_f64() * 1000.0;
             }
             if dump_all_layers {
                 if let Some(dir) = &dump_dir {
@@ -3005,6 +3075,7 @@ impl<B: KernelBackend> Engine<B> {
         }
 
         if emit_logits {
+            let logits_start = profile_prefill.then(std::time::Instant::now);
             let last_hidden = Self::ptr_offset(
                 prefill.hidden.ptr(),
                 (tokens - 1) * self.topology.hidden_size * 2,
@@ -3051,6 +3122,32 @@ impl<B: KernelBackend> Engine<B> {
                 forward.normed.ptr(),
                 forward.logits.ptr(),
             )?;
+            if let Some(logits_start) = logits_start {
+                qwen36_fp4_kernels::cuda_synchronize()?;
+                prof_logits_ms += logits_start.elapsed().as_secs_f64() * 1000.0;
+            }
+        }
+
+        if let Some(chunk_profile_start) = chunk_profile_start {
+            let measured_ms = prof_embed_ms
+                + prof_input_norm_quant_ms
+                + prof_linear_attn_ms
+                + prof_full_attn_ms
+                + prof_post_norm_quant_ms
+                + prof_mlp_ms
+                + prof_logits_ms;
+            eprintln!(
+                "prefill.profile.chunk start={start_position} tokens={tokens} embed={:.3} input_norm_quant={:.3} linear_attn={:.3} full_attn={:.3} post_norm_quant={:.3} mlp={:.3} logits={:.3} total_measured={:.3} wall={:.3}",
+                prof_embed_ms,
+                prof_input_norm_quant_ms,
+                prof_linear_attn_ms,
+                prof_full_attn_ms,
+                prof_post_norm_quant_ms,
+                prof_mlp_ms,
+                prof_logits_ms,
+                measured_ms,
+                chunk_profile_start.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         Ok(())
@@ -4050,7 +4147,7 @@ impl<B: KernelBackend> Engine<B> {
             Some(quantized) => Some(quantized),
             None => Self::common_nvfp4_quant(&in_proj_linears)?,
         };
-        let fused_prefill = if cuda_prefill_fused_linear_attn_enabled() {
+        let fused_prefill = if cuda_prefill_fused_linear_attn_enabled(self.config.max_context) {
             self.linear_attn_in_proj_fused_layer_opt(layer.layer_index)
         } else {
             None
@@ -4965,7 +5062,7 @@ impl<B: KernelBackend> Engine<B> {
             LayerWeights::LinearAttention(layer) => layer.layer_index,
             LayerWeights::FullAttention(layer) => layer.layer_index,
         };
-        if cuda_prefill_fused_mlp_enabled()
+        if cuda_prefill_fused_mlp_enabled(self.config.max_context)
             && prefill.block_out.bytes() >= tokens * 2 * self.topology.intermediate_size * 2
         {
             if let Some(fused) = self.mlp_fused_main_opt(layer_idx) {
@@ -5010,7 +5107,7 @@ impl<B: KernelBackend> Engine<B> {
             LayerWeights::LinearAttention(layer) => layer.layer_index,
             LayerWeights::FullAttention(layer) => layer.layer_index,
         };
-        if cuda_prefill_fused_mlp_enabled()
+        if cuda_prefill_fused_mlp_enabled(self.config.max_context)
             && prefill.block_out.bytes() >= tokens * 2 * self.topology.intermediate_size * 2
         {
             if let Some(fused) = self.mlp_fused_main_opt(layer_idx) {
@@ -5987,10 +6084,13 @@ impl Engine<CudaBackend> {
         )?;
         let gpu_forward = GpuForwardBuffers::allocate(&engine.topology, engine.config.max_context)?;
         let prefill_capacity = cuda_prefill_capacity(engine.config.max_context);
-        let fused_mlp_prefill = cuda_prefill_fused_mlp_enabled() && cuda_mlp_fused_enabled();
+        let fused_mlp_prefill = cuda_prefill_fused_mlp_enabled(engine.config.max_context)
+            && cuda_mlp_fused_enabled(engine.config.max_context);
         let gpu_prefill =
             GpuPrefillBuffers::allocate(&engine.topology, prefill_capacity, fused_mlp_prefill)?;
-        let mlp_fused = if cuda_mlp_fused_enabled() || cuda_prefill_fused_mlp_enabled() {
+        let mlp_fused = if cuda_mlp_fused_enabled(engine.config.max_context)
+            || cuda_prefill_fused_mlp_enabled(engine.config.max_context)
+        {
             Some(MlpFusedStore::build(
                 &gpu_weights,
                 &manifest,
@@ -5999,12 +6099,13 @@ impl Engine<CudaBackend> {
         } else {
             None
         };
-        let linear_attn_in_proj_fused =
-            if cuda_linear_attn_fused_enabled() || cuda_prefill_fused_linear_attn_enabled() {
-                Some(LinearAttnInProjFusedStore::build(&gpu_weights, &manifest)?)
-            } else {
-                None
-            };
+        let linear_attn_in_proj_fused = if cuda_linear_attn_fused_enabled(engine.config.max_context)
+            || cuda_prefill_fused_linear_attn_enabled(engine.config.max_context)
+        {
+            Some(LinearAttnInProjFusedStore::build(&gpu_weights, &manifest)?)
+        } else {
+            None
+        };
         engine.weights = Some(manifest);
         engine.gpu_weights = Some(gpu_weights);
         engine.gpu_buffers = Some(gpu_buffers);
@@ -6181,6 +6282,7 @@ impl Engine<CudaBackend> {
             + forward_group.total_bytes
             + prefill_group.total_bytes
             + fused_group.total_bytes;
+        let max_context = self.config.max_context;
 
         Some(GpuMemoryReport {
             total_reported_bytes,
@@ -6189,10 +6291,15 @@ impl Engine<CudaBackend> {
             forward: forward_group,
             prefill: prefill_group,
             fused: fused_group,
-            max_context: self.config.max_context,
+            max_context,
             prefill_capacity: prefill.capacity,
             kv_cache_dtype: self.config.kv_cache_dtype,
             mtp_speculative_tokens: self.config.mtp_speculative_tokens,
+            long_context_mode: cuda_long_context_mode_enabled(max_context),
+            long_context_auto_min_context: cuda_long_context_auto_min_context(),
+            mlp_fused_enabled: cuda_mlp_fused_enabled(max_context),
+            linear_attn_fused_enabled: cuda_linear_attn_fused_enabled(max_context),
+            prefill_fused_linear_attn_enabled: cuda_prefill_fused_linear_attn_enabled(max_context),
         })
     }
 }

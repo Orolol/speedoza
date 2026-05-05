@@ -82,6 +82,15 @@ cargo run -p qwen36-fp4 -- validate-weights --model-dir /path/to/model
 cargo run -p qwen36-fp4 --features cuda -- gpu-load --model-dir /path/to/model --max-context 2256
 ```
 
+## CUDA Runtime Knobs
+
+- `QWEN36_KV_CACHE_DTYPE=tq35` selects the TurboQuant 3.5-bit KV cache.
+- `QWEN36_LONG_CONTEXT_MODE` overrides the automatic long-context policy. When unset, contexts at or above 8192 tokens disable the large fused weight stores to save VRAM; set `QWEN36_LONG_CONTEXT_MODE=0` to force the fused stores back on, or `=1` to force long-context mode on smaller runs.
+- `QWEN36_LONG_CONTEXT_AUTO_MIN_CONTEXT=<tokens>` changes the automatic threshold.
+- `QWEN36_PREFILL_SPLIT_MAX_TOKENS=<tokens>` raises the opt-in split-KV prefill chunk limit for long-context experiments. The default remains tuned for short MTP verify chunks.
+- `QWEN36_PREFILL_SPLIT_MIN_SPLITS=<count>` changes the split-KV prefill activation threshold when the max-token override is used.
+- `QWEN36_PROFILE_PREFILL_CHUNKS=1` prints per-prefill-chunk timing buckets for profiling. It synchronizes between buckets and should not be used for throughput numbers.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
