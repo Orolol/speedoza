@@ -98,9 +98,13 @@ Remaining gap:
 
 The active optimization track is single-GPU RTX 5090 throughput for exactly `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP` and the shipped NVFP4/MTP quantization. No generic-model fallback is required; prefer explicit guards and hard errors when an assumption is model-specific.
 
-### Direction B decode_gemv (NVFP4 N=1 hand-rolled gemv)
+### Direction B decode_gemv (NVFP4 N=1 hand-rolled gemv) — **default ON**
 
-`QWEN36_DECODE_GEMV=1` (default OFF) routes the decode-time NVFP4 GEMMs at gemv shape through a hand-rolled tensor-core kernel built on the SM_120a `mma.kind::mxf4nvf4.scale_vec::4X.m16n8k64` atom (`kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu`). Soft-fallback to cuBLASLt for any unsupported shape via the existing dispatch in `crates/kernels/src/backend.rs`. Build script defaults to `-arch=sm_120a` (mandatory for the FP4 block-scaled MMA PTX).
+The decode-time NVFP4 GEMMs at gemv shape are routed through a hand-rolled tensor-core kernel built on the SM_120a `mma.kind::mxf4nvf4.scale_vec::4X.m16n8k64` atom (`kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu`). Soft-fallback to cuBLASLt for any unsupported shape via the existing dispatch in `crates/kernels/src/backend.rs`. Build script defaults to `-arch=sm_120a` (mandatory for the FP4 block-scaled MMA PTX).
+
+**The path is enabled by default.** Two opt-out env vars (kill switches; either disables):
+- `QWEN36_DECODE_GEMV_DISABLE=1` (preferred name)
+- `QWEN36_DECODE_GEMV=0` (back-compat with the original opt-in flag)
 
 Supported regime (B3.7 adaptive): `n==1 && m%16==0 && (k%1024==0 OR k%512==0)`. The entry point picks 16 warps/CTA when K%1024==0 (preferred path, more occupancy) or 8 warps/CTA when K%512==0 only (fallback). Anything else returns NOT_IMPLEMENTED. This covers all realistic decode K values: 5120/8192/17408 → 16-warp path; 3584 (out_proj for linear-attention layers) → 8-warp path. Two kernel instantiations are compiled into the .so.
 

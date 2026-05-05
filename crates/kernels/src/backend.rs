@@ -442,18 +442,32 @@ fn megakernel_enabled() -> bool {
 }
 
 /// Cached env-var lookup gating the Direction B decode-time NVFP4 gemv path.
-/// Set `QWEN36_DECODE_GEMV=1` to opt in; the default (unset / 0) keeps the
-/// existing megakernel/cuBLASLt route active. Cached so the dispatch hot
-/// path does not re-parse the environment per GEMM call.
+///
+/// As of B3.7 the gemv kernel beats cuBLASLt on the gated bench by +14.5%
+/// (MTP=0) and +4.1% (MTP=4) at the shipped Qwen3.6 NVFP4 shapes, with
+/// hard parity (`chat hello / hello world × MTP {0..4}` byte-for-byte
+/// against cuBLASLt). The path is therefore **enabled by default**.
+///
+/// Two opt-out env vars (kill switches; either one disables):
+/// - `QWEN36_DECODE_GEMV_DISABLE=1` (preferred; explicit name)
+/// - `QWEN36_DECODE_GEMV=0` (back-compat with the original opt-in flag)
+///
+/// Cached so the dispatch hot path does not re-parse the environment
+/// per GEMM call.
 #[cfg(feature = "cuda")]
 fn decode_gemv_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("QWEN36_DECODE_GEMV").ok().as_deref(),
+        let disabled_by_kill_switch = matches!(
+            std::env::var("QWEN36_DECODE_GEMV_DISABLE").ok().as_deref(),
             Some("1") | Some("true") | Some("yes") | Some("on")
-        )
+        );
+        let disabled_by_opt_in_flag = matches!(
+            std::env::var("QWEN36_DECODE_GEMV").ok().as_deref(),
+            Some("0") | Some("false") | Some("no") | Some("off")
+        );
+        !(disabled_by_kill_switch || disabled_by_opt_in_flag)
     })
 }
 
