@@ -102,29 +102,30 @@ The active optimization track is single-GPU RTX 5090 throughput for exactly `sak
 
 `QWEN36_DECODE_GEMV=1` (default OFF) routes the decode-time NVFP4 GEMMs at gemv shape through a hand-rolled tensor-core kernel built on the SM_120a `mma.kind::mxf4nvf4.scale_vec::4X.m16n8k64` atom (`kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu`). Soft-fallback to cuBLASLt for any unsupported shape via the existing dispatch in `crates/kernels/src/backend.rs`. Build script defaults to `-arch=sm_120a` (mandatory for the FP4 block-scaled MMA PTX).
 
-Supported regime (B3.4 split-K): `n==1 && m%16==0 && k%256==0`. The k%256 constraint comes from K being sharded into 4 equal pieces (one per warp), each a multiple of the kKPerMma=64 inner-loop chunk. Realistic decode K values (5120, 8192, 17408) all satisfy.
+Supported regime (B3.7 adaptive): `n==1 && m%16==0 && (k%1024==0 OR k%512==0)`. The entry point picks 16 warps/CTA when K%1024==0 (preferred path, more occupancy) or 8 warps/CTA when K%512==0 only (fallback). Anything else returns NOT_IMPLEMENTED. This covers all realistic decode K values: 5120/8192/17408 → 16-warp path; 3584 (out_proj for linear-attention layers) → 8-warp path. Two kernel instantiations are compiled into the .so.
 
 Hard parity gate: `chat --prompt "hello" / "hello world" --max-new-tokens 12 --mtp-speculative-tokens {0..4}` matches the cuBLASLt baseline byte-for-byte for all 10 combinations (re-verified after B3.4 split-K, commit `502bab2`).
 
-Bench (`bench --prompt-tokens 128 --max-new-tokens 128`, 2026-05-05, B3.6 with 16 warps/CTA, median of 3 warm runs after first-run JIT/cache warm-up):
+Bench (`bench --prompt-tokens 128 --max-new-tokens 128`, 2026-05-05, B3.7 adaptive 8/16-warp dispatch, average of 3 warm runs):
 
-| Mode  | cuBLASLt | gemv (B3.6) | Δ |
+| Mode  | cuBLASLt | gemv (B3.7) | Δ |
 |-------|----------|-------------|---|
-| MTP=0 | ~42.5 tok/s | **~49.0 tok/s** | **+15%** (gemv wins) |
-| MTP=4 | ~70 tok/s   | **~96 tok/s**   | **+37%** (gemv wins big) |
+| MTP=0 | 43.5 tok/s | **49.85 tok/s** | **+14.5%** (gemv wins) |
+| MTP=4 | 95.4 tok/s | **99.3 tok/s**  | **+4.1%** (gemv wins) |
 
-Note: the MTP=4 baseline varies day to day (78–125 observed across sessions due to GPU clocks/thermals); the relative speedup vs same-day cuBLASLt is the stable metric. First-run after kernel rebuild is unreliable (warm-up: kernel JIT + L2 fill); always discard run 1.
+Note: baselines vary day to day (MTP=4 baseline observed at 70-125 across sessions due to GPU clocks/thermals); the relative speedup vs same-day cuBLASLt is the stable metric. First-run after kernel rebuild is unreliable (warm-up: kernel JIT + L2 fill); always discard run 1.
 
 Optimization stack:
 - B3.1 (`a1f1dd9`): naive FP4 MMA atom — gap was -48%
 - B3.3.0 (`c20fc6b`): smem activation cache + coalesced SF loads — gap -38.7%
-- B3.3.1 step 1 (`063ed4b`): cooperative gmem→smem weight staging (regressed to -36.7%, scaffolding)
+- B3.3.1 step 1 (`063ed4b`): cooperative gmem→smem weight staging (scaffolding)
 - B3.3.2 (`2bb78b5`): cp.async double-buffering — gap -34%
 - B3.4 (`502bab2`): intra-CTA split-K with 4 warps/CTA — gap -15.6%
 - B3.5 (`7af83f7`): bump to 8 warps/CTA (split-K factor 8) — gap -9.6%
-- B3.6 (HEAD): 16 warps/CTA, 512 threads/CTA — **gemv now BEATS cuBLASLt** (+15% MTP=0, +37% MTP=4)
+- B3.6 (`83c35a8`): 16 warps/CTA, 512 threads/CTA — gemv crosses parity
+- B3.7 (`314da21`): adaptive 8/16-warp template dispatch — **gemv wins +14.5% MTP=0, +4.1% MTP=4**, plus adds K=3584 shape coverage
 
-The split-K + warp-widening combo was the structural fix. Each doubling of warps/CTA doubled the achieved warps/SM at low-M shapes, climbing from 3% → 12% → 23% → ~47% occupancy. cp.async pipelining hides memory latency across the now-many in-flight warps.
+The split-K + warp-widening combo was the structural fix. Each doubling of warps/CTA doubled the achieved warps/SM at low-M shapes, climbing from 3% → 12% → 23% → ~47% occupancy. cp.async pipelining hides memory latency across the now-many in-flight warps. Adaptive dispatch picks the right warp count per K alignment without losing perf.
 
 LDSM for weights (`SM100_SU4_DU8x16_x4_LDSM_N` sub-byte LDSM) was investigated and is a blocker for the k64 mxf4nvf4 atom — CUTLASS only pairs the sub-byte LDSM with the k32 f8f6f4 path (`docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md` +B3.3.1 step 2 investigation in commit `502bab2`'s parent thread). Plain `SM75_U32x4_LDSM_N` would consolidate 4 ld.shared.u32 → 1 ldmatrix per warp but offers limited gain since smem reads aren't the current bottleneck. Plan in `docs/superpowers/plans/2026-05-04-direction-b-nvfp4-gemv-b3.md`.
 
