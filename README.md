@@ -89,6 +89,8 @@ cargo run -p qwen36-fp4 --features cuda -- gpu-load --model-dir /path/to/model -
 - `QWEN36_LONG_CONTEXT_AUTO_MIN_CONTEXT=<tokens>` changes the automatic threshold.
 - `QWEN36_PREFILL_SPLIT_MAX_TOKENS=<tokens>` raises the opt-in split-KV prefill chunk limit for long-context experiments. The default remains tuned for short MTP verify chunks.
 - `QWEN36_PREFILL_SPLIT_MIN_SPLITS=<count>` changes the split-KV prefill activation threshold when the max-token override is used.
+- `QWEN36_DECODE_ATTENTION_BUCKET_MIN_CONTEXT=<tokens>` changes the minimum active-context bucket used to size decode split-KV launches. The default is 8192, so a run reserving 262K context no longer launches 262K-sized decode attention splits while decoding near 8K.
+- `QWEN36_DECODE_ATTENTION_BUCKET_DISABLE=1` restores the older behavior where decode split-KV launch shapes are sized from the configured `max_context`.
 - `QWEN36_PROFILE_PREFILL_CHUNKS=1` prints per-prefill-chunk timing buckets for profiling. It synchronizes between buckets and should not be used for throughput numbers.
 
 ## License
