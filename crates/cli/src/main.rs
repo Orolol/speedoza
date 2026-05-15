@@ -139,8 +139,13 @@ enum Command {
         prompt_tokens: usize,
         #[arg(long, default_value_t = 256)]
         max_new_tokens: usize,
-        #[arg(long, default_value = "x")]
+        #[arg(long, default_value = "x", conflicts_with = "prompt_file")]
         token_text: String,
+        /// Read prompt text from a UTF-8 file and use the first
+        /// `--prompt-tokens` tokens after tokenization. Mutually exclusive
+        /// with `--token-text` (which synthesizes a repeating prompt).
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         mtp_speculative_tokens: usize,
         #[arg(long, default_value_t = 1)]
@@ -300,6 +305,7 @@ fn main() -> Result<()> {
             prompt_tokens,
             max_new_tokens,
             token_text,
+            prompt_file,
             mtp_speculative_tokens,
             mtp_tree_leaves,
         } => {
@@ -311,6 +317,7 @@ fn main() -> Result<()> {
                 prompt_tokens,
                 max_new_tokens,
                 token_text,
+                prompt_file,
                 mtp_speculative_tokens,
                 mtp_tree_leaves,
             )?;
@@ -949,6 +956,7 @@ fn run_bench(
     prompt_token_count: usize,
     max_new_tokens: usize,
     token_text: String,
+    prompt_file: Option<PathBuf>,
     mtp_speculative_tokens: usize,
     mtp_tree_leaves: usize,
 ) -> Result<()> {
@@ -959,7 +967,10 @@ fn run_bench(
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
     let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
-    let prompt_tokens = synthetic_prompt_tokens(&tokenizer, &token_text, prompt_token_count)?;
+    let prompt_tokens = match prompt_file.as_deref() {
+        Some(path) => prompt_tokens_from_file(&tokenizer, path, prompt_token_count)?,
+        None => synthetic_prompt_tokens(&tokenizer, &token_text, prompt_token_count)?,
+    };
     let mtp_schedule = mtp_schedule(mtp_speculative_tokens, prompt_tokens.len());
     let config = EngineConfig {
         max_context: prompt_tokens
@@ -1521,6 +1532,35 @@ fn run_bench_mtp_tree(
 }
 
 #[cfg(feature = "cuda")]
+fn prompt_tokens_from_file(
+    tokenizer: &QwenTokenizer,
+    path: &std::path::Path,
+    target_tokens: usize,
+) -> Result<Vec<u32>> {
+    if target_tokens == 0 {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path).map_err(|err| {
+        anyhow::anyhow!("failed to read --prompt-file {}: {err}", path.display())
+    })?;
+    let tokens = tokenizer.encode(&text, false)?;
+    if tokens.len() < target_tokens {
+        anyhow::bail!(
+            "prompt-file {} has only {} tokens, requested {}",
+            path.display(),
+            tokens.len(),
+            target_tokens,
+        );
+    }
+    eprintln!(
+        "bench: using {} tokens from {}",
+        target_tokens,
+        path.display(),
+    );
+    Ok(tokens.into_iter().take(target_tokens).collect())
+}
+
+#[cfg(feature = "cuda")]
 fn synthetic_prompt_tokens(
     tokenizer: &QwenTokenizer,
     token_text: &str,
@@ -1591,6 +1631,7 @@ fn run_bench(
     _prompt_tokens: usize,
     _max_new_tokens: usize,
     _token_text: String,
+    _prompt_file: Option<PathBuf>,
     _mtp_speculative_tokens: usize,
     _mtp_tree_leaves: usize,
 ) -> Result<()> {

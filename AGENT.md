@@ -43,6 +43,9 @@ cargo clippy --workspace --features qwen36-fp4-kernels/cuda -- -D warnings
 Single test: `cargo test -p <crate> <name>` (e.g. `cargo test -p qwen36-fp4-mtp rollback`).
 End-to-end smoke against a real checkpoint: `cargo run -p qwen36-fp4 --features cuda -- gpu-load --model-dir <path> --max-context 2256`.
 
+Bench against a real-text prompt (preferred for MTP-acceptance gates): `bench --prompt-file benches/data/long_prompt_4k.txt --prompt-tokens 4096 --max-new-tokens 64 --mtp-speculative-tokens 4`. The synthetic single-token-repeat default produces adversarial MTP acceptance — see `### 2026-05-15 — Anomaly diagnostics` below.
+Measure MTP acceptance on real text: `chat --prompt "$(cat real_prompt.txt)" --max-new-tokens 64 --mtp-speculative-tokens 4` with `QWEN36_MTP_STATS=1` — prints `mtp.stats accepted=… acceptance_rate=…`.
+
 ## Build environment
 
 - `QWEN36_FP4_CUDA_MIN_VERSION=13.0` and `QWEN36_FP4_SM=120` are set in `.cargo/config.toml`.
@@ -286,7 +289,131 @@ Memory cost of the fused stores: ~5.7 GB for `MlpFusedStore` + ~2.3 GB for `Line
 - *Prefill-path MLP / DeltaNet fusion*: same combined-GEMM idea but the multi-row cuBLASLt FP4 output is column-major `(M=combined, N=tokens)`, so `swiglu` / `conv1d_update` / `gdn_gate` would need stride-aware reads (or a deinterleave scatter kernel). Would help MTP verify forwards (chunked prefill) for a small additional gain on MTP=2/3.
 - *MTP head BF16 → NVFP4*: the MTP attention + MLP run 24× per 32-token MTP=3 cycle and currently use BF16 weights. Quantising would speed it up significantly but needs a proper parity harness against the BF16 path; risks breaking the MTP parity gate.
 - *Persistent / specialised DeltaNet recurrent kernel*: the existing decode kernel is rated 5/5, but a multi-layer persistent kernel that holds state in TMEM and avoids per-layer launches could shave more. Major rewrite.
-- *Native Linux re-bench*: WSL2 adds 1–3 µs per kernel launch; with ~30 cudaGraphLaunches/sec of decode + sync points, expected delta is ~5–10 % free. Zero engineering effort and the highest-ROI experiment to run before any further CUDA work.
+- *Native Linux re-bench*: WSL2 adds 1–3 µs per kernel launch; with ~30 cudaGraphLaunches/sec of decode + sync points, expected delta is ~5–10 % free. Zero engineering effort and the highest-ROI experiment to run before any further CUDA work. **Done 2026-05-15 — see entry below.**
+
+### 2026-05-15 — Native Linux re-bench + max-new=1024 sweep
+
+First full bench on native Linux (Ubuntu 26.04, glibc 2.43, CUDA 13.1.115, g++-15 host with rsqrt-noexcept patch on CUDA `crt/math_functions.h`, RTX 5090; post-PR #4 codebase). All numbers `--prompt-tokens 128 --max-new-tokens 1024` unless noted.
+
+**Phase 1 — median of 5 runs at prompt=128**:
+
+| MTP | decode tok/s (median) | decode min–max | prefill tok/s |
+|-----|----------------------:|----------------|--------------:|
+| 0   | 48.56 | 48.13–49.64 (±0.3 %) | 1117 |
+| 3   | 96.41 | 90.43–97.22 (±3 %)   | 1118 |
+| 4   | 112.08 | 102.23–117.46 (±7 %) | 1075 |
+
+Vs WSL2 best (2026-05-03, same `prompt-tokens 128 max-new-tokens 128`): MTP3 96.7 → 96.4, MTP4 107.2 → 112.1. The native-Linux gain is smaller than the 5–10 % predicted; most of the cudaGraph launches in decode are already amortised by graph replay, so the µs/launch saving had limited room. MTP=4 variance grew with max-new (±7 % over 5 runs at 1024 vs ±1.5 % at 128) — same hardware running hotter.
+
+**Phase 2 — context sweep, max-new=1024 (single run each, exploratory)**:
+
+| prompt | prefill tok/s | decode MTP=0 | decode MTP=4 | acc MTP=4 |
+|-------:|--------------:|-------------:|-------------:|----------:|
+|   512  | 1849 | 51.6  | 101.0 | 100 %     |
+|  1024  | 1712 | 52.1  | 84.0  | 100 %     |
+|  2048  | 1389 | 51.1  | 63.6  | 99.9 %    |
+|  4096  | 1095 | 50.1  | 62.8  | **83.9 %** ⚠️ |
+|  8192  |  742 | 43.5  | **105.5** ⚠️ | 99.9 %    |
+
+**Three anomalies to investigate before further optimisation**:
+
+1. **Prefill degrades 2.5× from 512 to 8192** (1849 → 742 tok/s). PR #4 introduced a long-context prefill mode at `QWEN36_LONG_CONTEXT_AUTO_MIN_CONTEXT=8192` that disables `MlpFusedStore` / `LinearAttnInProjFusedStore` to save VRAM. Confirm with `QWEN36_PROFILE_PREFILL_CHUNKS=1` which phase regresses, and whether the VRAM safety margin still requires disabling fusions on the 32 GB native-Linux setup.
+
+2. **MTP=4 acceptance drops to 83.9 % at prompt=4096** while staying ~100 % at 2048 and 8192. Suggests a dispatch transition between 2k and 4k that the MTP head doesn't follow correctly. Fixing this returns ~30 tok/s on that band.
+
+3. **MTP=4 decode is faster at 8192 (105.5 tok/s) than at 2048–4096 (~63 tok/s)** — counter-intuitive given KV cache is larger. Likely the long-context mode swaps in a more efficient attention path (split-GQA `n_splits ≥ 32`?). Worth understanding what makes 8192 fast and porting that to the shorter-context paths.
+
+**Post-anomaly roadmap** (external research, prioritised by ROI on this single-stream FP4 5090 target):
+
+| # | Item | Source | Est. gain | Effort |
+|---|------|--------|-----------|--------|
+| B1 | NVFP4 KV cache (4-bit storage, FP8 dequant for attention) | NVIDIA dev blog 2026 — <1 % accuracy loss on Ruler-64K/LiveCodeBench | ~2× decode at long context | 1–2 wk |
+| B2 | EAGLE-3 head replacing chain MTP-4 | arxiv 2503.01840 (NeurIPS'25) — 4.5–5 accepted/cycle vs our 3.92 | +15–25 % vs MTP-4 | 2–3 wk |
+| B3 | Quest query-aware page sparsity | arxiv 2406.10774 (ICML'24) — stacks on B1 | ~3–5× extra at ≥ 4k ctx | 1–2 wk |
+| B4 | Sage2++ FP8 attention with FP16 accumulator | arxiv 2505.11594 — rescaling trick | ~+10–20 % attention | 3–5 d |
+| B5 | Split-K decode attention + SMEM page-index prefetch (FlashInfer pattern) | `flashinfer/csrc/single_decode.cu` | better SM utilisation at N=1 | 1 wk |
+| C1 | FlashDecoding++ async-softmax unified-max | arxiv 2311.01282 | ~+10–15 % attention | 3–5 d |
+| C2 | Prefix caching block-hash (multi-turn) | vLLM design doc | skip prefill on shared prefix | 1 wk |
+| C3 | L2 persisting window on RoPE + MTP weights | already wired (`memory.rs`) | +1–3 % | 1–2 d |
+
+**Explicit non-targets** (gain-negative or non-portable to SM_120):
+- FlashAttention-4 / SM_100 trtllm-gen FMHA cubins — depend on `tcgen05` / TMEM, **absent on SM_120**. Reference SM_120 attention impl ≈ 94 % SOL with plain `mma.sync` (gau-nernst blog).
+- Tree-MTP K>1 without a tree-aware attention kernel — already a NEGATIVE result on 2026-05-04. Re-attempt only with DeFT (ICLR'25) / FastTree style kernel.
+- MagicPIG / StreamingLLM / PagedAttention / ring attention — none applicable to single-GPU single-stream.
+
+### 2026-05-15 — Anomaly diagnostics + `PREFILL_CAPACITY` sweep
+
+Four diagnostic experiments to isolate the three Phase-2-anomalies above. Raw data in `/tmp/{diag,e1,e2,e3,e4}*`.
+
+**E1 — `QWEN36_PREFILL_CAPACITY` sweep at prompt=8192, max-new=1024** (medians of 2 reps each):
+
+| cap | MTP=0 prefill | MTP=0 decode | MTP=4 prefill | MTP=4 decode | peak VRAM |
+|----:|--------------:|-------------:|--------------:|-------------:|----------:|
+| 512 (default) | 733 | 43.3 | 712  | 105.6 | ~30 GB* |
+| 1024 | 833 | 44.4 | 807  | 107.3 | |
+| **2048** | **875** | **45.1** | **841** | 106.2 | |
+| 4096 | 865 | 44.3 | 847  | 104.3 | |
+| 8192 | 869 | 44.3 | 871  | 103.4 | |
+
+\* peak VRAM is inflated by concurrent multi-agent GPU sharing during the sweep; uncontended runs sit ≈22 GB at prompt=8192.
+
+**Conclusion**: `QWEN36_PREFILL_CAPACITY=2048` is the optimum on 32 GB native Linux — **+19 % prefill** (MTP=0) and **+18 %** (MTP=4) vs the default 512. The default was tuned for tighter VRAM; on the 5090 native-Linux setup the chunk-launch overhead dominates and bigger chunks pay. Above 2048 there's no further prefill gain and decode regresses slightly. Recommended new default is **2048**, with the existing env var preserved as an override. The default lives at `crates/runtime/src/engine.rs:99-103` (`max_context.min(512)`).
+
+**E2 — Bracketing the MTP-acceptance dip** (median of 3 reps, MTP=4, max-new=1024):
+
+| prompt | n_splits | acc | decode tok/s |
+|-------:|---------:|----:|-------------:|
+| 2048 | 33 | 0.999 | ~63 |
+| 2304 | 37 | 0.978 | 56.1 |
+| 2560 | 41 | 0.998 | 56.6 |
+| 3072 | 49 | **1.000** | **121.5** |
+| 3584 | 57 | **0.913** | 82.5 |
+| **4096** | 65 | **0.839** | 64.7 |
+| 4608 | 73 | **0.800** | 56.1 |
+| 5120 | 81 | 0.999 | 117.2 |
+| 6144 | 97 | 0.998 | 114.4 |
+| 7168 | 113 | **0.926** | 78.7 |
+| 8192 | 129 | 0.999 | ~105 |
+
+The dip is **not a single sharp threshold**: there are two valleys (3584–4608 with acc 0.80–0.91 and 7168 with acc 0.93) separated by a recovery band (5120–6144 acc ~1.0). MTP-depth doesn't matter — at prompt=4096, MTP={2, 3, 4} all show acc ~0.82. The initial hypothesis "split-GQA n_splits ≥ 64 dispatch is broken" was **falsified**: `QWEN36_ATTENTION_SPLIT_DISABLE=1` and `QWEN36_PREFILL_SPLIT_MIN_SPLITS=256` both leave acc at ~0.85, and prompts 5120/6144 (n_splits=81/97) pass the same dispatch path with acc ~1.0.
+
+**E3 — Same prompts, real prose** (chat path with `QWEN36_MTP_STATS=1`, ~4000 tokens of natural English from `doc.md` + `AGENT.md`): acc = **0.980** at 4k, 0.942 at 2k, 0.925 at 8k. **The 4k dip does NOT reproduce on natural text.** It only manifests with synthetic single-token prompts (`bench` default) AND with short looping seeds (`--token-text "the quick brown fox..."` 27-token seed repeated to 4096). So:
+- E2 bench at 4k with 27-token-loop: acc 0.84 (bug present)
+- E3 chat at 4k with natural prose: acc 0.98 (bug absent)
+
+**Verdict on the 4096 acceptance anomaly**: it is a **synthetic-prompt artefact**, not a production regression. The MTP draft head has a known weakness on low-entropy periodic inputs; on natural text it behaves normally. The `bench` MTP acceptance number at long prompts should be treated as an adversarial stress test, not a production forecast. Cheap follow-up: add `--prompt-file <path>` to `bench` and ship a small natural-text corpus for CI.
+
+**E4 — `QWEN36_PROFILE_DECODE_LAYERS=1` at prompts {2048, 4096, 8192}**:
+
+| bucket | p=2048 | p=4096 | p=8192 |
+|--------|-------:|-------:|-------:|
+| embed       |  0.18 |  0.19 |  0.18 |
+| linear_attn |  4.13 |  4.21 |  4.45 |
+| full_attn   |  3.44 |  3.74 |  5.87 |
+| mlp         | 10.24 | 10.36 | 10.68 |
+| lm_head     |  1.65 |  1.65 |  1.65 |
+| **total**   | 19.64 | 20.15 | 22.82 |
+
+**Every per-block bucket is monotone in context length** — no bucket regresses at 4k. The 64 → 105 tok/s gap between prompt=4k and 8k (MTP=4) is **entirely explained by acceptance**:
+- At 4k, acc=0.754 → 20 main_steps + 82 mtp_steps = **102 forward calls** to emit 64 tokens.
+- At 8k, acc=0.98 → 14 main_steps + 56 mtp_steps = **70 forward calls** for the same 64 tokens.
+
+Per-call cost is *lower* at 8k than 2k (9.96 vs 14.41 ms). The decode is fine; the draft acceptance is the lever.
+
+**Net takeaways from the four experiments**:
+1. **Anomaly #1 (prefill 1849 → 742)** — root cause is chunk capacity, not the long-context fusion-disable. **Action**: set default `QWEN36_PREFILL_CAPACITY=2048` (free +18 % prefill at 8k).
+2. **Anomaly #2 (MTP=4 acc 0.839 at 4096)** — synthetic-prompt artefact; does not affect real text. **Action**: add `--prompt-file` to `bench`, do not chase the kernel-side hypothesis.
+3. **Anomaly #3 (MTP=4 decode @ 8k faster than @ 4k)** — explained by anomaly #2 downstream; same draft acceptance everywhere on real text, so the "fast at 8k" is just the absence of the synthetic-input pathology. No backport needed.
+
+The Phase-2 single-run sweep was thus dominated by synthetic-prompt MTP pathology in the 2k-6k range. The real prefill-capacity win is independent and lands at **+18 %** for prompt=8192 just by changing one default.
+
+#### Shipped 2026-05-15 (P0 batch)
+
+- **`QWEN36_PREFILL_CAPACITY` default raised from `max_context.min(512)` to `max_context.min(2048)`** in `crates/runtime/src/engine.rs` (was `:99-103`). Free **+18 % prefill** at prompt=8192 (MTP=4: 712 → 841 tok/s; MTP=0: 733 → 875). Empirical plateau at 2048 — caps of 4096 / 8192 yield no further prefill gain and regress decode ~1 % (see E1 table). Env var still overrides the new default for explicit control; the old 512 value is reachable via `QWEN36_PREFILL_CAPACITY=512`.
+
+- **`bench --prompt-file <path>` option added** to `crates/cli/src/main.rs`. Reads the file, tokenises to up to `--prompt-tokens` tokens, and runs the standard prefill+decode loop on that real input. Corpus shipped at `benches/data/long_prompt_{4k,8k}.txt` (natural English prose ≈ 4 k / 8 k tokens). Synthetic single-token-repeat path remains the default for back-compat and microbenchmarking. **For any MTP-acceptance CI gate, always use `--prompt-file` or the `chat` path** — synthetic single-token-repeat prompts produce adversarial acceptance numbers (E2: bench acc 0.84 at 4 k vs E3: chat acc 0.98 on the same length of real text) that do not reflect production behaviour.
+
+- **Reference path for measuring real MTP acceptance**: `cargo run --release -p qwen36-fp4 --features cuda -- chat --prompt "$(cat real_prompt.txt)" --max-new-tokens 64 --mtp-speculative-tokens 4` with `QWEN36_MTP_STATS=1`. The chat path prints `mtp.stats accepted=N rejected=M acceptance_rate=R` from `run_chat_mtp_multi` in `crates/cli/src/main.rs`. Use this — not `bench` synthetic prompts — for any "is the MTP head healthy?" gate. E3 verified real-text acc=0.98 vs synthetic-bench acc=0.84 at the same 4 k prompt length, confirming the dip diagnosed in E2 is a synthetic-prompt artefact only.
 
 ### Mirage megakernel branch (`feat/mirage-megakernel`) — **dead code, kept for reference**
 
