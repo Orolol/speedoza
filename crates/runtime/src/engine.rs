@@ -112,6 +112,16 @@ fn cuda_long_context_auto_min_context() -> usize {
 }
 
 #[cfg(feature = "cuda")]
+const CUDA_DECODE_ATTENTION_BUCKET_MIN_CONTEXT: usize = 8192;
+
+#[cfg(feature = "cuda")]
+fn cuda_decode_attention_bucket_min_context() -> usize {
+    cuda_env_usize("QWEN36_DECODE_ATTENTION_BUCKET_MIN_CONTEXT")
+        .unwrap_or(CUDA_DECODE_ATTENTION_BUCKET_MIN_CONTEXT)
+        .max(1)
+}
+
+#[cfg(feature = "cuda")]
 fn cuda_long_context_mode_enabled(max_context: usize) -> bool {
     cuda_env_bool_value("QWEN36_LONG_CONTEXT_MODE")
         .unwrap_or_else(|| max_context >= cuda_long_context_auto_min_context())
@@ -254,6 +264,7 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
 #[cfg(feature = "cuda")]
 struct DecodeGraphState {
     kind: DecodeGraphKind,
+    attention_context_limit: usize,
     stream: qwen36_fp4_kernels::graph::OwnedCudaStream,
     exec: qwen36_fp4_kernels::graph::CudaGraphExec,
     raw_graph: qwen36_fp4_kernels::graph::CudaGraph,
@@ -524,11 +535,11 @@ impl<B: KernelBackend> Engine<B> {
     pub fn enable_decode_graph(&mut self) -> Result<()> {
         use qwen36_fp4_kernels::graph::{self, CudaStream};
 
-        if self
-            .decode_graph
-            .as_ref()
-            .is_some_and(|graph| graph.kind == DecodeGraphKind::Decode)
-        {
+        let attention_context_limit = self.graph_attention_context_limit(DecodeGraphKind::Decode);
+        if self.decode_graph.as_ref().is_some_and(|graph| {
+            graph.kind == DecodeGraphKind::Decode
+                && graph.attention_context_limit == attention_context_limit
+        }) {
             return Ok(());
         }
         if self.decode_graph.is_some() {
@@ -593,6 +604,7 @@ impl<B: KernelBackend> Engine<B> {
 
         self.decode_graph = Some(DecodeGraphState {
             kind: DecodeGraphKind::Decode,
+            attention_context_limit,
             stream,
             exec,
             raw_graph,
@@ -604,9 +616,22 @@ impl<B: KernelBackend> Engine<B> {
     /// `enable_decode_graph` was called first.
     #[cfg(feature = "cuda")]
     pub fn decode_graph_step(&mut self) -> Result<()> {
+        let attention_context_limit = self.graph_attention_context_limit(DecodeGraphKind::Decode);
+        if self.decode_graph.as_ref().is_some_and(|graph| {
+            graph.kind == DecodeGraphKind::Decode
+                && graph.attention_context_limit != attention_context_limit
+        }) {
+            self.enable_decode_graph()?;
+            return Ok(());
+        }
         let graph_state = self.decode_graph.as_ref().ok_or_else(|| {
             CoreError::Runtime("decode_graph_step called without an active capture".to_owned())
         })?;
+        if graph_state.kind != DecodeGraphKind::Decode {
+            return Err(CoreError::Runtime(
+                "decode_graph_step found a non-decode graph".to_owned(),
+            ));
+        }
         qwen36_fp4_kernels::graph::launch(graph_state.exec, graph_state.stream.handle())?;
         // Mirror the device-side position bump on the host so callers that
         // read `state.position` see the truth.
@@ -618,11 +643,12 @@ impl<B: KernelBackend> Engine<B> {
     fn ensure_mtp_verify_graph_two_tokens(&mut self, start_position: usize) -> Result<()> {
         use qwen36_fp4_kernels::graph::{self, CudaStream};
 
-        if self
-            .decode_graph
-            .as_ref()
-            .is_some_and(|graph| graph.kind == DecodeGraphKind::MtpVerifyOne)
-        {
+        let attention_context_limit =
+            self.decode_attention_context_limit_for_active_context(start_position + 2);
+        if self.decode_graph.as_ref().is_some_and(|graph| {
+            graph.kind == DecodeGraphKind::MtpVerifyOne
+                && graph.attention_context_limit == attention_context_limit
+        }) {
             return Ok(());
         }
         if self.decode_graph.is_some() {
@@ -686,6 +712,7 @@ impl<B: KernelBackend> Engine<B> {
 
         self.decode_graph = Some(DecodeGraphState {
             kind: DecodeGraphKind::MtpVerifyOne,
+            attention_context_limit,
             stream,
             exec,
             raw_graph,
@@ -722,6 +749,9 @@ impl<B: KernelBackend> Engine<B> {
         }
         let assume_accept = mtp_assume_accept_enabled();
         let batched_lm_head = mtp_batched_lm_head_enabled();
+        let verify_tokens = draft_count + 1;
+        let attention_context_limit =
+            self.decode_attention_context_limit_for_active_context(start_position + verify_tokens);
         if self.decode_graph.as_ref().is_some_and(|graph| {
             graph.kind
                 == (DecodeGraphKind::MtpVerifyMulti {
@@ -729,6 +759,7 @@ impl<B: KernelBackend> Engine<B> {
                     assume_accept,
                     batched_lm_head,
                 })
+                && graph.attention_context_limit == attention_context_limit
         }) {
             return Ok(());
         }
@@ -749,7 +780,6 @@ impl<B: KernelBackend> Engine<B> {
 
         let stream = CudaStream::create()?;
         let stream_handle = stream.handle();
-        let verify_tokens = draft_count + 1;
         let start_position_device_i32 = self.cuda_prefill()?.position_i32.ptr();
         graph::set_active_stream(stream_handle);
 
@@ -880,6 +910,7 @@ impl<B: KernelBackend> Engine<B> {
                 assume_accept,
                 batched_lm_head,
             },
+            attention_context_limit,
             stream,
             exec,
             raw_graph,
@@ -916,11 +947,12 @@ impl<B: KernelBackend> Engine<B> {
     pub fn enable_mtp_decode_graph(&mut self) -> Result<()> {
         use qwen36_fp4_kernels::graph::{self, CudaStream};
 
-        if self
-            .decode_graph
-            .as_ref()
-            .is_some_and(|graph| graph.kind == DecodeGraphKind::MtpDecodeOne)
-        {
+        let attention_context_limit =
+            self.graph_attention_context_limit(DecodeGraphKind::MtpDecodeOne);
+        if self.decode_graph.as_ref().is_some_and(|graph| {
+            graph.kind == DecodeGraphKind::MtpDecodeOne
+                && graph.attention_context_limit == attention_context_limit
+        }) {
             return Ok(());
         }
         if self.decode_graph.is_some() {
@@ -988,6 +1020,7 @@ impl<B: KernelBackend> Engine<B> {
 
         self.decode_graph = Some(DecodeGraphState {
             kind: DecodeGraphKind::MtpDecodeOne,
+            attention_context_limit,
             stream,
             exec,
             raw_graph,
@@ -3789,6 +3822,7 @@ impl<B: KernelBackend> Engine<B> {
             k_bf16: forward.aux.ptr(),
             scalar_position_device_i32: position_device_i32,
         })?;
+        let attention_context_limit = self.decode_attention_context_limit_for_position(position);
         self.backend.attention_decode(&AttentionDecodeSpec {
             layer_index: layer.layer_index,
             position,
@@ -3810,8 +3844,10 @@ impl<B: KernelBackend> Engine<B> {
             partial_acc_f32: forward.attn_partial_acc.ptr(),
             partial_max_f32: forward.attn_partial_max.ptr(),
             partial_denom_f32: forward.attn_partial_denom.ptr(),
-            decode_n_splits: self.decode_attention_n_splits(),
-            split_timesteps_per_block: self.attention_split_timesteps_per_block(),
+            decode_n_splits: self
+                .decode_attention_n_splits_for_context_limit(attention_context_limit),
+            split_timesteps_per_block: self
+                .attention_split_timesteps_per_block_for(attention_context_limit),
         })?;
         self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
             rows: 1,
@@ -3906,6 +3942,7 @@ impl<B: KernelBackend> Engine<B> {
             k_bf16: forward.aux.ptr(),
             scalar_position_device_i32: position_device_i32,
         })?;
+        let attention_context_limit = self.decode_attention_context_limit_for_position(position);
         self.backend.attention_decode(&AttentionDecodeSpec {
             layer_index: layer.layer_index,
             position,
@@ -3927,8 +3964,10 @@ impl<B: KernelBackend> Engine<B> {
             partial_acc_f32: forward.attn_partial_acc.ptr(),
             partial_max_f32: forward.attn_partial_max.ptr(),
             partial_denom_f32: forward.attn_partial_denom.ptr(),
-            decode_n_splits: self.decode_attention_n_splits(),
-            split_timesteps_per_block: self.attention_split_timesteps_per_block(),
+            decode_n_splits: self
+                .decode_attention_n_splits_for_context_limit(attention_context_limit),
+            split_timesteps_per_block: self
+                .attention_split_timesteps_per_block_for(attention_context_limit),
         })?;
         self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
             rows: 1,
@@ -4024,7 +4063,9 @@ impl<B: KernelBackend> Engine<B> {
             split_timesteps_per_block: if start_position_device_i32 == DevicePtr::NULL {
                 self.attention_split_timesteps_per_block_for(start_position + tokens)
             } else {
-                self.attention_split_timesteps_per_block()
+                let context_limit =
+                    self.decode_attention_context_limit_for_active_context(start_position + tokens);
+                self.attention_split_timesteps_per_block_for(context_limit)
             },
             tree_ancestor_bitmap_u64: DevicePtr::NULL,
             verify_chunk_rows: 0,
@@ -4568,7 +4609,9 @@ impl<B: KernelBackend> Engine<B> {
             split_timesteps_per_block: if start_position_device_i32 == DevicePtr::NULL {
                 self.attention_split_timesteps_per_block_for(start_position + tokens)
             } else {
-                self.attention_split_timesteps_per_block()
+                let context_limit =
+                    self.decode_attention_context_limit_for_active_context(start_position + tokens);
+                self.attention_split_timesteps_per_block_for(context_limit)
             },
             tree_ancestor_bitmap_u64: DevicePtr::NULL,
             verify_chunk_rows: 0,
@@ -5780,11 +5823,6 @@ impl<B: KernelBackend> Engine<B> {
     /// around 1K context for MTP short-chunk attention; 64 exposes more
     /// T-axis parallelism once the graph shape reaches ~2K context on the 5090.
     #[cfg(feature = "cuda")]
-    fn attention_split_timesteps_per_block(&self) -> usize {
-        self.attention_split_timesteps_per_block_for(self.config.max_context)
-    }
-
-    #[cfg(feature = "cuda")]
     fn attention_split_timesteps_per_block_for(&self, context: usize) -> usize {
         if let Some(value) = cuda_env_usize("QWEN36_ATTENTION_SPLIT_TIMESTEPS") {
             return value.max(ATTN_MIN_SPLIT_TIMESTEPS_PER_BLOCK);
@@ -5798,24 +5836,60 @@ impl<B: KernelBackend> Engine<B> {
         }
     }
 
-    /// Pick the number of split-KV blocks per q-head for decode attention.
-    /// Sized from `max_context` (not the current position) so the same value
-    /// is valid for both fresh kernel calls and CUDA-graph replays where the
-    /// position grows after capture. Returns 0 when the configured context
-    /// is short enough that the per-q-head kernel is faster (split + reduce
-    /// launch overhead would dominate).
     #[cfg(feature = "cuda")]
-    fn decode_attention_n_splits(&self) -> usize {
+    fn decode_attention_context_limit_for_position(&self, position: usize) -> usize {
+        self.decode_attention_context_limit_for_active_context(position.saturating_add(1))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn decode_attention_context_limit_for_active_context(&self, active_context: usize) -> usize {
+        if cuda_env_bool("QWEN36_DECODE_ATTENTION_BUCKET_DISABLE") {
+            return self.config.max_context.max(1);
+        }
+
+        let max_context = self.config.max_context.max(1);
+        let active_context = active_context.clamp(1, max_context);
+        let bucket_floor = cuda_decode_attention_bucket_min_context().min(max_context);
+        let wanted = active_context.max(bucket_floor);
+        wanted
+            .checked_next_power_of_two()
+            .unwrap_or(max_context)
+            .min(max_context)
+            .max(active_context)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn graph_attention_context_limit(&self, kind: DecodeGraphKind) -> usize {
+        match kind {
+            DecodeGraphKind::Decode | DecodeGraphKind::MtpDecodeOne => {
+                self.decode_attention_context_limit_for_position(self.state.position)
+            }
+            DecodeGraphKind::MtpVerifyOne => {
+                self.decode_attention_context_limit_for_active_context(self.state.position + 2)
+            }
+            DecodeGraphKind::MtpVerifyMulti { drafts, .. } => self
+                .decode_attention_context_limit_for_active_context(
+                    self.state.position + drafts + 1,
+                ),
+        }
+    }
+
+    /// Pick the number of split-KV blocks per q-head for decode attention.
+    /// Sized from a context bucket instead of the configured `max_context`.
+    /// This keeps CUDA graph launch shapes stable inside the bucket while
+    /// avoiding thousands of empty split-KV blocks when a run reserves a very
+    /// large context window but is currently decoding around 8K-32K tokens.
+    #[cfg(feature = "cuda")]
+    fn decode_attention_n_splits_for_context_limit(&self, context_limit: usize) -> usize {
         if cuda_env_bool("QWEN36_ATTENTION_SPLIT_DISABLE") {
             return 0;
         }
         if let Some(value) = cuda_env_usize("QWEN36_DECODE_ATTENTION_N_SPLITS") {
             return value;
         }
-        let n_splits = self
-            .config
-            .max_context
-            .div_ceil(self.attention_split_timesteps_per_block());
+        let n_splits = context_limit
+            .max(1)
+            .div_ceil(self.attention_split_timesteps_per_block_for(context_limit));
         if n_splits >= 2 { n_splits } else { 0 }
     }
 
@@ -5826,7 +5900,8 @@ impl<B: KernelBackend> Engine<B> {
         start_position_device_i32: DevicePtr,
     ) -> usize {
         if start_position_device_i32 != DevicePtr::NULL {
-            return self.decode_attention_n_splits();
+            let context_limit = self.decode_attention_context_limit_for_active_context(context);
+            return self.decode_attention_n_splits_for_context_limit(context_limit);
         }
         if cuda_env_bool("QWEN36_ATTENTION_SPLIT_DISABLE") {
             return 0;
