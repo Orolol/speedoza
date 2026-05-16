@@ -177,6 +177,14 @@ namespace {
 
 __global__ void increment_i32_kernel(int32_t *target) { *target += 1; }
 
+__global__ void mtp_assume_accept_chain_advance_kernel(
+    int32_t *position_i32, size_t position_count, int32_t position_delta) {
+  size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < position_count) {
+    position_i32[idx] += position_delta;
+  }
+}
+
 } // namespace
 
 extern "C" int qwen36_increment_i32(qwen36_device_ptr_t target_i32) {
@@ -185,6 +193,27 @@ extern "C" int qwen36_increment_i32(qwen36_device_ptr_t target_i32) {
   }
   increment_i32_kernel<<<1, 1, 0, qwen36_internal_active_stream()>>>(
       reinterpret_cast<int32_t *>(static_cast<uintptr_t>(target_i32.ptr)));
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int qwen36_mtp_assume_accept_chain_advance(
+    qwen36_device_ptr_t position_i32, size_t draft_count, size_t position_count,
+    int32_t position_delta) {
+  if (position_i32.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  if (draft_count == 0 || draft_count > 4 || position_count == 0 ||
+      position_delta <= 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  unsigned int threads = 32;
+  unsigned int blocks =
+      static_cast<unsigned int>((position_count + threads - 1) / threads);
+  mtp_assume_accept_chain_advance_kernel<<<blocks, threads, 0,
+                                           qwen36_internal_active_stream()>>>(
+      reinterpret_cast<int32_t *>(static_cast<uintptr_t>(position_i32.ptr)),
+      position_count, position_delta);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }

@@ -10,7 +10,8 @@ pub use cuda_graph::{CudaGraphBucket, CudaGraphPlan};
 pub use engine::{Engine, EngineConfig, ForwardOutput};
 #[cfg(feature = "cuda")]
 pub use engine::{
-    GpuMemoryGroup, GpuMemoryItem, GpuMemoryReport, MtpMultiVerifyResult, MtpVerifyResult,
+    GpuMemoryGroup, GpuMemoryItem, GpuMemoryReport, MtpDeviceChainResult, MtpMultiVerifyResult,
+    MtpVerifyResult,
 };
 #[cfg(feature = "cuda")]
 pub use gpu::{GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers, GpuTensor, GpuWeightStore};
