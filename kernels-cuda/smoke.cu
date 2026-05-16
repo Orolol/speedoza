@@ -238,6 +238,64 @@ int main() {
                  "attention prefill split");
   }
 
+  constexpr size_t tile2_tokens = 16;
+  qwen36_device_ptr_t prefill_tile2_q =
+      dev_alloc<__nv_bfloat16>(q_values * tile2_tokens);
+  qwen36_device_ptr_t prefill_tile2_k =
+      dev_alloc<__nv_bfloat16>(kv_values * tile2_tokens);
+  qwen36_device_ptr_t prefill_tile2_v =
+      dev_alloc<__nv_bfloat16>(kv_values * tile2_tokens);
+  qwen36_device_ptr_t prefill_tile2_cache_k =
+      dev_alloc<__nv_bfloat16>(kv_values * tile2_tokens);
+  qwen36_device_ptr_t prefill_tile2_cache_v =
+      dev_alloc<__nv_bfloat16>(kv_values * tile2_tokens);
+  qwen36_device_ptr_t prefill_tile2_out =
+      dev_alloc<__nv_bfloat16>(q_values * tile2_tokens);
+  copy_bf16(prefill_tile2_q,
+            std::vector<float>(q_values * tile2_tokens, 0.25f));
+  copy_bf16(prefill_tile2_k,
+            std::vector<float>(kv_values * tile2_tokens, 0.5f));
+  copy_bf16(prefill_tile2_v,
+            std::vector<float>(kv_values * tile2_tokens, 1.0f));
+  copy_bf16(prefill_tile2_cache_k,
+            std::vector<float>(kv_values * tile2_tokens, 0.0f));
+  copy_bf16(prefill_tile2_cache_v,
+            std::vector<float>(kv_values * tile2_tokens, 0.0f));
+  qwen36_attention_prefill_spec_t prefill_tile2_spec{};
+  prefill_tile2_spec.start_position = 0;
+  prefill_tile2_spec.tokens = tile2_tokens;
+  prefill_tile2_spec.q_bf16 = prefill_tile2_q;
+  prefill_tile2_spec.k_bf16 = prefill_tile2_k;
+  prefill_tile2_spec.v_bf16 = prefill_tile2_v;
+  prefill_tile2_spec.kv_cache_k = prefill_tile2_cache_k;
+  prefill_tile2_spec.kv_cache_v = prefill_tile2_cache_v;
+  prefill_tile2_spec.output_bf16 = prefill_tile2_out;
+  prefill_tile2_spec.shape = attn;
+  setenv("QWEN36_PREFILL_GQA_TILE2", "1", 1);
+  must_status(qwen36_attention_prefill(&prefill_tile2_spec),
+              "attention prefill gqa tile2");
+  unsetenv("QWEN36_PREFILL_GQA_TILE2");
+  std::vector<float> prefill_tile2_values =
+      read_bf16(prefill_tile2_out, q_values * tile2_tokens);
+  for (size_t i = 0; i < prefill_tile2_values.size(); ++i) {
+    expect_close(prefill_tile2_values[i], 1.0f, 0.02f,
+                 "attention prefill gqa tile2");
+  }
+
+  qwen36_device_ptr_t prefill_tile4_out =
+      dev_alloc<__nv_bfloat16>(q_values * tile2_tokens);
+  prefill_tile2_spec.output_bf16 = prefill_tile4_out;
+  setenv("QWEN36_PREFILL_GQA_TILE_TOKENS", "4", 1);
+  must_status(qwen36_attention_prefill(&prefill_tile2_spec),
+              "attention prefill gqa tile4");
+  unsetenv("QWEN36_PREFILL_GQA_TILE_TOKENS");
+  std::vector<float> prefill_tile4_values =
+      read_bf16(prefill_tile4_out, q_values * tile2_tokens);
+  for (size_t i = 0; i < prefill_tile4_values.size(); ++i) {
+    expect_close(prefill_tile4_values[i], 1.0f, 0.02f,
+                 "attention prefill gqa tile4");
+  }
+
   qwen36_device_ptr_t kq = dev_alloc<int8_t>(kv_values);
   qwen36_device_ptr_t vq = dev_alloc<int8_t>(kv_values);
   qwen36_device_ptr_t meta = dev_alloc<float>(attn.kv_heads * 2);

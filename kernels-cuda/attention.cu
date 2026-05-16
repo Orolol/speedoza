@@ -25,6 +25,11 @@ size_t env_usize_or(const char *name, size_t fallback) {
   return static_cast<size_t>(value);
 }
 
+bool env_bool_enabled(const char *name) {
+  const char *raw = getenv(name);
+  return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+}
+
 constexpr int kKvCacheBf16 = 0;
 constexpr int kKvCacheFp8 = 1;
 constexpr int kKvCacheTurboQuant3 = 2;
@@ -2011,6 +2016,194 @@ __global__ void attention_prefill_gqa_kernel(
   }
 }
 
+// Experimental GQA prefill tile that processes a few adjacent query tokens per
+// block. It keeps the current GQA sharing across q_per_kv heads, and also
+// reuses each K/V cache row across multiple causal query rows. This is intentionally
+// limited to BF16/FP8 KV layouts first; TurboQuant needs per-row inverse value
+// rotations and will get a separate implementation once the dispatch proves
+// useful on long prompts.
+template <int kTileTokens>
+__global__ void attention_prefill_gqa_tile_kernel(
+    const __nv_bfloat16 *q, const void *cache_k, const void *cache_v,
+    const float *cache_metadata, int kv_cache_dtype, __nv_bfloat16 *output,
+    size_t start_position, const int32_t *start_position_device, size_t tokens,
+    qwen36_attention_shape_t shape) {
+  __shared__ size_t shared_start_position;
+  __shared__ float kv_sram[kGqaMaxHeadDim];
+  __shared__ float warp_partials[kTileTokens][kGqaMaxWarps][kGqaMaxQPerKv];
+  __shared__ float max_score_sram[kTileTokens][kGqaMaxQPerKv];
+  __shared__ float denom_sram[kTileTokens][kGqaMaxQPerKv];
+  __shared__ float scale_old[kTileTokens][kGqaMaxQPerKv];
+  __shared__ float scale_new[kTileTokens][kGqaMaxQPerKv];
+
+  const size_t kvh = blockIdx.x;
+  const size_t token_base = static_cast<size_t>(blockIdx.y) * kTileTokens;
+  const size_t q_per_kv = shape.q_heads / shape.kv_heads;
+  const size_t head_dim = shape.head_dim;
+  const float qk_scale = rsqrtf(static_cast<float>(head_dim));
+  const unsigned warp_id = threadIdx.x >> 5;
+  const unsigned lane_id = threadIdx.x & 31;
+  const unsigned n_warps = (blockDim.x + 31u) >> 5;
+  const bool tile_active = threadIdx.x < head_dim;
+
+  if (threadIdx.x == 0) {
+    shared_start_position = start_position_device != nullptr
+                                ? static_cast<size_t>(*start_position_device)
+                                : start_position;
+  }
+  if (threadIdx.x < q_per_kv) {
+#pragma unroll
+    for (int row = 0; row < kTileTokens; ++row) {
+      max_score_sram[row][threadIdx.x] = -INFINITY;
+      denom_sram[row][threadIdx.x] = 0.0f;
+      scale_old[row][threadIdx.x] = 0.0f;
+      scale_new[row][threadIdx.x] = 0.0f;
+    }
+  }
+  __syncthreads();
+
+  size_t row_token[kTileTokens];
+  size_t row_position[kTileTokens];
+  bool row_active[kTileTokens];
+#pragma unroll
+  for (int row = 0; row < kTileTokens; ++row) {
+    row_token[row] = token_base + row;
+    row_active[row] = row_token[row] < tokens;
+    row_position[row] = shared_start_position + row_token[row];
+  }
+  if (!row_active[0]) {
+    return;
+  }
+  const size_t max_position =
+      row_active[1] ? row_position[1] : row_position[0];
+
+  float q_local[kTileTokens][kGqaMaxQPerKv];
+#pragma unroll
+  for (int row = 0; row < kTileTokens; ++row) {
+#pragma unroll
+    for (int qh_local = 0; qh_local < kGqaMaxQPerKv; ++qh_local) {
+      q_local[row][qh_local] = 0.0f;
+    }
+  }
+  if (tile_active) {
+#pragma unroll
+    for (int row = 0; row < kTileTokens; ++row) {
+      if (!row_active[row]) {
+        continue;
+      }
+      for (size_t qh_local = 0; qh_local < q_per_kv; ++qh_local) {
+        const size_t qh = kvh * q_per_kv + qh_local;
+        q_local[row][qh_local] = __bfloat162float(
+            q[(row_token[row] * shape.q_heads + qh) * head_dim + threadIdx.x]);
+      }
+    }
+  }
+
+  float acc[kTileTokens][kGqaMaxQPerKv];
+#pragma unroll
+  for (int row = 0; row < kTileTokens; ++row) {
+#pragma unroll
+    for (int qh_local = 0; qh_local < kGqaMaxQPerKv; ++qh_local) {
+      acc[row][qh_local] = 0.0f;
+    }
+  }
+
+  for (size_t t = 0; t <= max_position; ++t) {
+    const size_t vector_index = t * shape.kv_heads + kvh;
+    if (tile_active) {
+      kv_sram[threadIdx.x] = load_cache_value(
+          cache_k, cache_metadata, kv_cache_dtype,
+          vector_index * head_dim + threadIdx.x, head_dim, 0);
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int row = 0; row < kTileTokens; ++row) {
+      const bool causal_visible = row_active[row] && t <= row_position[row];
+      for (size_t qh_local = 0; qh_local < q_per_kv; ++qh_local) {
+        float local = 0.0f;
+        if (tile_active && causal_visible) {
+          local = q_local[row][qh_local] * kv_sram[threadIdx.x];
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+          local += __shfl_xor_sync(0xffffffff, local, offset);
+        }
+        if (lane_id == 0) {
+          warp_partials[row][warp_id][qh_local] = local;
+        }
+      }
+    }
+    __syncthreads();
+
+    if (threadIdx.x < q_per_kv) {
+#pragma unroll
+      for (int row = 0; row < kTileTokens; ++row) {
+        if (!row_active[row] || t > row_position[row]) {
+          continue;
+        }
+        float total = 0.0f;
+        for (unsigned w = 0; w < n_warps; ++w) {
+          total += warp_partials[row][w][threadIdx.x];
+        }
+        const float score = total * qk_scale;
+        const float old_max = max_score_sram[row][threadIdx.x];
+        const float new_max = fmaxf(old_max, score);
+        const float so =
+            isinf(old_max) && old_max < 0.0f ? 0.0f : expf(old_max - new_max);
+        const float sn = expf(score - new_max);
+        scale_old[row][threadIdx.x] = so;
+        scale_new[row][threadIdx.x] = sn;
+        denom_sram[row][threadIdx.x] =
+            denom_sram[row][threadIdx.x] * so + sn;
+        max_score_sram[row][threadIdx.x] = new_max;
+      }
+    }
+    __syncthreads();
+
+    if (tile_active) {
+      kv_sram[threadIdx.x] = load_cache_value(
+          cache_v, cache_metadata, kv_cache_dtype,
+          vector_index * head_dim + threadIdx.x, head_dim, 1);
+    }
+    __syncthreads();
+
+    if (tile_active) {
+      const float v_val = kv_sram[threadIdx.x];
+#pragma unroll
+      for (int row = 0; row < kTileTokens; ++row) {
+        if (!row_active[row] || t > row_position[row]) {
+          continue;
+        }
+#pragma unroll
+        for (int qh_local = 0; qh_local < kGqaMaxQPerKv; ++qh_local) {
+          if (qh_local >= static_cast<int>(q_per_kv)) {
+            break;
+          }
+          acc[row][qh_local] = acc[row][qh_local] * scale_old[row][qh_local] +
+                               scale_new[row][qh_local] * v_val;
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tile_active) {
+#pragma unroll
+    for (int row = 0; row < kTileTokens; ++row) {
+      if (!row_active[row]) {
+        continue;
+      }
+      for (size_t qh_local = 0; qh_local < q_per_kv; ++qh_local) {
+        const float dn = denom_sram[row][qh_local];
+        const size_t qh = kvh * q_per_kv + qh_local;
+        output[(row_token[row] * shape.q_heads + qh) * head_dim +
+               threadIdx.x] = __float2bfloat16(acc[row][qh_local] / dn);
+      }
+    }
+  }
+}
+
 __global__ void attention_prefill_kernel(
     const __nv_bfloat16 *q, const void *cache_k,
     const void *cache_v, const float *cache_metadata, int kv_cache_dtype, __nv_bfloat16 *output,
@@ -2297,6 +2490,49 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
       spec->shape.head_dim <= static_cast<size_t>(kGqaMaxHeadDim) &&
       q_per_kv <= static_cast<size_t>(kGqaMaxQPerKv) && q_per_kv > 1 &&
       spec->tokens >= kPrefillGqaMinTokens;
+  const bool gqa_tile2_enabled = env_bool_enabled("QWEN36_PREFILL_GQA_TILE2");
+  const size_t gqa_tile_tokens = env_usize_or(
+      "QWEN36_PREFILL_GQA_TILE_TOKENS", gqa_tile2_enabled ? 2 : 0);
+  const bool gqa_tile2_eligible =
+      gqa_eligible && (gqa_tile_tokens == 2 || gqa_tile_tokens == 4) &&
+      !is_tq_cache_dtype(spec->kv_cache_dtype);
+  if (gqa_tile2_eligible) {
+    if (tree_mask_present) {
+      return QWEN36_STATUS_NOT_IMPLEMENTED;
+    }
+    unsigned int gqa_threads = static_cast<unsigned int>(spec->shape.head_dim);
+    gqa_threads = (gqa_threads + 31u) & ~31u;
+    if (gqa_threads == 0) {
+      gqa_threads = 32u;
+    } else if (gqa_threads > 256u) {
+      gqa_threads = 256u;
+    }
+    const dim3 gqa_grid(
+        static_cast<unsigned int>(spec->shape.kv_heads),
+        static_cast<unsigned int>(
+            (spec->tokens + gqa_tile_tokens - 1) / gqa_tile_tokens));
+    if (gqa_tile_tokens == 4) {
+      attention_prefill_gqa_tile_kernel<4><<<
+          gqa_grid, gqa_threads, 0, qwen36_internal_active_stream()>>>(
+          ptr<const __nv_bfloat16>(spec->q_bf16),
+          ptr<const void>(spec->kv_cache_k), ptr<const void>(spec->kv_cache_v),
+          ptr<const float>(spec->kv_cache_metadata), spec->kv_cache_dtype,
+          ptr<__nv_bfloat16>(spec->output_bf16), spec->start_position,
+          ptr<const int32_t>(spec->start_position_device_i32), spec->tokens,
+          spec->shape);
+    } else {
+      attention_prefill_gqa_tile_kernel<2><<<
+          gqa_grid, gqa_threads, 0, qwen36_internal_active_stream()>>>(
+          ptr<const __nv_bfloat16>(spec->q_bf16),
+          ptr<const void>(spec->kv_cache_k), ptr<const void>(spec->kv_cache_v),
+          ptr<const float>(spec->kv_cache_metadata), spec->kv_cache_dtype,
+          ptr<__nv_bfloat16>(spec->output_bf16), spec->start_position,
+          ptr<const int32_t>(spec->start_position_device_i32), spec->tokens,
+          spec->shape);
+    }
+    cudaError_t err = cudaGetLastError();
+    return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+  }
   if (gqa_eligible) {
     if (tree_mask_present) {
       return QWEN36_STATUS_NOT_IMPLEMENTED;
