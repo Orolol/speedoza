@@ -87,6 +87,7 @@ cargo run -p qwen36-fp4 --features cuda -- gpu-load --model-dir /path/to/model -
 - `QWEN36_KV_CACHE_DTYPE=tq35` selects the TurboQuant 3.5-bit KV cache.
 - `QWEN36_LONG_CONTEXT_MODE` overrides the automatic long-context policy. When unset, contexts at or above 8192 tokens disable the large fused weight stores to save VRAM; set `QWEN36_LONG_CONTEXT_MODE=0` to force the fused stores back on, or `=1` to force long-context mode on smaller runs.
 - `QWEN36_LONG_CONTEXT_AUTO_MIN_CONTEXT=<tokens>` changes the automatic threshold.
+- `QWEN36_PREFILL_CAPACITY=<tokens>` overrides the prefill chunk buffer capacity. By default, contexts up to 16K allocate an 8K prefill chunk to avoid splitting 8K prompts into four passes; larger reserved contexts keep the older 2K chunk to limit VRAM growth.
 - `QWEN36_PREFILL_SPLIT_MAX_TOKENS=<tokens>` raises the opt-in split-KV prefill chunk limit for long-context experiments. The default remains tuned for short MTP verify chunks.
 - `QWEN36_PREFILL_SPLIT_MIN_SPLITS=<count>` changes the split-KV prefill activation threshold when the max-token override is used.
 - `QWEN36_DECODE_ATTENTION_BUCKET_MIN_CONTEXT=<tokens>` changes the minimum active-context bucket used to size decode split-KV launches. The default is 8192, so a run reserving 262K context no longer launches 262K-sized decode attention splits while decoding near 8K.

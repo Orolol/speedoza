@@ -96,9 +96,21 @@ fn cuda_env_workspace_bytes() -> usize {
 }
 
 #[cfg(feature = "cuda")]
+const CUDA_PREFILL_CAPACITY_SHORT_CONTEXT: usize = 8192;
+#[cfg(feature = "cuda")]
+const CUDA_PREFILL_CAPACITY_LONG_CONTEXT: usize = 2048;
+#[cfg(feature = "cuda")]
+const CUDA_PREFILL_CAPACITY_SHORT_CONTEXT_MAX: usize = 16384;
+
+#[cfg(feature = "cuda")]
 fn cuda_prefill_capacity(max_context: usize) -> usize {
+    let auto_capacity = if max_context <= CUDA_PREFILL_CAPACITY_SHORT_CONTEXT_MAX {
+        CUDA_PREFILL_CAPACITY_SHORT_CONTEXT
+    } else {
+        CUDA_PREFILL_CAPACITY_LONG_CONTEXT
+    };
     cuda_env_usize("QWEN36_PREFILL_CAPACITY")
-        .unwrap_or_else(|| max_context.min(2048))
+        .unwrap_or(auto_capacity)
         .clamp(1, max_context.max(1))
 }
 
