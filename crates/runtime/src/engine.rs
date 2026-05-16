@@ -2069,7 +2069,10 @@ impl<B: KernelBackend> Engine<B> {
             position_count,
         )?;
 
-        self.mtp_snapshot_state(start_position, verify_tokens)?;
+        let assume_accept = mtp_assume_accept_enabled();
+        if !(use_multi_graph && assume_accept) {
+            self.mtp_snapshot_state(start_position, verify_tokens)?;
+        }
         if use_multi_graph {
             self.ensure_mtp_verify_graph_multi_tokens(draft_tokens.len(), start_position)?;
             self.launch_mtp_verify_graph_multi_tokens(draft_tokens.len())?;
@@ -2079,7 +2082,7 @@ impl<B: KernelBackend> Engine<B> {
                 .mtp_verify_token_u32
                 .copy_to_host(&mut verify_bytes)?;
             let mut verified_tokens = Vec::with_capacity(draft_tokens.len());
-            if mtp_assume_accept_enabled() {
+            if assume_accept {
                 verified_tokens.extend_from_slice(draft_tokens);
             } else {
                 for (draft_idx, draft_token) in draft_tokens.iter().copied().enumerate() {
