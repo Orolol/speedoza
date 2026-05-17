@@ -34,9 +34,7 @@ constexpr int kFlashN = 64;       // K rows per K-iter
 constexpr int kFlashD = 256;      // head_dim
 constexpr int kFlashWarps = 4;
 constexpr int kFlashThreads = 32 * kFlashWarps;
-constexpr int kFlashMTiles = kFlashM / 16; // 2
 constexpr int kFlashNTiles = kFlashN / 16; // 4
-constexpr int kFlashDTiles = kFlashD / 16; // 16
 
 constexpr int kKvCacheBf16 = 0;
 constexpr int kKvCacheFp8 = 1;
@@ -324,39 +322,11 @@ attention_flash_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
     }
 
     // ---- write output for this q_head ----
-    // Reuse sm_S as scratch to store one warp's O-tile so we can divide by l
-    // and write back as bf16 cooperatively.
-    float *sm_O_tile = sm_S; // 16 * 256 floats = 16 KB, sm_S has 32*64*4 = 8 KB
-    // sm_S only has 8KB so it isn't big enough for a 16x256 f32 tile.  Use
-    // sm_S + sm_P + sm_m + sm_l + sm_alpha contiguous region (8 + 4 + 0.4 KB,
-    // total ~13 KB) — also not enough.  Just write 16 D-frags at a time
-    // through sm_S (8 KB) for the warp's M-tile rows.
-    //
-    // Concretely: sm_S can hold 16 rows × 128 cols of f32 (8 KB).  Each
-    // warp owns 16 rows × 128 D (the 8 D-tiles of width 16 from
-    // my_d_tile_base*16 to (my_d_tile_base+8)*16).  That fits.
-    //
-    // Two warps share the same M-tile; we serialise them so each gets to use
-    // sm_S in turn.  Warps owning M-tile 1 wait, then their pair flips.
-    // Simpler: each pair of warps owns DIFFERENT D ranges, so they can write
-    // into DIFFERENT sm_S regions concurrently.  Use sm_S [16 × 256] f32?
-    // We only have 8 KB → 2048 floats → 8 rows of 256.  Not enough.
-    //
-    // Cleanest fix: write directly to global output using the wmma store
-    // primitive followed by a thread-wide scaling pass.  The wmma
-    // store_matrix_sync writes into a contiguous SMEM/global region of
-    // 16x16 floats — too big for our remaining SMEM, so we store to global
-    // f32 scratch?  We don't have a global f32 scratch.
-    //
-    // Reuse the sm_K and sm_V regions which we no longer need at this point.
-    // sm_K + sm_V = 64 KB of bf16 = 16 KB if we view as f32 (we have plenty
-    // of capacity to view it as f32 — 16384 floats = enough for 16x256x4
-    // (16 rows × 256 cols f32) per M-tile, so 8 KB per M-tile, two M-tiles
-    // fit in 16 KB).  Use sm_K as the O scratch, treating it as
-    // f32[2 × 16 × 256] (one block per M-tile).
+    // Reuse sm_K (64*256*2 = 32 KB = 8K floats) as f32 O scratch, exactly
+    // sized for 2 M-tiles × 16 rows × 256 cols of FP32.  Each warp stores
+    // its 8 D-frags to the half of the scratch owned by its M-tile, then
+    // we divide by l and emit BF16 cooperatively.
     float *sm_O_scratch = reinterpret_cast<float *>(sm_K);
-    // sm_K capacity is 64*256*2 = 32768 bytes = 8192 floats.  Need
-    // 2 (M-tiles) × 16 × 256 = 8192 floats.  Exactly fits.
     __syncthreads();
 #pragma unroll
     for (int d_local = 0; d_local < 8; ++d_local) {
