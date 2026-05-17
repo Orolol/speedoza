@@ -222,42 +222,51 @@ attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
         break;
       }
 
-      // Stage K bf16 into sm_V (temp: we overwrite with V below once smooth-K
-      // quant has run).
-      for (size_t i = threadIdx.x; i < kSageN * kSageD; i += blockDim.x) {
-        const size_t n = i / kSageD;
-        const size_t d = i % kSageD;
-        const size_t kv_idx = k_base + n;
-        if (kv_idx >= kv_total) {
-          sm_V[i] = __float2bfloat16(0.0f);
-        } else {
-          const size_t cache_index =
-              (kv_idx * shape.kv_heads + kvh) * head_dim + d;
-          sm_V[i] = __float2bfloat16(
-              sage_load_kv_f32(cache_k, kv_cache_dtype, cache_index));
+      // Smooth-K is opt-in (off in this configuration).  When on we stage K
+      // bf16 in sm_V, compute the per-channel mean, then quantise; when off
+      // we skip the staging entirely and read K from the cache directly into
+      // the int8 buffer, matching the B.0 layout that won +23% at T=1024.
+      constexpr bool kSmoothKEnabled = false;
+      if constexpr (kSmoothKEnabled) {
+        for (size_t i = threadIdx.x; i < kSageN * kSageD; i += blockDim.x) {
+          const size_t n = i / kSageD;
+          const size_t d = i % kSageD;
+          const size_t kv_idx = k_base + n;
+          if (kv_idx >= kv_total) {
+            sm_V[i] = __float2bfloat16(0.0f);
+          } else {
+            const size_t cache_index =
+                (kv_idx * shape.kv_heads + kvh) * head_dim + d;
+            sm_V[i] = __float2bfloat16(
+                sage_load_kv_f32(cache_k, kv_cache_dtype, cache_index));
+          }
         }
-      }
-      __syncthreads();
-
-      // Smooth-K: compute per-channel mean of K and subtract before INT8
-      // quantisation.  The resulting per-row "Q · K_mean" bias is a constant
-      // across all N positions of S, so softmax shift-invariance cancels it
-      // and we never need to add it back.
-      for (size_t d = threadIdx.x; d < kSageD; d += blockDim.x) {
-        float sum = 0.0f;
+        __syncthreads();
+        for (size_t d = threadIdx.x; d < kSageD; d += blockDim.x) {
+          float sum = 0.0f;
 #pragma unroll
-        for (int n = 0; n < kSageN; ++n) {
-          sum += __bfloat162float(sm_V[n * kSageD + d]);
+          for (int n = 0; n < kSageN; ++n) {
+            sum += __bfloat162float(sm_V[n * kSageD + d]);
+          }
+          sm_k_mean[d] = sum / static_cast<float>(kSageN);
         }
-        sm_k_mean[d] = sum / static_cast<float>(kSageN);
+        __syncthreads();
+        sage_per_row_quantize<kSageKRowsPerWarp>(
+            sm_K_int8, sm_kscale, [&](int row, int d) -> float {
+              return __bfloat162float(sm_V[row * kSageD + d]) - sm_k_mean[d];
+            });
+      } else {
+        sage_per_row_quantize<kSageKRowsPerWarp>(
+            sm_K_int8, sm_kscale, [&](int row, int d) -> float {
+              const size_t kv_idx = k_base + row;
+              if (kv_idx >= kv_total) {
+                return 0.0f;
+              }
+              const size_t cache_index =
+                  (kv_idx * shape.kv_heads + kvh) * head_dim + d;
+              return sage_load_kv_f32(cache_k, kv_cache_dtype, cache_index);
+            });
       }
-      __syncthreads();
-
-      // Quantize K (smooth) from the staged bf16 tile → sm_K_int8.
-      sage_per_row_quantize<kSageKRowsPerWarp>(
-          sm_K_int8, sm_kscale, [&](int row, int d) -> float {
-            return __bfloat162float(sm_V[row * kSageD + d]) - sm_k_mean[d];
-          });
       __syncthreads();
 
       // Now load V bf16 over sm_V (BF16 PV path; switches to FP8 in B.2).
