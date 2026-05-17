@@ -2482,6 +2482,18 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
     return QWEN36_STATUS_SUCCESS;
   }
 
+  // SageAttention-style prefill (INT8 Q·K + BF16 P·V via wmma). Opt-in while
+  // Phase B.0 is shaking out parity + perf; selected before the flash path so
+  // both share the same eligibility predicate.
+  const bool sage_eligible =
+      env_bool_enabled("QWEN36_ATTENTION_SAGE_PREFILL") &&
+      spec->tokens >= 16 && spec->shape.head_dim == 256 && !tree_mask_present &&
+      !is_tq_cache_dtype(spec->kv_cache_dtype) && spec->shape.kv_heads > 0 &&
+      spec->shape.q_heads % spec->shape.kv_heads == 0;
+  if (sage_eligible) {
+    return qwen36_attention_sage_prefill(spec);
+  }
+
   // Flash-attention prefill (wmma bf16, head_dim=256, no tree-mask, no TQ
   // cache).  On by default for the Qwen3.6 hot shape; set
   // QWEN36_ATTENTION_FLASH_PREFILL=0 to fall back to the scalar GQA kernel.
