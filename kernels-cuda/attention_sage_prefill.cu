@@ -173,6 +173,8 @@ attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
   const size_t max_kv_visible = start_pos + token_base + rows_in_tile - 1;
 
   extern __shared__ unsigned char smem_raw[];
+  // sm_V doubles as K-staging buffer (we load K bf16 here, compute the
+  // per-channel mean, quantise to sm_K_int8, then overwrite with V).
   __nv_bfloat16 *sm_V = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
   int8_t *sm_Q_int8 = reinterpret_cast<int8_t *>(sm_V + kSageN * kSageD);
   int8_t *sm_K_int8 = sm_Q_int8 + kSageM * kSageD;
@@ -184,6 +186,7 @@ attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
   float *sm_m = sm_kscale + kSageN;
   float *sm_l = sm_m + kSageM;
   float *sm_alpha = sm_l + kSageM;
+  float *sm_k_mean = sm_alpha + kSageM; // [kSageD] per-channel K mean (smooth-K)
   // After the K-iter loop we reuse the sm_V region (32 KB) as f32 O scratch.
 
   for (size_t qh_local = 0; qh_local < q_per_kv; ++qh_local) {
@@ -219,7 +222,45 @@ attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
         break;
       }
 
-      // Load V bf16 (BF16 PV path; switches to FP8 in B.2).
+      // Stage K bf16 into sm_V (temp: we overwrite with V below once smooth-K
+      // quant has run).
+      for (size_t i = threadIdx.x; i < kSageN * kSageD; i += blockDim.x) {
+        const size_t n = i / kSageD;
+        const size_t d = i % kSageD;
+        const size_t kv_idx = k_base + n;
+        if (kv_idx >= kv_total) {
+          sm_V[i] = __float2bfloat16(0.0f);
+        } else {
+          const size_t cache_index =
+              (kv_idx * shape.kv_heads + kvh) * head_dim + d;
+          sm_V[i] = __float2bfloat16(
+              sage_load_kv_f32(cache_k, kv_cache_dtype, cache_index));
+        }
+      }
+      __syncthreads();
+
+      // Smooth-K: compute per-channel mean of K and subtract before INT8
+      // quantisation.  The resulting per-row "Q · K_mean" bias is a constant
+      // across all N positions of S, so softmax shift-invariance cancels it
+      // and we never need to add it back.
+      for (size_t d = threadIdx.x; d < kSageD; d += blockDim.x) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int n = 0; n < kSageN; ++n) {
+          sum += __bfloat162float(sm_V[n * kSageD + d]);
+        }
+        sm_k_mean[d] = sum / static_cast<float>(kSageN);
+      }
+      __syncthreads();
+
+      // Quantize K (smooth) from the staged bf16 tile → sm_K_int8.
+      sage_per_row_quantize<kSageKRowsPerWarp>(
+          sm_K_int8, sm_kscale, [&](int row, int d) -> float {
+            return __bfloat162float(sm_V[row * kSageD + d]) - sm_k_mean[d];
+          });
+      __syncthreads();
+
+      // Now load V bf16 over sm_V (BF16 PV path; switches to FP8 in B.2).
       for (size_t i = threadIdx.x; i < kSageN * kSageD; i += blockDim.x) {
         const size_t n = i / kSageD;
         const size_t d = i % kSageD;
@@ -233,18 +274,6 @@ attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
               sage_load_kv_f32(cache_v, kv_cache_dtype, cache_index));
         }
       }
-      // Quantize K to int8 directly from cache (avoid an intermediate bf16
-      // tile — keeps the SMEM budget under sm_120a's 100 KB cap).
-      sage_per_row_quantize<kSageKRowsPerWarp>(
-          sm_K_int8, sm_kscale, [&](int row, int d) -> float {
-            const size_t kv_idx = k_base + row;
-            if (kv_idx >= kv_total) {
-              return 0.0f;
-            }
-            const size_t cache_index =
-                (kv_idx * shape.kv_heads + kvh) * head_dim + d;
-            return sage_load_kv_f32(cache_k, kv_cache_dtype, cache_index);
-          });
       __syncthreads();
 
       // -------------------- S = Q @ K^T (inline PTX m16n8k32 INT8) --------------------
@@ -454,14 +483,14 @@ qwen36_attention_sage_prefill(const qwen36_attention_prefill_spec_t *spec) {
 
   // sm_V (32 KB) + sm_Q_int8 (8 KB) + sm_K_int8 (16 KB) + sm_S (8 KB)
   // + sm_P (4 KB) + sm_qscale (128 B) + sm_kscale (256 B) + 3·M f32 row state
-  // ≈ 69 KB.  Comfortably below the 100 KB sm_120a per-block cap.
+  // + sm_k_mean (D f32 = 1 KB) ≈ 70 KB.  Below the 100 KB sm_120a cap.
   const size_t smem_bytes =
       kSageN * kSageD * sizeof(__nv_bfloat16) +
       kSageM * kSageD * sizeof(int8_t) + kSageN * kSageD * sizeof(int8_t) +
       kSageM * kSageN * sizeof(float) +
       kSageM * kSageN * sizeof(__nv_bfloat16) +
       kSageM * sizeof(float) + kSageN * sizeof(float) +
-      3 * kSageM * sizeof(float);
+      3 * kSageM * sizeof(float) + kSageD * sizeof(float);
   cudaFuncSetAttribute(attention_sage_prefill_kernel,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(smem_bytes));
