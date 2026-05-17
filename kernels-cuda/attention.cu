@@ -30,6 +30,17 @@ bool env_bool_enabled(const char *name) {
   return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
 }
 
+// `default_value` when env unset/empty; otherwise true unless the first char
+// indicates a falsy value (0, f/F, n/N).
+bool env_bool_or(const char *name, bool default_value) {
+  const char *raw = getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return default_value;
+  }
+  return raw[0] != '0' && raw[0] != 'f' && raw[0] != 'F' && raw[0] != 'n' &&
+         raw[0] != 'N';
+}
+
 constexpr int kKvCacheBf16 = 0;
 constexpr int kKvCacheFp8 = 1;
 constexpr int kKvCacheTurboQuant3 = 2;
@@ -2471,11 +2482,11 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
     return QWEN36_STATUS_SUCCESS;
   }
 
-  // Opt-in flash-attention prefill (wmma bf16, head_dim=256, no tree-mask, no
-  // TQ cache). Off by default while we shake out parity; promote once the
-  // bench/parity bar is met.
+  // Flash-attention prefill (wmma bf16, head_dim=256, no tree-mask, no TQ
+  // cache).  On by default for the Qwen3.6 hot shape; set
+  // QWEN36_ATTENTION_FLASH_PREFILL=0 to fall back to the scalar GQA kernel.
   const bool flash_eligible =
-      env_bool_enabled("QWEN36_ATTENTION_FLASH_PREFILL") &&
+      env_bool_or("QWEN36_ATTENTION_FLASH_PREFILL", true) &&
       spec->tokens >= 16 && spec->shape.head_dim == 256 && !tree_mask_present &&
       !is_tq_cache_dtype(spec->kv_cache_dtype) && spec->shape.kv_heads > 0 &&
       spec->shape.q_heads % spec->shape.kv_heads == 0;
