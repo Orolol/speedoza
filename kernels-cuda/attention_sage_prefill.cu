@@ -70,6 +70,33 @@ __device__ __forceinline__ float sage_load_kv_f32(const void *cache,
   return __bfloat162float(reinterpret_cast<const __nv_bfloat16 *>(cache)[index]);
 }
 
+// Inline-PTX wrapper for the m16n8k32 INT8 mma atom.
+//   D[16×8] (s32) = A[16×32] (s8, row-major) * B[32×8] (s8, col-major) + C[16×8] (s32)
+// Per-thread fragment layout (laneid l ∈ 0..31):
+//   A: 4 b32 regs (16 packed s8 each, 4 s8 per reg)
+//     a0 = A[l/4 + 0, (l%4)*4 + 0..3]
+//     a1 = A[l/4 + 8, (l%4)*4 + 0..3]
+//     a2 = A[l/4 + 0, 16 + (l%4)*4 + 0..3]
+//     a3 = A[l/4 + 8, 16 + (l%4)*4 + 0..3]
+//   B: 2 b32 regs (8 packed s8 each)
+//     b0 = B[(l%4)*4 + 0..3,      l/4]
+//     b1 = B[16 + (l%4)*4 + 0..3, l/4]
+//   D: 4 s32 regs
+//     d0 = D[l/4 + 0, (l%4)*2 + 0]
+//     d1 = D[l/4 + 0, (l%4)*2 + 1]
+//     d2 = D[l/4 + 8, (l%4)*2 + 0]
+//     d3 = D[l/4 + 8, (l%4)*2 + 1]
+__device__ __forceinline__ void
+mma_m16n8k32_s8(int32_t (&d)[4], const uint32_t (&a)[4],
+                const uint32_t (&b)[2], const int32_t (&c)[4]) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+      : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+        "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
+}
+
 // Per-row INT8 quantisation: each warp owns `rows_per_warp` rows.  For each
 // row, the 32 lanes scan D=256 cols (8 elements per lane), compute the row
 // abs-max via shfl_xor reduction, write the scale to `sm_scale[row]`, then
@@ -220,30 +247,71 @@ attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
           });
       __syncthreads();
 
-      // -------------------- S = Q @ K^T (INT8 wmma m16n16k16) --------------------
+      // -------------------- S = Q @ K^T (inline PTX m16n8k32 INT8) --------------------
+      // Each warp owns 4 N-atoms of 8 cols each, covering its 32-col N-half.
+      // Per K-iter (k=32), one mma_m16n8k32_s8 per atom; 8 K-iters total for D=256.
+      // s_acc[n_atom][4] holds the accumulator regs across K-iters.
+      int32_t s_acc[4][4];
 #pragma unroll
-      for (int n_in_half = 0; n_in_half < 2; ++n_in_half) {
-        const int n_col = my_n_col_base + n_in_half * 16;
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char,
-                       wmma::row_major>
-            q_frag;
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char,
-                       wmma::col_major>
-            k_frag;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> s_frag;
-        wmma::fill_fragment(s_frag, 0);
+      for (int nt = 0; nt < 4; ++nt) {
 #pragma unroll
-        for (int d = 0; d < kSageD; d += 16) {
-          wmma::load_matrix_sync(q_frag,
-                                 sm_Q_int8 + my_m_row_base * kSageD + d,
-                                 kSageD);
-          wmma::load_matrix_sync(k_frag, sm_K_int8 + n_col * kSageD + d,
-                                 kSageD);
-          wmma::mma_sync(s_frag, q_frag, k_frag, s_frag);
+        for (int r = 0; r < 4; ++r) {
+          s_acc[nt][r] = 0;
         }
-        wmma::store_matrix_sync(
-            reinterpret_cast<int32_t *>(sm_S) + my_m_row_base * kSageN + n_col,
-            s_frag, kSageN, wmma::mem_row_major);
+      }
+      const int a_row_lo = my_m_row_base + (lane_id >> 2);
+      const int a_row_hi = a_row_lo + 8;
+      const int ab_col_off = (lane_id & 3) * 4;
+#pragma unroll
+      for (int k_iter_q = 0; k_iter_q < kSageD / 32; ++k_iter_q) {
+        const int k_base_q = k_iter_q * 32;
+        uint32_t a[4];
+        a[0] = *reinterpret_cast<const uint32_t *>(
+            &sm_Q_int8[a_row_lo * kSageD + k_base_q + ab_col_off]);
+        a[1] = *reinterpret_cast<const uint32_t *>(
+            &sm_Q_int8[a_row_hi * kSageD + k_base_q + ab_col_off]);
+        a[2] = *reinterpret_cast<const uint32_t *>(
+            &sm_Q_int8[a_row_lo * kSageD + k_base_q + ab_col_off + 16]);
+        a[3] = *reinterpret_cast<const uint32_t *>(
+            &sm_Q_int8[a_row_hi * kSageD + k_base_q + ab_col_off + 16]);
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+          const int n_atom_base = my_n_col_base + nt * 8;
+          const int b_n = n_atom_base + (lane_id >> 2);
+          uint32_t b[2];
+          b[0] = *reinterpret_cast<const uint32_t *>(
+              &sm_K_int8[b_n * kSageD + k_base_q + ab_col_off]);
+          b[1] = *reinterpret_cast<const uint32_t *>(
+              &sm_K_int8[b_n * kSageD + k_base_q + ab_col_off + 16]);
+          int32_t c[4];
+#pragma unroll
+          for (int r = 0; r < 4; ++r) {
+            c[r] = s_acc[nt][r];
+          }
+          int32_t d_out[4];
+          mma_m16n8k32_s8(d_out, a, b, c);
+#pragma unroll
+          for (int r = 0; r < 4; ++r) {
+            s_acc[nt][r] = d_out[r];
+          }
+        }
+      }
+      // Store the 4 atoms' D-fragments to sm_S as int32 (will be dequant'd to f32 below).
+      {
+        int32_t *sm_S_i32 = reinterpret_cast<int32_t *>(sm_S);
+        const int s_row_lo = my_m_row_base + (lane_id >> 2);
+        const int s_row_hi = s_row_lo + 8;
+        const int s_col_off = (lane_id & 3) * 2;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+          const int n_atom_base = my_n_col_base + nt * 8;
+          const int col_lo = n_atom_base + s_col_off;
+          const int col_hi = col_lo + 1;
+          sm_S_i32[s_row_lo * kSageN + col_lo] = s_acc[nt][0];
+          sm_S_i32[s_row_lo * kSageN + col_hi] = s_acc[nt][1];
+          sm_S_i32[s_row_hi * kSageN + col_lo] = s_acc[nt][2];
+          sm_S_i32[s_row_hi * kSageN + col_hi] = s_acc[nt][3];
+        }
       }
       __syncthreads();
 
