@@ -522,6 +522,7 @@ int qwen36_megakernel_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 int qwen36_decode_nvfp4_gemv(const qwen36_nvfp4_gemm_spec_t *spec);
 int qwen36_bf16_gemm(const qwen36_bf16_gemm_spec_t *spec);
 int qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec);
+int qwen36_attention_flash_prefill(const qwen36_attention_prefill_spec_t *spec);
 int qwen36_deltanet_decode(const qwen36_deltanet_decode_spec_t *spec);
 int qwen36_deltanet_prefill(const qwen36_deltanet_prefill_spec_t *spec);
 int qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec);

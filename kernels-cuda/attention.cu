@@ -2471,6 +2471,18 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
     return QWEN36_STATUS_SUCCESS;
   }
 
+  // Opt-in flash-attention prefill (wmma bf16, head_dim=256, no tree-mask, no
+  // TQ cache). Off by default while we shake out parity; promote once the
+  // bench/parity bar is met.
+  const bool flash_eligible =
+      env_bool_enabled("QWEN36_ATTENTION_FLASH_PREFILL") &&
+      spec->tokens >= 16 && spec->shape.head_dim == 256 && !tree_mask_present &&
+      !is_tq_cache_dtype(spec->kv_cache_dtype) && spec->shape.kv_heads > 0 &&
+      spec->shape.q_heads % spec->shape.kv_heads == 0;
+  if (flash_eligible) {
+    return qwen36_attention_flash_prefill(spec);
+  }
+
   // Prefer the GQA-aware kernel for the common Qwen3.6 shape: it lays out
   // the grid as (kv_heads × tokens) instead of (q_heads × tokens) and
   // shares each cache row across the q_per_kv queries that consume it,
