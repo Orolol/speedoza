@@ -2482,6 +2482,13 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
     return QWEN36_STATUS_SUCCESS;
   }
 
+  // Both the flash and sage prefill kernels use an M=32 Q-tile, which gives
+  // a grid of (kv_heads=4, ceil(tokens/32)).  At short contexts that grid is
+  // too small to saturate the 170 SMs on a 5090, so the scalar GQA kernel
+  // wins (it gets one block per token, 4×T blocks).  Empirically the wmma
+  // and INT8 kernels start winning at T≥1024 (~128 blocks at q_per_kv=6).
+  constexpr size_t kPrefillFlashMinTokens = 1024;
+
   // SageAttention-style prefill (INT8 Q·K via inline-PTX mma.m16n8k32, BF16
   // P·V). On by default for the Qwen3.6 hot shape; set
   // QWEN36_ATTENTION_SAGE_PREFILL=0 to fall back to the BF16 flash kernel.
@@ -2489,8 +2496,9 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
   // predicate.
   const bool sage_eligible =
       env_bool_or("QWEN36_ATTENTION_SAGE_PREFILL", true) &&
-      spec->tokens >= 16 && spec->shape.head_dim == 256 && !tree_mask_present &&
-      !is_tq_cache_dtype(spec->kv_cache_dtype) && spec->shape.kv_heads > 0 &&
+      spec->tokens >= kPrefillFlashMinTokens && spec->shape.head_dim == 256 &&
+      !tree_mask_present && !is_tq_cache_dtype(spec->kv_cache_dtype) &&
+      spec->shape.kv_heads > 0 &&
       spec->shape.q_heads % spec->shape.kv_heads == 0;
   if (sage_eligible) {
     return qwen36_attention_sage_prefill(spec);
@@ -2501,8 +2509,9 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
   // QWEN36_ATTENTION_FLASH_PREFILL=0 to fall back to the scalar GQA kernel.
   const bool flash_eligible =
       env_bool_or("QWEN36_ATTENTION_FLASH_PREFILL", true) &&
-      spec->tokens >= 16 && spec->shape.head_dim == 256 && !tree_mask_present &&
-      !is_tq_cache_dtype(spec->kv_cache_dtype) && spec->shape.kv_heads > 0 &&
+      spec->tokens >= kPrefillFlashMinTokens && spec->shape.head_dim == 256 &&
+      !tree_mask_present && !is_tq_cache_dtype(spec->kv_cache_dtype) &&
+      spec->shape.kv_heads > 0 &&
       spec->shape.q_heads % spec->shape.kv_heads == 0;
   if (flash_eligible) {
     return qwen36_attention_flash_prefill(spec);
