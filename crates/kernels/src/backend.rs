@@ -211,6 +211,13 @@ impl KernelBackend for CudaBackend {
         })
     }
 
+    fn deltanet_prefill(&self, spec: &DeltaNetPrefillSpec) -> Result<()> {
+        let ffi_spec = ffi::DeltaNetPrefillSpec::from(spec);
+        check("qwen36_deltanet_prefill", unsafe {
+            ffi::qwen36_deltanet_prefill(&ffi_spec)
+        })
+    }
+
     fn attention_prefill(&self, spec: &AttentionPrefillSpec) -> Result<()> {
         let ffi_spec = ffi::AttentionPrefillSpec::from(spec);
         check("qwen36_attention_prefill", unsafe {
@@ -649,6 +656,55 @@ mod ffi {
                 output_bf16: value.output_bf16,
                 gate_f32: value.gate_f32,
                 beta_f32: value.beta_f32,
+                shape: DeltaNetShape::from(value.shape),
+                state_decay: value.state_decay,
+                update_scale: value.update_scale,
+                qk_l2norm: i32::from(value.qk_l2norm),
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct DeltaNetPrefillSpec {
+        pub layer_index: usize,
+        pub tokens: usize,
+        pub chunk_size: usize,
+        pub q_token_stride: usize,
+        pub k_token_stride: usize,
+        pub v_token_stride: usize,
+        pub q_bf16: DevicePtr,
+        pub k_bf16: DevicePtr,
+        pub v_bf16: DevicePtr,
+        pub state_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+        pub gate_f32: DevicePtr,
+        pub beta_f32: DevicePtr,
+        pub workspace: DevicePtr,
+        pub workspace_bytes: usize,
+        pub shape: DeltaNetShape,
+        pub state_decay: f32,
+        pub update_scale: f32,
+        pub qk_l2norm: i32,
+    }
+
+    impl From<&crate::deltanet::DeltaNetPrefillSpec> for DeltaNetPrefillSpec {
+        fn from(value: &crate::deltanet::DeltaNetPrefillSpec) -> Self {
+            Self {
+                layer_index: value.layer_index,
+                tokens: value.tokens,
+                chunk_size: value.chunk_size,
+                q_token_stride: value.q_token_stride,
+                k_token_stride: value.k_token_stride,
+                v_token_stride: value.v_token_stride,
+                q_bf16: value.q_bf16,
+                k_bf16: value.k_bf16,
+                v_bf16: value.v_bf16,
+                state_bf16: value.state_bf16,
+                output_bf16: value.output_bf16,
+                gate_f32: value.gate_f32,
+                beta_f32: value.beta_f32,
+                workspace: value.workspace,
+                workspace_bytes: value.workspace_bytes,
                 shape: DeltaNetShape::from(value.shape),
                 state_decay: value.state_decay,
                 update_scale: value.update_scale,
@@ -1355,6 +1411,7 @@ mod ffi {
         pub fn qwen36_decode_nvfp4_gemv(spec: *const Nvfp4GemmSpec) -> i32;
         pub fn qwen36_attention_prefill(spec: *const AttentionPrefillSpec) -> i32;
         pub fn qwen36_deltanet_decode(spec: *const DeltaNetDecodeSpec) -> i32;
+        pub fn qwen36_deltanet_prefill(spec: *const DeltaNetPrefillSpec) -> i32;
         pub fn qwen36_attention_decode(spec: *const AttentionDecodeSpec) -> i32;
         pub fn qwen36_turboquant_encode_kv(spec: *const TurboQuantEncodeSpec) -> i32;
         pub fn qwen36_turboquant_attention(spec: *const TurboQuantAttentionSpec) -> i32;

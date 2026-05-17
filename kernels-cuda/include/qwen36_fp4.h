@@ -228,6 +228,28 @@ typedef struct {
 } qwen36_deltanet_decode_spec_t;
 
 typedef struct {
+  size_t layer_index;
+  size_t tokens;
+  size_t chunk_size;
+  size_t q_token_stride;
+  size_t k_token_stride;
+  size_t v_token_stride;
+  qwen36_device_ptr_t q_bf16;
+  qwen36_device_ptr_t k_bf16;
+  qwen36_device_ptr_t v_bf16;
+  qwen36_device_ptr_t state_bf16;
+  qwen36_device_ptr_t output_bf16;
+  qwen36_device_ptr_t gate_f32;
+  qwen36_device_ptr_t beta_f32;
+  qwen36_device_ptr_t workspace;
+  size_t workspace_bytes;
+  qwen36_deltanet_shape_t shape;
+  float state_decay;
+  float update_scale;
+  int qk_l2norm;
+} qwen36_deltanet_prefill_spec_t;
+
+typedef struct {
   size_t rows;
   size_t hidden;
   float eps;
@@ -501,6 +523,7 @@ int qwen36_decode_nvfp4_gemv(const qwen36_nvfp4_gemm_spec_t *spec);
 int qwen36_bf16_gemm(const qwen36_bf16_gemm_spec_t *spec);
 int qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec);
 int qwen36_deltanet_decode(const qwen36_deltanet_decode_spec_t *spec);
+int qwen36_deltanet_prefill(const qwen36_deltanet_prefill_spec_t *spec);
 int qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec);
 int qwen36_turboquant_encode_kv(const qwen36_turboquant_encode_spec_t *spec);
 int qwen36_turboquant_attention(const qwen36_turboquant_attention_spec_t *spec);

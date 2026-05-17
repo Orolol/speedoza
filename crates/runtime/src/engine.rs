@@ -7,7 +7,7 @@ use qwen36_fp4_core::{CoreError, KvCacheDtype, ModelLayout, ModelTopology, Resul
 use qwen36_fp4_kernels::{
     AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
     Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode,
-    CudaBackend, DeltaNetDecodeSpec, DeltaNetShape, DevicePtr, EmbeddingLookupSpec, GdnGateSpec,
+    CudaBackend, DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape, DevicePtr, EmbeddingLookupSpec, GdnGateSpec,
     Nvfp4GemmSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec,
     QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec,
     SamplingRowsSpec, SamplingSpec, SwiGluNvfp4QuantizeSpec, SwiGluSpec,
@@ -159,6 +159,11 @@ fn cuda_prefill_fused_mlp_enabled(max_context: usize) -> bool {
 fn cuda_prefill_fused_linear_attn_enabled(max_context: usize) -> bool {
     cuda_linear_attn_fused_enabled(max_context)
         && !cuda_env_bool("QWEN36_PREFILL_FUSED_LINEAR_ATTN_DISABLE")
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_deltanet_chunked_prefill_enabled() -> bool {
+    cuda_env_bool_value("QWEN36_DELTANET_CHUNKED_PREFILL").unwrap_or(true)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4350,31 +4355,64 @@ impl<B: KernelBackend> Engine<B> {
                 )?;
             }
         }
-        self.backend.deltanet_decode(&DeltaNetDecodeSpec {
-            layer_index: layer.layer_index,
-            tokens_in_persistent_loop: tokens,
-            q_token_stride: qkv_dim,
-            k_token_stride: qkv_dim,
-            v_token_stride: qkv_dim,
-            q_bf16: prefill.aux.ptr(),
-            k_bf16: Self::ptr_offset(prefill.aux.ptr(), key_dim * 2)?,
-            v_bf16: Self::ptr_offset(prefill.aux.ptr(), key_dim * 4)?,
-            state_bf16: state,
-            conv_history_bf16: conv_history,
-            output_bf16: prefill.aux3.ptr(),
-            gate_f32: prefill.gate_f32.ptr(),
-            beta_f32: prefill.beta_f32.ptr(),
-            shape: DeltaNetShape {
-                qk_heads: self.topology.linear_num_key_heads,
-                v_heads: self.topology.linear_num_value_heads,
-                key_dim: self.topology.linear_key_head_dim,
-                value_dim: self.topology.linear_value_head_dim,
-                conv_kernel: self.topology.linear_conv_kernel_dim,
-            },
-            state_decay: 1.0,
-            update_scale: 1.0,
-            qk_l2norm: true,
-        })?;
+        let delta_shape = DeltaNetShape {
+            qk_heads: self.topology.linear_num_key_heads,
+            v_heads: self.topology.linear_num_value_heads,
+            key_dim: self.topology.linear_key_head_dim,
+            value_dim: self.topology.linear_value_head_dim,
+            conv_kernel: self.topology.linear_conv_kernel_dim,
+        };
+        // Gate on env var + Qwen3.6 shape match (the chunked kernel currently
+        // only supports {qk=16, v=48, K=V=128, C=32}).  Falls back to the
+        // sequential per-token kernel otherwise.
+        let use_chunked = cuda_deltanet_chunked_prefill_enabled()
+            && delta_shape.qk_heads == 16
+            && delta_shape.v_heads == 48
+            && delta_shape.key_dim == 128
+            && delta_shape.value_dim == 128;
+        if use_chunked {
+            self.backend.deltanet_prefill(&DeltaNetPrefillSpec {
+                layer_index: layer.layer_index,
+                tokens,
+                chunk_size: 32,
+                q_token_stride: qkv_dim,
+                k_token_stride: qkv_dim,
+                v_token_stride: qkv_dim,
+                q_bf16: prefill.aux.ptr(),
+                k_bf16: Self::ptr_offset(prefill.aux.ptr(), key_dim * 2)?,
+                v_bf16: Self::ptr_offset(prefill.aux.ptr(), key_dim * 4)?,
+                state_bf16: state,
+                output_bf16: prefill.aux3.ptr(),
+                gate_f32: prefill.gate_f32.ptr(),
+                beta_f32: prefill.beta_f32.ptr(),
+                workspace: DevicePtr::NULL,
+                workspace_bytes: 0,
+                shape: delta_shape,
+                state_decay: 1.0,
+                update_scale: 1.0,
+                qk_l2norm: true,
+            })?;
+        } else {
+            self.backend.deltanet_decode(&DeltaNetDecodeSpec {
+                layer_index: layer.layer_index,
+                tokens_in_persistent_loop: tokens,
+                q_token_stride: qkv_dim,
+                k_token_stride: qkv_dim,
+                v_token_stride: qkv_dim,
+                q_bf16: prefill.aux.ptr(),
+                k_bf16: Self::ptr_offset(prefill.aux.ptr(), key_dim * 2)?,
+                v_bf16: Self::ptr_offset(prefill.aux.ptr(), key_dim * 4)?,
+                state_bf16: state,
+                conv_history_bf16: conv_history,
+                output_bf16: prefill.aux3.ptr(),
+                gate_f32: prefill.gate_f32.ptr(),
+                beta_f32: prefill.beta_f32.ptr(),
+                shape: delta_shape,
+                state_decay: 1.0,
+                update_scale: 1.0,
+                qk_l2norm: true,
+            })?;
+        }
         if layer.layer_index == 0 {
             if let Ok(dir) = std::env::var("QWEN36_DEBUG_DUMP_DIR") {
                 self.dump_buffer_to_disk(

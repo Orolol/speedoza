@@ -37,6 +37,7 @@ EXTRA_SRC+=(kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu)
   "${CUTLASS_FLAGS[@]}" \
   kernels-cuda/nvfp4_gemm.cu \
   kernels-cuda/deltanet.cu \
+  kernels-cuda/deltanet_prefill.cu \
   kernels-cuda/attention.cu \
   kernels-cuda/turboquant.cu \
   kernels-cuda/ops.cu \
