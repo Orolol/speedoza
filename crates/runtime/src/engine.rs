@@ -100,7 +100,7 @@ const CUDA_PREFILL_CAPACITY_SHORT_CONTEXT: usize = 8192;
 #[cfg(feature = "cuda")]
 const CUDA_PREFILL_CAPACITY_LONG_CONTEXT: usize = 2048;
 #[cfg(feature = "cuda")]
-const CUDA_PREFILL_CAPACITY_SHORT_CONTEXT_MAX: usize = 16384;
+const CUDA_PREFILL_CAPACITY_SHORT_CONTEXT_MAX: usize = 32768;
 
 #[cfg(feature = "cuda")]
 fn cuda_prefill_capacity(max_context: usize) -> usize {
