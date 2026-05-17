@@ -86,6 +86,29 @@ pub fn increment_i32(target: DevicePtr) -> Result<()> {
     Ok(())
 }
 
+/// Recycle a graph-captured assume-accept MTP window entirely on-device.
+pub fn mtp_assume_accept_chain_advance(
+    position_i32: DevicePtr,
+    draft_count: usize,
+    position_count: usize,
+    position_delta: i32,
+) -> Result<()> {
+    let status = unsafe {
+        ffi::qwen36_mtp_assume_accept_chain_advance(
+            position_i32,
+            draft_count,
+            position_count,
+            position_delta,
+        )
+    };
+    if status != 0 {
+        return Err(CoreError::Runtime(format!(
+            "qwen36_mtp_assume_accept_chain_advance failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CudaGraph(*mut core::ffi::c_void);
 
@@ -180,5 +203,11 @@ mod ffi {
         pub fn qwen36_cuda_graph_exec_destroy(exec: GraphExec) -> i32;
         pub fn qwen36_cuda_graph_launch(exec: GraphExec, stream: Stream) -> i32;
         pub fn qwen36_increment_i32(target: DevicePtr) -> i32;
+        pub fn qwen36_mtp_assume_accept_chain_advance(
+            position_i32: DevicePtr,
+            draft_count: usize,
+            position_count: usize,
+            position_delta: i32,
+        ) -> i32;
     }
 }

@@ -58,6 +58,16 @@ fn mtp_schedule(requested_tokens: usize, prompt_tokens: usize) -> MtpSchedule {
 }
 
 #[cfg(feature = "cuda")]
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.as_str(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        )
+    })
+}
+
+#[cfg(feature = "cuda")]
 fn cuda_kv_cache_dtype(default: KvCacheDtype) -> KvCacheDtype {
     match std::env::var("QWEN36_KV_CACHE_DTYPE")
         .ok()
@@ -1307,6 +1317,28 @@ fn run_bench_mtp_multi(
     let rebuilds = 0_usize;
     let mut mtp_verify_seconds = 0.0_f64;
 
+    if env_flag_enabled("QWEN36_MTP_DEVICE_CHAIN")
+        && env_flag_enabled("QWEN36_MTP_ASSUME_ACCEPT")
+        && draft_tokens.len() >= 2
+    {
+        let chain_start = Instant::now();
+        let chain = engine.run_mtp_assume_accept_device_chain(
+            current_token,
+            &draft_tokens,
+            max_new_tokens,
+            draft_window,
+        )?;
+        mtp_verify_seconds += chain_start.elapsed().as_secs_f64();
+        if chain.cycles > 0 {
+            generated += chain.generated_tokens;
+            main_decode_steps += chain.cycles;
+            accepted_draft_tokens += chain.accepted_draft_tokens;
+            mtp_decode_steps += chain.cycles * draft_window;
+            current_token = chain.next_token;
+            draft_tokens = chain.next_draft_tokens;
+        }
+    }
+
     while generated < max_new_tokens {
         generated += 1;
         if generated >= max_new_tokens {
@@ -1540,9 +1572,8 @@ fn prompt_tokens_from_file(
     if target_tokens == 0 {
         return Ok(Vec::new());
     }
-    let text = std::fs::read_to_string(path).map_err(|err| {
-        anyhow::anyhow!("failed to read --prompt-file {}: {err}", path.display())
-    })?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| anyhow::anyhow!("failed to read --prompt-file {}: {err}", path.display()))?;
     let tokens = tokenizer.encode(&text, false)?;
     if tokens.len() < target_tokens {
         anyhow::bail!(

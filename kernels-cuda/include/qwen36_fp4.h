@@ -562,6 +562,15 @@ int qwen36_copy_strided_rows(const qwen36_copy_strided_rows_spec_t *spec);
 // across decode iterations without host parameter updates.
 int qwen36_increment_i32(qwen36_device_ptr_t target_i32);
 
+// Advance graph-captured assume-accept MTP positions in-place:
+//   position_i32[0..count] += position_delta
+// Token samplers write the next window directly into token_u32, so repeated
+// CUDA graph launches consume prior MTP outputs without host readback/re-upload.
+int qwen36_mtp_assume_accept_chain_advance(qwen36_device_ptr_t position_i32,
+                                           size_t draft_count,
+                                           size_t position_count,
+                                           int32_t position_delta);
+
 // All kernel launches funnel through a single ambient CUDA stream so callers
 // can switch streams (e.g. to enable graph capture) without touching every
 // kernel call site. The default value is the legacy default stream (0),

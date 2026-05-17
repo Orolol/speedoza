@@ -7,10 +7,10 @@ use qwen36_fp4_core::{CoreError, KvCacheDtype, ModelLayout, ModelTopology, Resul
 use qwen36_fp4_kernels::{
     AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
     Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode,
-    CudaBackend, DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape, DevicePtr, EmbeddingLookupSpec, GdnGateSpec,
-    Nvfp4GemmSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec,
-    QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec,
-    SamplingRowsSpec, SamplingSpec, SwiGluNvfp4QuantizeSpec, SwiGluSpec,
+    CudaBackend, DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape, DevicePtr,
+    EmbeddingLookupSpec, GdnGateSpec, Nvfp4GemmSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
+    PartialRopeSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec,
+    RmsNormSpec, SamplingRowsSpec, SamplingSpec, SwiGluNvfp4QuantizeSpec, SwiGluSpec,
 };
 use qwen36_fp4_kernels::{KernelBackend, NoCudaBackend};
 #[cfg(feature = "cuda")]
@@ -74,6 +74,18 @@ fn mtp_recurrent_snapshot_enabled() -> bool {
 #[cfg(feature = "cuda")]
 fn mtp_assume_accept_enabled() -> bool {
     cuda_env_bool("QWEN36_MTP_ASSUME_ACCEPT")
+}
+
+#[cfg(feature = "cuda")]
+fn mtp_device_chain_enabled() -> bool {
+    cuda_env_bool("QWEN36_MTP_DEVICE_CHAIN")
+}
+
+#[cfg(feature = "cuda")]
+fn mtp_device_chain_batch() -> usize {
+    cuda_env_usize("QWEN36_MTP_DEVICE_CHAIN_BATCH")
+        .unwrap_or(2)
+        .clamp(1, 64)
 }
 
 #[cfg(feature = "cuda")]
@@ -245,6 +257,16 @@ pub struct MtpMultiVerifyResult {
     pub next_draft_tokens: Vec<u32>,
 }
 
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MtpDeviceChainResult {
+    pub cycles: usize,
+    pub generated_tokens: usize,
+    pub accepted_draft_tokens: usize,
+    pub next_token: u32,
+    pub next_draft_tokens: Vec<u32>,
+}
+
 pub struct Engine<B: KernelBackend = NoCudaBackend> {
     pub topology: ModelTopology,
     pub config: EngineConfig,
@@ -297,6 +319,8 @@ enum DecodeGraphKind {
         drafts: usize,
         assume_accept: bool,
         batched_lm_head: bool,
+        device_chain: bool,
+        device_chain_batch: usize,
     },
 }
 
@@ -756,6 +780,7 @@ impl<B: KernelBackend> Engine<B> {
         &mut self,
         draft_count: usize,
         start_position: usize,
+        device_chain_batch: usize,
     ) -> Result<()> {
         use qwen36_fp4_kernels::graph::{self, CudaStream};
 
@@ -766,15 +791,24 @@ impl<B: KernelBackend> Engine<B> {
         }
         let assume_accept = mtp_assume_accept_enabled();
         let batched_lm_head = mtp_batched_lm_head_enabled();
+        let device_chain = assume_accept && mtp_device_chain_enabled();
+        let device_chain_batch = if device_chain {
+            device_chain_batch.max(1)
+        } else {
+            1
+        };
         let verify_tokens = draft_count + 1;
+        let active_context = start_position + verify_tokens * device_chain_batch;
         let attention_context_limit =
-            self.decode_attention_context_limit_for_active_context(start_position + verify_tokens);
+            self.decode_attention_context_limit_for_active_context(active_context);
         if self.decode_graph.as_ref().is_some_and(|graph| {
             graph.kind
                 == (DecodeGraphKind::MtpVerifyMulti {
                     drafts: draft_count,
                     assume_accept,
                     batched_lm_head,
+                    device_chain,
+                    device_chain_batch,
                 })
                 && graph.attention_context_limit == attention_context_limit
         }) {
@@ -803,108 +837,195 @@ impl<B: KernelBackend> Engine<B> {
         let capture_result = (|| -> Result<(graph::CudaGraph, graph::CudaGraphExec)> {
             graph::begin_capture(stream_handle)?;
 
-            let draft_input_src = self.cuda_prefill()?.token_u32.ptr_at(4)?;
-            self.cuda_forward()?
-                .mtp_verify_token_u32
-                .copy_from_device_ptr_at(0, draft_input_src, draft_count * 4)?;
-            self.prefill_cuda_chunk(
-                verify_tokens,
-                start_position,
-                start_position_device_i32,
-                false,
-            )?;
-            self.final_norm_prefill_rows(verify_tokens)?;
-            if !assume_accept && mtp_batched_lm_head_enabled() {
-                self.prefill_rows_logits_for_mtp_verify(verify_tokens)?;
-                let verified_base_ptr = self
-                    .cuda_forward()?
-                    .mtp_verify_token_u32
-                    .ptr_at(MTP_GRAPH_VERIFIED_BASE * 4)?;
-                let next_token_ptr = self
-                    .cuda_forward()?
-                    .mtp_verify_token_u32
-                    .ptr_at(draft_count * 4)?;
-                self.queue_sample_greedy_rows_into(
-                    self.cuda_forward()?.mtp_logits.ptr(),
-                    verify_tokens,
-                    verified_base_ptr,
-                    next_token_ptr,
-                )?;
-            } else {
-                if !assume_accept {
-                    for draft_idx in 0..draft_count {
-                        self.prefill_row_logits(draft_idx)?;
-                        let verified_ptr = self
-                            .cuda_forward()?
-                            .mtp_verify_token_u32
-                            .ptr_at((MTP_GRAPH_VERIFIED_BASE + draft_idx) * 4)?;
-                        self.queue_sample_greedy_into(verified_ptr)?;
-                    }
-                }
-
-                self.prefill_row_logits(draft_count)?;
-                let next_token_ptr = self
-                    .cuda_forward()?
-                    .mtp_verify_token_u32
-                    .ptr_at(draft_count * 4)?;
-                self.queue_sample_greedy_into(next_token_ptr)?;
-            }
-
-            self.run_mtp_prefill_chunk_with_tokens(
-                verify_tokens,
-                start_position,
-                start_position_device_i32,
-                self.cuda_prefill()?.normed.ptr(),
-                self.cuda_forward()?.mtp_verify_token_u32.ptr(),
-                true,
-            )?;
-            let first_next_draft_ptr = self
-                .cuda_forward()?
-                .mtp_verify_token_u32
-                .ptr_at(MTP_GRAPH_NEXT_DRAFT_BASE * 4)?;
-            self.queue_sample_greedy_into(first_next_draft_ptr)?;
-
-            if draft_count > 1 {
-                let hidden = self.topology.hidden_size;
-                let last_hidden = Self::ptr_offset(
-                    self.cuda_prefill()?.normed.ptr(),
-                    (verify_tokens - 1) * hidden * 2,
-                )?;
-                for draft_idx in 1..draft_count {
-                    let position = start_position
-                        .checked_add(verify_tokens)
-                        .and_then(|value| value.checked_add(draft_idx - 1))
-                        .ok_or_else(|| {
-                            CoreError::Runtime("MTP graph draft position overflow".to_owned())
-                        })?;
-                    let position_ptr = Self::ptr_offset(
+            for _ in 0..device_chain_batch {
+                if device_chain {
+                    self.prefill_cuda_chunk(
+                        verify_tokens,
+                        start_position,
                         start_position_device_i32,
-                        (verify_tokens + draft_idx - 1) * 4,
+                        false,
                     )?;
-                    let input_slot = MTP_GRAPH_NEXT_DRAFT_BASE + draft_idx - 1;
-                    let output_slot = MTP_GRAPH_NEXT_DRAFT_BASE + draft_idx;
-                    let input_token = self
-                        .cuda_forward()?
-                        .mtp_verify_token_u32
-                        .ptr_at(input_slot * 4)?;
-                    let target_hidden = if draft_idx == 1 {
-                        last_hidden
-                    } else {
-                        self.cuda_prefill()?.normed.ptr()
-                    };
+                    self.final_norm_prefill_rows(verify_tokens)?;
+
+                    self.prefill_row_logits(draft_count)?;
+                    let shifted_next_token_ptr = self
+                        .cuda_prefill()?
+                        .token_u32
+                        .ptr_at((1 + draft_count) * 4)?;
+                    self.queue_sample_greedy_into_with_mirror(
+                        shifted_next_token_ptr,
+                        self.cuda_prefill()?.token_u32.ptr(),
+                    )?;
+
                     self.run_mtp_prefill_chunk_with_tokens(
-                        1,
-                        position,
-                        position_ptr,
-                        target_hidden,
-                        input_token,
+                        verify_tokens,
+                        start_position,
+                        start_position_device_i32,
+                        self.cuda_prefill()?.normed.ptr(),
+                        self.cuda_prefill()?.token_u32.ptr_at(4)?,
                         true,
                     )?;
-                    let output_token = self
+
+                    let first_next_draft_ptr = self.cuda_prefill()?.token_u32.ptr_at(4)?;
+                    self.queue_sample_greedy_into(first_next_draft_ptr)?;
+
+                    if draft_count > 1 {
+                        let hidden = self.topology.hidden_size;
+                        let last_hidden = Self::ptr_offset(
+                            self.cuda_prefill()?.normed.ptr(),
+                            (verify_tokens - 1) * hidden * 2,
+                        )?;
+                        for draft_idx in 1..draft_count {
+                            let position = start_position
+                                .checked_add(verify_tokens)
+                                .and_then(|value| value.checked_add(draft_idx - 1))
+                                .ok_or_else(|| {
+                                    CoreError::Runtime(
+                                        "MTP graph draft position overflow".to_owned(),
+                                    )
+                                })?;
+                            let position_ptr = Self::ptr_offset(
+                                start_position_device_i32,
+                                (verify_tokens + draft_idx - 1) * 4,
+                            )?;
+                            let input_token =
+                                self.cuda_prefill()?.token_u32.ptr_at(draft_idx * 4)?;
+                            let target_hidden = if draft_idx == 1 {
+                                last_hidden
+                            } else {
+                                self.cuda_prefill()?.normed.ptr()
+                            };
+                            self.run_mtp_prefill_chunk_with_tokens(
+                                1,
+                                position,
+                                position_ptr,
+                                target_hidden,
+                                input_token,
+                                true,
+                            )?;
+                            let output_token =
+                                self.cuda_prefill()?.token_u32.ptr_at((1 + draft_idx) * 4)?;
+                            self.queue_sample_greedy_into(output_token)?;
+                        }
+                    }
+
+                    let position_delta = i32::try_from(verify_tokens).map_err(|_| {
+                        CoreError::Runtime(format!(
+                            "MTP graph verify_tokens {verify_tokens} does not fit i32"
+                        ))
+                    })?;
+                    graph::mtp_assume_accept_chain_advance(
+                        start_position_device_i32,
+                        draft_count,
+                        verify_tokens + draft_count,
+                        position_delta,
+                    )?;
+                    continue;
+                }
+
+                let draft_input_src = self.cuda_prefill()?.token_u32.ptr_at(4)?;
+                self.cuda_forward()?
+                    .mtp_verify_token_u32
+                    .copy_from_device_ptr_at(0, draft_input_src, draft_count * 4)?;
+                self.prefill_cuda_chunk(
+                    verify_tokens,
+                    start_position,
+                    start_position_device_i32,
+                    false,
+                )?;
+                self.final_norm_prefill_rows(verify_tokens)?;
+                if !assume_accept && mtp_batched_lm_head_enabled() {
+                    self.prefill_rows_logits_for_mtp_verify(verify_tokens)?;
+                    let verified_base_ptr = self
                         .cuda_forward()?
                         .mtp_verify_token_u32
-                        .ptr_at(output_slot * 4)?;
-                    self.queue_sample_greedy_into(output_token)?;
+                        .ptr_at(MTP_GRAPH_VERIFIED_BASE * 4)?;
+                    let next_token_ptr = self
+                        .cuda_forward()?
+                        .mtp_verify_token_u32
+                        .ptr_at(draft_count * 4)?;
+                    self.queue_sample_greedy_rows_into(
+                        self.cuda_forward()?.mtp_logits.ptr(),
+                        verify_tokens,
+                        verified_base_ptr,
+                        next_token_ptr,
+                    )?;
+                } else {
+                    if !assume_accept {
+                        for draft_idx in 0..draft_count {
+                            self.prefill_row_logits(draft_idx)?;
+                            let verified_ptr = self
+                                .cuda_forward()?
+                                .mtp_verify_token_u32
+                                .ptr_at((MTP_GRAPH_VERIFIED_BASE + draft_idx) * 4)?;
+                            self.queue_sample_greedy_into(verified_ptr)?;
+                        }
+                    }
+
+                    self.prefill_row_logits(draft_count)?;
+                    let next_token_ptr = self
+                        .cuda_forward()?
+                        .mtp_verify_token_u32
+                        .ptr_at(draft_count * 4)?;
+                    self.queue_sample_greedy_into(next_token_ptr)?;
+                }
+
+                self.run_mtp_prefill_chunk_with_tokens(
+                    verify_tokens,
+                    start_position,
+                    start_position_device_i32,
+                    self.cuda_prefill()?.normed.ptr(),
+                    self.cuda_forward()?.mtp_verify_token_u32.ptr(),
+                    true,
+                )?;
+                let first_next_draft_ptr = self
+                    .cuda_forward()?
+                    .mtp_verify_token_u32
+                    .ptr_at(MTP_GRAPH_NEXT_DRAFT_BASE * 4)?;
+                self.queue_sample_greedy_into(first_next_draft_ptr)?;
+
+                if draft_count > 1 {
+                    let hidden = self.topology.hidden_size;
+                    let last_hidden = Self::ptr_offset(
+                        self.cuda_prefill()?.normed.ptr(),
+                        (verify_tokens - 1) * hidden * 2,
+                    )?;
+                    for draft_idx in 1..draft_count {
+                        let position = start_position
+                            .checked_add(verify_tokens)
+                            .and_then(|value| value.checked_add(draft_idx - 1))
+                            .ok_or_else(|| {
+                                CoreError::Runtime("MTP graph draft position overflow".to_owned())
+                            })?;
+                        let position_ptr = Self::ptr_offset(
+                            start_position_device_i32,
+                            (verify_tokens + draft_idx - 1) * 4,
+                        )?;
+                        let input_slot = MTP_GRAPH_NEXT_DRAFT_BASE + draft_idx - 1;
+                        let output_slot = MTP_GRAPH_NEXT_DRAFT_BASE + draft_idx;
+                        let input_token = self
+                            .cuda_forward()?
+                            .mtp_verify_token_u32
+                            .ptr_at(input_slot * 4)?;
+                        let target_hidden = if draft_idx == 1 {
+                            last_hidden
+                        } else {
+                            self.cuda_prefill()?.normed.ptr()
+                        };
+                        self.run_mtp_prefill_chunk_with_tokens(
+                            1,
+                            position,
+                            position_ptr,
+                            target_hidden,
+                            input_token,
+                            true,
+                        )?;
+                        let output_token = self
+                            .cuda_forward()?
+                            .mtp_verify_token_u32
+                            .ptr_at(output_slot * 4)?;
+                        self.queue_sample_greedy_into(output_token)?;
+                    }
                 }
             }
 
@@ -926,6 +1047,8 @@ impl<B: KernelBackend> Engine<B> {
                 drafts: draft_count,
                 assume_accept,
                 batched_lm_head,
+                device_chain,
+                device_chain_batch,
             },
             attention_context_limit,
             stream,
@@ -936,15 +1059,27 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
-    fn launch_mtp_verify_graph_multi_tokens(&self, draft_count: usize) -> Result<()> {
+    fn launch_mtp_verify_graph_multi_tokens(
+        &self,
+        draft_count: usize,
+        device_chain_batch: usize,
+    ) -> Result<()> {
         let graph_state = self.decode_graph.as_ref().ok_or_else(|| {
             CoreError::Runtime("MTP multi verify graph launch requested before capture".to_owned())
         })?;
+        let device_chain = mtp_assume_accept_enabled() && mtp_device_chain_enabled();
+        let device_chain_batch = if device_chain {
+            device_chain_batch.max(1)
+        } else {
+            1
+        };
         if graph_state.kind
             != (DecodeGraphKind::MtpVerifyMulti {
                 drafts: draft_count,
                 assume_accept: mtp_assume_accept_enabled(),
                 batched_lm_head: mtp_batched_lm_head_enabled(),
+                device_chain,
+                device_chain_batch,
             })
         {
             return Err(CoreError::Runtime(
@@ -953,6 +1088,103 @@ impl<B: KernelBackend> Engine<B> {
         }
         qwen36_fp4_kernels::graph::launch(graph_state.exec, graph_state.stream.handle())?;
         Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn run_mtp_assume_accept_device_chain(
+        &mut self,
+        current_token: u32,
+        draft_tokens: &[u32],
+        max_generated_tokens: usize,
+        next_draft_count: usize,
+    ) -> Result<MtpDeviceChainResult> {
+        if !mtp_assume_accept_enabled() {
+            return Err(CoreError::Runtime(
+                "MTP device chain requires QWEN36_MTP_ASSUME_ACCEPT=1".to_owned(),
+            ));
+        }
+        if !mtp_device_chain_enabled() {
+            return Err(CoreError::Runtime(
+                "MTP device chain requires QWEN36_MTP_DEVICE_CHAIN=1".to_owned(),
+            ));
+        }
+        if !(2..=MTP_MAX_DRAFT_TOKENS).contains(&draft_tokens.len()) {
+            return Err(CoreError::Runtime(format!(
+                "MTP device chain expects 2..={MTP_MAX_DRAFT_TOKENS} drafts, got {}",
+                draft_tokens.len()
+            )));
+        }
+        if next_draft_count != draft_tokens.len() {
+            return Err(CoreError::Runtime(format!(
+                "MTP device chain requires next_draft_count to match the draft window (got {next_draft_count}, expected {})",
+                draft_tokens.len()
+            )));
+        }
+
+        let start_position = self.state.position;
+        let verify_tokens = draft_tokens.len() + 1;
+        let available_tokens = self.config.max_context.saturating_sub(start_position);
+        let mut cycles = max_generated_tokens
+            .min(available_tokens)
+            .checked_div(verify_tokens)
+            .unwrap_or(0);
+        let attention_context_limit =
+            self.decode_attention_context_limit_for_active_context(start_position + verify_tokens);
+        while cycles > 0
+            && self.decode_attention_context_limit_for_active_context(
+                start_position + cycles * verify_tokens,
+            ) != attention_context_limit
+        {
+            cycles -= 1;
+        }
+
+        if cycles == 0 {
+            return Ok(MtpDeviceChainResult {
+                cycles: 0,
+                generated_tokens: 0,
+                accepted_draft_tokens: 0,
+                next_token: current_token,
+                next_draft_tokens: draft_tokens.to_vec(),
+            });
+        }
+
+        let mut verify_input = Vec::with_capacity(verify_tokens);
+        verify_input.push(current_token);
+        verify_input.extend_from_slice(draft_tokens);
+        self.write_prefill_tokens_and_position_count(
+            &verify_input,
+            start_position,
+            verify_tokens + next_draft_count,
+        )?;
+
+        let max_batch = mtp_device_chain_batch().min(cycles).max(1);
+        let mut remaining_cycles = cycles;
+        while remaining_cycles > 0 {
+            let batch = remaining_cycles.min(max_batch);
+            self.activate_existing_graph_stream(DecodeGraphKind::MtpVerifyMulti {
+                drafts: draft_tokens.len(),
+                assume_accept: true,
+                batched_lm_head: mtp_batched_lm_head_enabled(),
+                device_chain: true,
+                device_chain_batch: batch,
+            });
+            self.ensure_mtp_verify_graph_multi_tokens(draft_tokens.len(), start_position, batch)?;
+            self.launch_mtp_verify_graph_multi_tokens(draft_tokens.len(), batch)?;
+            remaining_cycles -= batch;
+        }
+
+        let mut final_tokens = self.read_prefill_token_bundle(0, 1 + next_draft_count)?;
+        let next_token = final_tokens[0];
+        let next_draft_tokens = final_tokens.split_off(1);
+        let generated_tokens = cycles * verify_tokens;
+        self.state.advance(generated_tokens);
+        Ok(MtpDeviceChainResult {
+            cycles,
+            generated_tokens,
+            accepted_draft_tokens: cycles * draft_tokens.len(),
+            next_token,
+            next_draft_tokens,
+        })
     }
 
     /// Capture one MTP verification iteration:
@@ -1673,6 +1905,18 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn read_prefill_token_bundle(&self, base_slot: usize, count: usize) -> Result<Vec<u32>> {
+        let mut bytes = vec![0_u8; count * 4];
+        self.cuda_prefill()?
+            .token_u32
+            .copy_to_host_at(base_slot * 4, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect())
+    }
+
+    #[cfg(feature = "cuda")]
     fn generate_mtp_drafts_from_target(
         &self,
         first_shifted_token: u32,
@@ -2069,6 +2313,8 @@ impl<B: KernelBackend> Engine<B> {
                 drafts: draft_tokens.len(),
                 assume_accept: mtp_assume_accept_enabled(),
                 batched_lm_head: mtp_batched_lm_head_enabled(),
+                device_chain: mtp_assume_accept_enabled() && mtp_device_chain_enabled(),
+                device_chain_batch: 1,
             });
         }
 
@@ -2091,8 +2337,8 @@ impl<B: KernelBackend> Engine<B> {
             self.mtp_snapshot_state(start_position, verify_tokens)?;
         }
         if use_multi_graph {
-            self.ensure_mtp_verify_graph_multi_tokens(draft_tokens.len(), start_position)?;
-            self.launch_mtp_verify_graph_multi_tokens(draft_tokens.len())?;
+            self.ensure_mtp_verify_graph_multi_tokens(draft_tokens.len(), start_position, 1)?;
+            self.launch_mtp_verify_graph_multi_tokens(draft_tokens.len(), 1)?;
 
             let mut verify_bytes = [0_u8; MTP_GRAPH_BUNDLE_U32S * 4];
             self.cuda_forward()?
