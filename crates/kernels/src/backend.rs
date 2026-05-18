@@ -5,10 +5,11 @@ use crate::attention::{AttentionDecodeSpec, AttentionPrefillSpec};
 use crate::deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec};
 use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
-    Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, Conv1dUpdateSpec,
-    CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec,
-    Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec,
-    RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
+    Bf16GemmSpec, Bf16MatVecArgmaxRowsSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec,
+    Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec,
+    Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec,
+    QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, SigmoidGateSpec,
+    SigmoidGateStridedSpec,
 };
 use crate::rmsnorm::RmsNormSpec;
 use crate::rope::PartialRopeSpec;
@@ -93,6 +94,10 @@ pub trait KernelBackend: Send + Sync {
 
     fn bf16_matvec(&self, _spec: &Bf16MatVecSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("bf16_matvec"))
+    }
+
+    fn bf16_matvec_argmax_rows(&self, _spec: &Bf16MatVecArgmaxRowsSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("bf16_matvec_argmax_rows"))
     }
 
     fn bf16_gemm(&self, _spec: &Bf16GemmSpec) -> Result<()> {
@@ -300,6 +305,13 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::Bf16MatVecSpec::from(spec);
         check("qwen36_bf16_matvec", unsafe {
             ffi::qwen36_bf16_matvec(&ffi_spec)
+        })
+    }
+
+    fn bf16_matvec_argmax_rows(&self, spec: &Bf16MatVecArgmaxRowsSpec) -> Result<()> {
+        let ffi_spec = ffi::Bf16MatVecArgmaxRowsSpec::from(spec);
+        check("qwen36_bf16_matvec_argmax_rows", unsafe {
+            ffi::qwen36_bf16_matvec_argmax_rows(&ffi_spec)
         })
     }
 
@@ -967,6 +979,35 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct Bf16MatVecArgmaxRowsSpec {
+        pub rows: usize,
+        pub out_features: usize,
+        pub in_features: usize,
+        pub input_bf16: DevicePtr,
+        pub weight_bf16: DevicePtr,
+        pub output_token_u32: DevicePtr,
+        pub mirror_last_output_token_u32: DevicePtr,
+        pub workspace: DevicePtr,
+        pub workspace_bytes: usize,
+    }
+
+    impl From<&crate::ops::Bf16MatVecArgmaxRowsSpec> for Bf16MatVecArgmaxRowsSpec {
+        fn from(value: &crate::ops::Bf16MatVecArgmaxRowsSpec) -> Self {
+            Self {
+                rows: value.rows,
+                out_features: value.out_features,
+                in_features: value.in_features,
+                input_bf16: value.input_bf16,
+                weight_bf16: value.weight_bf16,
+                output_token_u32: value.output_token_u32,
+                mirror_last_output_token_u32: value.mirror_last_output_token_u32,
+                workspace: value.workspace,
+                workspace_bytes: value.workspace_bytes,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct TopkArgmaxSpec {
         pub vocab_size: usize,
         pub k: usize,
@@ -1426,6 +1467,7 @@ mod ffi {
         pub fn qwen36_embedding_lookup(spec: *const EmbeddingLookupSpec) -> i32;
         pub fn qwen36_bf16_gemm(spec: *const Bf16GemmSpec) -> i32;
         pub fn qwen36_bf16_matvec(spec: *const Bf16MatVecSpec) -> i32;
+        pub fn qwen36_bf16_matvec_argmax_rows(spec: *const Bf16MatVecArgmaxRowsSpec) -> i32;
         pub fn qwen36_nvfp4_matvec(spec: *const Nvfp4MatVecSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_bf16(spec: *const Nvfp4QuantizeSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_rows(spec: *const Nvfp4QuantizeRowsSpec) -> i32;
