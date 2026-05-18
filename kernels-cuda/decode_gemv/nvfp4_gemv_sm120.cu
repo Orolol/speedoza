@@ -90,6 +90,22 @@
 // conditionally a no-op for the compute_120 fallback PTX image.
 #define QWEN36_DECODE_GEMV_MMA 1
 
+// When enabled, the kernel stages SFA + SFB into SMEM at entry instead of
+// re-loading them from gmem on every K-iter. The per-iter scatter reads on
+// SFA (each lane fetches its own m_row_sf slot, 16 unique addresses per
+// warp) hit several L1 cache lines across the kernel lifetime; by loading
+// once cooperatively up front we make the inner loop pure-SMEM for the
+// scale stream. Staging cost is one extra __syncthreads() at the prologue.
+//
+// SFA SMEM layout is k-chunk-major then row-minor:
+//   sm_sfa[chunk * kRowsPerBlock + m_row] holds one uint32 = 4 SF bytes
+//   (k_groups [chunk*4 .. chunk*4+3]) for that m_row. For a fixed chunk,
+//   the 16 unique m_rows occupy 16 contiguous banks (chunk*16 + m_row mod
+//   32), so warp-wide reads at the SAME chunk hit 16 distinct banks — no
+//   conflicts. SFB is a flat scale_cols-byte vector (broadcast read per
+//   iter so bank does not matter).
+#define QWEN36_DECODE_GEMV_SF_SMEM 1
+
 namespace {
 
 __host__ __device__ size_t gemv_div_ceil(size_t a, size_t b) {
@@ -249,6 +265,12 @@ nvfp4_gemv_mma_kernel_tpl(const uint8_t *__restrict__ a_fp4,
   // no tail.
   constexpr unsigned kATileBufBytes =
       static_cast<unsigned>(kWarpsPerBlock) * 2u * kATilePerWarpBytes;
+  // Reduction scratch is 2 halves × kRowsPerBlock rows × kWarpsPerBlock
+  // floats — laid out as [2][kRowsPerBlock][kWarpsPerBlock]. Constant so
+  // the SF staging buffer can be addressed at a compile-time offset.
+  constexpr unsigned kReductionBytes =
+      2u * static_cast<unsigned>(kRowsPerBlock) *
+      static_cast<unsigned>(kWarpsPerBlock) * sizeof(float);
   extern __shared__ uint8_t smem[];
   uint8_t *smem_b_fp4 = smem;                                      // K/2 B
   uint8_t *smem_a_base = smem + K / 2;                             // tile region
@@ -263,6 +285,18 @@ nvfp4_gemv_mma_kernel_tpl(const uint8_t *__restrict__ a_fp4,
   // [2][16][kWarpsPerBlock] floats.
   float *smem_reduction =
       reinterpret_cast<float *>(smem_a_base + kATileBufBytes);
+  // Optional SF staging buffers (see QWEN36_DECODE_GEMV_SF_SMEM block at
+  // file top for the layout rationale). Both live past the reduction
+  // scratch — sized at runtime since they depend on scale_cols=K/16.
+  // sm_sfa: kRowsPerBlock * scale_cols bytes, interleaved
+  //         sm_sfa[chunk * kRowsPerBlock + m_row] = one uint32 (4 SF bytes)
+  // sm_sfb: scale_cols bytes flat (k_group → 1 SF byte).
+#if QWEN36_DECODE_GEMV_SF_SMEM
+  uint8_t *const smem_sfa_base =
+      reinterpret_cast<uint8_t *>(smem_reduction) + kReductionBytes;
+  uint8_t *const smem_sfb_base =
+      smem_sfa_base + static_cast<size_t>(kRowsPerBlock) * scale_cols;
+#endif
   {
     const size_t b_bytes = packed_cols;
     const size_t b_vecs = b_bytes / 16;  // K/2 % 16 == 0
@@ -273,6 +307,45 @@ nvfp4_gemv_mma_kernel_tpl(const uint8_t *__restrict__ a_fp4,
       smem_b_vec[i] = b_fp4_vec[i];
     }
   }
+#if QWEN36_DECODE_GEMV_SF_SMEM
+  // Cooperative SFA load: every thread fetches a few uint32 slots. Each
+  // slot covers 4 SF groups for one (chunk, m_row) pair. Bank-conflict
+  // analysis: with stride kRowsPerBlock=16 between adjacent chunks, lanes
+  // at the SAME chunk reading 16 unique m_rows land on banks {chunk*16+0,
+  // chunk*16+1, ..., chunk*16+15} mod 32 — all distinct. (Lanes that
+  // duplicate the same m_row hit the same address → broadcast, not a
+  // conflict.) The address pair format makes uint32 reads exact.
+  {
+    const size_t per_row_chunks = scale_cols / 4;
+    const size_t total_sfa_u32 =
+        static_cast<size_t>(kRowsPerBlock) * per_row_chunks;
+    uint32_t *const smem_sfa_u32 = reinterpret_cast<uint32_t *>(smem_sfa_base);
+    for (size_t t = threadIdx.x; t < total_sfa_u32;
+         t += static_cast<size_t>(kThreadsPerBlock)) {
+      const size_t row_in_tile = t & (static_cast<size_t>(kRowsPerBlock) - 1);
+      const size_t k_chunk_idx = t >> 4;  // log2(kRowsPerBlock)
+      const size_t k_group = k_chunk_idx * 4;
+      const size_t a_row_raw = m_base + row_in_tile;
+      const size_t a_row_safe = a_row_raw < M ? a_row_raw : (M - 1);
+      const size_t gmem_off =
+          gemv_vec16_scale_offset(k_group, a_row_safe, sf_inner_dim);
+      smem_sfa_u32[t] =
+          *reinterpret_cast<const uint32_t *>(a_scale + gmem_off);
+    }
+    // SFB is a single column shared across the whole CTA. outer=0 always
+    // at N=1, so we just stream scale_cols/4 uint32s straight from gmem
+    // into the flat SMEM vector.
+    const size_t total_sfb_u32 = per_row_chunks;
+    uint32_t *const smem_sfb_u32 = reinterpret_cast<uint32_t *>(smem_sfb_base);
+    for (size_t t = threadIdx.x; t < total_sfb_u32;
+         t += static_cast<size_t>(kThreadsPerBlock)) {
+      const size_t k_group = t * 4;
+      const size_t gmem_off = gemv_vec16_scale_offset(k_group, 0, sf_inner_dim);
+      smem_sfb_u32[t] =
+          *reinterpret_cast<const uint32_t *>(b_scale + gmem_off);
+    }
+  }
+#endif
   __syncthreads();
 
   // Lane decomposition for the operand layouts (canonical m16n8k* form).
@@ -289,9 +362,13 @@ nvfp4_gemv_mma_kernel_tpl(const uint8_t *__restrict__ a_fp4,
   // OOB gmem fetches. Their MMA output is discarded by the epilogue
   // bound check (`row_lo < M` / `row_hi < M`), and their A-tile rows are
   // zero-filled by the cooperative load below.
+#if !QWEN36_DECODE_GEMV_SF_SMEM
+  // Only needed for per-iter gmem SFA reads. With SMEM staging the SF
+  // tile is computed once at the prologue using the same clamp.
   const size_t a_row_for_sf_raw = m_base + m_row_sf;
   const size_t a_row_for_sf =
       a_row_for_sf_raw < M ? a_row_for_sf_raw : (M - 1);
+#endif
 
   // SFB at N=1: outer is always 0, no n-decomposition needed.
 
@@ -356,7 +433,11 @@ nvfp4_gemv_mma_kernel_tpl(const uint8_t *__restrict__ a_fp4,
   for (size_t kc_local = 0; kc_local < k_chunks_per_warp; ++kc_local) {
     const size_t kc_global = kc_warp_start + kc_local;
     const size_t k_byte_base = kc_global * (kKPerMma / 2);  // 32 B per chunk
+#if !QWEN36_DECODE_GEMV_SF_SMEM
+    // Per-iter gmem SFA/SFB offset computation. With SMEM staging the
+    // chunk index `kc_global` is enough to index the staged tile.
     const size_t k_group_base = kc_global * 4;              // 4 SF groups
+#endif
     const unsigned cur_buf = static_cast<unsigned>(kc_local) & 1u;
 
     // Issue the NEXT chunk into the OTHER buffer (no race — distinct
@@ -403,17 +484,30 @@ nvfp4_gemv_mma_kernel_tpl(const uint8_t *__restrict__ a_fp4,
     uint32_t b1 =
         *reinterpret_cast<const uint32_t *>(smem_b_fp4 + b_byte_off_v1);
 
-    // ---- SFA/SFB coalesced as one uint32 each (B3.3.0). ----
+    // ---- SFA/SFB coalesced as one uint32 each. ----
+#if QWEN36_DECODE_GEMV_SF_SMEM
+    // SMEM-staged path: addressing is dense and bank-conflict-free (see
+    // the entry-point staging block for layout / conflict analysis). The
+    // gemv_vec16_scale_offset swizzle was already paid up front.
+    const size_t k_chunk_idx = kc_global;  // == k_group_base / 4
+    const uint32_t sfa = reinterpret_cast<const uint32_t *>(
+        smem_sfa_base)[k_chunk_idx * static_cast<size_t>(kRowsPerBlock) +
+                       m_row_sf];
+    const uint32_t sfb =
+        reinterpret_cast<const uint32_t *>(smem_sfb_base)[k_chunk_idx];
+#else
+    // Original gmem path. SFA lanes scatter across two cache lines per
+    // warp per iter; SFB is broadcast (outer=0 at N=1) so one cache line
+    // covers all lanes.
     const size_t sfa_off =
         gemv_vec16_scale_offset(k_group_base, a_row_for_sf, sf_inner_dim);
     const uint32_t sfa =
         *reinterpret_cast<const uint32_t *>(a_scale + sfa_off);
-
-    // SFB: outer = 0 at N=1.
     const size_t sfb_off =
         gemv_vec16_scale_offset(k_group_base, 0, sf_inner_dim);
     const uint32_t sfb =
         *reinterpret_cast<const uint32_t *>(b_scale + sfb_off);
+#endif
 
     mma_mxf4nvf4_4x_m16n8k64(acc0, acc1, acc2, acc3,
                              a0, a1, a2, a3,
@@ -521,15 +615,26 @@ extern "C" int qwen36_decode_nvfp4_gemv(
   //   - K/2 bytes activation column (B operand, CTA-shared).
   //   - chosen_warps * 2 * 512 bytes per-warp double-buffered A tile.
   //   - 2 * 16 * chosen_warps * 4 bytes cross-warp reduction scratch.
-  // E.g. K=5120, chosen_warps=16 → 2560 + 16384 + 2048 = 20.5 KiB.
-  //      K=5120, chosen_warps=8  → 2560 +  8192 + 1024 = 11.5 KiB.
-  // Both well under the 48 KiB default per-block smem cap on SM_120.
+  //   - (SF SMEM staging only) 16 * (K/16) bytes SFA + (K/16) bytes SFB.
+  // E.g. K=5120, chosen_warps=16, SF staging on:
+  //        2560 + 16384 + 2048 + 5120 + 320 = 26432 B (~26 KiB).
+  //      K=34816, chosen_warps=16, SF staging on:
+  //       17408 + 16384 + 2048 + 34816 + 2176 = 72832 B (~71 KiB).
+  // Both under the 100 KiB sm_120 dynamic per-block max.
   const size_t a_tile_bytes = static_cast<size_t>(chosen_warps) * 2u *
                               static_cast<size_t>(kATilePerWarpBytes);
   const size_t reduction_bytes =
       2u * static_cast<size_t>(kRowsPerBlock) *
       static_cast<size_t>(chosen_warps) * sizeof(float);
-  const size_t smem_bytes = K / 2 + a_tile_bytes + reduction_bytes;
+#if QWEN36_DECODE_GEMV_SF_SMEM
+  const size_t sf_scale_cols = K / 16;
+  const size_t sf_staging_bytes =
+      static_cast<size_t>(kRowsPerBlock) * sf_scale_cols + sf_scale_cols;
+#else
+  const size_t sf_staging_bytes = 0;
+#endif
+  const size_t smem_bytes =
+      K / 2 + a_tile_bytes + reduction_bytes + sf_staging_bytes;
 
   if (chosen_warps == 16) {
     const dim3 block(16u * 32u, 1, 1);
