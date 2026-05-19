@@ -961,6 +961,38 @@ int main() {
   dev_free<__nv_bfloat16>(sigmoid_out);
 
   // ---------------------------------------------------------------------
+  // Phase 1.1 — L2 prefetch kernel does not crash on a realistic-sized
+  // buffer (32 MB). Just dispatches the kernel on the registered prefetch
+  // stream and synchronizes; correctness is validated indirectly via the
+  // end-to-end parity gate.
+  // ---------------------------------------------------------------------
+  {
+    constexpr size_t kBytes = 32 * 1024 * 1024;
+    qwen36_device_ptr_t buf = dev_alloc<uint8_t>(kBytes);
+    must_status(qwen36_cuda_memset(buf, 0x5A, kBytes), "memset prefetch buf");
+
+    qwen36_cuda_stream_t pre_stream = nullptr;
+    must_status(qwen36_cuda_stream_create(&pre_stream),
+                "stream_create for prefetch smoke");
+    qwen36_set_prefetch_stream(pre_stream);
+
+    must_status(qwen36_l2_prefetch(buf, kBytes, 128),
+                "l2_prefetch dispatch");
+    must_status(qwen36_cuda_stream_synchronize(pre_stream),
+                "stream_synchronize after prefetch");
+
+    // Missing prefetch stream is a programming error → expect INVALID_ARGUMENT.
+    qwen36_set_prefetch_stream(nullptr);
+    expect_status(qwen36_l2_prefetch(buf, kBytes, 128),
+                  QWEN36_STATUS_INVALID_ARGUMENT,
+                  "l2_prefetch without registered prefetch stream");
+
+    must_status(qwen36_cuda_stream_destroy(pre_stream),
+                "stream_destroy prefetch smoke");
+    dev_free<uint8_t>(buf);
+  }
+
+  // ---------------------------------------------------------------------
   // Phase 0.4 — Cross-stream sync inside a captured CUDA graph.
   // Validates that the prefetch stream + event ABI added in Phase 0.1 is
   // graph-captureable: main writes A, prefetch waits, prefetch writes B,
