@@ -610,6 +610,31 @@ int qwen36_full_attn_block_stage_c_qkv_rope(
     size_t rope_dims, int32_t position, float base_theta, float eps,
     float input_tensor_scale);
 
+// Per-block megakernel — Stage F.1: MLP gate+up NVFP4 GEMV. First
+// sub-phase of the MLP fusion. Output is BF16 [2 * intermediate]
+// arranged as gate||up (matching the engine's combined gate+up store).
+//
+// Uses a persistent grid + atomic work counter: m-tiles (2*intermediate
+// / 16 of them, e.g. 2176 for Qwen3.6) are distributed across a fixed
+// CTA pool sized to the SM's true concurrent capacity. The caller
+// pre-zeroes `barrier_state` (the first 4 bytes are the work counter;
+// no inter-CTA spinlock is used in F.1 because it is the only phase
+// today). Alignment: 2*intermediate % 16 == 0, hidden_size % 512 == 0.
+// `gate_up_alpha = gate_up_weight_tensor_scale * input_tensor_scale`
+// is folded host-side. Activation is the post-attn-quantized FP4
+// produced by Stage E (so this kernel is the natural successor in
+// the full-attn pipeline). F.2/F.3/F.4 will append SwiGLU + down GEMV
+// + residual_add phases on the same launch and use the remaining
+// barrier slots (still safe because the persistent grid stays ≤
+// concurrent CTA capacity).
+int qwen36_full_attn_block_stage_f1_gate_up(
+    qwen36_device_ptr_t hidden_quantized_fp4,
+    qwen36_device_ptr_t hidden_quantized_scale,
+    qwen36_device_ptr_t mlp_gate_up_fp4,
+    qwen36_device_ptr_t mlp_gate_up_scale, float gate_up_alpha,
+    qwen36_device_ptr_t gate_up_out, qwen36_device_ptr_t barrier_state,
+    size_t intermediate, size_t hidden_size);
+
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 
 // Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot

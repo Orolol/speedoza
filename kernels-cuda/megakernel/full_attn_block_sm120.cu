@@ -703,7 +703,7 @@ qwen36_full_attn_block_stage_e_kernel(
 
   // Phase 1 — o_proj GEMV. M = hidden_size (5120), K = q_features (6144).
   qwen36_gemv::nvfp4_gemv_mma_body<8>(
-      o_proj_fp4, o_proj_scale, attention_quantized_fp4,
+      blockIdx.x, o_proj_fp4, o_proj_scale, attention_quantized_fp4,
       attention_quantized_scale, o_alpha, o_proj_out,
       static_cast<size_t>(hidden_size), static_cast<size_t>(q_features));
   phase_barrier(&barrier_state[1], gridDim.x);
@@ -765,26 +765,25 @@ qwen36_full_attn_block_stage_c_kernel(
 
   // Phase 1 — Q proj.
   qwen36_gemv::nvfp4_gemv_mma_body<8>(
-      q_weight_fp4, q_weight_scale, quantized_fp4, quantized_scale_e4m3,
-      q_alpha, q_out, static_cast<size_t>(q_features),
+      blockIdx.x, q_weight_fp4, q_weight_scale, quantized_fp4,
+      quantized_scale_e4m3, q_alpha, q_out, static_cast<size_t>(q_features),
       static_cast<size_t>(hidden_size));
   phase_barrier(&barrier_state[1], gridDim.x);
 
   // Phase 2 — K proj. The GEMV body's bounds checks skip rows ≥ M, so all
   // CTAs run the cooperative B load and the MMA loop but only CTAs whose
   // m_base < kv_features write output. Wasted compute on tail CTAs is the
-  // tradeoff for keeping the grid uniform across QKV phases (no separate
-  // m_tile_idx parameterization yet — that would require body refactor).
+  // tradeoff for keeping the grid uniform across QKV phases.
   qwen36_gemv::nvfp4_gemv_mma_body<8>(
-      k_weight_fp4, k_weight_scale, quantized_fp4, quantized_scale_e4m3,
-      k_alpha, k_out, static_cast<size_t>(kv_features),
+      blockIdx.x, k_weight_fp4, k_weight_scale, quantized_fp4,
+      quantized_scale_e4m3, k_alpha, k_out, static_cast<size_t>(kv_features),
       static_cast<size_t>(hidden_size));
   phase_barrier(&barrier_state[2], gridDim.x);
 
   // Phase 3 — V proj (same shape as K).
   qwen36_gemv::nvfp4_gemv_mma_body<8>(
-      v_weight_fp4, v_weight_scale, quantized_fp4, quantized_scale_e4m3,
-      v_alpha, v_out, static_cast<size_t>(kv_features),
+      blockIdx.x, v_weight_fp4, v_weight_scale, quantized_fp4,
+      quantized_scale_e4m3, v_alpha, v_out, static_cast<size_t>(kv_features),
       static_cast<size_t>(hidden_size));
   phase_barrier(&barrier_state[3], gridDim.x);
 
@@ -819,11 +818,56 @@ qwen36_full_attn_block_stage_b3_kernel(
   // Phase 1 — Q projection NVFP4 GEMV. Every CTA participates; each owns
   // one m16 output tile (blockIdx.x ∈ [0, q_features/16)).
   qwen36_gemv::nvfp4_gemv_mma_body<8>(
-      q_weight_fp4, q_weight_scale, quantized_fp4, quantized_scale_e4m3,
-      q_alpha, q_out, static_cast<size_t>(q_features),
+      blockIdx.x, q_weight_fp4, q_weight_scale, quantized_fp4,
+      quantized_scale_e4m3, q_alpha, q_out, static_cast<size_t>(q_features),
       static_cast<size_t>(hidden_size));
 
   phase_barrier(&barrier_state[1], gridDim.x);
+}
+
+// Stage F.1 kernel: MLP gate+up NVFP4 GEMV (persistent grid).
+//
+// The MLP m-dimension is 2*intermediate = 34816 → 2176 m-tiles, which
+// exceeds the grid size that can be concurrently resident on the 5090
+// (~340 CTAs given the 17 KB smem footprint of the GEMV body). A
+// gridDim-sized atomic barrier across 2176 CTAs would deadlock —
+// late-batch CTAs cannot make progress while the first batch spins.
+// Stage F therefore uses the persistent + work-stealing pattern:
+// launch ≤ concurrent CTA capacity, each CTA loops `atomicAdd(work)`
+// to grab the next m-tile until the counter exceeds the tile count.
+//
+// `work_counter` must be pre-zeroed by the caller (same discipline as
+// the barrier slots). No phase barrier is needed because F.1 is the
+// only phase right now — kernel completion is the synchronization
+// point. F.2/F.3/F.4 will append later phases and re-introduce
+// barriers (safe here because the persistent grid size matches
+// concurrent capacity).
+__global__ void __launch_bounds__(QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS)
+qwen36_full_attn_block_stage_f1_kernel(
+    const uint8_t *__restrict__ hidden_quantized_fp4,
+    const uint8_t *__restrict__ hidden_quantized_scale,
+    const uint8_t *__restrict__ mlp_gate_up_fp4,
+    const uint8_t *__restrict__ mlp_gate_up_scale, float gate_up_alpha,
+    __nv_bfloat16 *__restrict__ gate_up_out,
+    uint32_t *__restrict__ work_counter, uint32_t total_m_tiles,
+    uint32_t two_intermediate, uint32_t hidden_size) {
+  __shared__ uint32_t my_tile_shared;
+  for (;;) {
+    if (threadIdx.x == 0) {
+      my_tile_shared = atomicAdd(work_counter, 1u);
+    }
+    __syncthreads();
+    const uint32_t m_tile_idx = my_tile_shared;
+    if (m_tile_idx >= total_m_tiles) {
+      break;
+    }
+    qwen36_gemv::nvfp4_gemv_mma_body<8>(
+        m_tile_idx, mlp_gate_up_fp4, mlp_gate_up_scale,
+        hidden_quantized_fp4, hidden_quantized_scale, gate_up_alpha,
+        gate_up_out, static_cast<size_t>(two_intermediate),
+        static_cast<size_t>(hidden_size));
+    __syncthreads(); // republish smem before next iteration overwrites it
+  }
 }
 
 __global__ void __launch_bounds__(QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS)
@@ -1232,6 +1276,84 @@ extern "C" int qwen36_full_attn_block_stage_b_rmsnorm_quantize(
           : nullptr,
       reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(barrier_state.ptr)),
       static_cast<uint32_t>(hidden_size), eps, input_tensor_scale);
+
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int qwen36_full_attn_block_stage_f1_gate_up(
+    qwen36_device_ptr_t hidden_quantized_fp4,
+    qwen36_device_ptr_t hidden_quantized_scale,
+    qwen36_device_ptr_t mlp_gate_up_fp4,
+    qwen36_device_ptr_t mlp_gate_up_scale, float gate_up_alpha,
+    qwen36_device_ptr_t gate_up_out, qwen36_device_ptr_t barrier_state,
+    size_t intermediate, size_t hidden_size) {
+  if (hidden_quantized_fp4.ptr == 0 || hidden_quantized_scale.ptr == 0 ||
+      mlp_gate_up_fp4.ptr == 0 || mlp_gate_up_scale.ptr == 0 ||
+      gate_up_out.ptr == 0 || barrier_state.ptr == 0 || intermediate == 0 ||
+      hidden_size == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  // Alignment gates: M = 2*intermediate must be a multiple of the m-tile
+  // (16), K = hidden_size must be a multiple of the GEMV K-shard
+  // (kWarpsPerBlock=8 × kKPerMma=64 = 512).
+  const size_t two_intermediate = 2u * intermediate;
+  if ((two_intermediate & 15u) != 0u || (hidden_size & 511u) != 0u) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  if (two_intermediate > 0xFFFFFFFFu || hidden_size > 0xFFFFFFFFu) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+
+  extern cudaStream_t qwen36_internal_active_stream();
+  cudaStream_t stream = qwen36_internal_active_stream();
+
+  // Persistent grid sized to match concurrent CTA capacity. The 5090 has
+  // 170 SMs; with the GEMV body's ~17 KB smem + 256 threads + ~60-reg
+  // pressure we typically fit 1-2 CTAs/SM (well under what shared smem
+  // alone permits — register pressure is the limit). 256 CTAs is a safe
+  // upper bound that keeps every CTA concurrent regardless of the wave
+  // size NVCC ultimately picks, while still saturating the SM count.
+  // The work-stealing loop inside the kernel iterates over m-tiles, so
+  // there is no correctness dependency on the chosen grid size — only
+  // on it being ≤ true concurrent capacity (no inter-CTA spinlock).
+  constexpr unsigned kPersistentGridCtas = 256u;
+  const unsigned total_m_tiles =
+      static_cast<unsigned>(two_intermediate / qwen36_gemv::kRowsPerBlock);
+  const unsigned grid_ctas =
+      kPersistentGridCtas < total_m_tiles ? kPersistentGridCtas : total_m_tiles;
+
+  constexpr unsigned kWarps = 8;
+  const size_t k_over_2 = hidden_size / 2; // K of the gate+up GEMV
+  const size_t a_tile_bytes =
+      static_cast<size_t>(kWarps) * 2u * qwen36_gemv::kATilePerWarpBytes;
+  const size_t reduction_bytes =
+      2u * static_cast<size_t>(qwen36_gemv::kRowsPerBlock) *
+      static_cast<size_t>(kWarps) * sizeof(float);
+  const size_t sf_scale_cols = hidden_size / 16;
+  const size_t sf_staging_bytes =
+      static_cast<size_t>(qwen36_gemv::kRowsPerBlock) * sf_scale_cols +
+      sf_scale_cols;
+  const size_t smem_bytes =
+      k_over_2 + a_tile_bytes + reduction_bytes + sf_staging_bytes;
+
+  qwen36_full_attn_block_stage_f1_kernel<<<
+      grid_ctas, QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS, smem_bytes,
+      stream>>>(
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(hidden_quantized_fp4.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(hidden_quantized_scale.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(mlp_gate_up_fp4.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(mlp_gate_up_scale.ptr)),
+      gate_up_alpha,
+      reinterpret_cast<__nv_bfloat16 *>(
+          static_cast<uintptr_t>(gate_up_out.ptr)),
+      reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(barrier_state.ptr)),
+      total_m_tiles, static_cast<uint32_t>(two_intermediate),
+      static_cast<uint32_t>(hidden_size));
 
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;

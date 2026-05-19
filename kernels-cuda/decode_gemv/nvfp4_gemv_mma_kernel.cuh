@@ -18,7 +18,10 @@
 //       + kRowsPerBlock * (K/16) + (K/16)  (SFA + SFB staging, when on)
 //     and start it at the buffer base (the body reinterprets `extern
 //     __shared__ uint8_t smem[]`).
-//   - Grid: 1 CTA per 16-row m-tile (blockIdx.x ∈ [0, ceil(M/16))).
+//   - Pass `m_tile_idx ∈ [0, ceil(M/16))` — the row-tile this invocation
+//     owns. The non-persistent grid-shaped use ships `blockIdx.x`; a
+//     persistent megakernel can call the body in a loop with an atomic
+//     work counter (Stage F.1 onward).
 //   - Caller is responsible for the M, K alignment gates the dispatcher
 //     enforces (M % 16 == 0; K % (kWarpsPerBlockTpl * 64) == 0).
 
@@ -34,7 +37,8 @@ namespace qwen36_gemv {
 
 template <int kWarpsPerBlockTpl>
 __device__ inline void
-nvfp4_gemv_mma_body(const uint8_t *__restrict__ a_fp4,
+nvfp4_gemv_mma_body(unsigned m_tile_idx,
+                    const uint8_t *__restrict__ a_fp4,
                     const uint8_t *__restrict__ a_scale,
                     const uint8_t *__restrict__ b_fp4,
                     const uint8_t *__restrict__ b_scale, float alpha,
@@ -46,7 +50,7 @@ nvfp4_gemv_mma_body(const uint8_t *__restrict__ a_fp4,
 
   const unsigned warp_id = threadIdx.x >> 5;
   const unsigned lane = threadIdx.x & 31;
-  const size_t m_base = static_cast<size_t>(blockIdx.x) * kRowsPerBlock;
+  const size_t m_base = static_cast<size_t>(m_tile_idx) * kRowsPerBlock;
 
   const size_t packed_cols = K / 2;
   const size_t scale_cols = K / 16;
@@ -141,7 +145,7 @@ nvfp4_gemv_mma_body(const uint8_t *__restrict__ a_fp4,
   const unsigned a_load_row_in_tile = lane >> 1;
   const unsigned a_load_byte_off = (lane & 1u) << 4;
   const size_t a_load_global_row =
-      static_cast<size_t>(blockIdx.x) * kRowsPerBlock + a_load_row_in_tile;
+      static_cast<size_t>(m_tile_idx) * kRowsPerBlock + a_load_row_in_tile;
   const bool a_load_row_valid = a_load_global_row < M;
   const uint8_t *a_load_row_ptr =
       a_load_row_valid ? (a_fp4 + a_load_global_row * packed_cols) : nullptr;

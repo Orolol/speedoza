@@ -1904,6 +1904,129 @@ int main() {
   }
 
   // ---------------------------------------------------------------------
+  // Phase 2.6 — Megakernel Stage F.1: MLP gate+up NVFP4 GEMV fused.
+  // Compares the megakernel's BF16 output against the standalone
+  // qwen36_decode_nvfp4_gemv path at the production MLP shape
+  // (M=2*intermediate=34816, K=hidden_size=5120). Both call the same
+  // __device__ GEMV body (post-refactor), so byte-exact equality is
+  // the target. Stage F.1 is the first MLP sub-phase; F.2/F.3/F.4
+  // will append SwiGLU + down GEMV + residual_add to the same launch.
+  // ---------------------------------------------------------------------
+  {
+    constexpr size_t kHidden = 5120;        // K for gate+up GEMV
+    constexpr size_t kIntermediate = 17408; // half of M
+    constexpr size_t kTwoIntermediate = 2 * kIntermediate;
+    constexpr float kGateUpAlpha = 1.0f; // pre-folded tensor scales product
+
+    // Activation: NVFP4 quantized [hidden_size] in the vec16 tile layout.
+    constexpr size_t kActFp4Bytes = kHidden / 2;
+    constexpr size_t kActScaleBytes = 40960; // vec16 tile for 320×1 inner×outer
+
+    // Weight: NVFP4 [2*intermediate, hidden_size/2] packed.
+    constexpr size_t kWeightFp4Bytes = kTwoIntermediate * kHidden / 2;
+    constexpr size_t kWeightScaleInnerDim = 320; // round_up(5120/16, 4)
+    constexpr size_t kWeightScaleBytes =
+        ((kTwoIntermediate + 127) / 128) * (kWeightScaleInnerDim / 4) * 512;
+
+    qwen36_device_ptr_t f_act_fp4 = dev_alloc<uint8_t>(kActFp4Bytes);
+    qwen36_device_ptr_t f_act_scale = dev_alloc<uint8_t>(kActScaleBytes);
+    qwen36_device_ptr_t f_w_fp4 = dev_alloc<uint8_t>(kWeightFp4Bytes);
+    qwen36_device_ptr_t f_w_scale = dev_alloc<uint8_t>(kWeightScaleBytes);
+    qwen36_device_ptr_t f_gu_ref = dev_alloc<__nv_bfloat16>(kTwoIntermediate);
+    qwen36_device_ptr_t f_gu_meg = dev_alloc<__nv_bfloat16>(kTwoIntermediate);
+    qwen36_device_ptr_t f_barrier = dev_alloc<uint32_t>(4);
+
+    // Random FP4 nibbles restricted to 0..3 (values 0.0, 0.5, 1.0, 1.5) so
+    // K=5120 accumulated dot products stay bf16-safe. Scales: 0x38 = e4m3
+    // value 1.0 throughout. Matches the Stage B.3 smoke's recipe.
+    std::mt19937 rng(0xF1F1F1F1u);
+    std::uniform_int_distribution<uint32_t> nibble_dist(0, 3);
+    std::vector<uint8_t> act_bytes(kActFp4Bytes);
+    for (auto &b : act_bytes) {
+      b = static_cast<uint8_t>(nibble_dist(rng) | (nibble_dist(rng) << 4));
+    }
+    copy_raw<uint8_t>(f_act_fp4, act_bytes);
+    std::vector<uint8_t> act_scale_bytes(kActScaleBytes, 0x38);
+    copy_raw<uint8_t>(f_act_scale, act_scale_bytes);
+
+    std::vector<uint8_t> w_bytes(kWeightFp4Bytes);
+    for (auto &b : w_bytes) {
+      b = static_cast<uint8_t>(nibble_dist(rng) | (nibble_dist(rng) << 4));
+    }
+    copy_raw<uint8_t>(f_w_fp4, w_bytes);
+    std::vector<uint8_t> w_scale_bytes(kWeightScaleBytes, 0x38);
+    copy_raw<uint8_t>(f_w_scale, w_scale_bytes);
+
+    must_status(qwen36_cuda_memset(f_gu_ref, 0,
+                                   kTwoIntermediate * sizeof(__nv_bfloat16)),
+                "memset f_gu_ref");
+    must_status(qwen36_cuda_memset(f_gu_meg, 0,
+                                   kTwoIntermediate * sizeof(__nv_bfloat16)),
+                "memset f_gu_meg");
+    must_status(qwen36_cuda_memset(f_barrier, 0, 4 * sizeof(uint32_t)),
+                "memset f_barrier");
+
+    // Reference path: standalone gate+up NVFP4 GEMV.
+    qwen36_nvfp4_gemm_spec_t gspec{};
+    gspec.m = kTwoIntermediate;
+    gspec.n = 1;
+    gspec.k = kHidden;
+    gspec.a_fp4 = f_w_fp4;
+    gspec.a_scale = f_w_scale;
+    gspec.b_fp4 = f_act_fp4;
+    gspec.b_scale = f_act_scale;
+    gspec.c_bf16 = f_gu_ref;
+    gspec.alpha = kGateUpAlpha;
+    must_status(qwen36_decode_nvfp4_gemv(&gspec),
+                "f.1 reference decode_nvfp4_gemv");
+
+    // Megakernel Stage F.1 path.
+    must_status(qwen36_full_attn_block_stage_f1_gate_up(
+                    f_act_fp4, f_act_scale, f_w_fp4, f_w_scale, kGateUpAlpha,
+                    f_gu_meg, f_barrier, kIntermediate, kHidden),
+                "qwen36_full_attn_block_stage_f1_gate_up");
+
+    auto gu_ref = read_bf16(f_gu_ref, kTwoIntermediate);
+    auto gu_meg = read_bf16(f_gu_meg, kTwoIntermediate);
+    size_t mismatches = 0;
+    double dot = 0.0, nr = 0.0, nm = 0.0;
+    for (size_t i = 0; i < kTwoIntermediate; ++i) {
+      if (gu_ref[i] != gu_meg[i] && mismatches < 4) {
+        fprintf(stderr,
+                "  f.1 gate_up mismatch @ %zu: ref=%.6f meg=%.6f diff=%.3e\n",
+                i, gu_ref[i], gu_meg[i], gu_ref[i] - gu_meg[i]);
+        ++mismatches;
+      } else if (gu_ref[i] != gu_meg[i]) {
+        ++mismatches;
+      }
+      dot += static_cast<double>(gu_ref[i]) * static_cast<double>(gu_meg[i]);
+      nr += static_cast<double>(gu_ref[i]) * static_cast<double>(gu_ref[i]);
+      nm += static_cast<double>(gu_meg[i]) * static_cast<double>(gu_meg[i]);
+    }
+    const double cos_sim = dot / sqrt(nr * nm);
+    if (mismatches == 0) {
+      printf("megakernel stage F.1 gate+up OK (byte-exact, n=%zu)\n",
+             kTwoIntermediate);
+    } else {
+      printf("megakernel stage F.1 gate+up mismatches=%zu cos_sim=%.6f\n",
+             mismatches, cos_sim);
+      if (cos_sim < 0.998) {
+        fprintf(stderr, "  cos_sim %.6f below 0.998 floor — failing smoke\n",
+                cos_sim);
+        exit(1);
+      }
+    }
+
+    dev_free<uint32_t>(f_barrier);
+    dev_free<__nv_bfloat16>(f_gu_meg);
+    dev_free<__nv_bfloat16>(f_gu_ref);
+    dev_free<uint8_t>(f_w_scale);
+    dev_free<uint8_t>(f_w_fp4);
+    dev_free<uint8_t>(f_act_scale);
+    dev_free<uint8_t>(f_act_fp4);
+  }
+
+  // ---------------------------------------------------------------------
   // Phase 0.4 — Cross-stream sync inside a captured CUDA graph.
   // Validates that the prefetch stream + event ABI added in Phase 0.1 is
   // graph-captureable: main writes A, prefetch waits, prefetch writes B,

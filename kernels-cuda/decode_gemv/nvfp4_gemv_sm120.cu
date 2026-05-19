@@ -106,7 +106,7 @@ nvfp4_gemv_mma_kernel_tpl(const uint8_t *__restrict__ a_fp4,
                           __nv_bfloat16 *__restrict__ output, size_t M,
                           size_t K) {
   qwen36_gemv::nvfp4_gemv_mma_body<kWarpsPerBlockTpl>(
-      a_fp4, a_scale, b_fp4, b_scale, alpha, output, M, K);
+      blockIdx.x, a_fp4, a_scale, b_fp4, b_scale, alpha, output, M, K);
 }
 
 // Explicit instantiations — force both specialization symbols into the .so.
