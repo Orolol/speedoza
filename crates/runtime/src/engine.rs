@@ -6536,10 +6536,7 @@ impl<B: KernelBackend> Engine<B> {
     /// recorded for `event` has completed. Must be called once per `Some`
     /// returned by [`Self::fork_productive_spin`].
     #[cfg(feature = "cuda")]
-    fn join_productive_spin(
-        &self,
-        event: qwen36_fp4_kernels::graph::CudaEvent,
-    ) -> Result<()> {
+    fn join_productive_spin(&self, event: qwen36_fp4_kernels::graph::CudaEvent) -> Result<()> {
         let active = qwen36_fp4_kernels::graph::get_active_stream();
         qwen36_fp4_kernels::graph::stream_wait_event(active, event)
     }

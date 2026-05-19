@@ -471,11 +471,7 @@ mod ffi {
             hit_ratio: f32,
         ) -> i32;
         pub fn qwen36_cuda_clear_l2_access_window() -> i32;
-        pub fn qwen36_l2_prefetch(
-            base: DevicePtr,
-            bytes: usize,
-            target_cta_count: i32,
-        ) -> i32;
+        pub fn qwen36_l2_prefetch(base: DevicePtr, bytes: usize, target_cta_count: i32) -> i32;
     }
 }
 

@@ -993,6 +993,51 @@ int main() {
   }
 
   // ---------------------------------------------------------------------
+  // Phase 2.1 — Megakernel Stage A skeleton: identity copy through the
+  // atomic-barrier infrastructure. Validates that the 272-CTA persistent
+  // grid + monotonic-counter barrier doesn't deadlock and produces an
+  // exact byte copy. Real computation lands in later stages.
+  // ---------------------------------------------------------------------
+  {
+    constexpr size_t kHidden = 5120; // Qwen3.6 hidden_size
+    qwen36_device_ptr_t hidden_in = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t hidden_out = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t barrier = dev_alloc<uint32_t>(4);
+
+    // Fill input with a deterministic ramp.
+    std::vector<float> ramp(kHidden);
+    for (size_t i = 0; i < kHidden; ++i) {
+      ramp[i] = static_cast<float>(i % 257) * 0.0125f - 1.0f;
+    }
+    copy_bf16(hidden_in, ramp);
+    must_status(qwen36_cuda_memset(hidden_out, 0xCC, kHidden * sizeof(__nv_bfloat16)),
+                "memset hidden_out poison");
+    must_status(qwen36_cuda_memset(barrier, 0, 4 * sizeof(uint32_t)),
+                "memset barrier zero");
+
+    must_status(qwen36_full_attn_block_stage_a(hidden_in, hidden_out, barrier,
+                                                kHidden),
+                "full_attn_block_stage_a");
+
+    auto got = read_bf16(hidden_out, kHidden);
+    for (size_t i = 0; i < kHidden; ++i) {
+      const float expected = __bfloat162float(__float2bfloat16(ramp[i]));
+      if (got[i] != expected) {
+        fprintf(stderr,
+                "megakernel stage A identity copy mismatch at %zu: got %.6f "
+                "expected %.6f\n",
+                i, got[i], expected);
+        exit(1);
+      }
+    }
+    printf("megakernel stage A skeleton OK\n");
+
+    dev_free<uint32_t>(barrier);
+    dev_free<__nv_bfloat16>(hidden_out);
+    dev_free<__nv_bfloat16>(hidden_in);
+  }
+
+  // ---------------------------------------------------------------------
   // Phase 0.4 — Cross-stream sync inside a captured CUDA graph.
   // Validates that the prefetch stream + event ABI added in Phase 0.1 is
   // graph-captureable: main writes A, prefetch waits, prefetch writes B,

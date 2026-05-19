@@ -26,6 +26,8 @@ fi
 # decode_gemv is pure CUDA (no CUTLASS dep), always compile the real one.
 EXTRA_SRC+=(kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu)
 EXTRA_SRC+=(kernels-cuda/decode_gemv/l2_prefetch.cu)
+# Phase-2 per-block megakernel — pure CUDA, no CUTLASS dep.
+EXTRA_SRC+=(kernels-cuda/megakernel/full_attn_block_sm120.cu)
 
 "${NVCC}" \
   -std=c++17 \

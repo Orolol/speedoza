@@ -511,6 +511,17 @@ int qwen36_cuda_clear_l2_access_window(void);
 int qwen36_l2_prefetch(qwen36_device_ptr_t base, size_t bytes,
                        int target_cta_count);
 
+// Per-block megakernel for full-attn decode — Stage A (skeleton).
+// Identity copy of `hidden_in` to `hidden_out` through a single phase
+// barrier. Exercises the persistent-grid + atomic-barrier infrastructure
+// that Stages B-F will plug computation into. Caller must zero
+// `barrier_state` (≥ `phases * 4` bytes; Stage A uses 4 bytes) before
+// every launch. Runs on the active stream.
+int qwen36_full_attn_block_stage_a(qwen36_device_ptr_t hidden_in,
+                                   qwen36_device_ptr_t hidden_out,
+                                   qwen36_device_ptr_t barrier_state,
+                                   size_t hidden_size);
+
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 
 // Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot
