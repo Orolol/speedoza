@@ -57,6 +57,7 @@
 
 #include "qwen36_fp4.h"
 #include "active_stream.h"
+#include "nvfp4_gemv_mma_helpers.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -69,144 +70,16 @@
 // (begin/end/cbegin/cend etc.) as device variables, but `::cuda::std`
 // isn't declared in the host compilation unit, so g++ chokes with
 // "'::cuda' has not been declared". Mirror the exact PTX from the cute
-// atom (cute/arch/mma_sm120.hpp:3215, kind::mxf4nvf4.scale_vec::4X
-// .m16n8k64 with e2m1 × e2m1 and ue4m3 scales) inline below. This keeps
-// the TU self-contained — no cute, no cuda::std.
+// atom in nvfp4_gemv_mma_helpers.cuh instead.
 //
-// The `kind::mxf4nvf4` opcode is sm_120a-only. Building with
-// `-arch=sm_120a` emits BOTH a compute_120 (PTX-forward) image AND a
-// compute_120a image; the compute_120 image must softly fall through, so
-// we gate the asm on __CUDA_ARCH_FEAT_SM120_ALL.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200) &&                       \
-    defined(__CUDA_ARCH_FEAT_SM120_ALL)
-#define QWEN36_DECODE_GEMV_MMA_DEVICE 1
-#else
-#define QWEN36_DECODE_GEMV_MMA_DEVICE 0
-#endif
+// The cp.async / MMA / SF helpers + constants (kRowsPerBlock, kKPerMma,
+// kATilePerWarpBytes, etc.) and the QWEN36_DECODE_GEMV_* macros all live
+// in that header so the per-block megakernel
+// (kernels-cuda/megakernel/full_attn_block_sm120.cu) can reuse them
+// without duplicating the inline PTX. Bring them into the unqualified
+// namespace below for the existing kernel body's call sites.
 
-// Host-side guard: enabled whenever the CUDA toolchain can target sm_120a
-// (driver / nvcc 12.8+). Nothing on the host depends on the device-side
-// macro. We always compile the kernel; the device-side body is
-// conditionally a no-op for the compute_120 fallback PTX image.
-#define QWEN36_DECODE_GEMV_MMA 1
-
-// When enabled, the kernel stages SFA + SFB into SMEM at entry instead of
-// re-loading them from gmem on every K-iter. The per-iter scatter reads on
-// SFA (each lane fetches its own m_row_sf slot, 16 unique addresses per
-// warp) hit several L1 cache lines across the kernel lifetime; by loading
-// once cooperatively up front we make the inner loop pure-SMEM for the
-// scale stream. Staging cost is one extra __syncthreads() at the prologue.
-//
-// SFA SMEM layout is k-chunk-major then row-minor:
-//   sm_sfa[chunk * kRowsPerBlock + m_row] holds one uint32 = 4 SF bytes
-//   (k_groups [chunk*4 .. chunk*4+3]) for that m_row. For a fixed chunk,
-//   the 16 unique m_rows occupy 16 contiguous banks (chunk*16 + m_row mod
-//   32), so warp-wide reads at the SAME chunk hit 16 distinct banks — no
-//   conflicts. SFB is a flat scale_cols-byte vector (broadcast read per
-//   iter so bank does not matter).
-#define QWEN36_DECODE_GEMV_SF_SMEM 1
-
-namespace {
-
-__host__ __device__ size_t gemv_div_ceil(size_t a, size_t b) {
-  return (a + b - 1) / b;
-}
-
-__host__ __device__ size_t gemv_round_up(size_t v, size_t m) {
-  return gemv_div_ceil(v, m) * m;
-}
-
-// cuBLASLt vec16 scale-swizzle layout. See ops.cu:vec16_scale_offset.
-__host__ __device__ size_t gemv_vec16_scale_offset(size_t inner, size_t outer,
-                                                   size_t sf_inner_dim) {
-  const size_t block_inner = (inner / 4) * 4;
-  const size_t block_outer = outer / 128;
-  const size_t block_offset = (block_inner + block_outer * sf_inner_dim) * 128;
-  const size_t tile_outer = outer % 128;
-  const size_t tile_inner = inner % 4;
-  return block_offset + (tile_outer % 32) * 16 + (tile_outer / 32) * 4 +
-         tile_inner;
-}
-
-// File-scope constants that are independent of the warp count — these stay
-// here so the entry-point can compute the launch geometry uniformly.
-constexpr int kRowsPerWarp = 16;
-constexpr int kRowsPerBlock = kRowsPerWarp;  // 16 — one m16 MMA tile / CTA
-constexpr int kKPerMma = 64;
-constexpr unsigned kATilePerWarpBytes =
-    static_cast<unsigned>(kRowsPerBlock) * 32u;  // 512
-
-// ---- cp.async helpers (sm_80+; available on sm_120). ----
-// `cg` (cache global, bypass L1) is the right choice for streaming the A
-// weight tile — we don't reuse it after consumption. Predicated form uses
-// the trailing src-size operand: when src_bytes==0, the destination smem
-// is filled with 16 zeros (PTX cp.async semantics). This lets us drop the
-// per-thread tail-row branch.
-__device__ __forceinline__ void cp_async_16_pred(unsigned smem_addr,
-                                                 const void *gmem_ptr,
-                                                 bool valid) {
-#if QWEN36_DECODE_GEMV_MMA_DEVICE
-  const unsigned src_bytes = valid ? 16u : 0u;
-  asm volatile(
-      "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-      :
-      : "r"(smem_addr), "l"(gmem_ptr), "r"(src_bytes));
-#else
-  (void)smem_addr;
-  (void)gmem_ptr;
-  (void)valid;
-#endif
-}
-
-__device__ __forceinline__ void cp_async_commit() {
-#if QWEN36_DECODE_GEMV_MMA_DEVICE
-  asm volatile("cp.async.commit_group;\n");
-#endif
-}
-
-template <int N>
-__device__ __forceinline__ void cp_async_wait_group() {
-#if QWEN36_DECODE_GEMV_MMA_DEVICE
-  asm volatile("cp.async.wait_group %0;\n" : : "n"(N));
-#endif
-}
-
-// Inline-PTX wrapper for the SM120 mxf4nvf4 scale_vec::4X m16n8k64 atom.
-// Direct mirror of cute/arch/mma_sm120.hpp:3215. Lives at file scope so
-// the kernel body stays readable.
-__device__ __forceinline__ void mma_mxf4nvf4_4x_m16n8k64(
-    float &d0, float &d1, float &d2, float &d3,
-    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-    uint32_t b0, uint32_t b1,
-    float c0, float c1, float c2, float c3,
-    uint32_t sfa0, uint32_t sfb0) {
-#if QWEN36_DECODE_GEMV_MMA_DEVICE
-  constexpr uint16_t bid = 0;
-  constexpr uint16_t tid = 0;
-  asm volatile(
-      "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-      "{%0,  %1,  %2,  %3},"
-      "{%4,  %5,  %6,  %7},"
-      "{%8,  %9},"
-      "{%10, %11, %12, %13},"
-      "{%14},"
-      "{%15, %16},"
-      "{%17},"
-      "{%18, %19};\n"
-      : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-        "r"(b0), "r"(b1),
-        "f"(c0), "f"(c1), "f"(c2), "f"(c3),
-        "r"(sfa0), "h"(bid), "h"(tid),
-        "r"(sfb0), "h"(bid), "h"(tid));
-#else
-  d0 = c0; d1 = c1; d2 = c2; d3 = c3;
-  (void)a0; (void)a1; (void)a2; (void)a3;
-  (void)b0; (void)b1; (void)sfa0; (void)sfb0;
-#endif
-}
-
-}  // namespace
+using namespace qwen36_gemv;
 
 // Templated kernel. Two specializations are emitted (kWarpsPerBlockTpl =
 // 16 and 8). The kernel is declared at namespace scope so explicit
