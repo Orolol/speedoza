@@ -522,6 +522,17 @@ int qwen36_full_attn_block_stage_a(qwen36_device_ptr_t hidden_in,
                                    qwen36_device_ptr_t barrier_state,
                                    size_t hidden_size);
 
+// Per-block megakernel — Stage B.1: RMSNorm phase only. CTA 0 cooperates
+// on one row of length `hidden_size` (decode is N=1) using the (1+weight)
+// parameterization (matches Qwen base layer norms). Other CTAs idle at
+// the barrier; later stages fill them. Designed to be byte-exact with
+// `qwen36_rmsnorm` invoked with the same input, no residual, and
+// `direct_weight = 0`. `barrier_state` ≥ 4 bytes, zeroed by caller.
+int qwen36_full_attn_block_stage_b_rmsnorm(
+    qwen36_device_ptr_t hidden_in, qwen36_device_ptr_t input_norm_weight,
+    qwen36_device_ptr_t hidden_normed_out, qwen36_device_ptr_t barrier_state,
+    size_t hidden_size, float eps);
+
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 
 // Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot

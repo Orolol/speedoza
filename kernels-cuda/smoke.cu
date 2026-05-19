@@ -1038,6 +1038,102 @@ int main() {
   }
 
   // ---------------------------------------------------------------------
+  // Phase 2.2.1 — Megakernel Stage B.1: RMSNorm phase parity.
+  // Targets byte-exact match with qwen36_rmsnorm (the reference path used
+  // by the engine for non-quantized layer norms).
+  // ---------------------------------------------------------------------
+  {
+    constexpr size_t kHidden = 5120; // Qwen3.6 hidden_size
+    constexpr float kEps = 1e-6f;
+
+    qwen36_device_ptr_t b1_input = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t b1_weight = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t b1_ref_out = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t b1_meg_out = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t b1_barrier = dev_alloc<uint32_t>(4);
+
+    // Deterministic input + weight, mixing positive/negative magnitudes
+    // typical for hidden activations and small layer-norm weights.
+    std::vector<float> input(kHidden);
+    std::vector<float> weight(kHidden);
+    std::mt19937 rng(0xB1B1B1B1u);
+    std::normal_distribution<float> in_dist(0.0f, 0.5f);
+    std::normal_distribution<float> w_dist(0.0f, 0.02f);
+    for (size_t i = 0; i < kHidden; ++i) {
+      input[i] = in_dist(rng);
+      weight[i] = w_dist(rng);
+    }
+    copy_bf16(b1_input, input);
+    copy_bf16(b1_weight, weight);
+    must_status(qwen36_cuda_memset(b1_ref_out, 0, kHidden * sizeof(__nv_bfloat16)),
+                "memset b1_ref_out");
+    must_status(qwen36_cuda_memset(b1_meg_out, 0, kHidden * sizeof(__nv_bfloat16)),
+                "memset b1_meg_out");
+    must_status(qwen36_cuda_memset(b1_barrier, 0, 4 * sizeof(uint32_t)),
+                "memset b1_barrier");
+
+    // Reference path: qwen36_rmsnorm with (1+weight) parameterization
+    // (direct_weight = 0), no residual.
+    qwen36_rmsnorm_spec_t ref_spec{};
+    ref_spec.rows = 1;
+    ref_spec.hidden = kHidden;
+    ref_spec.eps = kEps;
+    ref_spec.input_bf16 = b1_input;
+    ref_spec.weight_bf16 = b1_weight;
+    ref_spec.residual_bf16 = qwen36_device_ptr_t{0};
+    ref_spec.residual_out_bf16 = qwen36_device_ptr_t{0};
+    ref_spec.output_bf16 = b1_ref_out;
+    ref_spec.direct_weight = 0;
+    must_status(qwen36_rmsnorm(&ref_spec), "qwen36_rmsnorm reference");
+
+    // Megakernel path.
+    must_status(qwen36_full_attn_block_stage_b_rmsnorm(
+                    b1_input, b1_weight, b1_meg_out, b1_barrier, kHidden, kEps),
+                "qwen36_full_attn_block_stage_b_rmsnorm");
+
+    auto ref = read_bf16(b1_ref_out, kHidden);
+    auto meg = read_bf16(b1_meg_out, kHidden);
+
+    // Byte-exact target. If a divergence shows up, downgrade to cosine
+    // similarity ≥ 0.998 per the project parity convention.
+    double dot = 0.0;
+    double nr = 0.0;
+    double nm = 0.0;
+    size_t mismatches = 0;
+    for (size_t i = 0; i < kHidden; ++i) {
+      if (ref[i] != meg[i] && mismatches < 4) {
+        fprintf(stderr,
+                "  b.1 rmsnorm mismatch @ %zu: ref=%.6f meg=%.6f diff=%.3e\n",
+                i, ref[i], meg[i], ref[i] - meg[i]);
+        ++mismatches;
+      } else if (ref[i] != meg[i]) {
+        ++mismatches;
+      }
+      dot += static_cast<double>(ref[i]) * static_cast<double>(meg[i]);
+      nr += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+      nm += static_cast<double>(meg[i]) * static_cast<double>(meg[i]);
+    }
+    const double cos_sim = dot / sqrt(nr * nm);
+    if (mismatches == 0) {
+      printf("megakernel stage B.1 rmsnorm OK (byte-exact)\n");
+    } else {
+      printf("megakernel stage B.1 rmsnorm mismatches=%zu cos_sim=%.6f\n",
+             mismatches, cos_sim);
+      if (cos_sim < 0.998) {
+        fprintf(stderr,
+                "  cos_sim %.6f below 0.998 floor — failing smoke\n", cos_sim);
+        exit(1);
+      }
+    }
+
+    dev_free<uint32_t>(b1_barrier);
+    dev_free<__nv_bfloat16>(b1_meg_out);
+    dev_free<__nv_bfloat16>(b1_ref_out);
+    dev_free<__nv_bfloat16>(b1_weight);
+    dev_free<__nv_bfloat16>(b1_input);
+  }
+
+  // ---------------------------------------------------------------------
   // Phase 0.4 — Cross-stream sync inside a captured CUDA graph.
   // Validates that the prefetch stream + event ABI added in Phase 0.1 is
   // graph-captureable: main writes A, prefetch waits, prefetch writes B,
