@@ -1665,6 +1665,245 @@ int main() {
   }
 
   // ---------------------------------------------------------------------
+  // Phase 2.5 — Megakernel Stage E: attention output → NVFP4 quantize →
+  // o_proj GEMV → residual add → post-attn RMSNorm + NVFP4 quantize, all
+  // fused. Compares (residual_out, post_normed, post_fp4, post_scale)
+  // against the reference: nvfp4_quantize_bf16 → decode_nvfp4_gemv →
+  // rmsnorm_nvfp4_quantize (with residual input).
+  // ---------------------------------------------------------------------
+  {
+    constexpr size_t kHidden = 5120;
+    constexpr size_t kQFeatures = 6144;
+    constexpr float kEps = 1e-6f;
+    constexpr float kAttnTensorScale = 1.0f;
+    constexpr float kPostTensorScale = 1.0f;
+    constexpr float kOAlpha = 1.0f;
+
+    // Activation scale buffers (vec16 layout). Two sizes:
+    //   attn   : 1 row × ceil(q_features/16) inner groups (K side).
+    //   normed : 1 row × ceil(hidden/16) inner groups (output of post-norm).
+    constexpr size_t kAttnScaleBytes =
+        ((1 + 127) / 128) * (((kQFeatures / 16 + 3) / 4) * 4 / 4) * 512;
+    constexpr size_t kPostScaleBytes = 40960; // same as kHidden=5120 / 16
+    constexpr size_t kOWeightScaleBytes =
+        ((kHidden + 127) / 128) *
+        (((kQFeatures / 16 + 3) / 4) * 4 / 4) * 512;
+
+    qwen36_device_ptr_t e_attn = dev_alloc<__nv_bfloat16>(kQFeatures);
+    qwen36_device_ptr_t e_resid_in = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t e_post_norm_w = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t e_ow_fp4 =
+        dev_alloc<uint8_t>(kHidden * kQFeatures / 2);
+    qwen36_device_ptr_t e_ow_scale = dev_alloc<uint8_t>(kOWeightScaleBytes);
+
+    // Intermediate (shared between reference and megakernel since both
+    // overwrite). attn_quantized: (FP4 + scales) of attention output.
+    qwen36_device_ptr_t e_attn_q_fp4 = dev_alloc<uint8_t>(kQFeatures / 2);
+    qwen36_device_ptr_t e_attn_q_scale = dev_alloc<uint8_t>(kAttnScaleBytes);
+    qwen36_device_ptr_t e_oproj_out = dev_alloc<__nv_bfloat16>(kHidden);
+
+    // Reference outputs.
+    qwen36_device_ptr_t e_resid_ref = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t e_normed_ref = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t e_post_fp4_ref = dev_alloc<uint8_t>(kHidden / 2);
+    qwen36_device_ptr_t e_post_scale_ref = dev_alloc<uint8_t>(kPostScaleBytes);
+
+    // Megakernel outputs.
+    qwen36_device_ptr_t e_resid_meg = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t e_normed_meg = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t e_post_fp4_meg = dev_alloc<uint8_t>(kHidden / 2);
+    qwen36_device_ptr_t e_post_scale_meg = dev_alloc<uint8_t>(kPostScaleBytes);
+
+    qwen36_device_ptr_t e_barrier = dev_alloc<uint32_t>(8);
+
+    std::mt19937 rng(0xE0E0E0E0u);
+    std::normal_distribution<float> in_dist(0.0f, 0.3f);
+    std::normal_distribution<float> w_dist(0.0f, 0.02f);
+    std::vector<float> attn(kQFeatures), resid(kHidden), norm_w(kHidden);
+    for (auto &v : attn) v = in_dist(rng);
+    for (auto &v : resid) v = in_dist(rng);
+    for (auto &v : norm_w) v = w_dist(rng);
+    copy_bf16(e_attn, attn);
+    copy_bf16(e_resid_in, resid);
+    copy_bf16(e_post_norm_w, norm_w);
+
+    std::vector<uint8_t> ow_bytes(kHidden * kQFeatures / 2);
+    std::uniform_int_distribution<uint32_t> nibble_dist(0, 3);
+    for (auto &b : ow_bytes) {
+      b = static_cast<uint8_t>(nibble_dist(rng) | (nibble_dist(rng) << 4));
+    }
+    copy_raw<uint8_t>(e_ow_fp4, ow_bytes);
+    std::vector<uint8_t> ow_scale_bytes(kOWeightScaleBytes, 0x38);
+    copy_raw<uint8_t>(e_ow_scale, ow_scale_bytes);
+
+    auto zero_inter = [&]() {
+      must_status(qwen36_cuda_memset(e_attn_q_fp4, 0, kQFeatures / 2),
+                  "memset e_attn_q_fp4");
+      must_status(qwen36_cuda_memset(e_attn_q_scale, 0, kAttnScaleBytes),
+                  "memset e_attn_q_scale");
+      must_status(qwen36_cuda_memset(
+                      e_oproj_out, 0, kHidden * sizeof(__nv_bfloat16)),
+                  "memset e_oproj_out");
+      must_status(qwen36_cuda_memset(e_barrier, 0, 8 * sizeof(uint32_t)),
+                  "memset e_barrier");
+    };
+    zero_inter();
+    must_status(qwen36_cuda_memset(e_resid_ref, 0,
+                                   kHidden * sizeof(__nv_bfloat16)),
+                "memset e_resid_ref");
+    must_status(qwen36_cuda_memset(e_normed_ref, 0,
+                                   kHidden * sizeof(__nv_bfloat16)),
+                "memset e_normed_ref");
+    must_status(qwen36_cuda_memset(e_post_fp4_ref, 0, kHidden / 2),
+                "memset e_post_fp4_ref");
+    must_status(qwen36_cuda_memset(e_post_scale_ref, 0, kPostScaleBytes),
+                "memset e_post_scale_ref");
+    must_status(qwen36_cuda_memset(e_resid_meg, 0,
+                                   kHidden * sizeof(__nv_bfloat16)),
+                "memset e_resid_meg");
+    must_status(qwen36_cuda_memset(e_normed_meg, 0,
+                                   kHidden * sizeof(__nv_bfloat16)),
+                "memset e_normed_meg");
+    must_status(qwen36_cuda_memset(e_post_fp4_meg, 0, kHidden / 2),
+                "memset e_post_fp4_meg");
+    must_status(qwen36_cuda_memset(e_post_scale_meg, 0, kPostScaleBytes),
+                "memset e_post_scale_meg");
+
+    // Reference path.
+    // Step 1: quantize attention output.
+    qwen36_nvfp4_quantize_spec_t qspec{};
+    qspec.values = kQFeatures;
+    qspec.input_bf16 = e_attn;
+    qspec.output_fp4 = e_attn_q_fp4;
+    qspec.output_scale_e4m3 = e_attn_q_scale;
+    qspec.output_tensor_scale_f32 = qwen36_device_ptr_t{0};
+    qspec.input_tensor_scale_f32 = kAttnTensorScale;
+    must_status(qwen36_nvfp4_quantize_bf16(&qspec),
+                "e reference nvfp4_quantize_bf16");
+
+    // Step 2: o_proj GEMV.
+    qwen36_nvfp4_gemm_spec_t gspec{};
+    gspec.m = kHidden;
+    gspec.n = 1;
+    gspec.k = kQFeatures;
+    gspec.a_fp4 = e_ow_fp4;
+    gspec.a_scale = e_ow_scale;
+    gspec.b_fp4 = e_attn_q_fp4;
+    gspec.b_scale = e_attn_q_scale;
+    gspec.c_bf16 = e_oproj_out;
+    gspec.alpha = kOAlpha;
+    must_status(qwen36_decode_nvfp4_gemv(&gspec),
+                "e reference decode_nvfp4_gemv");
+
+    // Step 3: post-norm + quantize with residual_in folded in.
+    qwen36_rmsnorm_nvfp4_quantize_spec_t rspec{};
+    rspec.hidden = kHidden;
+    rspec.eps = kEps;
+    rspec.input_bf16 = e_oproj_out;
+    rspec.weight_bf16 = e_post_norm_w;
+    rspec.residual_bf16 = e_resid_in;
+    rspec.residual_out_bf16 = e_resid_ref;
+    rspec.output_bf16 = e_normed_ref;
+    rspec.output_fp4 = e_post_fp4_ref;
+    rspec.output_scale_e4m3 = e_post_scale_ref;
+    rspec.output_tensor_scale_f32 = qwen36_device_ptr_t{0};
+    rspec.input_tensor_scale_f32 = kPostTensorScale;
+    must_status(qwen36_rmsnorm_nvfp4_quantize(&rspec),
+                "e reference rmsnorm_nvfp4_quantize");
+
+    // Megakernel path (overwrites intermediates with identical math).
+    zero_inter();
+    must_status(qwen36_full_attn_block_stage_e_o_proj_residual_norm(
+                    e_attn, e_resid_in, e_ow_fp4, e_ow_scale, kOAlpha,
+                    e_post_norm_w, e_attn_q_fp4, e_attn_q_scale, e_oproj_out,
+                    e_resid_meg, e_normed_meg, e_post_fp4_meg,
+                    e_post_scale_meg, e_barrier, kQFeatures, kHidden, kEps,
+                    kPostTensorScale, kAttnTensorScale),
+                "qwen36_full_attn_block_stage_e_o_proj_residual_norm");
+
+    // Compare.
+    auto cmp_bf16 = [&](qwen36_device_ptr_t a, qwen36_device_ptr_t b,
+                        size_t n, const char *label) {
+      auto va = read_bf16(a, n);
+      auto vb = read_bf16(b, n);
+      size_t mm = 0;
+      double dot = 0, nr = 0, nm = 0;
+      for (size_t i = 0; i < n; ++i) {
+        if (va[i] != vb[i]) ++mm;
+        dot += static_cast<double>(va[i]) * static_cast<double>(vb[i]);
+        nr += static_cast<double>(va[i]) * static_cast<double>(va[i]);
+        nm += static_cast<double>(vb[i]) * static_cast<double>(vb[i]);
+      }
+      const double cs = dot / sqrt(nr * nm);
+      if (mm == 0) {
+        printf("  stage E %s OK (byte-exact, n=%zu)\n", label, n);
+      } else {
+        printf("  stage E %s mismatches=%zu cos_sim=%.6f\n", label, mm, cs);
+        if (cs < 0.998) {
+          fprintf(stderr, "  cos_sim below 0.998 floor — failing smoke\n");
+          exit(1);
+        }
+      }
+    };
+    auto cmp_bytes = [&](qwen36_device_ptr_t a, qwen36_device_ptr_t b,
+                         size_t n, const char *label) {
+      auto va = read_raw<uint8_t>(a, n);
+      auto vb = read_raw<uint8_t>(b, n);
+      size_t mm = 0;
+      for (size_t i = 0; i < n; ++i)
+        if (va[i] != vb[i]) ++mm;
+      if (mm == 0) {
+        printf("  stage E %s OK (byte-exact, n=%zu)\n", label, n);
+      } else {
+        fprintf(stderr, "  stage E %s mismatches=%zu\n", label, mm);
+        exit(1);
+      }
+    };
+    cmp_bf16(e_resid_ref, e_resid_meg, kHidden, "residual_out");
+    cmp_bf16(e_normed_ref, e_normed_meg, kHidden, "post_normed");
+    cmp_bytes(e_post_fp4_ref, e_post_fp4_meg, kHidden / 2, "post_fp4");
+
+    // Scales: compare only the 320 logical positions (the rest is tile
+    // padding written-but-meaningless).
+    auto ref_s = read_raw<uint8_t>(e_post_scale_ref, kPostScaleBytes);
+    auto meg_s = read_raw<uint8_t>(e_post_scale_meg, kPostScaleBytes);
+    auto sf_off = [&](size_t g) {
+      const size_t block_inner = (g / 4) * 4;
+      return block_inner * 128 + (g % 4);
+    };
+    size_t scale_mm = 0;
+    for (size_t g = 0; g < kHidden / 16; ++g) {
+      if (ref_s[sf_off(g)] != meg_s[sf_off(g)]) ++scale_mm;
+    }
+    if (scale_mm == 0) {
+      printf("  stage E post_scale OK (byte-exact, n=%zu groups)\n",
+             kHidden / 16);
+    } else {
+      fprintf(stderr, "  stage E post_scale mismatches=%zu\n", scale_mm);
+      exit(1);
+    }
+    printf("megakernel stage E OK\n");
+
+    dev_free<uint32_t>(e_barrier);
+    dev_free<uint8_t>(e_post_scale_meg);
+    dev_free<uint8_t>(e_post_fp4_meg);
+    dev_free<__nv_bfloat16>(e_normed_meg);
+    dev_free<__nv_bfloat16>(e_resid_meg);
+    dev_free<uint8_t>(e_post_scale_ref);
+    dev_free<uint8_t>(e_post_fp4_ref);
+    dev_free<__nv_bfloat16>(e_normed_ref);
+    dev_free<__nv_bfloat16>(e_resid_ref);
+    dev_free<__nv_bfloat16>(e_oproj_out);
+    dev_free<uint8_t>(e_attn_q_scale);
+    dev_free<uint8_t>(e_attn_q_fp4);
+    dev_free<uint8_t>(e_ow_scale);
+    dev_free<uint8_t>(e_ow_fp4);
+    dev_free<__nv_bfloat16>(e_post_norm_w);
+    dev_free<__nv_bfloat16>(e_resid_in);
+    dev_free<__nv_bfloat16>(e_attn);
+  }
+
+  // ---------------------------------------------------------------------
   // Phase 0.4 — Cross-stream sync inside a captured CUDA graph.
   // Validates that the prefetch stream + event ABI added in Phase 0.1 is
   // graph-captureable: main writes A, prefetch waits, prefetch writes B,

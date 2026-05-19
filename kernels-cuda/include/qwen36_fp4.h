@@ -564,6 +564,28 @@ int qwen36_full_attn_block_stage_b_q_proj(
     qwen36_device_ptr_t barrier_state, size_t hidden_size, size_t q_features,
     float eps, float input_tensor_scale);
 
+// Per-block megakernel — Stage E: attention output → NVFP4 quantize →
+// o_proj GEMV → residual add → post-attn RMSNorm + NVFP4 quantize, all
+// fused into one launch. Picks up where Stage D (attention) leaves off
+// in the full-attn layer pipeline. Caller pre-zeroes `barrier_state`
+// (≥ 4 × 4 bytes). `q_features` % 512 == 0 (GEMV K-shard alignment);
+// `hidden_size` % 16 == 0 (GEMV m-tile alignment). `o_alpha` is the
+// pre-folded product of the o_proj per-tensor scales. Pass tensor
+// scales (≤ 0 selects 1.0 internally).
+int qwen36_full_attn_block_stage_e_o_proj_residual_norm(
+    qwen36_device_ptr_t attention_out, qwen36_device_ptr_t residual_in,
+    qwen36_device_ptr_t o_proj_fp4, qwen36_device_ptr_t o_proj_scale,
+    float o_alpha, qwen36_device_ptr_t post_norm_weight,
+    qwen36_device_ptr_t attention_quantized_fp4,
+    qwen36_device_ptr_t attention_quantized_scale,
+    qwen36_device_ptr_t o_proj_out, qwen36_device_ptr_t residual_out,
+    qwen36_device_ptr_t post_normed_out,
+    qwen36_device_ptr_t post_quantized_fp4,
+    qwen36_device_ptr_t post_quantized_scale,
+    qwen36_device_ptr_t barrier_state, size_t q_features, size_t hidden_size,
+    float eps, float post_input_tensor_scale,
+    float attention_output_tensor_scale);
+
 // Per-block megakernel — Stage C: Stage B.3 + K projection + V projection
 // + partial RoPE on Q/K, fused into one launch. Grid sized to the widest
 // phase (Q proj: ceil(q_features/16) CTAs); smaller K/V phases share the

@@ -450,6 +450,275 @@ __device__ inline void qwen36_full_attn_block_partial_rope_phase(
   }
 }
 
+// Pure NVFP4 quantize phase (no RMSNorm). Same per-group amax → e4m3
+// scale → e2m1 pack math as the rmsnorm_quantize_phase, just without the
+// rsqrt/(1+weight) preamble. Used in Stage E to quantize the attention
+// output before the o_proj NVFP4 GEMV.
+__device__ inline void qwen36_full_attn_block_quantize_phase(
+    const __nv_bfloat16 *__restrict__ input,
+    uint8_t *__restrict__ output_fp4, uint8_t *__restrict__ output_scale,
+    float *__restrict__ tensor_scale, uint32_t hidden,
+    float input_tensor_scale) {
+  const size_t groups = div_ceil_size(hidden, 16);
+  const size_t scale_inner_dim = round_up_size(groups, 4);
+  const float global_scale =
+      input_tensor_scale > 0.0f ? input_tensor_scale : 1.0f;
+
+  for (size_t group = threadIdx.x; group < groups; group += blockDim.x) {
+    const size_t start = group * 16;
+    const size_t group_end = (start + 16 <= hidden) ? 16 : (hidden - start);
+    float amax = 0.0f;
+    float values[16];
+    if (group_end == 16) {
+      const __nv_bfloat162 *input_pair =
+          reinterpret_cast<const __nv_bfloat162 *>(input + start);
+#pragma unroll
+      for (size_t p = 0; p < 8; ++p) {
+        const __nv_bfloat162 ip = input_pair[p];
+        const float a = __low2float(ip);
+        const float b = __high2float(ip);
+        values[p * 2] = a;
+        values[p * 2 + 1] = b;
+        amax = fmaxf(amax, fmaxf(fabsf(a), fabsf(b)));
+      }
+    } else {
+      for (size_t offset = 0; offset < group_end; ++offset) {
+        const size_t d = start + offset;
+        const float v = __bfloat162float(input[d]);
+        values[offset] = v;
+        amax = fmaxf(amax, fabsf(v));
+      }
+    }
+
+    const float scale_value =
+        amax > 0.0f ? fmaxf(amax / (6.0f * global_scale), 1.0e-8f) : 1.0f;
+    const uint8_t scale_code = encode_e4m3_positive(scale_value);
+    output_scale[vec16_scale_offset(group, 0, scale_inner_dim)] = scale_code;
+    const float decoded_scale =
+        fmaxf(decode_e4m3(scale_code) * global_scale, 1.0e-8f);
+
+    for (size_t offset = 0; offset < 16 && start + offset < hidden;
+         offset += 2) {
+      const size_t d = start + offset;
+      uint8_t packed = encode_e2m1(values[offset] / decoded_scale);
+      if (d + 1 < hidden) {
+        packed |= static_cast<uint8_t>(
+            encode_e2m1(values[offset + 1] / decoded_scale) << 4);
+      }
+      output_fp4[d / 2] = packed;
+    }
+  }
+
+  if (threadIdx.x == 0 && tensor_scale != nullptr) {
+    *tensor_scale = global_scale;
+  }
+}
+
+// Fused residual + RMSNorm + NVFP4 quantize phase. Math mirrors
+// `rmsnorm_nvfp4_quantize_kernel` in kernels-cuda/ops.cu:231 exactly —
+// folds (input + residual) before the sum-of-squares so we don't pay a
+// BF16 round-trip on the residual sum between phases. Used by Stage E
+// where the o_proj output and the pre-attention residual must be added
+// before the post-attn norm.
+__device__ inline void
+qwen36_full_attn_block_residual_rmsnorm_quantize_phase(
+    const __nv_bfloat16 *__restrict__ input,
+    const __nv_bfloat16 *__restrict__ residual,
+    const __nv_bfloat16 *__restrict__ weight,
+    __nv_bfloat16 *__restrict__ residual_out,
+    __nv_bfloat16 *__restrict__ output_bf16, uint8_t *__restrict__ output_fp4,
+    uint8_t *__restrict__ output_scale, float *__restrict__ tensor_scale,
+    uint32_t hidden, float eps, float input_tensor_scale) {
+  extern __shared__ float scratch[];
+  float local_sum = 0.0f;
+
+  const uint32_t pairs = hidden >> 1;
+  const __nv_bfloat162 *input2 =
+      reinterpret_cast<const __nv_bfloat162 *>(input);
+  const __nv_bfloat162 *residual2 =
+      reinterpret_cast<const __nv_bfloat162 *>(residual);
+
+  for (uint32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
+    const __nv_bfloat162 ip = input2[p];
+    const __nv_bfloat162 rp = residual2[p];
+    const float a = __low2float(ip) + __low2float(rp);
+    const float b = __high2float(ip) + __high2float(rp);
+    local_sum += a * a + b * b;
+  }
+  if ((hidden & 1u) != 0u && threadIdx.x == 0u) {
+    const float v = __bfloat162float(input[hidden - 1u]) +
+                    __bfloat162float(residual[hidden - 1u]);
+    local_sum += v * v;
+  }
+
+  scratch[threadIdx.x] = local_sum;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float norm_scale =
+      rsqrtf(scratch[0] / static_cast<float>(hidden) + eps);
+
+  const size_t groups = div_ceil_size(hidden, 16);
+  const size_t scale_inner_dim = round_up_size(groups, 4);
+  const float global_scale =
+      input_tensor_scale > 0.0f ? input_tensor_scale : 1.0f;
+
+  for (size_t group = threadIdx.x; group < groups; group += blockDim.x) {
+    const size_t start = group * 16;
+    const size_t group_end = (start + 16 <= hidden) ? 16 : (hidden - start);
+    float amax = 0.0f;
+    float residual_values[16];
+    float weighted_values[16];
+
+    if (group_end == 16) {
+      const __nv_bfloat162 *input_pair =
+          reinterpret_cast<const __nv_bfloat162 *>(input + start);
+      const __nv_bfloat162 *residual_pair =
+          reinterpret_cast<const __nv_bfloat162 *>(residual + start);
+      const __nv_bfloat162 *weight_pair =
+          reinterpret_cast<const __nv_bfloat162 *>(weight + start);
+      __nv_bfloat162 *output_pair =
+          output_bf16 != nullptr
+              ? reinterpret_cast<__nv_bfloat162 *>(output_bf16 + start)
+              : nullptr;
+#pragma unroll
+      for (size_t p = 0; p < 8; ++p) {
+        const __nv_bfloat162 ip = input_pair[p];
+        const __nv_bfloat162 rp = residual_pair[p];
+        const __nv_bfloat162 wp = weight_pair[p];
+        const float a = __low2float(ip) + __low2float(rp);
+        const float b = __high2float(ip) + __high2float(rp);
+        const float w0 = __low2float(wp);
+        const float w1 = __high2float(wp);
+        const float weighted0 = a * norm_scale * (1.0f + w0);
+        const float weighted1 = b * norm_scale * (1.0f + w1);
+        residual_values[p * 2] = a;
+        residual_values[p * 2 + 1] = b;
+        weighted_values[p * 2] = weighted0;
+        weighted_values[p * 2 + 1] = weighted1;
+        if (output_pair != nullptr) {
+          output_pair[p] = __floats2bfloat162_rn(weighted0, weighted1);
+        }
+        amax = fmaxf(amax, fmaxf(fabsf(weighted0), fabsf(weighted1)));
+      }
+    } else {
+      for (size_t offset = 0; offset < group_end; ++offset) {
+        const size_t d = start + offset;
+        const float v =
+            __bfloat162float(input[d]) + __bfloat162float(residual[d]);
+        const float w = __bfloat162float(weight[d]);
+        const float weighted = v * norm_scale * (1.0f + w);
+        residual_values[offset] = v;
+        weighted_values[offset] = weighted;
+        if (output_bf16 != nullptr) {
+          output_bf16[d] = __float2bfloat16(weighted);
+        }
+        amax = fmaxf(amax, fabsf(weighted));
+      }
+    }
+
+    const float scale_value =
+        amax > 0.0f ? fmaxf(amax / (6.0f * global_scale), 1.0e-8f) : 1.0f;
+    const uint8_t scale_code = encode_e4m3_positive(scale_value);
+    output_scale[vec16_scale_offset(group, 0, scale_inner_dim)] = scale_code;
+    const float decoded_scale =
+        fmaxf(decode_e4m3(scale_code) * global_scale, 1.0e-8f);
+
+    for (size_t offset = 0; offset < 16 && start + offset < hidden;
+         offset += 2) {
+      const size_t d = start + offset;
+      uint8_t packed = encode_e2m1(weighted_values[offset] / decoded_scale);
+      if (d + 1 < hidden) {
+        packed |= static_cast<uint8_t>(
+            encode_e2m1(weighted_values[offset + 1] / decoded_scale) << 4);
+      }
+      output_fp4[d / 2] = packed;
+    }
+    if (residual_out != nullptr) {
+      if (group_end == 16) {
+        __nv_bfloat162 *resout_pair =
+            reinterpret_cast<__nv_bfloat162 *>(residual_out + start);
+#pragma unroll
+        for (size_t p = 0; p < 8; ++p) {
+          resout_pair[p] = __floats2bfloat162_rn(residual_values[p * 2],
+                                                  residual_values[p * 2 + 1]);
+        }
+      } else {
+        for (size_t offset = 0; offset < group_end; ++offset) {
+          residual_out[start + offset] =
+              __float2bfloat16(residual_values[offset]);
+        }
+      }
+    }
+  }
+
+  if (threadIdx.x == 0 && tensor_scale != nullptr) {
+    *tensor_scale = global_scale;
+  }
+}
+
+// Stage E kernel: attention output → quantize → o_proj GEMV → fused
+// (residual + post-attn RMSNorm + NVFP4 quantize). Phase layout:
+//   0 [CTA 0]      Quantize attention output (BF16 → FP4 + scales).
+//   barrier
+//   1 [all CTAs]   o_proj GEMV  (M = hidden_size, K = q_features).
+//   barrier
+//   2 [CTA 0]      Fused residual + post-attn RMSNorm + NVFP4 quantize.
+//                  Matches the reference fused kernel exactly (no BF16
+//                  round-trip on the residual sum), so the post-norm
+//                  outputs are byte-identical to qwen36_rmsnorm_nvfp4
+//                  _quantize invoked with `residual_bf16 = residual_in`.
+//   barrier (clean exit)
+//
+// Grid sized to the widest phase (o_proj). Use the same 384-CTA shape as
+// Stage C so engine integration can share the grid across the layer.
+__global__ void __launch_bounds__(QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS)
+qwen36_full_attn_block_stage_e_kernel(
+    const __nv_bfloat16 *__restrict__ attention_out,
+    const __nv_bfloat16 *__restrict__ residual_in,
+    const uint8_t *__restrict__ o_proj_fp4,
+    const uint8_t *__restrict__ o_proj_scale, float o_alpha,
+    const __nv_bfloat16 *__restrict__ post_norm_weight,
+    uint8_t *__restrict__ attention_quantized_fp4,
+    uint8_t *__restrict__ attention_quantized_scale,
+    __nv_bfloat16 *__restrict__ o_proj_out,
+    __nv_bfloat16 *__restrict__ residual_out,
+    __nv_bfloat16 *__restrict__ post_normed_out,
+    uint8_t *__restrict__ post_quantized_fp4,
+    uint8_t *__restrict__ post_quantized_scale,
+    uint32_t *__restrict__ barrier_state, uint32_t q_features,
+    uint32_t hidden_size, float eps, float post_input_tensor_scale,
+    float attention_output_tensor_scale) {
+  // Phase 0 — Quantize attention output.
+  if (blockIdx.x == 0) {
+    qwen36_full_attn_block_quantize_phase(
+        attention_out, attention_quantized_fp4, attention_quantized_scale,
+        /*tensor_scale=*/nullptr, q_features, attention_output_tensor_scale);
+  }
+  phase_barrier(&barrier_state[0], gridDim.x);
+
+  // Phase 1 — o_proj GEMV. M = hidden_size (5120), K = q_features (6144).
+  qwen36_gemv::nvfp4_gemv_mma_body<8>(
+      o_proj_fp4, o_proj_scale, attention_quantized_fp4,
+      attention_quantized_scale, o_alpha, o_proj_out,
+      static_cast<size_t>(hidden_size), static_cast<size_t>(q_features));
+  phase_barrier(&barrier_state[1], gridDim.x);
+
+  // Phase 2 — Fused residual + post-attn RMSNorm + NVFP4 quantize.
+  if (blockIdx.x == 0) {
+    qwen36_full_attn_block_residual_rmsnorm_quantize_phase(
+        o_proj_out, residual_in, post_norm_weight, residual_out,
+        post_normed_out, post_quantized_fp4, post_quantized_scale,
+        /*tensor_scale=*/nullptr, hidden_size, eps,
+        post_input_tensor_scale);
+  }
+  phase_barrier(&barrier_state[2], gridDim.x);
+}
+
 // Stage C kernel: Stage B.3 + K projection + V projection + partial RoPE
 // on Q/K. Phase layout:
 //   0  [CTA 0]            RMSNorm + NVFP4 quantize hidden
@@ -642,6 +911,106 @@ extern "C" int qwen36_full_attn_block_stage_b_rmsnorm(
           static_cast<uintptr_t>(hidden_normed_out.ptr)),
       reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(barrier_state.ptr)),
       static_cast<uint32_t>(hidden_size), eps);
+
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int qwen36_full_attn_block_stage_e_o_proj_residual_norm(
+    qwen36_device_ptr_t attention_out, qwen36_device_ptr_t residual_in,
+    qwen36_device_ptr_t o_proj_fp4, qwen36_device_ptr_t o_proj_scale,
+    float o_alpha, qwen36_device_ptr_t post_norm_weight,
+    qwen36_device_ptr_t attention_quantized_fp4,
+    qwen36_device_ptr_t attention_quantized_scale,
+    qwen36_device_ptr_t o_proj_out, qwen36_device_ptr_t residual_out,
+    qwen36_device_ptr_t post_normed_out,
+    qwen36_device_ptr_t post_quantized_fp4,
+    qwen36_device_ptr_t post_quantized_scale,
+    qwen36_device_ptr_t barrier_state, size_t q_features, size_t hidden_size,
+    float eps, float post_input_tensor_scale,
+    float attention_output_tensor_scale) {
+  if (attention_out.ptr == 0 || residual_in.ptr == 0 ||
+      o_proj_fp4.ptr == 0 || o_proj_scale.ptr == 0 ||
+      post_norm_weight.ptr == 0 || attention_quantized_fp4.ptr == 0 ||
+      attention_quantized_scale.ptr == 0 || o_proj_out.ptr == 0 ||
+      residual_out.ptr == 0 || post_quantized_fp4.ptr == 0 ||
+      post_quantized_scale.ptr == 0 || barrier_state.ptr == 0 ||
+      q_features == 0 || hidden_size == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  if (q_features > 0xFFFFFFFFu || hidden_size > 0xFFFFFFFFu) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  // o_proj GEMV: M = hidden_size aligned to 16, K = q_features aligned to 512.
+  if ((hidden_size & 15u) != 0u || (q_features & 511u) != 0u) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+
+  extern cudaStream_t qwen36_internal_active_stream();
+  cudaStream_t stream = qwen36_internal_active_stream();
+
+  // Grid: max of o_proj m-tiles (hidden_size/16) and the Stage C shape
+  // (q_features/16) so engine integration can use the same grid for both
+  // megakernel launches in a full-attn layer.
+  const unsigned o_proj_tiles =
+      static_cast<unsigned>((hidden_size + 15u) / 16u);
+  const unsigned q_proj_tiles =
+      static_cast<unsigned>((q_features + 15u) / 16u);
+  const unsigned grid_ctas =
+      o_proj_tiles > q_proj_tiles ? o_proj_tiles : q_proj_tiles;
+
+  constexpr unsigned kWarps = 8;
+  const size_t k_over_2 = q_features / 2; // K of the o_proj GEMV
+  const size_t a_tile_bytes =
+      static_cast<size_t>(kWarps) * 2u * qwen36_gemv::kATilePerWarpBytes;
+  const size_t reduction_bytes =
+      2u * static_cast<size_t>(qwen36_gemv::kRowsPerBlock) *
+      static_cast<size_t>(kWarps) * sizeof(float);
+  const size_t sf_scale_cols = q_features / 16;
+  const size_t sf_staging_bytes =
+      static_cast<size_t>(qwen36_gemv::kRowsPerBlock) * sf_scale_cols +
+      sf_scale_cols;
+  const size_t gemv_smem =
+      k_over_2 + a_tile_bytes + reduction_bytes + sf_staging_bytes;
+  const size_t rmsnorm_smem =
+      QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS * sizeof(float);
+  const size_t smem_bytes =
+      gemv_smem > rmsnorm_smem ? gemv_smem : rmsnorm_smem;
+
+  qwen36_full_attn_block_stage_e_kernel<<<
+      grid_ctas, QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS, smem_bytes,
+      stream>>>(
+      reinterpret_cast<const __nv_bfloat16 *>(
+          static_cast<uintptr_t>(attention_out.ptr)),
+      reinterpret_cast<const __nv_bfloat16 *>(
+          static_cast<uintptr_t>(residual_in.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(o_proj_fp4.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(o_proj_scale.ptr)),
+      o_alpha,
+      reinterpret_cast<const __nv_bfloat16 *>(
+          static_cast<uintptr_t>(post_norm_weight.ptr)),
+      reinterpret_cast<uint8_t *>(
+          static_cast<uintptr_t>(attention_quantized_fp4.ptr)),
+      reinterpret_cast<uint8_t *>(
+          static_cast<uintptr_t>(attention_quantized_scale.ptr)),
+      reinterpret_cast<__nv_bfloat16 *>(
+          static_cast<uintptr_t>(o_proj_out.ptr)),
+      reinterpret_cast<__nv_bfloat16 *>(
+          static_cast<uintptr_t>(residual_out.ptr)),
+      post_normed_out.ptr != 0
+          ? reinterpret_cast<__nv_bfloat16 *>(
+                static_cast<uintptr_t>(post_normed_out.ptr))
+          : nullptr,
+      reinterpret_cast<uint8_t *>(
+          static_cast<uintptr_t>(post_quantized_fp4.ptr)),
+      reinterpret_cast<uint8_t *>(
+          static_cast<uintptr_t>(post_quantized_scale.ptr)),
+      reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(barrier_state.ptr)),
+      static_cast<uint32_t>(q_features),
+      static_cast<uint32_t>(hidden_size), eps, post_input_tensor_scale,
+      attention_output_tensor_scale);
 
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
