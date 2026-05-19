@@ -1444,6 +1444,227 @@ int main() {
   }
 
   // ---------------------------------------------------------------------
+  // Phase 2.3 — Megakernel Stage C: Q + K + V projections + partial RoPE
+  // fused. Compares (Q_post_rope, K_post_rope, V) bytes against the
+  // standalone reference: rmsnorm_nvfp4_quantize → decode_nvfp4_gemv × 3
+  // → partial_rope. Same __device__ GEMV body + same RoPE math → byte-
+  // exact target. Skips q_proj_deinterleave and q/k norms (those are
+  // engine-layer concerns handled in Stage E/engine integration).
+  // ---------------------------------------------------------------------
+  {
+    constexpr size_t kHidden = 5120;
+    constexpr size_t kQFeatures = 6144;   // 24 heads × 256 dim
+    constexpr size_t kKvFeatures = 1024;  // 4 heads × 256 dim
+    constexpr size_t kQHeads = 24;
+    constexpr size_t kKvHeads = 4;
+    constexpr size_t kHeadDim = 256;
+    constexpr size_t kRopeDims = 64;
+    constexpr int32_t kPosition = 7;
+    constexpr float kBaseTheta = 1000000.0f;
+    constexpr float kEps = 1e-6f;
+    constexpr float kInputTensorScale = 1.0f;
+    constexpr float kQAlpha = 1.0f;
+    constexpr float kKAlpha = 1.0f;
+    constexpr float kVAlpha = 1.0f;
+
+    constexpr size_t kActScaleBytes = 40960;
+    constexpr size_t kQWeightScaleBytes =
+        ((kQFeatures + 127) / 128) * (320 / 4) * 512;
+    constexpr size_t kKvWeightScaleBytes =
+        ((kKvFeatures + 127) / 128) * (320 / 4) * 512;
+
+    qwen36_device_ptr_t c_hidden = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t c_norm_w = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t c_qw_fp4 =
+        dev_alloc<uint8_t>(kQFeatures * kHidden / 2);
+    qwen36_device_ptr_t c_qw_scale = dev_alloc<uint8_t>(kQWeightScaleBytes);
+    qwen36_device_ptr_t c_kw_fp4 =
+        dev_alloc<uint8_t>(kKvFeatures * kHidden / 2);
+    qwen36_device_ptr_t c_kw_scale = dev_alloc<uint8_t>(kKvWeightScaleBytes);
+    qwen36_device_ptr_t c_vw_fp4 =
+        dev_alloc<uint8_t>(kKvFeatures * kHidden / 2);
+    qwen36_device_ptr_t c_vw_scale = dev_alloc<uint8_t>(kKvWeightScaleBytes);
+
+    qwen36_device_ptr_t c_normed_bf16 = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t c_normed_fp4 = dev_alloc<uint8_t>(kHidden / 2);
+    qwen36_device_ptr_t c_normed_scale = dev_alloc<uint8_t>(kActScaleBytes);
+    qwen36_device_ptr_t c_normed_tscale = dev_alloc<float>(1);
+    qwen36_device_ptr_t c_q_ref = dev_alloc<__nv_bfloat16>(kQFeatures);
+    qwen36_device_ptr_t c_k_ref = dev_alloc<__nv_bfloat16>(kKvFeatures);
+    qwen36_device_ptr_t c_v_ref = dev_alloc<__nv_bfloat16>(kKvFeatures);
+    qwen36_device_ptr_t c_q_meg = dev_alloc<__nv_bfloat16>(kQFeatures);
+    qwen36_device_ptr_t c_k_meg = dev_alloc<__nv_bfloat16>(kKvFeatures);
+    qwen36_device_ptr_t c_v_meg = dev_alloc<__nv_bfloat16>(kKvFeatures);
+    qwen36_device_ptr_t c_barrier = dev_alloc<uint32_t>(8);
+
+    std::vector<float> hidden(kHidden);
+    std::vector<float> norm_w(kHidden);
+    std::mt19937 rng(0xC0C0C0C0u);
+    std::normal_distribution<float> nrm(0.0f, 0.5f);
+    std::normal_distribution<float> w_dist(0.0f, 0.02f);
+    for (size_t i = 0; i < kHidden; ++i) {
+      hidden[i] = nrm(rng);
+      norm_w[i] = w_dist(rng);
+    }
+    copy_bf16(c_hidden, hidden);
+    copy_bf16(c_norm_w, norm_w);
+
+    std::uniform_int_distribution<uint32_t> nibble_dist(0, 3);
+    auto fill_random_fp4 = [&](qwen36_device_ptr_t dst, size_t bytes) {
+      std::vector<uint8_t> buf(bytes);
+      for (auto &b : buf) {
+        b = static_cast<uint8_t>(nibble_dist(rng) | (nibble_dist(rng) << 4));
+      }
+      copy_raw<uint8_t>(dst, buf);
+    };
+    fill_random_fp4(c_qw_fp4, kQFeatures * kHidden / 2);
+    fill_random_fp4(c_kw_fp4, kKvFeatures * kHidden / 2);
+    fill_random_fp4(c_vw_fp4, kKvFeatures * kHidden / 2);
+    std::vector<uint8_t> uniform_scale_q(kQWeightScaleBytes, 0x38);
+    std::vector<uint8_t> uniform_scale_kv(kKvWeightScaleBytes, 0x38);
+    copy_raw<uint8_t>(c_qw_scale, uniform_scale_q);
+    copy_raw<uint8_t>(c_kw_scale, uniform_scale_kv);
+    copy_raw<uint8_t>(c_vw_scale, uniform_scale_kv);
+
+    auto zero_outputs = [&]() {
+      must_status(qwen36_cuda_memset(c_normed_bf16, 0,
+                                     kHidden * sizeof(__nv_bfloat16)),
+                  "memset c_normed_bf16");
+      must_status(qwen36_cuda_memset(c_normed_fp4, 0, kHidden / 2),
+                  "memset c_normed_fp4");
+      must_status(qwen36_cuda_memset(c_normed_scale, 0, kActScaleBytes),
+                  "memset c_normed_scale");
+      must_status(qwen36_cuda_memset(c_normed_tscale, 0, sizeof(float)),
+                  "memset c_normed_tscale");
+      must_status(qwen36_cuda_memset(c_barrier, 0, 8 * sizeof(uint32_t)),
+                  "memset c_barrier");
+    };
+    zero_outputs();
+    must_status(qwen36_cuda_memset(c_q_ref, 0, kQFeatures * sizeof(__nv_bfloat16)),
+                "memset c_q_ref");
+    must_status(qwen36_cuda_memset(c_k_ref, 0, kKvFeatures * sizeof(__nv_bfloat16)),
+                "memset c_k_ref");
+    must_status(qwen36_cuda_memset(c_v_ref, 0, kKvFeatures * sizeof(__nv_bfloat16)),
+                "memset c_v_ref");
+    must_status(qwen36_cuda_memset(c_q_meg, 0, kQFeatures * sizeof(__nv_bfloat16)),
+                "memset c_q_meg");
+    must_status(qwen36_cuda_memset(c_k_meg, 0, kKvFeatures * sizeof(__nv_bfloat16)),
+                "memset c_k_meg");
+    must_status(qwen36_cuda_memset(c_v_meg, 0, kKvFeatures * sizeof(__nv_bfloat16)),
+                "memset c_v_meg");
+
+    // Reference: rmsnorm+quantize → Q → K → V → partial_rope.
+    qwen36_rmsnorm_nvfp4_quantize_spec_t rspec{};
+    rspec.hidden = kHidden;
+    rspec.eps = kEps;
+    rspec.input_bf16 = c_hidden;
+    rspec.weight_bf16 = c_norm_w;
+    rspec.residual_bf16 = qwen36_device_ptr_t{0};
+    rspec.residual_out_bf16 = qwen36_device_ptr_t{0};
+    rspec.output_bf16 = c_normed_bf16;
+    rspec.output_fp4 = c_normed_fp4;
+    rspec.output_scale_e4m3 = c_normed_scale;
+    rspec.output_tensor_scale_f32 = c_normed_tscale;
+    rspec.input_tensor_scale_f32 = kInputTensorScale;
+    must_status(qwen36_rmsnorm_nvfp4_quantize(&rspec),
+                "c reference rmsnorm_nvfp4_quantize");
+
+    auto run_gemv = [&](qwen36_device_ptr_t w_fp4, qwen36_device_ptr_t w_scale,
+                        qwen36_device_ptr_t out, size_t m, float alpha) {
+      qwen36_nvfp4_gemm_spec_t gspec{};
+      gspec.m = m;
+      gspec.n = 1;
+      gspec.k = kHidden;
+      gspec.a_fp4 = w_fp4;
+      gspec.a_scale = w_scale;
+      gspec.b_fp4 = c_normed_fp4;
+      gspec.b_scale = c_normed_scale;
+      gspec.c_bf16 = out;
+      gspec.alpha = alpha;
+      must_status(qwen36_decode_nvfp4_gemv(&gspec),
+                  "c reference decode_nvfp4_gemv");
+    };
+    run_gemv(c_qw_fp4, c_qw_scale, c_q_ref, kQFeatures, kQAlpha);
+    run_gemv(c_kw_fp4, c_kw_scale, c_k_ref, kKvFeatures, kKAlpha);
+    run_gemv(c_vw_fp4, c_vw_scale, c_v_ref, kKvFeatures, kVAlpha);
+
+    qwen36_partial_rope_spec_t pspec{};
+    pspec.tokens = 1;
+    pspec.q_heads = kQHeads;
+    pspec.kv_heads = kKvHeads;
+    pspec.head_dim = kHeadDim;
+    pspec.rope_dims = kRopeDims;
+    pspec.base_theta = kBaseTheta;
+    pspec.position_i32 = kPosition;
+    pspec.use_scalar_position = 1;
+    pspec.positions_i32 = qwen36_device_ptr_t{0};
+    pspec.q_bf16 = c_q_ref;
+    pspec.k_bf16 = c_k_ref;
+    pspec.scalar_position_device_i32 = qwen36_device_ptr_t{0};
+    must_status(qwen36_partial_rope(&pspec), "c reference partial_rope");
+
+    // Megakernel Stage C: replays the intermediates, writes _meg outputs.
+    zero_outputs();
+    must_status(qwen36_full_attn_block_stage_c_qkv_rope(
+                    c_hidden, c_norm_w, c_qw_fp4, c_qw_scale, kQAlpha,
+                    c_kw_fp4, c_kw_scale, kKAlpha, c_vw_fp4, c_vw_scale,
+                    kVAlpha, c_normed_bf16, c_normed_fp4, c_normed_scale,
+                    c_q_meg, c_k_meg, c_v_meg, c_barrier, kHidden,
+                    kQFeatures, kKvFeatures, kQHeads, kKvHeads, kHeadDim,
+                    kRopeDims, kPosition, kBaseTheta, kEps,
+                    kInputTensorScale),
+                "qwen36_full_attn_block_stage_c_qkv_rope");
+
+    auto compare = [&](qwen36_device_ptr_t a, qwen36_device_ptr_t b,
+                       size_t n, const char *label) {
+      auto va = read_bf16(a, n);
+      auto vb = read_bf16(b, n);
+      size_t mm = 0;
+      double dot = 0, nr = 0, nm = 0;
+      for (size_t i = 0; i < n; ++i) {
+        if (va[i] != vb[i]) ++mm;
+        dot += static_cast<double>(va[i]) * static_cast<double>(vb[i]);
+        nr += static_cast<double>(va[i]) * static_cast<double>(va[i]);
+        nm += static_cast<double>(vb[i]) * static_cast<double>(vb[i]);
+      }
+      const double cs = dot / sqrt(nr * nm);
+      if (mm == 0) {
+        printf("  stage C %s OK (byte-exact, n=%zu)\n", label, n);
+      } else {
+        printf("  stage C %s mismatches=%zu cos_sim=%.6f\n", label, mm, cs);
+        if (cs < 0.998) {
+          fprintf(stderr, "  cos_sim below 0.998 floor — failing smoke\n");
+          exit(1);
+        }
+      }
+    };
+    compare(c_q_ref, c_q_meg, kQFeatures, "Q (post-RoPE)");
+    compare(c_k_ref, c_k_meg, kKvFeatures, "K (post-RoPE)");
+    compare(c_v_ref, c_v_meg, kKvFeatures, "V");
+    printf("megakernel stage C OK\n");
+
+    dev_free<uint32_t>(c_barrier);
+    dev_free<__nv_bfloat16>(c_v_meg);
+    dev_free<__nv_bfloat16>(c_k_meg);
+    dev_free<__nv_bfloat16>(c_q_meg);
+    dev_free<__nv_bfloat16>(c_v_ref);
+    dev_free<__nv_bfloat16>(c_k_ref);
+    dev_free<__nv_bfloat16>(c_q_ref);
+    dev_free<float>(c_normed_tscale);
+    dev_free<uint8_t>(c_normed_scale);
+    dev_free<uint8_t>(c_normed_fp4);
+    dev_free<__nv_bfloat16>(c_normed_bf16);
+    dev_free<uint8_t>(c_vw_scale);
+    dev_free<uint8_t>(c_vw_fp4);
+    dev_free<uint8_t>(c_kw_scale);
+    dev_free<uint8_t>(c_kw_fp4);
+    dev_free<uint8_t>(c_qw_scale);
+    dev_free<uint8_t>(c_qw_fp4);
+    dev_free<__nv_bfloat16>(c_norm_w);
+    dev_free<__nv_bfloat16>(c_hidden);
+  }
+
+  // ---------------------------------------------------------------------
   // Phase 0.4 — Cross-stream sync inside a captured CUDA graph.
   // Validates that the prefetch stream + event ABI added in Phase 0.1 is
   // graph-captureable: main writes A, prefetch waits, prefetch writes B,

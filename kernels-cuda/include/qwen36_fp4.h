@@ -564,6 +564,30 @@ int qwen36_full_attn_block_stage_b_q_proj(
     qwen36_device_ptr_t barrier_state, size_t hidden_size, size_t q_features,
     float eps, float input_tensor_scale);
 
+// Per-block megakernel — Stage C: Stage B.3 + K projection + V projection
+// + partial RoPE on Q/K, fused into one launch. Grid sized to the widest
+// phase (Q proj: ceil(q_features/16) CTAs); smaller K/V phases share the
+// same grid and skip tail CTAs via the GEMV body's bounds checks.
+// Caller pre-zeroes `barrier_state` (≥ 5 × 4 bytes for 5 phase barriers).
+// `hidden_size` % 512 == 0, `q_features` % 16 == 0, `kv_features` % 16 == 0.
+// `position` is the scalar token position (decode is N=1); `base_theta`
+// matches the model's RoPE theta. Partial RoPE is split-half (Qwen3.6
+// convention), applied in place to `q_out` and `k_out`.
+int qwen36_full_attn_block_stage_c_qkv_rope(
+    qwen36_device_ptr_t hidden_in, qwen36_device_ptr_t input_norm_weight,
+    qwen36_device_ptr_t q_weight_fp4, qwen36_device_ptr_t q_weight_scale,
+    float q_alpha, qwen36_device_ptr_t k_weight_fp4,
+    qwen36_device_ptr_t k_weight_scale, float k_alpha,
+    qwen36_device_ptr_t v_weight_fp4, qwen36_device_ptr_t v_weight_scale,
+    float v_alpha, qwen36_device_ptr_t hidden_normed_out_bf16,
+    qwen36_device_ptr_t quantized_fp4,
+    qwen36_device_ptr_t quantized_scale_e4m3, qwen36_device_ptr_t q_out,
+    qwen36_device_ptr_t k_out, qwen36_device_ptr_t v_out,
+    qwen36_device_ptr_t barrier_state, size_t hidden_size, size_t q_features,
+    size_t kv_features, size_t q_heads, size_t kv_heads, size_t head_dim,
+    size_t rope_dims, int32_t position, float base_theta, float eps,
+    float input_tensor_scale);
+
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 
 // Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot

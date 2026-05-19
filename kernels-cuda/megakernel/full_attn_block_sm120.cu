@@ -404,6 +404,128 @@ qwen36_full_attn_block_stage_b2_kernel(
 // using `QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_CTAS` would under-provision Q
 // proj (M=6144 → 384 CTAs > 272). The barrier slot count is gridDim.x at
 // runtime, so the smaller-CTA Stage B.1/B.2 launches stay correct.
+// Partial RoPE phase (Qwen3.6 split-half rotation). Each CTA owns one
+// pair index p ∈ [0, rope_dims/2); threads parallelize over the
+// (q_heads + kv_heads) heads. Math mirrors `partial_rope_kernel` in
+// kernels-cuda/ops.cu:406 and uses the same `apply_rope_half_pair` math
+// (split-then-rotate, not adjacent-pair).
+__device__ inline void
+apply_rope_half_pair_inline(__nv_bfloat16 *values, size_t offset,
+                            size_t half_dim, size_t pair, float cosv,
+                            float sinv) {
+  const size_t first = offset + pair;
+  const size_t second = offset + half_dim + pair;
+  const float x0 = __bfloat162float(values[first]);
+  const float x1 = __bfloat162float(values[second]);
+  values[first] = __float2bfloat16(x0 * cosv - x1 * sinv);
+  values[second] = __float2bfloat16(x1 * cosv + x0 * sinv);
+}
+
+__device__ inline void qwen36_full_attn_block_partial_rope_phase(
+    __nv_bfloat16 *__restrict__ q, __nv_bfloat16 *__restrict__ k,
+    int32_t position, uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
+    uint32_t rope_dims, float base_theta) {
+  const uint32_t half_dim = rope_dims / 2;
+  if (blockIdx.x >= half_dim) {
+    return; // tail CTAs sit out RoPE; the barrier still gates everyone.
+  }
+  const uint32_t p = blockIdx.x;
+  const float pos = static_cast<float>(position);
+  const float inv_freq =
+      powf(base_theta,
+           -static_cast<float>(2 * p) / static_cast<float>(rope_dims));
+  const float angle = pos * inv_freq;
+  const float cosv = cosf(angle);
+  const float sinv = sinf(angle);
+  for (uint32_t head = threadIdx.x; head < q_heads + kv_heads;
+       head += blockDim.x) {
+    if (head < q_heads) {
+      apply_rope_half_pair_inline(q, static_cast<size_t>(head) * head_dim,
+                                  half_dim, p, cosv, sinv);
+    } else {
+      const uint32_t kv_head = head - q_heads;
+      apply_rope_half_pair_inline(k, static_cast<size_t>(kv_head) * head_dim,
+                                  half_dim, p, cosv, sinv);
+    }
+  }
+}
+
+// Stage C kernel: Stage B.3 + K projection + V projection + partial RoPE
+// on Q/K. Phase layout:
+//   0  [CTA 0]            RMSNorm + NVFP4 quantize hidden
+//   barrier
+//   1  [all CTAs]         Q proj GEMV   (M = q_features)
+//   barrier
+//   2  [CTAs < kv/16]     K proj GEMV   (M = kv_features; tail CTAs idle
+//                                          via body's row-bounds check)
+//   barrier
+//   3  [CTAs < kv/16]     V proj GEMV   (M = kv_features)
+//   barrier
+//   4  [CTAs < rope/2]    partial RoPE on Q + K (split-half pairs)
+//   barrier (clean exit)
+//
+// Grid sized to the widest phase (Q proj, ceil(q_features/16)). The body's
+// bounds checks make the smaller K/V phases correct with the same grid.
+__global__ void __launch_bounds__(QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS)
+qwen36_full_attn_block_stage_c_kernel(
+    const __nv_bfloat16 *__restrict__ hidden_in,
+    const __nv_bfloat16 *__restrict__ input_norm_weight,
+    const uint8_t *__restrict__ q_weight_fp4,
+    const uint8_t *__restrict__ q_weight_scale, float q_alpha,
+    const uint8_t *__restrict__ k_weight_fp4,
+    const uint8_t *__restrict__ k_weight_scale, float k_alpha,
+    const uint8_t *__restrict__ v_weight_fp4,
+    const uint8_t *__restrict__ v_weight_scale, float v_alpha,
+    __nv_bfloat16 *__restrict__ hidden_normed_out_bf16,
+    uint8_t *__restrict__ quantized_fp4,
+    uint8_t *__restrict__ quantized_scale_e4m3,
+    __nv_bfloat16 *__restrict__ q_out, __nv_bfloat16 *__restrict__ k_out,
+    __nv_bfloat16 *__restrict__ v_out, uint32_t *__restrict__ barrier_state,
+    uint32_t hidden_size, uint32_t q_features, uint32_t kv_features,
+    uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim, uint32_t rope_dims,
+    int32_t position, float base_theta, float eps,
+    float input_tensor_scale) {
+  // Phase 0 — RMSNorm + quantize.
+  if (blockIdx.x == 0) {
+    qwen36_full_attn_block_rmsnorm_quantize_phase(
+        hidden_in, input_norm_weight, hidden_normed_out_bf16, quantized_fp4,
+        quantized_scale_e4m3, /*tensor_scale=*/nullptr, hidden_size, eps,
+        input_tensor_scale);
+  }
+  phase_barrier(&barrier_state[0], gridDim.x);
+
+  // Phase 1 — Q proj.
+  qwen36_gemv::nvfp4_gemv_mma_body<8>(
+      q_weight_fp4, q_weight_scale, quantized_fp4, quantized_scale_e4m3,
+      q_alpha, q_out, static_cast<size_t>(q_features),
+      static_cast<size_t>(hidden_size));
+  phase_barrier(&barrier_state[1], gridDim.x);
+
+  // Phase 2 — K proj. The GEMV body's bounds checks skip rows ≥ M, so all
+  // CTAs run the cooperative B load and the MMA loop but only CTAs whose
+  // m_base < kv_features write output. Wasted compute on tail CTAs is the
+  // tradeoff for keeping the grid uniform across QKV phases (no separate
+  // m_tile_idx parameterization yet — that would require body refactor).
+  qwen36_gemv::nvfp4_gemv_mma_body<8>(
+      k_weight_fp4, k_weight_scale, quantized_fp4, quantized_scale_e4m3,
+      k_alpha, k_out, static_cast<size_t>(kv_features),
+      static_cast<size_t>(hidden_size));
+  phase_barrier(&barrier_state[2], gridDim.x);
+
+  // Phase 3 — V proj (same shape as K).
+  qwen36_gemv::nvfp4_gemv_mma_body<8>(
+      v_weight_fp4, v_weight_scale, quantized_fp4, quantized_scale_e4m3,
+      v_alpha, v_out, static_cast<size_t>(kv_features),
+      static_cast<size_t>(hidden_size));
+  phase_barrier(&barrier_state[3], gridDim.x);
+
+  // Phase 4 — partial RoPE on Q + K in place.
+  qwen36_full_attn_block_partial_rope_phase(q_out, k_out, position, q_heads,
+                                             kv_heads, head_dim, rope_dims,
+                                             base_theta);
+  phase_barrier(&barrier_state[4], gridDim.x);
+}
+
 __global__ void __launch_bounds__(QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS)
 qwen36_full_attn_block_stage_b3_kernel(
     const __nv_bfloat16 *__restrict__ hidden_in,
@@ -520,6 +642,106 @@ extern "C" int qwen36_full_attn_block_stage_b_rmsnorm(
           static_cast<uintptr_t>(hidden_normed_out.ptr)),
       reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(barrier_state.ptr)),
       static_cast<uint32_t>(hidden_size), eps);
+
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int qwen36_full_attn_block_stage_c_qkv_rope(
+    qwen36_device_ptr_t hidden_in, qwen36_device_ptr_t input_norm_weight,
+    qwen36_device_ptr_t q_weight_fp4, qwen36_device_ptr_t q_weight_scale,
+    float q_alpha, qwen36_device_ptr_t k_weight_fp4,
+    qwen36_device_ptr_t k_weight_scale, float k_alpha,
+    qwen36_device_ptr_t v_weight_fp4, qwen36_device_ptr_t v_weight_scale,
+    float v_alpha, qwen36_device_ptr_t hidden_normed_out_bf16,
+    qwen36_device_ptr_t quantized_fp4,
+    qwen36_device_ptr_t quantized_scale_e4m3, qwen36_device_ptr_t q_out,
+    qwen36_device_ptr_t k_out, qwen36_device_ptr_t v_out,
+    qwen36_device_ptr_t barrier_state, size_t hidden_size, size_t q_features,
+    size_t kv_features, size_t q_heads, size_t kv_heads, size_t head_dim,
+    size_t rope_dims, int32_t position, float base_theta, float eps,
+    float input_tensor_scale) {
+  if (hidden_in.ptr == 0 || input_norm_weight.ptr == 0 ||
+      q_weight_fp4.ptr == 0 || q_weight_scale.ptr == 0 ||
+      k_weight_fp4.ptr == 0 || k_weight_scale.ptr == 0 ||
+      v_weight_fp4.ptr == 0 || v_weight_scale.ptr == 0 ||
+      quantized_fp4.ptr == 0 || quantized_scale_e4m3.ptr == 0 ||
+      q_out.ptr == 0 || k_out.ptr == 0 || v_out.ptr == 0 ||
+      barrier_state.ptr == 0 || hidden_size == 0 || q_features == 0 ||
+      kv_features == 0 || head_dim == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  if (hidden_size > 0xFFFFFFFFu || q_features > 0xFFFFFFFFu ||
+      kv_features > 0xFFFFFFFFu) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  if ((q_features & 15u) != 0u || (kv_features & 15u) != 0u ||
+      (hidden_size & 511u) != 0u) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+
+  extern cudaStream_t qwen36_internal_active_stream();
+  cudaStream_t stream = qwen36_internal_active_stream();
+
+  const unsigned grid_ctas =
+      static_cast<unsigned>((q_features + 15u) / 16u);
+  constexpr unsigned kWarps = 8;
+  const size_t k_over_2 = hidden_size / 2;
+  const size_t a_tile_bytes =
+      static_cast<size_t>(kWarps) * 2u * qwen36_gemv::kATilePerWarpBytes;
+  const size_t reduction_bytes =
+      2u * static_cast<size_t>(qwen36_gemv::kRowsPerBlock) *
+      static_cast<size_t>(kWarps) * sizeof(float);
+  const size_t sf_scale_cols = hidden_size / 16;
+  const size_t sf_staging_bytes =
+      static_cast<size_t>(qwen36_gemv::kRowsPerBlock) * sf_scale_cols +
+      sf_scale_cols;
+  const size_t gemv_smem =
+      k_over_2 + a_tile_bytes + reduction_bytes + sf_staging_bytes;
+  const size_t rmsnorm_smem =
+      QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS * sizeof(float);
+  const size_t smem_bytes =
+      gemv_smem > rmsnorm_smem ? gemv_smem : rmsnorm_smem;
+
+  qwen36_full_attn_block_stage_c_kernel<<<
+      grid_ctas, QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS, smem_bytes,
+      stream>>>(
+      reinterpret_cast<const __nv_bfloat16 *>(
+          static_cast<uintptr_t>(hidden_in.ptr)),
+      reinterpret_cast<const __nv_bfloat16 *>(
+          static_cast<uintptr_t>(input_norm_weight.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(q_weight_fp4.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(q_weight_scale.ptr)),
+      q_alpha,
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(k_weight_fp4.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(k_weight_scale.ptr)),
+      k_alpha,
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(v_weight_fp4.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(v_weight_scale.ptr)),
+      v_alpha,
+      reinterpret_cast<__nv_bfloat16 *>(
+          static_cast<uintptr_t>(hidden_normed_out_bf16.ptr)),
+      reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(quantized_fp4.ptr)),
+      reinterpret_cast<uint8_t *>(
+          static_cast<uintptr_t>(quantized_scale_e4m3.ptr)),
+      reinterpret_cast<__nv_bfloat16 *>(static_cast<uintptr_t>(q_out.ptr)),
+      reinterpret_cast<__nv_bfloat16 *>(static_cast<uintptr_t>(k_out.ptr)),
+      reinterpret_cast<__nv_bfloat16 *>(static_cast<uintptr_t>(v_out.ptr)),
+      reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(barrier_state.ptr)),
+      static_cast<uint32_t>(hidden_size),
+      static_cast<uint32_t>(q_features),
+      static_cast<uint32_t>(kv_features),
+      static_cast<uint32_t>(q_heads),
+      static_cast<uint32_t>(kv_heads),
+      static_cast<uint32_t>(head_dim),
+      static_cast<uint32_t>(rope_dims), position, base_theta, eps,
+      input_tensor_scale);
 
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
