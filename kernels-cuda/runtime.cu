@@ -381,6 +381,26 @@ extern "C" int qwen36_cuda_memset(qwen36_device_ptr_t dst, int value,
   return status(cudaMemset(ptr(dst), value, bytes));
 }
 
+// Async variant that targets the active stream so the call can be captured
+// inside a CUDA graph (mirrors the d2d_async pattern). Used by the
+// megakernel integration path (Stage B.3 / Stage C / Stage E) to zero the
+// per-launch barrier-state words before each launch without breaking graph
+// capture. Falls back to synchronous `cudaMemset` when no stream has been
+// registered (matches the d2d_async fallback).
+extern "C" int qwen36_cuda_memset_async(qwen36_device_ptr_t dst, int value,
+                                        size_t bytes) {
+  if (dst.ptr == 0 || bytes == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  add_counter(g_memset_calls);
+  add_counter(g_memset_bytes, bytes);
+  cudaStream_t stream = qwen36_internal_active_stream();
+  if (stream == nullptr) {
+    return status(cudaMemset(ptr(dst), value, bytes));
+  }
+  return status(cudaMemsetAsync(ptr(dst), value, bytes, stream));
+}
+
 extern "C" int qwen36_cuda_synchronize(void) {
   add_counter(g_synchronize_calls);
   return status(cudaDeviceSynchronize());

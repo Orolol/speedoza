@@ -186,3 +186,31 @@ pub struct CopyStridedRowsSpec {
     pub input_bf16: DevicePtr,
     pub output_bf16: DevicePtr,
 }
+
+/// Per-block megakernel Stage B.3: fused RMSNorm + NVFP4 quantize + Q
+/// projection NVFP4 GEMV in one launch. See
+/// `kernels-cuda/include/qwen36_fp4.h` for the full ABI documentation.
+///
+/// Caller pre-zeroes `barrier_state` (≥ 8 bytes) on the active stream
+/// (use `MegakernelBarrierState::reset_async`). `hidden_size` must be a
+/// multiple of 512 and `q_features` must be a multiple of 16.
+/// `q_alpha = q_weight_tensor_scale * input_tensor_scale` is folded host-
+/// side; the kernel ignores `output_tensor_scale_f32` because downstream
+/// GEMMs also fold their alphas host-side via `tensor_scalar_f32`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MegakernelFullAttnStageBQProjSpec {
+    pub hidden_size: usize,
+    pub q_features: usize,
+    pub eps: f32,
+    pub input_tensor_scale: f32,
+    pub q_alpha: f32,
+    pub hidden_in: DevicePtr,
+    pub input_norm_weight: DevicePtr,
+    pub q_weight_fp4: DevicePtr,
+    pub q_weight_scale: DevicePtr,
+    pub hidden_normed_out_bf16: DevicePtr,
+    pub quantized_fp4: DevicePtr,
+    pub quantized_scale_e4m3: DevicePtr,
+    pub q_out: DevicePtr,
+    pub barrier_state: DevicePtr,
+}

@@ -8,9 +8,10 @@ use qwen36_fp4_kernels::{
     AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
     Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode,
     CudaBackend, DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape, DevicePtr,
-    EmbeddingLookupSpec, GdnGateSpec, Nvfp4GemmSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
-    PartialRopeSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec,
-    RmsNormSpec, SamplingRowsSpec, SamplingSpec, SwiGluNvfp4QuantizeSpec, SwiGluSpec,
+    EmbeddingLookupSpec, GdnGateSpec, MegakernelFullAttnStageBQProjSpec, Nvfp4GemmSpec,
+    Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec, QProjDeinterleaveSpec,
+    QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec, SamplingRowsSpec, SamplingSpec,
+    SwiGluNvfp4QuantizeSpec, SwiGluSpec,
 };
 use qwen36_fp4_kernels::{KernelBackend, NoCudaBackend};
 #[cfg(feature = "cuda")]
@@ -20,8 +21,8 @@ use crate::cuda_graph::CudaGraphPlan;
 #[cfg(feature = "cuda")]
 use crate::gpu::{
     ATTN_MIN_SPLIT_TIMESTEPS_PER_BLOCK, GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers,
-    GpuWeightStore, LinearAttnInProjFused, LinearAttnInProjFusedStore, MlpFusedLayer,
-    MlpFusedStore, MtpKvSnapshotLayout,
+    GpuWeightStore, LinearAttnInProjFused, LinearAttnInProjFusedStore,
+    MEGAKERNEL_BARRIER_STAGE_B_Q_PROJ_BYTES, MlpFusedLayer, MlpFusedStore, MtpKvSnapshotLayout,
 };
 use crate::kv_cache::KvCachePlan;
 use crate::state::{DeltaNetStatePlan, RuntimeState};
@@ -67,6 +68,35 @@ fn cuda_env_bool(name: &str) -> bool {
 #[cfg(feature = "cuda")]
 fn productive_spin_enabled() -> bool {
     cuda_env_bool("QWEN36_PRODUCTIVE_SPIN")
+}
+
+/// Gate for the per-block megakernel Stage B.3 integration in the full-attn
+/// decode hot path. When ON, `run_full_attention_layer` replaces the
+/// standalone `rmsnorm_nvfp4_quantize` + Q-projection NVFP4 GEMV pair with
+/// a single fused `qwen36_full_attn_block_stage_b_q_proj` launch. K/V
+/// projections, q/k_norm, partial RoPE, and the attention itself stay on
+/// the existing kernel paths because Stage B.3 stops at Q (the
+/// Qwen3.6-specific q_proj_deinterleave + q_norm/k_norm steps live between
+/// the Q linear and RoPE, so the bigger Stage C fusion is not directly
+/// engine-droppable today). Cached once so the dispatch hot path does not
+/// re-parse the environment per layer.
+#[cfg(feature = "cuda")]
+fn megakernel_full_attn_stage_b_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| cuda_env_bool("QWEN36_MEGAKERNEL_FULL_ATTN_STAGE_B"))
+}
+
+/// Stage B.3 requires `hidden_size % 512 == 0` and `q_features % 16 == 0`.
+/// The runtime falls back to the existing standalone path when these
+/// alignments do not hold (defensive — Qwen3.6 satisfies both, but the
+/// gate keeps the path safe if someone configures a non-standard topology).
+#[cfg(feature = "cuda")]
+fn megakernel_full_attn_stage_b_supports(hidden_size: usize, q_features: usize) -> bool {
+    hidden_size > 0
+        && q_features > 0
+        && hidden_size & 511 == 0
+        && q_features & 15 == 0
 }
 
 #[cfg(feature = "cuda")]

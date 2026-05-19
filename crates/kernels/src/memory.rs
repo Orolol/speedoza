@@ -235,6 +235,20 @@ impl CudaDeviceBuffer {
             ffi::qwen36_cuda_memset(self.ptr, i32::from(value), self.bytes)
         })
     }
+
+    /// Async memset that targets the registered active stream so the
+    /// operation can be captured inside a CUDA graph. The megakernel
+    /// integration path uses this to zero per-launch barrier-state words
+    /// without breaking decode-time graph capture.
+    pub fn memset_async(&self, value: u8) -> Result<()> {
+        check("qwen36_cuda_memset_async", unsafe {
+            crate::backend::qwen36_cuda_memset_async_raw(
+                self.ptr,
+                i32::from(value),
+                self.bytes,
+            )
+        })
+    }
 }
 
 #[cfg(feature = "cuda")]

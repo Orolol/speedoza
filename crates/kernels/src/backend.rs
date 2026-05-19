@@ -6,9 +6,10 @@ use crate::deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec};
 use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
     Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, Conv1dUpdateSpec,
-    CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec,
-    Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec,
-    RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
+    CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec, MegakernelFullAttnStageBQProjSpec,
+    Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec,
+    QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, SigmoidGateSpec,
+    SigmoidGateStridedSpec,
 };
 use crate::rmsnorm::RmsNormSpec;
 use crate::rope::PartialRopeSpec;
@@ -149,6 +150,19 @@ pub trait KernelBackend: Send + Sync {
 
     fn copy_strided_rows(&self, _spec: &CopyStridedRowsSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("copy_strided_rows"))
+    }
+
+    /// Per-block megakernel Stage B.3 (RMSNorm + NVFP4 quantize + Q proj
+    /// GEMV fused into one launch). Optional fast path for the full-attn
+    /// layer hot loop; the runtime falls back to the standalone kernels
+    /// when this returns `UnsupportedNoCuda`.
+    fn megakernel_full_attn_stage_b_q_proj(
+        &self,
+        _spec: &MegakernelFullAttnStageBQProjSpec,
+    ) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda(
+            "megakernel_full_attn_stage_b_q_proj",
+        ))
     }
 }
 
@@ -397,6 +411,34 @@ impl KernelBackend for CudaBackend {
             ffi::qwen36_copy_strided_rows(&ffi_spec)
         })
     }
+
+    fn megakernel_full_attn_stage_b_q_proj(
+        &self,
+        spec: &MegakernelFullAttnStageBQProjSpec,
+    ) -> Result<()> {
+        // The C ABI is a wide flat parameter list (mirroring the standalone
+        // Stage B/C/E entry points which already shipped before this Rust
+        // wrapper). We unpack the Rust spec into individual args at the
+        // call site so callers can keep treating it as an aggregate.
+        check("qwen36_full_attn_block_stage_b_q_proj", unsafe {
+            ffi::qwen36_full_attn_block_stage_b_q_proj(
+                spec.hidden_in,
+                spec.input_norm_weight,
+                spec.q_weight_fp4,
+                spec.q_weight_scale,
+                spec.q_alpha,
+                spec.hidden_normed_out_bf16,
+                spec.quantized_fp4,
+                spec.quantized_scale_e4m3,
+                spec.q_out,
+                spec.barrier_state,
+                spec.hidden_size,
+                spec.q_features,
+                spec.eps,
+                spec.input_tensor_scale,
+            )
+        })
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -414,6 +456,20 @@ pub(crate) fn check(kernel: &'static str, code: i32) -> Result<()> {
     } else {
         Err(CoreError::KernelLaunch { kernel, code })
     }
+}
+
+/// Stream-aware memset entry point. Exposed as a function rather than a
+/// `CudaDeviceBuffer` method so callers that hold a raw `DevicePtr` (e.g.
+/// the engine's per-layer barrier-state slice into a larger arena) can use
+/// it directly. Used by the megakernel integration path so the barrier
+/// reset survives CUDA-graph capture.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn qwen36_cuda_memset_async_raw(
+    dst: DevicePtr,
+    value: i32,
+    bytes: usize,
+) -> i32 {
+    unsafe { ffi::qwen36_cuda_memset_async(dst, value, bytes) }
 }
 
 #[cfg(feature = "cuda")]
@@ -1439,5 +1495,33 @@ mod ffi {
         pub fn qwen36_q_proj_deinterleave(spec: *const QProjDeinterleaveSpec) -> i32;
         pub fn qwen36_q_proj_sigmoid_gate(spec: *const QProjSigmoidGateSpec) -> i32;
         pub fn qwen36_copy_strided_rows(spec: *const CopyStridedRowsSpec) -> i32;
+
+        // Per-block megakernel Stage B.3: RMSNorm + NVFP4 quantize + Q proj
+        // GEMV fused into one launch. C ABI declared in
+        // `kernels-cuda/include/qwen36_fp4.h`; signature kept in sync via
+        // commit-time integration (the standalone smoke test in
+        // `kernels-cuda/smoke.cu` exercises the byte-exact reference path).
+        pub fn qwen36_full_attn_block_stage_b_q_proj(
+            hidden_in: DevicePtr,
+            input_norm_weight: DevicePtr,
+            q_weight_fp4: DevicePtr,
+            q_weight_scale: DevicePtr,
+            q_alpha: f32,
+            hidden_normed_out_bf16: DevicePtr,
+            quantized_fp4: DevicePtr,
+            quantized_scale_e4m3: DevicePtr,
+            q_out: DevicePtr,
+            barrier_state: DevicePtr,
+            hidden_size: usize,
+            q_features: usize,
+            eps: f32,
+            input_tensor_scale: f32,
+        ) -> i32;
+
+        // Captureable variant of `qwen36_cuda_memset` that targets the
+        // active stream. Declared here rather than in qwen36_fp4.h to keep
+        // header churn minimal during the megakernel build-up; the C++
+        // definition lives in runtime.cu next to its sync sibling.
+        pub fn qwen36_cuda_memset_async(dst: DevicePtr, value: i32, bytes: usize) -> i32;
     }
 }
