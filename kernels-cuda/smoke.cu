@@ -1134,6 +1134,156 @@ int main() {
   }
 
   // ---------------------------------------------------------------------
+  // Phase 2.2.2 — Megakernel Stage B.2: fused RMSNorm + NVFP4 quantize
+  // parity. Compares the FP4-packed bytes, the per-block E4M3 scales (at
+  // the vec16_scale tile positions), the optional bf16 normed copy, and
+  // the propagated f32 tensor scale against the reference
+  // `qwen36_rmsnorm_nvfp4_quantize` for the no-residual / direct_weight=0
+  // path.
+  // ---------------------------------------------------------------------
+  {
+    constexpr size_t kHidden = 5120;
+    constexpr float kEps = 1e-6f;
+    constexpr float kInputTensorScale = 1.0f;
+    constexpr size_t kGroups = (kHidden + 15) / 16; // 320
+    constexpr size_t kSfInnerDim = ((kGroups + 3) / 4) * 4; // 320
+    // vec16_scale_bytes for one row: div_ceil(1, 128) * (sf_inner_dim/4) * 512
+    constexpr size_t kScaleBytes = 1 * (kSfInnerDim / 4) * 512; // 40,960
+
+    qwen36_device_ptr_t b2_input = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t b2_weight = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t b2_ref_bf16 = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t b2_ref_fp4 = dev_alloc<uint8_t>(kHidden / 2);
+    qwen36_device_ptr_t b2_ref_scale = dev_alloc<uint8_t>(kScaleBytes);
+    qwen36_device_ptr_t b2_ref_tscale = dev_alloc<float>(1);
+    qwen36_device_ptr_t b2_meg_bf16 = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t b2_meg_fp4 = dev_alloc<uint8_t>(kHidden / 2);
+    qwen36_device_ptr_t b2_meg_scale = dev_alloc<uint8_t>(kScaleBytes);
+    qwen36_device_ptr_t b2_meg_tscale = dev_alloc<float>(1);
+    qwen36_device_ptr_t b2_barrier = dev_alloc<uint32_t>(4);
+
+    std::vector<float> input(kHidden);
+    std::vector<float> weight(kHidden);
+    std::mt19937 rng(0xB2B2B2B2u);
+    std::normal_distribution<float> in_dist(0.0f, 0.5f);
+    std::normal_distribution<float> w_dist(0.0f, 0.02f);
+    for (size_t i = 0; i < kHidden; ++i) {
+      input[i] = in_dist(rng);
+      weight[i] = w_dist(rng);
+    }
+    copy_bf16(b2_input, input);
+    copy_bf16(b2_weight, weight);
+    must_status(qwen36_cuda_memset(b2_ref_bf16, 0, kHidden * sizeof(__nv_bfloat16)),
+                "memset b2_ref_bf16");
+    must_status(qwen36_cuda_memset(b2_ref_fp4, 0, kHidden / 2),
+                "memset b2_ref_fp4");
+    must_status(qwen36_cuda_memset(b2_ref_scale, 0, kScaleBytes),
+                "memset b2_ref_scale");
+    must_status(qwen36_cuda_memset(b2_ref_tscale, 0, sizeof(float)),
+                "memset b2_ref_tscale");
+    must_status(qwen36_cuda_memset(b2_meg_bf16, 0, kHidden * sizeof(__nv_bfloat16)),
+                "memset b2_meg_bf16");
+    must_status(qwen36_cuda_memset(b2_meg_fp4, 0, kHidden / 2),
+                "memset b2_meg_fp4");
+    must_status(qwen36_cuda_memset(b2_meg_scale, 0, kScaleBytes),
+                "memset b2_meg_scale");
+    must_status(qwen36_cuda_memset(b2_meg_tscale, 0, sizeof(float)),
+                "memset b2_meg_tscale");
+    must_status(qwen36_cuda_memset(b2_barrier, 0, 4 * sizeof(uint32_t)),
+                "memset b2_barrier");
+
+    // Reference path.
+    qwen36_rmsnorm_nvfp4_quantize_spec_t ref{};
+    ref.hidden = kHidden;
+    ref.eps = kEps;
+    ref.input_bf16 = b2_input;
+    ref.weight_bf16 = b2_weight;
+    ref.residual_bf16 = qwen36_device_ptr_t{0};
+    ref.residual_out_bf16 = qwen36_device_ptr_t{0};
+    ref.output_bf16 = b2_ref_bf16;
+    ref.output_fp4 = b2_ref_fp4;
+    ref.output_scale_e4m3 = b2_ref_scale;
+    ref.output_tensor_scale_f32 = b2_ref_tscale;
+    ref.input_tensor_scale_f32 = kInputTensorScale;
+    must_status(qwen36_rmsnorm_nvfp4_quantize(&ref),
+                "qwen36_rmsnorm_nvfp4_quantize reference");
+
+    // Megakernel path.
+    must_status(qwen36_full_attn_block_stage_b_rmsnorm_quantize(
+                    b2_input, b2_weight, b2_meg_bf16, b2_meg_fp4, b2_meg_scale,
+                    b2_meg_tscale, b2_barrier, kHidden, kEps,
+                    kInputTensorScale),
+                "qwen36_full_attn_block_stage_b_rmsnorm_quantize");
+
+    // Compare bf16, fp4, scales (only the 320 logical positions), tensor scale.
+    auto ref_bf16 = read_bf16(b2_ref_bf16, kHidden);
+    auto meg_bf16 = read_bf16(b2_meg_bf16, kHidden);
+    auto ref_fp4 = read_raw<uint8_t>(b2_ref_fp4, kHidden / 2);
+    auto meg_fp4 = read_raw<uint8_t>(b2_meg_fp4, kHidden / 2);
+    auto ref_scale_buf = read_raw<uint8_t>(b2_ref_scale, kScaleBytes);
+    auto meg_scale_buf = read_raw<uint8_t>(b2_meg_scale, kScaleBytes);
+    const float ref_tscale = read_one<float>(b2_ref_tscale);
+    const float meg_tscale = read_one<float>(b2_meg_tscale);
+
+    size_t bf16_mismatches = 0;
+    for (size_t i = 0; i < kHidden; ++i) {
+      if (ref_bf16[i] != meg_bf16[i]) ++bf16_mismatches;
+    }
+    size_t fp4_mismatches = 0;
+    for (size_t i = 0; i < kHidden / 2; ++i) {
+      if (ref_fp4[i] != meg_fp4[i]) {
+        if (fp4_mismatches < 4) {
+          fprintf(stderr, "  b.2 fp4 mismatch @ %zu: ref=0x%02x meg=0x%02x\n",
+                  i, ref_fp4[i], meg_fp4[i]);
+        }
+        ++fp4_mismatches;
+      }
+    }
+    size_t scale_mismatches = 0;
+    auto sf_offset = [&](size_t group) {
+      const size_t block_inner = (group / 4) * 4;
+      const size_t block_offset = block_inner * 128;
+      return block_offset + (group % 4);
+    };
+    for (size_t g = 0; g < kGroups; ++g) {
+      const size_t off = sf_offset(g);
+      if (ref_scale_buf[off] != meg_scale_buf[off]) {
+        if (scale_mismatches < 4) {
+          fprintf(stderr,
+                  "  b.2 scale mismatch group=%zu @ %zu: ref=0x%02x meg=0x%02x\n",
+                  g, off, ref_scale_buf[off], meg_scale_buf[off]);
+        }
+        ++scale_mismatches;
+      }
+    }
+    const bool tscale_ok = ref_tscale == meg_tscale;
+
+    if (bf16_mismatches == 0 && fp4_mismatches == 0 && scale_mismatches == 0 &&
+        tscale_ok) {
+      printf("megakernel stage B.2 rmsnorm+quantize OK (byte-exact)\n");
+    } else {
+      fprintf(stderr,
+              "megakernel stage B.2 byte-mismatches: bf16=%zu fp4=%zu scale=%zu "
+              "tscale_ok=%d (ref=%.6f meg=%.6f)\n",
+              bf16_mismatches, fp4_mismatches, scale_mismatches, tscale_ok,
+              ref_tscale, meg_tscale);
+      exit(1);
+    }
+
+    dev_free<uint32_t>(b2_barrier);
+    dev_free<float>(b2_meg_tscale);
+    dev_free<uint8_t>(b2_meg_scale);
+    dev_free<uint8_t>(b2_meg_fp4);
+    dev_free<__nv_bfloat16>(b2_meg_bf16);
+    dev_free<float>(b2_ref_tscale);
+    dev_free<uint8_t>(b2_ref_scale);
+    dev_free<uint8_t>(b2_ref_fp4);
+    dev_free<__nv_bfloat16>(b2_ref_bf16);
+    dev_free<__nv_bfloat16>(b2_weight);
+    dev_free<__nv_bfloat16>(b2_input);
+  }
+
+  // ---------------------------------------------------------------------
   // Phase 0.4 — Cross-stream sync inside a captured CUDA graph.
   // Validates that the prefetch stream + event ABI added in Phase 0.1 is
   // graph-captureable: main writes A, prefetch waits, prefetch writes B,

@@ -533,6 +533,20 @@ int qwen36_full_attn_block_stage_b_rmsnorm(
     qwen36_device_ptr_t hidden_normed_out, qwen36_device_ptr_t barrier_state,
     size_t hidden_size, float eps);
 
+// Per-block megakernel — Stage B.2: fused RMSNorm + NVFP4 quantize phase.
+// Produces FP4-packed bytes + e4m3 per-block scales (in the vec16_scale
+// tile layout the Q proj GEMV expects) so downstream stages can chain
+// directly. Optional bf16 normed copy and f32 tensor scale propagation
+// match `qwen36_rmsnorm_nvfp4_quantize`. Caller pre-zeroes `barrier_state`.
+// Pass `input_tensor_scale = 0.0` to use 1.0 as the global scale.
+int qwen36_full_attn_block_stage_b_rmsnorm_quantize(
+    qwen36_device_ptr_t hidden_in, qwen36_device_ptr_t input_norm_weight,
+    qwen36_device_ptr_t hidden_normed_out_bf16,
+    qwen36_device_ptr_t output_fp4, qwen36_device_ptr_t output_scale_e4m3,
+    qwen36_device_ptr_t output_tensor_scale_f32,
+    qwen36_device_ptr_t barrier_state, size_t hidden_size, float eps,
+    float input_tensor_scale);
+
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 
 // Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot
