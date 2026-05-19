@@ -297,6 +297,11 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
     /// instead of a host scalar so the same graph can replay across iterations.
     #[cfg(feature = "cuda")]
     decode_graph: Option<DecodeGraphState>,
+    /// Secondary prefetch stream + reusable event pool. Lazily constructed on
+    /// first use by the productive-spin / megakernel paths; `None` until then.
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    decode_aux: Option<DecodeAuxStreams>,
     backend: B,
 }
 
@@ -307,6 +312,62 @@ struct DecodeGraphState {
     stream: qwen36_fp4_kernels::graph::OwnedCudaStream,
     exec: qwen36_fp4_kernels::graph::CudaGraphExec,
     raw_graph: qwen36_fp4_kernels::graph::CudaGraph,
+}
+
+/// Auxiliary CUDA stream + event pool used by the decode hot path to overlap
+/// productive-spin L2 prefetch (Phase 1) and per-block megakernel side work
+/// (Phase 2) with the main stream. Lifetime spans the engine's CUDA-active
+/// session: the prefetch stream is registered with the kernel library on
+/// construction and unregistered on Drop so dispatches can't chase a dangling
+/// `cudaStream_t`.
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+struct DecodeAuxStreams {
+    prefetch_stream: qwen36_fp4_kernels::graph::OwnedCudaStream,
+    events: Vec<qwen36_fp4_kernels::graph::OwnedCudaEvent>,
+    next_event: std::cell::Cell<usize>,
+}
+
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+impl DecodeAuxStreams {
+    fn new(event_pool_size: usize) -> Result<Self> {
+        let stream = qwen36_fp4_kernels::graph::CudaStream::create()?;
+        // Register with the kernel library so kernel-side dispatchers can
+        // pick it up via `qwen36_internal_prefetch_stream()`.
+        qwen36_fp4_kernels::graph::set_prefetch_stream(stream.handle());
+        let mut events = Vec::with_capacity(event_pool_size);
+        for _ in 0..event_pool_size {
+            events.push(qwen36_fp4_kernels::graph::CudaEvent::create()?);
+        }
+        Ok(Self {
+            prefetch_stream: stream,
+            events,
+            next_event: std::cell::Cell::new(0),
+        })
+    }
+
+    fn prefetch_stream(&self) -> qwen36_fp4_kernels::graph::CudaStream {
+        self.prefetch_stream.handle()
+    }
+
+    /// Round-robin a sync token from the event pool. Callers must record and
+    /// wait on the returned event before the pool wraps around (pool size is
+    /// chosen at construction to make that easy).
+    fn next_event(&self) -> qwen36_fp4_kernels::graph::CudaEvent {
+        let idx = self.next_event.get();
+        self.next_event.set((idx + 1) % self.events.len());
+        self.events[idx].handle()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for DecodeAuxStreams {
+    fn drop(&mut self) {
+        // Clear the kernel-lib registration before the OwnedCudaStream Drop
+        // frees the underlying cudaStream_t.
+        qwen36_fp4_kernels::graph::set_prefetch_stream(qwen36_fp4_kernels::graph::CudaStream::NULL);
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -380,6 +441,8 @@ impl<B: KernelBackend> Engine<B> {
             linear_attn_in_proj_fused: None,
             #[cfg(feature = "cuda")]
             decode_graph: None,
+            #[cfg(feature = "cuda")]
+            decode_aux: None,
             backend,
         }
     }

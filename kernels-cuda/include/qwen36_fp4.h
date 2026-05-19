@@ -584,6 +584,29 @@ int qwen36_cuda_stream_create(qwen36_cuda_stream_t *out);
 int qwen36_cuda_stream_destroy(qwen36_cuda_stream_t stream);
 int qwen36_cuda_stream_synchronize(qwen36_cuda_stream_t stream);
 
+// Secondary "prefetch" stream used by the decode path to overlap idle-SM L2
+// prefetch (productive spin during full-attn) and any future megakernel-side
+// concurrent work with the main stream. Lifetime is owned by the engine: the
+// engine creates it at boot via `qwen36_cuda_stream_create` (cudaStreamNon-
+// Blocking) and registers it here with `qwen36_set_prefetch_stream`. Kernels
+// that want to dispatch onto it use `qwen36_internal_prefetch_stream` from
+// active_stream.h. Defaults to nullptr (= unused).
+qwen36_cuda_stream_t qwen36_get_prefetch_stream(void);
+void qwen36_set_prefetch_stream(qwen36_cuda_stream_t stream);
+
+// Generic CUDA event handle for cross-stream synchronization. Used by the
+// productive-spin and megakernel paths to record an event on one stream and
+// have another stream wait on it; the pattern is graph-captureable so the
+// decode CUDA graph can include cross-stream waits without re-recording.
+// Events are created with `cudaEventDisableTiming` to avoid the timer cost.
+typedef struct CUevent_st *qwen36_cuda_event_t;
+int qwen36_cuda_event_create(qwen36_cuda_event_t *out);
+int qwen36_cuda_event_destroy(qwen36_cuda_event_t event);
+int qwen36_cuda_event_record(qwen36_cuda_event_t event,
+                             qwen36_cuda_stream_t stream);
+int qwen36_cuda_stream_wait_event(qwen36_cuda_stream_t stream,
+                                  qwen36_cuda_event_t event);
+
 // Opaque handles for CUDA graph plumbing.
 typedef struct CUgraph_st *qwen36_cuda_graph_t;
 typedef struct CUgraphExec_st *qwen36_cuda_graph_exec_t;

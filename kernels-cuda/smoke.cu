@@ -960,6 +960,112 @@ int main() {
   dev_free<__nv_bfloat16>(sigmoid_input);
   dev_free<__nv_bfloat16>(sigmoid_out);
 
+  // ---------------------------------------------------------------------
+  // Phase 0.4 — Cross-stream sync inside a captured CUDA graph.
+  // Validates that the prefetch stream + event ABI added in Phase 0.1 is
+  // graph-captureable: main writes A, prefetch waits, prefetch writes B,
+  // main waits, main writes C. If event capture is wired wrong the graph
+  // will deadlock at instantiate or produce stale bytes.
+  // ---------------------------------------------------------------------
+  {
+    qwen36_device_ptr_t buf_a = dev_alloc<uint8_t>(1);
+    qwen36_device_ptr_t buf_b = dev_alloc<uint8_t>(1);
+    qwen36_device_ptr_t buf_c = dev_alloc<uint8_t>(1);
+    must_status(qwen36_cuda_memset(buf_a, 0x00, 1), "memset buf_a init");
+    must_status(qwen36_cuda_memset(buf_b, 0x00, 1), "memset buf_b init");
+    must_status(qwen36_cuda_memset(buf_c, 0x00, 1), "memset buf_c init");
+
+    // must_status() calls cudaDeviceSynchronize() which is illegal during
+    // capture, so we use a no-sync variant for everything between begin and
+    // end_capture (and for begin_capture itself, which leaves the stream in
+    // capture mode immediately).
+    auto must_status_async = [](int status, const char *what) {
+      if (status != QWEN36_STATUS_SUCCESS) {
+        fprintf(stderr, "%s returned status %d\n", what, status);
+        exit(1);
+      }
+    };
+
+    qwen36_cuda_stream_t xstream_main = nullptr;
+    qwen36_cuda_stream_t xstream_pref = nullptr;
+    must_status(qwen36_cuda_stream_create(&xstream_main),
+                "stream_create main");
+    must_status(qwen36_cuda_stream_create(&xstream_pref),
+                "stream_create prefetch");
+    qwen36_set_active_stream(xstream_main);
+    qwen36_set_prefetch_stream(xstream_pref);
+
+    qwen36_cuda_event_t event_a = nullptr;
+    qwen36_cuda_event_t event_b = nullptr;
+    must_status(qwen36_cuda_event_create(&event_a), "event_create a");
+    must_status(qwen36_cuda_event_create(&event_b), "event_create b");
+
+    must_status_async(qwen36_cuda_stream_begin_capture(xstream_main),
+                      "begin_capture main");
+
+    // 1) main writes 0xAA into buf_a.
+    must_cuda<uint8_t>(
+        cudaMemsetAsync(reinterpret_cast<void *>(buf_a.ptr), 0xAA, 1,
+                        reinterpret_cast<cudaStream_t>(xstream_main)),
+        "memsetAsync buf_a on main");
+    // 2) record event on main → prefetch waits.
+    must_status_async(qwen36_cuda_event_record(event_a, xstream_main),
+                      "event_record a on main");
+    must_status_async(qwen36_cuda_stream_wait_event(xstream_pref, event_a),
+                      "stream_wait_event prefetch waits for a");
+    // 3) prefetch writes 0xBB into buf_b (must happen after main's write).
+    must_cuda<uint8_t>(
+        cudaMemsetAsync(reinterpret_cast<void *>(buf_b.ptr), 0xBB, 1,
+                        reinterpret_cast<cudaStream_t>(xstream_pref)),
+        "memsetAsync buf_b on prefetch");
+    // 4) record event on prefetch → main waits.
+    must_status_async(qwen36_cuda_event_record(event_b, xstream_pref),
+                      "event_record b on prefetch");
+    must_status_async(qwen36_cuda_stream_wait_event(xstream_main, event_b),
+                      "stream_wait_event main waits for b");
+    // 5) main writes 0xCC into buf_c (must happen after prefetch's write).
+    must_cuda<uint8_t>(
+        cudaMemsetAsync(reinterpret_cast<void *>(buf_c.ptr), 0xCC, 1,
+                        reinterpret_cast<cudaStream_t>(xstream_main)),
+        "memsetAsync buf_c on main");
+
+    qwen36_cuda_graph_t graph = nullptr;
+    must_status_async(qwen36_cuda_stream_end_capture(xstream_main, &graph),
+                      "end_capture main");
+    qwen36_cuda_graph_exec_t exec = nullptr;
+    must_status(qwen36_cuda_graph_instantiate(graph, &exec),
+                "graph_instantiate");
+    must_status(qwen36_cuda_graph_launch(exec, xstream_main),
+                "graph_launch");
+    must_status(qwen36_cuda_stream_synchronize(xstream_main),
+                "stream_synchronize after replay");
+
+    const uint8_t got_a = read_one<uint8_t>(buf_a);
+    const uint8_t got_b = read_one<uint8_t>(buf_b);
+    const uint8_t got_c = read_one<uint8_t>(buf_c);
+    if (got_a != 0xAA || got_b != 0xBB || got_c != 0xCC) {
+      fprintf(stderr,
+              "cross-stream graph capture failed: a=0x%02x b=0x%02x c=0x%02x "
+              "(expected 0xAA, 0xBB, 0xCC)\n",
+              got_a, got_b, got_c);
+      exit(1);
+    }
+
+    must_status(qwen36_cuda_graph_exec_destroy(exec), "graph_exec_destroy");
+    must_status(qwen36_cuda_graph_destroy(graph), "graph_destroy");
+    must_status(qwen36_cuda_event_destroy(event_a), "event_destroy a");
+    must_status(qwen36_cuda_event_destroy(event_b), "event_destroy b");
+    qwen36_set_prefetch_stream(nullptr);
+    qwen36_set_active_stream(nullptr);
+    must_status(qwen36_cuda_stream_destroy(xstream_pref),
+                "stream_destroy prefetch");
+    must_status(qwen36_cuda_stream_destroy(xstream_main),
+                "stream_destroy main");
+    dev_free<uint8_t>(buf_a);
+    dev_free<uint8_t>(buf_b);
+    dev_free<uint8_t>(buf_c);
+  }
+
   printf("qwen36 CUDA smoke test passed\n");
   return 0;
 }

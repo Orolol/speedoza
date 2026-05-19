@@ -23,6 +23,11 @@ int status(cudaError_t value) {
 // engine route every kernel through it (e.g. for CUDA Graph capture).
 std::atomic<cudaStream_t> g_active_stream{nullptr};
 
+// Secondary "prefetch" stream registered by the engine. Used by productive
+// spin (Phase 1) and the per-block megakernel (Phase 2) to overlap idle-SM
+// L2 prefetch with the main stream. Defaults to nullptr (= unused).
+std::atomic<cudaStream_t> g_prefetch_stream{nullptr};
+
 std::atomic<unsigned long long> g_malloc_calls{0};
 std::atomic<unsigned long long> g_free_calls{0};
 std::atomic<unsigned long long> g_h2d_calls{0};
@@ -91,6 +96,20 @@ extern "C" void qwen36_set_active_stream(qwen36_cuda_stream_t stream) {
                         std::memory_order_release);
 }
 
+extern "C" cudaStream_t qwen36_internal_prefetch_stream() {
+  return g_prefetch_stream.load(std::memory_order_acquire);
+}
+
+extern "C" qwen36_cuda_stream_t qwen36_get_prefetch_stream(void) {
+  return reinterpret_cast<qwen36_cuda_stream_t>(
+      qwen36_internal_prefetch_stream());
+}
+
+extern "C" void qwen36_set_prefetch_stream(qwen36_cuda_stream_t stream) {
+  g_prefetch_stream.store(reinterpret_cast<cudaStream_t>(stream),
+                          std::memory_order_release);
+}
+
 extern "C" int qwen36_cuda_stream_create(qwen36_cuda_stream_t *out) {
   if (out == nullptr) {
     return QWEN36_STATUS_NULL_POINTER;
@@ -114,6 +133,44 @@ extern "C" int qwen36_cuda_stream_destroy(qwen36_cuda_stream_t stream) {
 extern "C" int qwen36_cuda_stream_synchronize(qwen36_cuda_stream_t stream) {
   add_counter(g_stream_synchronize_calls);
   return status(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)));
+}
+
+extern "C" int qwen36_cuda_event_create(qwen36_cuda_event_t *out) {
+  if (out == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  cudaEvent_t event = nullptr;
+  cudaError_t err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+  if (err != cudaSuccess) {
+    return status(err);
+  }
+  *out = reinterpret_cast<qwen36_cuda_event_t>(event);
+  return QWEN36_STATUS_SUCCESS;
+}
+
+extern "C" int qwen36_cuda_event_destroy(qwen36_cuda_event_t event) {
+  if (event == nullptr) {
+    return QWEN36_STATUS_SUCCESS;
+  }
+  return status(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(event)));
+}
+
+extern "C" int qwen36_cuda_event_record(qwen36_cuda_event_t event,
+                                        qwen36_cuda_stream_t stream) {
+  if (event == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  return status(cudaEventRecord(reinterpret_cast<cudaEvent_t>(event),
+                                reinterpret_cast<cudaStream_t>(stream)));
+}
+
+extern "C" int qwen36_cuda_stream_wait_event(qwen36_cuda_stream_t stream,
+                                             qwen36_cuda_event_t event) {
+  if (event == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  return status(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(stream),
+                                    reinterpret_cast<cudaEvent_t>(event), 0));
 }
 
 extern "C" int
