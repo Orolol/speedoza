@@ -25,6 +25,7 @@ else
 fi
 # decode_gemv is pure CUDA (no CUTLASS dep), always compile the real one.
 EXTRA_SRC+=(kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu)
+EXTRA_SRC+=(kernels-cuda/decode_gemv/l2_prefetch.cu)
 
 "${NVCC}" \
   -std=c++17 \

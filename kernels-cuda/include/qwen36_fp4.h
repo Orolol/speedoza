@@ -503,6 +503,14 @@ int qwen36_cuda_set_l2_access_window(qwen36_device_ptr_t base, size_t bytes,
                                       float hit_ratio);
 int qwen36_cuda_clear_l2_access_window(void);
 
+// Productive-spin L2 warmup. Read-only walk over `[base, base+bytes)` that
+// pulls every byte into L2 without computing. Launches `target_cta_count`
+// CTAs (default 128 when 0) onto the registered prefetch stream so it can
+// overlap the small-CTA full-attn decode kernel running on the main stream.
+// Returns QWEN36_STATUS_INVALID_ARGUMENT if no prefetch stream is registered.
+int qwen36_l2_prefetch(qwen36_device_ptr_t base, size_t bytes,
+                       int target_cta_count);
+
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 
 // Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot

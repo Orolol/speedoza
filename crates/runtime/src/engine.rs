@@ -65,6 +65,19 @@ fn cuda_env_bool(name: &str) -> bool {
 }
 
 #[cfg(feature = "cuda")]
+fn productive_spin_enabled() -> bool {
+    cuda_env_bool("QWEN36_PRODUCTIVE_SPIN")
+}
+
+#[cfg(feature = "cuda")]
+fn productive_spin_ctas() -> i32 {
+    cuda_env_usize("QWEN36_PRODUCTIVE_SPIN_CTAS")
+        .map(|v| v as i32)
+        .filter(|&v| (1..=1024).contains(&v))
+        .unwrap_or(128)
+}
+
+#[cfg(feature = "cuda")]
 fn mtp_recurrent_snapshot_enabled() -> bool {
     std::env::var("QWEN36_MTP_SNAPSHOT_RECURRENT")
         .ok()
@@ -671,6 +684,9 @@ impl<B: KernelBackend> Engine<B> {
         let stream = CudaStream::create()?;
         let stream_handle = stream.handle();
         graph::set_active_stream(stream_handle);
+        // Productive-spin prefetch stream + event pool must exist before
+        // capture begins so kernels can fork to it inside the graph.
+        self.ensure_decode_aux_if_enabled()?;
 
         // Capture: decode forward (using device position) + sample +
         // increment_i32. Wrapped in a closure so any error reverts the
@@ -774,6 +790,7 @@ impl<B: KernelBackend> Engine<B> {
         let stream_handle = stream.handle();
         let start_position_device_i32 = self.cuda_prefill()?.position_i32.ptr();
         graph::set_active_stream(stream_handle);
+        self.ensure_decode_aux_if_enabled()?;
 
         let capture_result = (|| -> Result<(graph::CudaGraph, graph::CudaGraphExec)> {
             graph::begin_capture(stream_handle)?;
@@ -896,6 +913,7 @@ impl<B: KernelBackend> Engine<B> {
         let stream_handle = stream.handle();
         let start_position_device_i32 = self.cuda_prefill()?.position_i32.ptr();
         graph::set_active_stream(stream_handle);
+        self.ensure_decode_aux_if_enabled()?;
 
         let capture_result = (|| -> Result<(graph::CudaGraph, graph::CudaGraphExec)> {
             graph::begin_capture(stream_handle)?;
@@ -1295,6 +1313,7 @@ impl<B: KernelBackend> Engine<B> {
         let stream = CudaStream::create()?;
         let stream_handle = stream.handle();
         graph::set_active_stream(stream_handle);
+        self.ensure_decode_aux_if_enabled()?;
 
         let capture_result = (|| -> Result<(graph::CudaGraph, graph::CudaGraphExec)> {
             graph::begin_capture(stream_handle)?;
@@ -4151,6 +4170,11 @@ impl<B: KernelBackend> Engine<B> {
             k_bf16: forward.aux.ptr(),
             scalar_position_device_i32: position_device_i32,
         })?;
+        // Productive spin: fork L2 prefetch of this layer's MLP combined
+        // weight onto the secondary stream so it overlaps the small-CTA
+        // attention kernel that follows. `None` when productive spin is
+        // disabled or no MLP fused store exists for this layer.
+        let prefetch_join = self.fork_productive_spin(layer.layer_index)?;
         let attention_context_limit = self.decode_attention_context_limit_for_position(position);
         self.backend.attention_decode(&AttentionDecodeSpec {
             layer_index: layer.layer_index,
@@ -4186,7 +4210,13 @@ impl<B: KernelBackend> Engine<B> {
             input_bf16: forward.aux3.ptr(),
             output_bf16: forward.aux3.ptr(),
         })?;
-        self.linear(&layer.o_proj, forward.aux3.ptr(), forward.block_out.ptr())
+        self.linear(&layer.o_proj, forward.aux3.ptr(), forward.block_out.ptr())?;
+        // Productive spin: join the prefetch so the MLP that follows (in the
+        // caller) finds the L2 warmed up.
+        if let Some(event) = prefetch_join {
+            self.join_productive_spin(event)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "cuda")]
@@ -6445,6 +6475,73 @@ impl<B: KernelBackend> Engine<B> {
         self.gpu_forward
             .as_ref()
             .ok_or_else(|| CoreError::Runtime("CUDA forward buffers are not allocated".to_owned()))
+    }
+
+    /// Ensure the secondary prefetch stream + event pool exist when productive
+    /// spin is enabled via `QWEN36_PRODUCTIVE_SPIN`. Called from every graph
+    /// capture entry point so the captured graph can reference the prefetch
+    /// stream. No-op (and no allocation) when the env var is off.
+    #[cfg(feature = "cuda")]
+    fn ensure_decode_aux_if_enabled(&mut self) -> Result<()> {
+        if !productive_spin_enabled() {
+            return Ok(());
+        }
+        if self.decode_aux.is_none() {
+            self.decode_aux = Some(DecodeAuxStreams::new(4)?);
+        }
+        Ok(())
+    }
+
+    /// Productive-spin fork: launches the L2 prefetch kernel on the secondary
+    /// stream targeting the given full-attn layer's MLP combined weight. The
+    /// prefetch runs concurrently with the attention kernel that follows on
+    /// the main stream. Returns the event to wait on before MLP starts.
+    ///
+    /// No-op when `decode_aux` is unset (productive spin disabled or no MLP
+    /// fused store for this layer). Caller must pair every `Some` return with
+    /// a matching [`Self::join_productive_spin`].
+    #[cfg(feature = "cuda")]
+    fn fork_productive_spin(
+        &self,
+        layer_idx: usize,
+    ) -> Result<Option<qwen36_fp4_kernels::graph::CudaEvent>> {
+        let aux = match self.decode_aux.as_ref() {
+            Some(aux) => aux,
+            None => return Ok(None),
+        };
+        let mlp = match self.mlp_fused_main_opt(layer_idx) {
+            Some(layer) => layer,
+            None => return Ok(None),
+        };
+        let active = qwen36_fp4_kernels::graph::get_active_stream();
+        let prefetch = aux.prefetch_stream();
+        // Fork: main → prefetch.
+        let fork_event = aux.next_event();
+        fork_event.record(active)?;
+        qwen36_fp4_kernels::graph::stream_wait_event(prefetch, fork_event)?;
+        // Launch prefetch on the prefetch stream (reads internal prefetch
+        // stream registered by DecodeAuxStreams::new).
+        qwen36_fp4_kernels::memory::cuda_l2_prefetch(
+            mlp.combined_weight.ptr(),
+            mlp.combined_weight.bytes(),
+            productive_spin_ctas(),
+        )?;
+        // Record join event on prefetch — caller will have main wait on it.
+        let join_event = aux.next_event();
+        join_event.record(prefetch)?;
+        Ok(Some(join_event))
+    }
+
+    /// Productive-spin join: blocks the main stream until the prefetch kernel
+    /// recorded for `event` has completed. Must be called once per `Some`
+    /// returned by [`Self::fork_productive_spin`].
+    #[cfg(feature = "cuda")]
+    fn join_productive_spin(
+        &self,
+        event: qwen36_fp4_kernels::graph::CudaEvent,
+    ) -> Result<()> {
+        let active = qwen36_fp4_kernels::graph::get_active_stream();
+        qwen36_fp4_kernels::graph::stream_wait_event(active, event)
     }
 
     #[cfg(feature = "cuda")]
