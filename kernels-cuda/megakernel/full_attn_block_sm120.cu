@@ -18,6 +18,8 @@
 // enough; we use `gridDim.x` as the per-phase target count.
 
 #include "qwen36_fp4.h"
+#include "../decode_gemv/nvfp4_gemv_mma_helpers.cuh"
+#include "../decode_gemv/nvfp4_gemv_mma_kernel.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -387,6 +389,52 @@ qwen36_full_attn_block_stage_b2_kernel(
   phase_barrier(&barrier_state[0], gridDim.x);
 }
 
+// Stage B.3 kernel: fuses Stage B.2 (RMSNorm + NVFP4 quantize) with the Q
+// projection NVFP4 GEMV in a single launch. Phase layout:
+//   - Phase 0 [CTA 0 only]: RMSNorm + quantize hidden → quantized_fp4 +
+//                            quantized_scale (vec16 tile layout).
+//   - Barrier 0.
+//   - Phase 1 [every CTA]: NVFP4 GEMV body — call into the shared
+//                          __device__ template the standalone GEMV uses.
+//                          Each CTA owns one m16 row tile; grid =
+//                          ceil(q_features / 16).
+//   - Barrier 1 (clean exit semantics).
+//
+// The grid must be sized to `ceil(q_features / 16)` CTAs at launch time;
+// using `QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_CTAS` would under-provision Q
+// proj (M=6144 → 384 CTAs > 272). The barrier slot count is gridDim.x at
+// runtime, so the smaller-CTA Stage B.1/B.2 launches stay correct.
+__global__ void __launch_bounds__(QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS)
+qwen36_full_attn_block_stage_b3_kernel(
+    const __nv_bfloat16 *__restrict__ hidden_in,
+    const __nv_bfloat16 *__restrict__ input_norm_weight,
+    const uint8_t *__restrict__ q_weight_fp4,
+    const uint8_t *__restrict__ q_weight_scale, float q_alpha,
+    __nv_bfloat16 *__restrict__ hidden_normed_out_bf16,
+    uint8_t *__restrict__ quantized_fp4,
+    uint8_t *__restrict__ quantized_scale_e4m3,
+    __nv_bfloat16 *__restrict__ q_out, uint32_t *__restrict__ barrier_state,
+    uint32_t hidden_size, uint32_t q_features, float eps,
+    float input_tensor_scale) {
+  // Phase 0 — RMSNorm + quantize on CTA 0.
+  if (blockIdx.x == 0) {
+    qwen36_full_attn_block_rmsnorm_quantize_phase(
+        hidden_in, input_norm_weight, hidden_normed_out_bf16, quantized_fp4,
+        quantized_scale_e4m3, /*tensor_scale=*/nullptr, hidden_size, eps,
+        input_tensor_scale);
+  }
+  phase_barrier(&barrier_state[0], gridDim.x);
+
+  // Phase 1 — Q projection NVFP4 GEMV. Every CTA participates; each owns
+  // one m16 output tile (blockIdx.x ∈ [0, q_features/16)).
+  qwen36_gemv::nvfp4_gemv_mma_body<8>(
+      q_weight_fp4, q_weight_scale, quantized_fp4, quantized_scale_e4m3,
+      q_alpha, q_out, static_cast<size_t>(q_features),
+      static_cast<size_t>(hidden_size));
+
+  phase_barrier(&barrier_state[1], gridDim.x);
+}
+
 __global__ void __launch_bounds__(QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS)
 qwen36_full_attn_block_stage_b1_kernel(
     const __nv_bfloat16 *__restrict__ hidden_in,
@@ -472,6 +520,83 @@ extern "C" int qwen36_full_attn_block_stage_b_rmsnorm(
           static_cast<uintptr_t>(hidden_normed_out.ptr)),
       reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(barrier_state.ptr)),
       static_cast<uint32_t>(hidden_size), eps);
+
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int qwen36_full_attn_block_stage_b_q_proj(
+    qwen36_device_ptr_t hidden_in, qwen36_device_ptr_t input_norm_weight,
+    qwen36_device_ptr_t q_weight_fp4, qwen36_device_ptr_t q_weight_scale,
+    float q_alpha, qwen36_device_ptr_t hidden_normed_out_bf16,
+    qwen36_device_ptr_t quantized_fp4,
+    qwen36_device_ptr_t quantized_scale_e4m3, qwen36_device_ptr_t q_out,
+    qwen36_device_ptr_t barrier_state, size_t hidden_size, size_t q_features,
+    float eps, float input_tensor_scale) {
+  if (hidden_in.ptr == 0 || input_norm_weight.ptr == 0 ||
+      q_weight_fp4.ptr == 0 || q_weight_scale.ptr == 0 ||
+      quantized_fp4.ptr == 0 || quantized_scale_e4m3.ptr == 0 ||
+      q_out.ptr == 0 || barrier_state.ptr == 0 || hidden_size == 0 ||
+      q_features == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  if (hidden_size > 0xFFFFFFFFu || q_features > 0xFFFFFFFFu) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  // Stage B.3 grid must cover Q projection. The GEMV body needs M aligned
+  // to 16 rows and K aligned to (8 warps * 64) = 512.
+  if ((q_features & 15u) != 0u || (hidden_size & 511u) != 0u) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+
+  extern cudaStream_t qwen36_internal_active_stream();
+  cudaStream_t stream = qwen36_internal_active_stream();
+
+  const unsigned grid_ctas =
+      static_cast<unsigned>((q_features + 15u) / 16u);
+  // SMEM = max of RMSNorm scratch (256 floats = 1024 B) and the GEMV tile
+  // footprint at K=hidden_size, 8 warps. The two phases share the same
+  // dynamic SMEM block and never overlap in time (barrier between them).
+  // GEMV layout matches the standalone dispatcher exactly.
+  constexpr unsigned kWarps = 8;
+  const size_t k_over_2 = hidden_size / 2;
+  const size_t a_tile_bytes =
+      static_cast<size_t>(kWarps) * 2u * qwen36_gemv::kATilePerWarpBytes;
+  const size_t reduction_bytes =
+      2u * static_cast<size_t>(qwen36_gemv::kRowsPerBlock) *
+      static_cast<size_t>(kWarps) * sizeof(float);
+  const size_t sf_scale_cols = hidden_size / 16;
+  const size_t sf_staging_bytes =
+      static_cast<size_t>(qwen36_gemv::kRowsPerBlock) * sf_scale_cols +
+      sf_scale_cols;
+  const size_t gemv_smem =
+      k_over_2 + a_tile_bytes + reduction_bytes + sf_staging_bytes;
+  const size_t rmsnorm_smem =
+      QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS * sizeof(float);
+  const size_t smem_bytes =
+      gemv_smem > rmsnorm_smem ? gemv_smem : rmsnorm_smem;
+
+  qwen36_full_attn_block_stage_b3_kernel<<<
+      grid_ctas, QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS, smem_bytes,
+      stream>>>(
+      reinterpret_cast<const __nv_bfloat16 *>(
+          static_cast<uintptr_t>(hidden_in.ptr)),
+      reinterpret_cast<const __nv_bfloat16 *>(
+          static_cast<uintptr_t>(input_norm_weight.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(q_weight_fp4.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(q_weight_scale.ptr)),
+      q_alpha,
+      reinterpret_cast<__nv_bfloat16 *>(
+          static_cast<uintptr_t>(hidden_normed_out_bf16.ptr)),
+      reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(quantized_fp4.ptr)),
+      reinterpret_cast<uint8_t *>(
+          static_cast<uintptr_t>(quantized_scale_e4m3.ptr)),
+      reinterpret_cast<__nv_bfloat16 *>(static_cast<uintptr_t>(q_out.ptr)),
+      reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(barrier_state.ptr)),
+      static_cast<uint32_t>(hidden_size),
+      static_cast<uint32_t>(q_features), eps, input_tensor_scale);
 
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;

@@ -1284,6 +1284,166 @@ int main() {
   }
 
   // ---------------------------------------------------------------------
+  // Phase 2.2.3 — Megakernel Stage B.3: Q projection NVFP4 GEMV fused.
+  // Compares the megakernel's Q output against the standalone reference
+  // path (qwen36_rmsnorm_nvfp4_quantize → qwen36_decode_nvfp4_gemv). Both
+  // share the SAME __device__ GEMV body now that the kernel-body extract
+  // is in place, so byte-exact equality is the target.
+  // ---------------------------------------------------------------------
+  {
+    constexpr size_t kHidden = 5120;     // K for Q proj — Qwen3.6 hidden
+    constexpr size_t kQFeatures = 6144;  // M for Q proj — q_heads * head_dim
+    constexpr float kEps = 1e-6f;
+    constexpr float kInputTensorScale = 1.0f;
+    constexpr float kQAlpha = 1.0f; // pre-folded tensor scales product
+
+    constexpr size_t kActScaleBytes = 40960; // vec16 tile for 320×1 inner×outer
+    constexpr size_t kWeightScaleInnerDim = 320; // round_up(5120/16, 4)
+    constexpr size_t kWeightScaleBytes =
+        ((kQFeatures + 127) / 128) * (kWeightScaleInnerDim / 4) * 512;
+
+    qwen36_device_ptr_t b3_hidden = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t b3_norm_w = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t b3_qweight_fp4 =
+        dev_alloc<uint8_t>(kQFeatures * kHidden / 2);
+    qwen36_device_ptr_t b3_qweight_scale = dev_alloc<uint8_t>(kWeightScaleBytes);
+    qwen36_device_ptr_t b3_normed_bf16 = dev_alloc<__nv_bfloat16>(kHidden);
+    qwen36_device_ptr_t b3_normed_fp4 = dev_alloc<uint8_t>(kHidden / 2);
+    qwen36_device_ptr_t b3_normed_scale = dev_alloc<uint8_t>(kActScaleBytes);
+    qwen36_device_ptr_t b3_normed_tscale = dev_alloc<float>(1);
+    qwen36_device_ptr_t b3_q_ref = dev_alloc<__nv_bfloat16>(kQFeatures);
+    qwen36_device_ptr_t b3_q_meg = dev_alloc<__nv_bfloat16>(kQFeatures);
+    qwen36_device_ptr_t b3_barrier = dev_alloc<uint32_t>(8);
+
+    // Inputs: small-magnitude random bf16. Weight FP4 bytes: random nibbles
+    // restricted to indices 0..3 (FP4 values 0.0, 0.5, 1.0, 1.5) to keep
+    // accumulated dot products in bf16-safe range. Scales: all 0x38 (e4m3
+    // value 1.0) so the layout assumption is exercised end-to-end without
+    // numerical surprises.
+    std::vector<float> hidden(kHidden);
+    std::vector<float> norm_w(kHidden);
+    std::mt19937 rng(0xB3B3B3B3u);
+    std::normal_distribution<float> nrm(0.0f, 0.5f);
+    std::normal_distribution<float> w_dist(0.0f, 0.02f);
+    for (size_t i = 0; i < kHidden; ++i) {
+      hidden[i] = nrm(rng);
+      norm_w[i] = w_dist(rng);
+    }
+    copy_bf16(b3_hidden, hidden);
+    copy_bf16(b3_norm_w, norm_w);
+
+    std::vector<uint8_t> qweight_bytes(kQFeatures * kHidden / 2);
+    std::uniform_int_distribution<uint32_t> nibble_dist(0, 3);
+    for (auto &b : qweight_bytes) {
+      b = static_cast<uint8_t>(nibble_dist(rng) | (nibble_dist(rng) << 4));
+    }
+    copy_raw<uint8_t>(b3_qweight_fp4, qweight_bytes);
+
+    std::vector<uint8_t> qweight_scale_bytes(kWeightScaleBytes, 0x38);
+    copy_raw<uint8_t>(b3_qweight_scale, qweight_scale_bytes);
+
+    must_status(qwen36_cuda_memset(b3_normed_bf16, 0,
+                                   kHidden * sizeof(__nv_bfloat16)),
+                "memset b3_normed_bf16");
+    must_status(qwen36_cuda_memset(b3_normed_fp4, 0, kHidden / 2),
+                "memset b3_normed_fp4");
+    must_status(qwen36_cuda_memset(b3_normed_scale, 0, kActScaleBytes),
+                "memset b3_normed_scale");
+    must_status(qwen36_cuda_memset(b3_normed_tscale, 0, sizeof(float)),
+                "memset b3_normed_tscale");
+    must_status(qwen36_cuda_memset(b3_q_ref, 0,
+                                   kQFeatures * sizeof(__nv_bfloat16)),
+                "memset b3_q_ref");
+    must_status(qwen36_cuda_memset(b3_q_meg, 0,
+                                   kQFeatures * sizeof(__nv_bfloat16)),
+                "memset b3_q_meg");
+    must_status(qwen36_cuda_memset(b3_barrier, 0, 8 * sizeof(uint32_t)),
+                "memset b3_barrier");
+
+    // Reference path: rmsnorm+quantize → standalone GEMV.
+    qwen36_rmsnorm_nvfp4_quantize_spec_t rspec{};
+    rspec.hidden = kHidden;
+    rspec.eps = kEps;
+    rspec.input_bf16 = b3_hidden;
+    rspec.weight_bf16 = b3_norm_w;
+    rspec.residual_bf16 = qwen36_device_ptr_t{0};
+    rspec.residual_out_bf16 = qwen36_device_ptr_t{0};
+    rspec.output_bf16 = b3_normed_bf16;
+    rspec.output_fp4 = b3_normed_fp4;
+    rspec.output_scale_e4m3 = b3_normed_scale;
+    rspec.output_tensor_scale_f32 = b3_normed_tscale;
+    rspec.input_tensor_scale_f32 = kInputTensorScale;
+    must_status(qwen36_rmsnorm_nvfp4_quantize(&rspec),
+                "b.3 reference rmsnorm_nvfp4_quantize");
+
+    qwen36_nvfp4_gemm_spec_t gspec{};
+    gspec.m = kQFeatures;
+    gspec.n = 1;
+    gspec.k = kHidden;
+    gspec.a_fp4 = b3_qweight_fp4;
+    gspec.a_scale = b3_qweight_scale;
+    gspec.b_fp4 = b3_normed_fp4;
+    gspec.b_scale = b3_normed_scale;
+    gspec.c_bf16 = b3_q_ref;
+    gspec.alpha = kQAlpha;
+    must_status(qwen36_decode_nvfp4_gemv(&gspec),
+                "b.3 reference decode_nvfp4_gemv");
+
+    // Megakernel Stage B.3 path. Reuses the same intermediate buffers
+    // (they get overwritten with the same content — both paths run the
+    // identical RMSNorm+quantize math). Validate Q output.
+    must_status(qwen36_full_attn_block_stage_b_q_proj(
+                    b3_hidden, b3_norm_w, b3_qweight_fp4, b3_qweight_scale,
+                    kQAlpha, b3_normed_bf16, b3_normed_fp4, b3_normed_scale,
+                    b3_q_meg, b3_barrier, kHidden, kQFeatures, kEps,
+                    kInputTensorScale),
+                "qwen36_full_attn_block_stage_b_q_proj");
+
+    auto q_ref = read_bf16(b3_q_ref, kQFeatures);
+    auto q_meg = read_bf16(b3_q_meg, kQFeatures);
+    size_t mismatches = 0;
+    double dot = 0.0, nr = 0.0, nm = 0.0;
+    for (size_t i = 0; i < kQFeatures; ++i) {
+      if (q_ref[i] != q_meg[i] && mismatches < 4) {
+        fprintf(stderr,
+                "  b.3 Q mismatch @ %zu: ref=%.6f meg=%.6f diff=%.3e\n", i,
+                q_ref[i], q_meg[i], q_ref[i] - q_meg[i]);
+        ++mismatches;
+      } else if (q_ref[i] != q_meg[i]) {
+        ++mismatches;
+      }
+      dot += static_cast<double>(q_ref[i]) * static_cast<double>(q_meg[i]);
+      nr += static_cast<double>(q_ref[i]) * static_cast<double>(q_ref[i]);
+      nm += static_cast<double>(q_meg[i]) * static_cast<double>(q_meg[i]);
+    }
+    const double cos_sim = dot / sqrt(nr * nm);
+    if (mismatches == 0) {
+      printf("megakernel stage B.3 Q proj OK (byte-exact)\n");
+    } else {
+      printf("megakernel stage B.3 Q proj mismatches=%zu cos_sim=%.6f\n",
+             mismatches, cos_sim);
+      if (cos_sim < 0.998) {
+        fprintf(stderr,
+                "  cos_sim %.6f below 0.998 floor — failing smoke\n",
+                cos_sim);
+        exit(1);
+      }
+    }
+
+    dev_free<uint32_t>(b3_barrier);
+    dev_free<__nv_bfloat16>(b3_q_meg);
+    dev_free<__nv_bfloat16>(b3_q_ref);
+    dev_free<float>(b3_normed_tscale);
+    dev_free<uint8_t>(b3_normed_scale);
+    dev_free<uint8_t>(b3_normed_fp4);
+    dev_free<__nv_bfloat16>(b3_normed_bf16);
+    dev_free<uint8_t>(b3_qweight_scale);
+    dev_free<uint8_t>(b3_qweight_fp4);
+    dev_free<__nv_bfloat16>(b3_norm_w);
+    dev_free<__nv_bfloat16>(b3_hidden);
+  }
+
+  // ---------------------------------------------------------------------
   // Phase 0.4 — Cross-stream sync inside a captured CUDA graph.
   // Validates that the prefetch stream + event ABI added in Phase 0.1 is
   // graph-captureable: main writes A, prefetch waits, prefetch writes B,

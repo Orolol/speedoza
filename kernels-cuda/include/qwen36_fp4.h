@@ -547,6 +547,23 @@ int qwen36_full_attn_block_stage_b_rmsnorm_quantize(
     qwen36_device_ptr_t barrier_state, size_t hidden_size, float eps,
     float input_tensor_scale);
 
+// Per-block megakernel — Stage B.3: Stage B.2 + Q projection NVFP4 GEMV
+// fused into one launch. Phase layout: CTA 0 RMSNorm+quantize → barrier →
+// all CTAs run the 8-warp GEMV body for Q (each CTA owns one m16 row tile)
+// → barrier. Grid = ceil(q_features / 16); block = 256 threads = 8 warps;
+// caller pre-zeroes `barrier_state` (≥ 2 × 4 bytes). `hidden_size` must be
+// a multiple of 512 (the 8-warp GEMV K-shard alignment) and `q_features`
+// must be a multiple of 16. `q_alpha` is the pre-folded product of the
+// per-tensor scales (`q_weight_tensor_scale * input_tensor_scale`).
+int qwen36_full_attn_block_stage_b_q_proj(
+    qwen36_device_ptr_t hidden_in, qwen36_device_ptr_t input_norm_weight,
+    qwen36_device_ptr_t q_weight_fp4, qwen36_device_ptr_t q_weight_scale,
+    float q_alpha, qwen36_device_ptr_t hidden_normed_out_bf16,
+    qwen36_device_ptr_t quantized_fp4,
+    qwen36_device_ptr_t quantized_scale_e4m3, qwen36_device_ptr_t q_out,
+    qwen36_device_ptr_t barrier_state, size_t hidden_size, size_t q_features,
+    float eps, float input_tensor_scale);
+
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 
 // Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot
