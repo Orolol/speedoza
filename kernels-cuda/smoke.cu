@@ -1906,15 +1906,22 @@ int main() {
   // ---------------------------------------------------------------------
   // Phase 2.6 — Megakernel Stage F.1: MLP gate+up NVFP4 GEMV fused.
   // Compares the megakernel's BF16 output against the standalone
-  // qwen36_decode_nvfp4_gemv path at the production MLP shape
-  // (M=2*intermediate=34816, K=hidden_size=5120). Both call the same
-  // __device__ GEMV body (post-refactor), so byte-exact equality is
-  // the target. Stage F.1 is the first MLP sub-phase; F.2/F.3/F.4
-  // will append SwiGLU + down GEMV + residual_add to the same launch.
+  // qwen36_decode_nvfp4_gemv path. Both call the same __device__ GEMV
+  // body (post-refactor), so byte-exact equality is the target. Stage
+  // F.1 is the first MLP sub-phase; F.2/F.3/F.4 will append SwiGLU +
+  // down GEMV + residual_add to the same launch.
+  //
+  // Shape uses K=5120 (production hidden_size) but a reduced
+  // intermediate (=4096 → M=8192) so the smoke's weight allocation
+  // stays ~20 MB instead of the production 89 MB. The persistent
+  // work-stealing loop is still exercised because M-tile count (512)
+  // exceeds the persistent grid size (256 CTAs) — each CTA grabs ~2
+  // tiles. Engine-side parity (chat / dump-logits) covers the
+  // production M=34816 path.
   // ---------------------------------------------------------------------
   {
     constexpr size_t kHidden = 5120;        // K for gate+up GEMV
-    constexpr size_t kIntermediate = 17408; // half of M
+    constexpr size_t kIntermediate = 4096;  // smoke-only reduction
     constexpr size_t kTwoIntermediate = 2 * kIntermediate;
     constexpr float kGateUpAlpha = 1.0f; // pre-folded tensor scales product
 
