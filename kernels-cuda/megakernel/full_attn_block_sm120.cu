@@ -1022,6 +1022,129 @@ qwen36_full_attn_block_stage_f2_kernel(
   phase_barrier(&barrier_state[3], gridDim.x);
 }
 
+// Stage F.4 kernel: complete MLP block fused into one persistent launch.
+// Phase layout (same persistent 256-CTA grid; same co-residency caveat
+// as F.2 — fine on dedicated GPU, fragile under heavy contention):
+//   0 [persistent, m-tile work-steal]    gate+up GEMV (M=2*intermediate)
+//   barrier (slot 1)
+//   1 [persistent, group work-steal]      SwiGLU + NVFP4 quantize (16-el
+//                                          groups; 1 warp/group)
+//   barrier (slot 3)
+//   2 [persistent, m-tile work-steal]    down GEMV (M=hidden_size,
+//                                          K=intermediate)
+//   barrier (slot 5)
+//   3 [persistent, element work-steal]   residual add in-place
+//                                          (hidden_size BF16 adds)
+//   barrier (slot 7, clean exit)
+//
+// `barrier_state` must hold ≥ 8 zeroed u32 slots (4 work counters
+// interleaved with 4 spinlocks). `down_alpha` is the pre-folded
+// per-tensor product for the down GEMV.
+__global__ void __launch_bounds__(QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS)
+qwen36_full_attn_block_stage_f4_kernel(
+    const uint8_t *__restrict__ hidden_quantized_fp4,
+    const uint8_t *__restrict__ hidden_quantized_scale,
+    const uint8_t *__restrict__ mlp_gate_up_fp4,
+    const uint8_t *__restrict__ mlp_gate_up_scale, float gate_up_alpha,
+    const uint8_t *__restrict__ mlp_down_fp4,
+    const uint8_t *__restrict__ mlp_down_scale, float down_alpha,
+    __nv_bfloat16 *__restrict__ gate_up_out,
+    uint8_t *__restrict__ swiglu_fp4, uint8_t *__restrict__ swiglu_scale,
+    __nv_bfloat16 *__restrict__ down_out,
+    __nv_bfloat16 *__restrict__ residual, uint32_t *__restrict__ barrier_state,
+    uint32_t gate_up_m_tiles, uint32_t swiglu_groups, uint32_t down_m_tiles,
+    uint32_t hidden_size, uint32_t intermediate, uint32_t two_intermediate,
+    float down_input_tensor_scale) {
+  __shared__ uint32_t shared_work;
+
+  // Phase 0 — gate+up GEMV.
+  for (;;) {
+    if (threadIdx.x == 0) {
+      shared_work = atomicAdd(&barrier_state[0], 1u);
+    }
+    __syncthreads();
+    const uint32_t m_tile_idx = shared_work;
+    if (m_tile_idx >= gate_up_m_tiles) {
+      break;
+    }
+    qwen36_gemv::nvfp4_gemv_mma_body<8>(
+        m_tile_idx, mlp_gate_up_fp4, mlp_gate_up_scale,
+        hidden_quantized_fp4, hidden_quantized_scale, gate_up_alpha,
+        gate_up_out, static_cast<size_t>(two_intermediate),
+        static_cast<size_t>(hidden_size));
+    __syncthreads();
+  }
+  phase_barrier(&barrier_state[1], gridDim.x);
+
+  // Phase 1 — SwiGLU + NVFP4 quantize.
+  {
+    const __nv_bfloat16 *gate_ptr = gate_up_out;
+    const __nv_bfloat16 *up_ptr = gate_up_out + intermediate;
+    const uint32_t warp_id = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    for (;;) {
+      if (threadIdx.x == 0) {
+        shared_work = atomicAdd(&barrier_state[2], 8u);
+      }
+      __syncthreads();
+      const uint32_t cta_group_base = shared_work;
+      if (cta_group_base >= swiglu_groups) {
+        break;
+      }
+      const uint32_t group_idx = cta_group_base + warp_id;
+      qwen36_full_attn_block_swiglu_quantize_warp_one_group(
+          gate_ptr, up_ptr, swiglu_fp4, swiglu_scale, group_idx,
+          intermediate, lane, down_input_tensor_scale);
+      __syncthreads();
+    }
+  }
+  phase_barrier(&barrier_state[3], gridDim.x);
+
+  // Phase 2 — down GEMV.
+  for (;;) {
+    if (threadIdx.x == 0) {
+      shared_work = atomicAdd(&barrier_state[4], 1u);
+    }
+    __syncthreads();
+    const uint32_t m_tile_idx = shared_work;
+    if (m_tile_idx >= down_m_tiles) {
+      break;
+    }
+    qwen36_gemv::nvfp4_gemv_mma_body<8>(
+        m_tile_idx, mlp_down_fp4, mlp_down_scale, swiglu_fp4, swiglu_scale,
+        down_alpha, down_out, static_cast<size_t>(hidden_size),
+        static_cast<size_t>(intermediate));
+    __syncthreads();
+  }
+  phase_barrier(&barrier_state[5], gridDim.x);
+
+  // Phase 3 — residual add in place. Element work-steal so each CTA
+  // grabs a stride; the BF16 round-trip matches the standalone
+  // residual_add path (which is just a BF16-precision add).
+  {
+    const uint32_t total_elems = hidden_size;
+    const uint32_t per_cta = QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS;
+    for (;;) {
+      if (threadIdx.x == 0) {
+        shared_work = atomicAdd(&barrier_state[6], per_cta);
+      }
+      __syncthreads();
+      const uint32_t base = shared_work;
+      if (base >= total_elems) {
+        break;
+      }
+      const uint32_t idx = base + threadIdx.x;
+      if (idx < total_elems) {
+        const float r = __bfloat162float(residual[idx]);
+        const float d = __bfloat162float(down_out[idx]);
+        residual[idx] = __float2bfloat16(r + d);
+      }
+      __syncthreads();
+    }
+  }
+  phase_barrier(&barrier_state[7], gridDim.x);
+}
+
 __global__ void __launch_bounds__(QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS)
 qwen36_full_attn_block_stage_b1_kernel(
     const __nv_bfloat16 *__restrict__ hidden_in,
@@ -1588,6 +1711,110 @@ extern "C" int qwen36_full_attn_block_stage_f2_gate_up_swiglu(
       static_cast<uint32_t>(two_intermediate),
       static_cast<uint32_t>(intermediate),
       static_cast<uint32_t>(hidden_size), down_input_tensor_scale);
+
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int qwen36_full_attn_block_stage_f4_mlp_block(
+    qwen36_device_ptr_t hidden_quantized_fp4,
+    qwen36_device_ptr_t hidden_quantized_scale,
+    qwen36_device_ptr_t mlp_gate_up_fp4,
+    qwen36_device_ptr_t mlp_gate_up_scale, float gate_up_alpha,
+    qwen36_device_ptr_t mlp_down_fp4, qwen36_device_ptr_t mlp_down_scale,
+    float down_alpha, qwen36_device_ptr_t gate_up_out,
+    qwen36_device_ptr_t swiglu_fp4, qwen36_device_ptr_t swiglu_scale,
+    qwen36_device_ptr_t down_out, qwen36_device_ptr_t residual,
+    qwen36_device_ptr_t barrier_state, size_t intermediate,
+    size_t hidden_size, float down_input_tensor_scale) {
+  if (hidden_quantized_fp4.ptr == 0 || hidden_quantized_scale.ptr == 0 ||
+      mlp_gate_up_fp4.ptr == 0 || mlp_gate_up_scale.ptr == 0 ||
+      mlp_down_fp4.ptr == 0 || mlp_down_scale.ptr == 0 ||
+      gate_up_out.ptr == 0 || swiglu_fp4.ptr == 0 || swiglu_scale.ptr == 0 ||
+      down_out.ptr == 0 || residual.ptr == 0 || barrier_state.ptr == 0 ||
+      intermediate == 0 || hidden_size == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const size_t two_intermediate = 2u * intermediate;
+  // Down GEMV K=intermediate must align to GEMV K-shard (512).
+  // Gate+up GEMV K=hidden_size also aligns to 512.
+  if ((two_intermediate & 15u) != 0u || (hidden_size & 15u) != 0u ||
+      (hidden_size & 511u) != 0u || (intermediate & 511u) != 0u) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  if (two_intermediate > 0xFFFFFFFFu || hidden_size > 0xFFFFFFFFu ||
+      intermediate > 0xFFFFFFFFu) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+
+  extern cudaStream_t qwen36_internal_active_stream();
+  cudaStream_t stream = qwen36_internal_active_stream();
+
+  constexpr unsigned kPersistentGridCtas = 256u;
+  const unsigned gate_up_m_tiles =
+      static_cast<unsigned>(two_intermediate / qwen36_gemv::kRowsPerBlock);
+  const unsigned swiglu_groups =
+      static_cast<unsigned>((intermediate + 15u) / 16u);
+  const unsigned down_m_tiles =
+      static_cast<unsigned>(hidden_size / qwen36_gemv::kRowsPerBlock);
+  unsigned widest = gate_up_m_tiles;
+  if (swiglu_groups > widest) {
+    widest = swiglu_groups;
+  }
+  if (down_m_tiles > widest) {
+    widest = down_m_tiles;
+  }
+  const unsigned grid_ctas =
+      kPersistentGridCtas < widest ? kPersistentGridCtas : widest;
+
+  // SMEM sized to the widest phase. The gate+up GEMV needs B-staging
+  // for K=hidden_size; the down GEMV needs B-staging for K=intermediate
+  // (which is 17408 for Qwen3.6, much larger than hidden_size=5120).
+  // Allocate the down-GEMV layout (max over phases).
+  constexpr unsigned kWarps = 8;
+  const size_t k_for_smem =
+      intermediate > hidden_size ? intermediate : hidden_size;
+  const size_t k_over_2 = k_for_smem / 2;
+  const size_t a_tile_bytes =
+      static_cast<size_t>(kWarps) * 2u * qwen36_gemv::kATilePerWarpBytes;
+  const size_t reduction_bytes =
+      2u * static_cast<size_t>(qwen36_gemv::kRowsPerBlock) *
+      static_cast<size_t>(kWarps) * sizeof(float);
+  const size_t sf_scale_cols = k_for_smem / 16;
+  const size_t sf_staging_bytes =
+      static_cast<size_t>(qwen36_gemv::kRowsPerBlock) * sf_scale_cols +
+      sf_scale_cols;
+  const size_t smem_bytes =
+      k_over_2 + a_tile_bytes + reduction_bytes + sf_staging_bytes;
+
+  qwen36_full_attn_block_stage_f4_kernel<<<
+      grid_ctas, QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS, smem_bytes,
+      stream>>>(
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(hidden_quantized_fp4.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(hidden_quantized_scale.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(mlp_gate_up_fp4.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(mlp_gate_up_scale.ptr)),
+      gate_up_alpha,
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(mlp_down_fp4.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(mlp_down_scale.ptr)),
+      down_alpha,
+      reinterpret_cast<__nv_bfloat16 *>(
+          static_cast<uintptr_t>(gate_up_out.ptr)),
+      reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(swiglu_fp4.ptr)),
+      reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(swiglu_scale.ptr)),
+      reinterpret_cast<__nv_bfloat16 *>(static_cast<uintptr_t>(down_out.ptr)),
+      reinterpret_cast<__nv_bfloat16 *>(static_cast<uintptr_t>(residual.ptr)),
+      reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(barrier_state.ptr)),
+      gate_up_m_tiles, swiglu_groups, down_m_tiles,
+      static_cast<uint32_t>(hidden_size),
+      static_cast<uint32_t>(intermediate),
+      static_cast<uint32_t>(two_intermediate), down_input_tensor_scale);
 
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;

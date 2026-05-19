@@ -654,6 +654,28 @@ int qwen36_full_attn_block_stage_f2_gate_up_swiglu(
     size_t intermediate, size_t hidden_size,
     float down_input_tensor_scale);
 
+// Per-block megakernel — Stage F.4: complete MLP block fused.
+// Subsumes F.1 (gate+up GEMV) and F.2 (+ SwiGLU + quantize) and adds:
+//   - phase 2: down NVFP4 GEMV (M=hidden_size, K=intermediate)
+//   - phase 3: residual add in-place (residual += down_out, BF16)
+// `residual` is updated in place — matches the standalone path's
+// `residual_add` semantics. `down_alpha` is the pre-folded per-tensor
+// product for the down GEMV. `barrier_state` must hold ≥ 8 zeroed u32
+// slots (4 work counters interleaved with 4 phase spinlocks).
+// Alignment: hidden_size % 512 == 0 (gate+up K) AND % 16 (down M);
+// intermediate % 512 == 0 (down K) AND 2*intermediate % 16 (gate+up M).
+int qwen36_full_attn_block_stage_f4_mlp_block(
+    qwen36_device_ptr_t hidden_quantized_fp4,
+    qwen36_device_ptr_t hidden_quantized_scale,
+    qwen36_device_ptr_t mlp_gate_up_fp4,
+    qwen36_device_ptr_t mlp_gate_up_scale, float gate_up_alpha,
+    qwen36_device_ptr_t mlp_down_fp4, qwen36_device_ptr_t mlp_down_scale,
+    float down_alpha, qwen36_device_ptr_t gate_up_out,
+    qwen36_device_ptr_t swiglu_fp4, qwen36_device_ptr_t swiglu_scale,
+    qwen36_device_ptr_t down_out, qwen36_device_ptr_t residual,
+    qwen36_device_ptr_t barrier_state, size_t intermediate,
+    size_t hidden_size, float down_input_tensor_scale);
+
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 
 // Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot
