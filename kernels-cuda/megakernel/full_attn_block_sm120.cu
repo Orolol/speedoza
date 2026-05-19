@@ -421,6 +421,74 @@ apply_rope_half_pair_inline(__nv_bfloat16 *values, size_t offset,
   values[second] = __float2bfloat16(x1 * cosv + x0 * sinv);
 }
 
+// SwiGLU + NVFP4 quantize, processed by one warp per 16-element group.
+// Mirrors `swiglu_nvfp4_quantize_kernel` in ops.cu exactly (same amax
+// reduction, same e4m3 scale rounding, same e2m1 nibble packing, same
+// vec16_scale_offset layout) but reorganised so a single warp owns
+// one group via shuffle reductions instead of a 32-thread CTA via
+// shared memory. Lane 0 publishes the e4m3 scale; lanes 0..7 emit
+// the packed FP4 nibbles. Byte-exact equivalence to the standalone
+// kernel is the property we test in the megakernel parity smoke.
+__device__ inline void
+qwen36_full_attn_block_swiglu_quantize_warp_one_group(
+    const __nv_bfloat16 *__restrict__ gate,
+    const __nv_bfloat16 *__restrict__ up, uint8_t *__restrict__ output_fp4,
+    uint8_t *__restrict__ output_scale, uint32_t group_idx,
+    uint32_t intermediate, uint32_t lane, float global_scale_in) {
+  const uint32_t start = group_idx * 16u;
+  if (start >= intermediate) {
+    return;
+  }
+  const float global_scale = global_scale_in > 0.0f ? global_scale_in : 1.0f;
+  const uint32_t scale_blocks = (intermediate + 15u) / 16u;
+  const uint32_t scale_inner_dim = (scale_blocks + 3u) & ~3u;
+
+  float y = 0.0f;
+  if (lane < 16u) {
+    const uint32_t idx = start + lane;
+    if (idx < intermediate) {
+      const float g = __bfloat162float(gate[idx]);
+      const float u = __bfloat162float(up[idx]);
+      const float silu = g / (1.0f + expf(-g));
+      y = silu * u;
+    }
+  }
+
+  float amax = fabsf(y);
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 16));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 8));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+
+  float decoded_scale_at_lane0 = 0.0f;
+  if (lane == 0u) {
+    const float scale_value =
+        amax > 0.0f ? fmaxf(amax / (6.0f * global_scale), 1.0e-8f) : 1.0f;
+    const uint8_t scale_code = encode_e4m3_positive(scale_value);
+    output_scale[vec16_scale_offset(group_idx, 0, scale_inner_dim)] =
+        scale_code;
+    decoded_scale_at_lane0 =
+        fmaxf(decode_e4m3(scale_code) * global_scale, 1.0e-8f);
+  }
+  const float decoded_scale =
+      __shfl_sync(0xffffffffu, decoded_scale_at_lane0, 0);
+
+  if (lane < 8u) {
+    const uint32_t col = start + lane * 2u;
+    if (col < intermediate) {
+      const float y_low = __shfl_sync(0xffffffffu, y, lane * 2u);
+      uint8_t packed = encode_e2m1(y_low / decoded_scale);
+      if (col + 1u < intermediate) {
+        const float y_high = __shfl_sync(0xffffffffu, y, lane * 2u + 1u);
+        packed |= static_cast<uint8_t>(
+            encode_e2m1(y_high / decoded_scale) << 4);
+      }
+      output_fp4[col / 2u] = packed;
+    }
+  }
+}
+
 __device__ inline void qwen36_full_attn_block_partial_rope_phase(
     __nv_bfloat16 *__restrict__ q, __nv_bfloat16 *__restrict__ k,
     int32_t position, uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
@@ -868,6 +936,90 @@ qwen36_full_attn_block_stage_f1_kernel(
         static_cast<size_t>(hidden_size));
     __syncthreads(); // republish smem before next iteration overwrites it
   }
+}
+
+// Stage F.2 kernel: Stage F.1 + SwiGLU + NVFP4 quantize. Phase layout
+// on the same persistent grid (256 CTAs):
+//   0 [persistent, m-tile work-steal]    gate+up GEMV.
+//   barrier
+//   1 [persistent, group work-steal]      SwiGLU + NVFP4 quantize.
+//                                          1 warp per 16-element group;
+//                                          each CTA claims 8 groups
+//                                          per atomicAdd batch.
+//   barrier (clean exit)
+//
+// `barrier_state` must hold ≥ 4 u32 slots zeroed by the caller:
+//   slot 0 — gate+up m-tile work counter
+//   slot 1 — phase 0/1 spinlock
+//   slot 2 — swiglu group work counter
+//   slot 3 — phase 1/exit spinlock
+//
+// Co-residency caveat: the inter-phase spinlock requires every CTA in
+// the grid to be concurrently scheduled. With a dedicated GPU and a
+// 256-CTA grid the 5090 satisfies this (5 CTAs/SM × 170 SMs = 850 ≫
+// 256). Under heavy contention from other processes (e.g. our dev
+// box's training jobs holding 30+ GB and 100% util) the time-slice
+// scheduler can defer some CTAs, causing the spinlock to wait
+// indefinitely. The decode hot path runs on a dedicated GPU so this
+// is not a deployment concern; for shared-GPU validation, either
+// quiesce the contending processes or switch to
+// `cudaLaunchCooperativeKernel` (a TODO for later if needed).
+__global__ void __launch_bounds__(QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS)
+qwen36_full_attn_block_stage_f2_kernel(
+    const uint8_t *__restrict__ hidden_quantized_fp4,
+    const uint8_t *__restrict__ hidden_quantized_scale,
+    const uint8_t *__restrict__ mlp_gate_up_fp4,
+    const uint8_t *__restrict__ mlp_gate_up_scale, float gate_up_alpha,
+    __nv_bfloat16 *__restrict__ gate_up_out,
+    uint8_t *__restrict__ swiglu_fp4, uint8_t *__restrict__ swiglu_scale,
+    uint32_t *__restrict__ barrier_state, uint32_t total_m_tiles,
+    uint32_t total_groups, uint32_t two_intermediate, uint32_t intermediate,
+    uint32_t hidden_size, float down_input_tensor_scale) {
+  __shared__ uint32_t shared_work;
+
+  // Phase 0 — gate+up GEMV via work-stealing m-tile counter.
+  for (;;) {
+    if (threadIdx.x == 0) {
+      shared_work = atomicAdd(&barrier_state[0], 1u);
+    }
+    __syncthreads();
+    const uint32_t m_tile_idx = shared_work;
+    if (m_tile_idx >= total_m_tiles) {
+      break;
+    }
+    qwen36_gemv::nvfp4_gemv_mma_body<8>(
+        m_tile_idx, mlp_gate_up_fp4, mlp_gate_up_scale,
+        hidden_quantized_fp4, hidden_quantized_scale, gate_up_alpha,
+        gate_up_out, static_cast<size_t>(two_intermediate),
+        static_cast<size_t>(hidden_size));
+    __syncthreads();
+  }
+  phase_barrier(&barrier_state[1], gridDim.x);
+
+  // Phase 1 — SwiGLU + NVFP4 quantize. Read gate from gate_up_out[0..),
+  // up from gate_up_out[intermediate..). 1 warp per group; CTA claims
+  // 8 groups per atomicAdd. Tail warps with group_idx ≥ total_groups
+  // exit inside the warp helper (early return on `start >= intermediate`).
+  const __nv_bfloat16 *gate_ptr = gate_up_out;
+  const __nv_bfloat16 *up_ptr = gate_up_out + intermediate;
+  const uint32_t warp_id = threadIdx.x >> 5;
+  const uint32_t lane = threadIdx.x & 31u;
+  for (;;) {
+    if (threadIdx.x == 0) {
+      shared_work = atomicAdd(&barrier_state[2], 8u);
+    }
+    __syncthreads();
+    const uint32_t cta_group_base = shared_work;
+    if (cta_group_base >= total_groups) {
+      break;
+    }
+    const uint32_t group_idx = cta_group_base + warp_id;
+    qwen36_full_attn_block_swiglu_quantize_warp_one_group(
+        gate_ptr, up_ptr, swiglu_fp4, swiglu_scale, group_idx,
+        intermediate, lane, down_input_tensor_scale);
+    __syncthreads();
+  }
+  phase_barrier(&barrier_state[3], gridDim.x);
 }
 
 __global__ void __launch_bounds__(QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS)
@@ -1354,6 +1506,88 @@ extern "C" int qwen36_full_attn_block_stage_f1_gate_up(
       reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(barrier_state.ptr)),
       total_m_tiles, static_cast<uint32_t>(two_intermediate),
       static_cast<uint32_t>(hidden_size));
+
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int qwen36_full_attn_block_stage_f2_gate_up_swiglu(
+    qwen36_device_ptr_t hidden_quantized_fp4,
+    qwen36_device_ptr_t hidden_quantized_scale,
+    qwen36_device_ptr_t mlp_gate_up_fp4,
+    qwen36_device_ptr_t mlp_gate_up_scale, float gate_up_alpha,
+    qwen36_device_ptr_t gate_up_out, qwen36_device_ptr_t swiglu_fp4,
+    qwen36_device_ptr_t swiglu_scale, qwen36_device_ptr_t barrier_state,
+    size_t intermediate, size_t hidden_size,
+    float down_input_tensor_scale) {
+  if (hidden_quantized_fp4.ptr == 0 || hidden_quantized_scale.ptr == 0 ||
+      mlp_gate_up_fp4.ptr == 0 || mlp_gate_up_scale.ptr == 0 ||
+      gate_up_out.ptr == 0 || swiglu_fp4.ptr == 0 || swiglu_scale.ptr == 0 ||
+      barrier_state.ptr == 0 || intermediate == 0 || hidden_size == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const size_t two_intermediate = 2u * intermediate;
+  if ((two_intermediate & 15u) != 0u || (hidden_size & 511u) != 0u) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  if (two_intermediate > 0xFFFFFFFFu || hidden_size > 0xFFFFFFFFu ||
+      intermediate > 0xFFFFFFFFu) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+
+  extern cudaStream_t qwen36_internal_active_stream();
+  cudaStream_t stream = qwen36_internal_active_stream();
+
+  // Persistent grid same as F.1 (256 CTAs ≤ concurrent capacity).
+  // total_m_tiles drives phase 0 work-stealing; total_groups drives
+  // phase 1. Choose grid_ctas to cover the wider of the two so a
+  // single CTA can always make progress on either phase (the per-phase
+  // loop's early-exit handles tail CTAs when the phase is narrower).
+  constexpr unsigned kPersistentGridCtas = 256u;
+  const unsigned total_m_tiles =
+      static_cast<unsigned>(two_intermediate / qwen36_gemv::kRowsPerBlock);
+  const unsigned total_groups =
+      static_cast<unsigned>((intermediate + 15u) / 16u);
+  const unsigned widest_work =
+      total_m_tiles > total_groups ? total_m_tiles : total_groups;
+  const unsigned grid_ctas =
+      kPersistentGridCtas < widest_work ? kPersistentGridCtas : widest_work;
+
+  constexpr unsigned kWarps = 8;
+  const size_t k_over_2 = hidden_size / 2;
+  const size_t a_tile_bytes =
+      static_cast<size_t>(kWarps) * 2u * qwen36_gemv::kATilePerWarpBytes;
+  const size_t reduction_bytes =
+      2u * static_cast<size_t>(qwen36_gemv::kRowsPerBlock) *
+      static_cast<size_t>(kWarps) * sizeof(float);
+  const size_t sf_scale_cols = hidden_size / 16;
+  const size_t sf_staging_bytes =
+      static_cast<size_t>(qwen36_gemv::kRowsPerBlock) * sf_scale_cols +
+      sf_scale_cols;
+  const size_t smem_bytes =
+      k_over_2 + a_tile_bytes + reduction_bytes + sf_staging_bytes;
+
+  qwen36_full_attn_block_stage_f2_kernel<<<
+      grid_ctas, QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS, smem_bytes,
+      stream>>>(
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(hidden_quantized_fp4.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(hidden_quantized_scale.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(mlp_gate_up_fp4.ptr)),
+      reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(mlp_gate_up_scale.ptr)),
+      gate_up_alpha,
+      reinterpret_cast<__nv_bfloat16 *>(
+          static_cast<uintptr_t>(gate_up_out.ptr)),
+      reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(swiglu_fp4.ptr)),
+      reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(swiglu_scale.ptr)),
+      reinterpret_cast<uint32_t *>(static_cast<uintptr_t>(barrier_state.ptr)),
+      total_m_tiles, total_groups,
+      static_cast<uint32_t>(two_intermediate),
+      static_cast<uint32_t>(intermediate),
+      static_cast<uint32_t>(hidden_size), down_input_tensor_scale);
 
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;

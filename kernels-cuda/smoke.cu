@@ -2034,6 +2034,175 @@ int main() {
   }
 
   // ---------------------------------------------------------------------
+  // Phase 2.6 — Megakernel Stage F.2: gate+up + SwiGLU + NVFP4 quantize.
+  // Compares the megakernel's swiglu FP4 + scale output against the
+  // standalone reference path (qwen36_decode_nvfp4_gemv →
+  // qwen36_swiglu_nvfp4_quantize). The megakernel's fused phase 1
+  // mirrors the standalone kernel exactly (same amax reduction, same
+  // e4m3 scale rounding, same e2m1 nibble packing, same vec16 layout)
+  // so byte-exact equality is the target.
+  // ---------------------------------------------------------------------
+  {
+    constexpr size_t kHidden = 5120;
+    constexpr size_t kIntermediate = 4096;
+    constexpr size_t kTwoIntermediate = 2 * kIntermediate;
+    constexpr float kGateUpAlpha = 1.0f;
+    constexpr float kDownInputTensorScale = 1.0f;
+
+    constexpr size_t kActFp4Bytes = kHidden / 2;
+    constexpr size_t kActScaleBytes = 40960;
+    constexpr size_t kWeightFp4Bytes = kTwoIntermediate * kHidden / 2;
+    constexpr size_t kWeightScaleInnerDim = 320;
+    constexpr size_t kWeightScaleBytes =
+        ((kTwoIntermediate + 127) / 128) * (kWeightScaleInnerDim / 4) * 512;
+    constexpr size_t kSwigluScaleInnerDim =
+        ((kIntermediate / 16) + 3) & ~size_t(3);
+    constexpr size_t kSwigluFp4Bytes = kIntermediate / 2;
+    constexpr size_t kSwigluScaleBytes =
+        ((1 + 127) / 128 + 1) * (kSwigluScaleInnerDim / 4) * 512;
+
+    qwen36_device_ptr_t f2_act_fp4 = dev_alloc<uint8_t>(kActFp4Bytes);
+    qwen36_device_ptr_t f2_act_scale = dev_alloc<uint8_t>(kActScaleBytes);
+    qwen36_device_ptr_t f2_w_fp4 = dev_alloc<uint8_t>(kWeightFp4Bytes);
+    qwen36_device_ptr_t f2_w_scale = dev_alloc<uint8_t>(kWeightScaleBytes);
+    qwen36_device_ptr_t f2_gu_ref = dev_alloc<__nv_bfloat16>(kTwoIntermediate);
+    qwen36_device_ptr_t f2_gu_meg = dev_alloc<__nv_bfloat16>(kTwoIntermediate);
+    qwen36_device_ptr_t f2_sw_fp4_ref = dev_alloc<uint8_t>(kSwigluFp4Bytes);
+    qwen36_device_ptr_t f2_sw_scale_ref = dev_alloc<uint8_t>(kSwigluScaleBytes);
+    qwen36_device_ptr_t f2_sw_tscale_ref = dev_alloc<float>(1);
+    qwen36_device_ptr_t f2_sw_fp4_meg = dev_alloc<uint8_t>(kSwigluFp4Bytes);
+    qwen36_device_ptr_t f2_sw_scale_meg = dev_alloc<uint8_t>(kSwigluScaleBytes);
+    qwen36_device_ptr_t f2_barrier = dev_alloc<uint32_t>(8);
+
+    std::mt19937 rng(0xF2F2F2F2u);
+    std::uniform_int_distribution<uint32_t> nibble_dist(0, 3);
+    std::vector<uint8_t> act_bytes(kActFp4Bytes);
+    for (auto &b : act_bytes) {
+      b = static_cast<uint8_t>(nibble_dist(rng) | (nibble_dist(rng) << 4));
+    }
+    copy_raw<uint8_t>(f2_act_fp4, act_bytes);
+    std::vector<uint8_t> act_scale_bytes(kActScaleBytes, 0x38);
+    copy_raw<uint8_t>(f2_act_scale, act_scale_bytes);
+    std::vector<uint8_t> w_bytes(kWeightFp4Bytes);
+    for (auto &b : w_bytes) {
+      b = static_cast<uint8_t>(nibble_dist(rng) | (nibble_dist(rng) << 4));
+    }
+    copy_raw<uint8_t>(f2_w_fp4, w_bytes);
+    std::vector<uint8_t> w_scale_bytes(kWeightScaleBytes, 0x38);
+    copy_raw<uint8_t>(f2_w_scale, w_scale_bytes);
+
+    must_status(qwen36_cuda_memset(f2_gu_ref, 0,
+                                   kTwoIntermediate * sizeof(__nv_bfloat16)),
+                "memset f2_gu_ref");
+    must_status(qwen36_cuda_memset(f2_gu_meg, 0,
+                                   kTwoIntermediate * sizeof(__nv_bfloat16)),
+                "memset f2_gu_meg");
+    must_status(qwen36_cuda_memset(f2_sw_fp4_ref, 0, kSwigluFp4Bytes),
+                "memset f2_sw_fp4_ref");
+    must_status(qwen36_cuda_memset(f2_sw_scale_ref, 0, kSwigluScaleBytes),
+                "memset f2_sw_scale_ref");
+    must_status(qwen36_cuda_memset(f2_sw_tscale_ref, 0, sizeof(float)),
+                "memset f2_sw_tscale_ref");
+    must_status(qwen36_cuda_memset(f2_sw_fp4_meg, 0, kSwigluFp4Bytes),
+                "memset f2_sw_fp4_meg");
+    must_status(qwen36_cuda_memset(f2_sw_scale_meg, 0, kSwigluScaleBytes),
+                "memset f2_sw_scale_meg");
+    must_status(qwen36_cuda_memset(f2_barrier, 0, 8 * sizeof(uint32_t)),
+                "memset f2_barrier");
+
+    // Reference path: gate+up GEMV → swiglu_nvfp4_quantize.
+    qwen36_nvfp4_gemm_spec_t gspec{};
+    gspec.m = kTwoIntermediate;
+    gspec.n = 1;
+    gspec.k = kHidden;
+    gspec.a_fp4 = f2_w_fp4;
+    gspec.a_scale = f2_w_scale;
+    gspec.b_fp4 = f2_act_fp4;
+    gspec.b_scale = f2_act_scale;
+    gspec.c_bf16 = f2_gu_ref;
+    gspec.alpha = kGateUpAlpha;
+    must_status(qwen36_decode_nvfp4_gemv(&gspec),
+                "f.2 reference decode_nvfp4_gemv");
+
+    qwen36_swiglu_nvfp4_quantize_spec_t swspec{};
+    swspec.intermediate = kIntermediate;
+    swspec.gate_bf16 = f2_gu_ref;
+    swspec.up_bf16 =
+        qwen36_device_ptr_t{f2_gu_ref.ptr +
+                            kIntermediate * sizeof(__nv_bfloat16)};
+    swspec.output_fp4 = f2_sw_fp4_ref;
+    swspec.output_scale_e4m3 = f2_sw_scale_ref;
+    swspec.output_tensor_scale_f32 = f2_sw_tscale_ref;
+    swspec.input_tensor_scale_f32 = kDownInputTensorScale;
+    must_status(qwen36_swiglu_nvfp4_quantize(&swspec),
+                "f.2 reference swiglu_nvfp4_quantize");
+
+    // Megakernel path: F.2 (gate+up + swiglu fused).
+    must_status(qwen36_full_attn_block_stage_f2_gate_up_swiglu(
+                    f2_act_fp4, f2_act_scale, f2_w_fp4, f2_w_scale,
+                    kGateUpAlpha, f2_gu_meg, f2_sw_fp4_meg, f2_sw_scale_meg,
+                    f2_barrier, kIntermediate, kHidden,
+                    kDownInputTensorScale),
+                "qwen36_full_attn_block_stage_f2_gate_up_swiglu");
+
+    auto sw_fp4_ref = read_raw<uint8_t>(f2_sw_fp4_ref, kSwigluFp4Bytes);
+    auto sw_fp4_meg = read_raw<uint8_t>(f2_sw_fp4_meg, kSwigluFp4Bytes);
+    size_t fp4_mm = 0;
+    for (size_t i = 0; i < kSwigluFp4Bytes; ++i) {
+      if (sw_fp4_ref[i] != sw_fp4_meg[i]) {
+        if (fp4_mm < 4) {
+          fprintf(stderr,
+                  "  f.2 swiglu fp4 mismatch @ %zu: ref=0x%02x meg=0x%02x\n",
+                  i, sw_fp4_ref[i], sw_fp4_meg[i]);
+        }
+        ++fp4_mm;
+      }
+    }
+    if (fp4_mm == 0) {
+      printf("  stage F.2 swiglu_fp4 OK (byte-exact, n=%zu)\n",
+             kSwigluFp4Bytes);
+    } else {
+      fprintf(stderr, "  stage F.2 swiglu_fp4 mismatches=%zu\n", fp4_mm);
+      exit(1);
+    }
+
+    auto sw_scale_ref = read_raw<uint8_t>(f2_sw_scale_ref, kSwigluScaleBytes);
+    auto sw_scale_meg = read_raw<uint8_t>(f2_sw_scale_meg, kSwigluScaleBytes);
+    size_t scale_mm = 0;
+    for (size_t i = 0; i < kSwigluScaleBytes; ++i) {
+      if (sw_scale_ref[i] != sw_scale_meg[i]) {
+        if (scale_mm < 4) {
+          fprintf(stderr,
+                  "  f.2 swiglu scale mismatch @ %zu: ref=0x%02x meg=0x%02x\n",
+                  i, sw_scale_ref[i], sw_scale_meg[i]);
+        }
+        ++scale_mm;
+      }
+    }
+    if (scale_mm == 0) {
+      printf("  stage F.2 swiglu_scale OK (byte-exact, n=%zu groups)\n",
+             kIntermediate / 16);
+    } else {
+      fprintf(stderr, "  stage F.2 swiglu_scale mismatches=%zu\n", scale_mm);
+      exit(1);
+    }
+    printf("megakernel stage F.2 OK\n");
+
+    dev_free<uint32_t>(f2_barrier);
+    dev_free<uint8_t>(f2_sw_scale_meg);
+    dev_free<uint8_t>(f2_sw_fp4_meg);
+    dev_free<float>(f2_sw_tscale_ref);
+    dev_free<uint8_t>(f2_sw_scale_ref);
+    dev_free<uint8_t>(f2_sw_fp4_ref);
+    dev_free<__nv_bfloat16>(f2_gu_meg);
+    dev_free<__nv_bfloat16>(f2_gu_ref);
+    dev_free<uint8_t>(f2_w_scale);
+    dev_free<uint8_t>(f2_w_fp4);
+    dev_free<uint8_t>(f2_act_scale);
+    dev_free<uint8_t>(f2_act_fp4);
+  }
+
+  // ---------------------------------------------------------------------
   // Phase 0.4 — Cross-stream sync inside a captured CUDA graph.
   // Validates that the prefetch stream + event ABI added in Phase 0.1 is
   // graph-captureable: main writes A, prefetch waits, prefetch writes B,

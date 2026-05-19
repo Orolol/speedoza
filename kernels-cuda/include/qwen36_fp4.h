@@ -635,6 +635,25 @@ int qwen36_full_attn_block_stage_f1_gate_up(
     qwen36_device_ptr_t gate_up_out, qwen36_device_ptr_t barrier_state,
     size_t intermediate, size_t hidden_size);
 
+// Per-block megakernel — Stage F.2: Stage F.1 + fused SwiGLU + NVFP4
+// quantize of the down-projection input. Outputs in addition to
+// `gate_up_out` (BF16, [2 * intermediate], gate||up): `swiglu_fp4`
+// (packed, [intermediate / 2]) and `swiglu_scale` (e4m3 per 16-element
+// group, vec16 tile layout matching `qwen36_swiglu_nvfp4_quantize`).
+// `barrier_state` must hold ≥ 4 zeroed u32 slots (two work counters +
+// two phase spinlocks). `down_input_tensor_scale` is the pre-folded
+// per-tensor scale for the down GEMV's NVFP4 input — equivalent to
+// the standalone path's `input_tensor_scale_f32`.
+int qwen36_full_attn_block_stage_f2_gate_up_swiglu(
+    qwen36_device_ptr_t hidden_quantized_fp4,
+    qwen36_device_ptr_t hidden_quantized_scale,
+    qwen36_device_ptr_t mlp_gate_up_fp4,
+    qwen36_device_ptr_t mlp_gate_up_scale, float gate_up_alpha,
+    qwen36_device_ptr_t gate_up_out, qwen36_device_ptr_t swiglu_fp4,
+    qwen36_device_ptr_t swiglu_scale, qwen36_device_ptr_t barrier_state,
+    size_t intermediate, size_t hidden_size,
+    float down_input_tensor_scale);
+
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 
 // Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot
