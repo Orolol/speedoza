@@ -415,6 +415,53 @@ The Phase-2 single-run sweep was thus dominated by synthetic-prompt MTP patholog
 
 - **Reference path for measuring real MTP acceptance**: `cargo run --release -p qwen36-fp4 --features cuda -- chat --prompt "$(cat real_prompt.txt)" --max-new-tokens 64 --mtp-speculative-tokens 4` with `QWEN36_MTP_STATS=1`. The chat path prints `mtp.stats accepted=N rejected=M acceptance_rate=R` from `run_chat_mtp_multi` in `crates/cli/src/main.rs`. Use this — not `bench` synthetic prompts — for any "is the MTP head healthy?" gate. E3 verified real-text acc=0.98 vs synthetic-bench acc=0.84 at the same 4 k prompt length, confirming the dip diagnosed in E2 is a synthetic-prompt artefact only.
 
+### 2026-05-19 — Productive spin / L2 prefetch (Phase 1) — **NEGATIVE result, disabled by default**
+
+Phase 1 of the megakernel roadmap built an idle-SM L2-prefetch path (à la
+AlpinDale's RTX 5090 megakernel post) that overlaps the small-CTA full-attn
+decode kernel with a read-only walk of the upcoming MLP combined weight
+(`gate+up`, ~89 MB) on a secondary CUDA stream. The 5090's 16 full-attn
+layers leave ~146 of 170 SMs idle during the 24-CTA attention kernel, so the
+mechanism is sound; it just **doesn't move the needle on this engine** because
+the decode CUDA graph already keeps the MLP weights L2-resident across
+iterations (same code path as the L2 access-window experiment on DeltaNet
+state — both lose to graph-replay locality).
+
+**Bench (RTX 5090 native Linux, median of 5)**:
+
+| Config | Baseline | `QWEN36_PRODUCTIVE_SPIN=1` (128 CTAs) | Δ |
+|---|---:|---:|---:|
+| `prompt=128 mtp=0` | 54.08 | 54.15 | +0.13 % |
+| `prompt=128 mtp=3` | 112.02 | 112.61 | +0.53 % |
+| `prompt=128 mtp=4` | 118.06 | 118.13 | +0.06 % |
+| `prompt=4096 mtp=0` | 53.64 | 53.35 | −0.54 % |
+
+All deltas within run-to-run noise. The plan's +5 % go/no-go threshold is not
+met; further CTA-count tuning would not cross it given the mechanism itself
+doesn't help here.
+
+**Status — kept opt-in, disabled by default**:
+
+- `QWEN36_PRODUCTIVE_SPIN=1` activates the prefetch fork in the full-attn
+  decode path. Off by default. Parity gate validated bit-equal output on
+  `chat --prompt hello/hello world --max-new-tokens 12` for MTP {0..4}.
+- `QWEN36_PRODUCTIVE_SPIN_CTAS=N` (default 128, range 1..=1024) — number of
+  CTAs the prefetch kernel launches on the secondary stream.
+- The supporting C ABI (`qwen36_l2_prefetch`,
+  `qwen36_internal_prefetch_stream`, `qwen36_cuda_event_*`) and the Rust
+  helpers (`DecodeAuxStreams`, `fork_productive_spin` /
+  `join_productive_spin`) **stay shipped** — they are the reusable cross-
+  stream sync infrastructure that Phase 2 (per-block megakernel) needs for
+  any future fork/join pattern inside the decode graph. The l2_prefetch
+  kernel itself lives at `kernels-cuda/decode_gemv/l2_prefetch.cu` and is
+  covered by a direct smoke test in `kernels-cuda/smoke.cu`.
+
+**Lesson for Phase 2**: stop targeting bandwidth that the captured graph
+already amortises. The remaining decode wins must come from collapsing
+kernel launches and keeping activations in registers/SMEM between sub-ops
+(per-block megakernel), not from prefetch tricks adjacent to the existing
+flow.
+
 ### Mirage megakernel branch (`feat/mirage-megakernel`) — **dead code, kept for reference**
 
 > **WARNING:** the file `kernels-cuda/megakernel/nvfp4_matvec_sm120.cu` does not actually run its CUTLASS path. It guards the SM120 body with `#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)` but never includes `<cutlass/arch/config.h>` (the header that defines the macro). So the `#if` evaluates to false at preprocessing and the function returns `NOT_IMPLEMENTED` for every shape, falling back to cuBLASLt silently. The parity claims below were never actually testing the megakernel — they were testing cuBLASLt twice. Discovered 2026-05-04 during Direction B development; documented in `docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md`. Direction B uses a hand-rolled gemv kernel (`kernels-cuda/decode_gemv/`) with verified parity instead. The megakernel scaffolding is left in place because the existing dispatch wiring + CUTLASS dependency are reusable for any future CUTLASS-based experiment, but **do not trust the "validated parity" claim below without re-running the gate.**
