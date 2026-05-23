@@ -7,9 +7,9 @@ use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
     Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, Conv1dUpdateSpec,
     CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec, MegakernelFullAttnStageBQProjSpec,
-    Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec,
-    QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, SigmoidGateSpec,
-    SigmoidGateStridedSpec,
+    MegakernelFullAttnStageESpec, MegakernelFullAttnStageF4Spec, Nvfp4MatVecSpec,
+    Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, QProjDeinterleaveSpec,
+    QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
 };
 use crate::rmsnorm::RmsNormSpec;
 use crate::rope::PartialRopeSpec;
@@ -162,6 +162,34 @@ pub trait KernelBackend: Send + Sync {
     ) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda(
             "megakernel_full_attn_stage_b_q_proj",
+        ))
+    }
+
+    /// Per-block megakernel Stage E (o_proj NVFP4 GEMV + residual + post-
+    /// attention RMSNorm + NVFP4 quantize, fused into one launch).
+    /// Optional fast path that closes the attention half of the full-attn
+    /// layer; runtime falls back when this returns `UnsupportedNoCuda`.
+    fn megakernel_full_attn_stage_e_o_proj_residual_norm(
+        &self,
+        _spec: &MegakernelFullAttnStageESpec,
+    ) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda(
+            "megakernel_full_attn_stage_e_o_proj_residual_norm",
+        ))
+    }
+
+    /// Per-block megakernel Stage F.4 (full MLP block: gate+up GEMV +
+    /// SwiGLU + NVFP4 quantize + down GEMV [+ optional residual add]).
+    /// Pass `residual = NULL` to skip phase 3 — the engine integration
+    /// path uses this so the next layer's input-norm fuse handles the
+    /// residual add. Runtime falls back when this returns
+    /// `UnsupportedNoCuda`.
+    fn megakernel_full_attn_stage_f4_mlp_block(
+        &self,
+        _spec: &MegakernelFullAttnStageF4Spec,
+    ) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda(
+            "megakernel_full_attn_stage_f4_mlp_block",
         ))
     }
 }
@@ -436,6 +464,65 @@ impl KernelBackend for CudaBackend {
                 spec.q_features,
                 spec.eps,
                 spec.input_tensor_scale,
+            )
+        })
+    }
+
+    fn megakernel_full_attn_stage_e_o_proj_residual_norm(
+        &self,
+        spec: &MegakernelFullAttnStageESpec,
+    ) -> Result<()> {
+        check(
+            "qwen36_full_attn_block_stage_e_o_proj_residual_norm",
+            unsafe {
+                ffi::qwen36_full_attn_block_stage_e_o_proj_residual_norm(
+                    spec.attention_out,
+                    spec.residual_in,
+                    spec.o_proj_fp4,
+                    spec.o_proj_scale,
+                    spec.o_alpha,
+                    spec.post_norm_weight,
+                    spec.attention_quantized_fp4,
+                    spec.attention_quantized_scale,
+                    spec.o_proj_out,
+                    spec.residual_out,
+                    spec.post_normed_out,
+                    spec.post_quantized_fp4,
+                    spec.post_quantized_scale,
+                    spec.barrier_state,
+                    spec.q_features,
+                    spec.hidden_size,
+                    spec.eps,
+                    spec.post_input_tensor_scale,
+                    spec.attention_output_tensor_scale,
+                )
+            },
+        )
+    }
+
+    fn megakernel_full_attn_stage_f4_mlp_block(
+        &self,
+        spec: &MegakernelFullAttnStageF4Spec,
+    ) -> Result<()> {
+        check("qwen36_full_attn_block_stage_f4_mlp_block", unsafe {
+            ffi::qwen36_full_attn_block_stage_f4_mlp_block(
+                spec.hidden_quantized_fp4,
+                spec.hidden_quantized_scale,
+                spec.mlp_gate_up_fp4,
+                spec.mlp_gate_up_scale,
+                spec.gate_up_alpha,
+                spec.mlp_down_fp4,
+                spec.mlp_down_scale,
+                spec.down_alpha,
+                spec.gate_up_out,
+                spec.swiglu_fp4,
+                spec.swiglu_scale,
+                spec.down_out,
+                spec.residual,
+                spec.barrier_state,
+                spec.intermediate,
+                spec.hidden_size,
+                spec.down_input_tensor_scale,
             )
         })
     }
@@ -1516,6 +1603,53 @@ mod ffi {
             q_features: usize,
             eps: f32,
             input_tensor_scale: f32,
+        ) -> i32;
+
+        // Per-block megakernel Stage E: o_proj GEMV + residual + post-attn
+        // RMSNorm + NVFP4 quantize fused. ABI in `qwen36_fp4.h`.
+        pub fn qwen36_full_attn_block_stage_e_o_proj_residual_norm(
+            attention_out: DevicePtr,
+            residual_in: DevicePtr,
+            o_proj_fp4: DevicePtr,
+            o_proj_scale: DevicePtr,
+            o_alpha: f32,
+            post_norm_weight: DevicePtr,
+            attention_quantized_fp4: DevicePtr,
+            attention_quantized_scale: DevicePtr,
+            o_proj_out: DevicePtr,
+            residual_out: DevicePtr,
+            post_normed_out: DevicePtr,
+            post_quantized_fp4: DevicePtr,
+            post_quantized_scale: DevicePtr,
+            barrier_state: DevicePtr,
+            q_features: usize,
+            hidden_size: usize,
+            eps: f32,
+            post_input_tensor_scale: f32,
+            attention_output_tensor_scale: f32,
+        ) -> i32;
+
+        // Per-block megakernel Stage F.4: full MLP block (gate+up GEMV +
+        // SwiGLU + NVFP4 quantize + down GEMV + optional residual add).
+        // Pass `residual.ptr == 0` to skip the in-place residual update.
+        pub fn qwen36_full_attn_block_stage_f4_mlp_block(
+            hidden_quantized_fp4: DevicePtr,
+            hidden_quantized_scale: DevicePtr,
+            mlp_gate_up_fp4: DevicePtr,
+            mlp_gate_up_scale: DevicePtr,
+            gate_up_alpha: f32,
+            mlp_down_fp4: DevicePtr,
+            mlp_down_scale: DevicePtr,
+            down_alpha: f32,
+            gate_up_out: DevicePtr,
+            swiglu_fp4: DevicePtr,
+            swiglu_scale: DevicePtr,
+            down_out: DevicePtr,
+            residual: DevicePtr,
+            barrier_state: DevicePtr,
+            intermediate: usize,
+            hidden_size: usize,
+            down_input_tensor_scale: f32,
         ) -> i32;
 
         // Captureable variant of `qwen36_cuda_memset` that targets the

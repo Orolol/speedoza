@@ -1131,8 +1131,13 @@ qwen36_full_attn_block_stage_f4_kernel(
 
   // Phase 3 — residual add in place. Element work-steal so each CTA
   // grabs a stride; the BF16 round-trip matches the standalone
-  // residual_add path (which is just a BF16-precision add).
-  {
+  // residual_add path (which is just a BF16-precision add). Skip the
+  // body entirely when `residual` is null — the engine integration
+  // path lets the next layer's input-norm fuse the residual add, so
+  // it passes `residual = nullptr` and reads `down_out` directly.
+  // All CTAs still hit the trailing barrier so the slot 7 spinlock
+  // resolves regardless of whether work was performed.
+  if (residual != nullptr) {
     const uint32_t total_elems = hidden_size;
     const uint32_t per_cta = QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS;
     for (;;) {
@@ -1759,7 +1764,7 @@ extern "C" int qwen36_full_attn_block_stage_f4_mlp_block(
       mlp_gate_up_fp4.ptr == 0 || mlp_gate_up_scale.ptr == 0 ||
       mlp_down_fp4.ptr == 0 || mlp_down_scale.ptr == 0 ||
       gate_up_out.ptr == 0 || swiglu_fp4.ptr == 0 || swiglu_scale.ptr == 0 ||
-      down_out.ptr == 0 || residual.ptr == 0 || barrier_state.ptr == 0 ||
+      down_out.ptr == 0 || barrier_state.ptr == 0 ||
       intermediate == 0 || hidden_size == 0) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }

@@ -214,3 +214,62 @@ pub struct MegakernelFullAttnStageBQProjSpec {
     pub q_out: DevicePtr,
     pub barrier_state: DevicePtr,
 }
+
+/// Per-block megakernel Stage E: o_proj GEMV + residual add + post-attn
+/// RMSNorm + NVFP4 quantize, fused into one launch. See
+/// `kernels-cuda/include/qwen36_fp4.h::qwen36_full_attn_block_stage_e
+/// _o_proj_residual_norm` for the full ABI. Caller pre-zeroes
+/// `barrier_state` (≥ 16 bytes — 4 phase barrier slots). Alignment:
+/// `q_features % 512 == 0`, `hidden_size % 16 == 0`.
+/// `o_alpha = o_proj_weight_tensor_scale * attention_output_tensor_scale`
+/// is folded host-side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MegakernelFullAttnStageESpec {
+    pub q_features: usize,
+    pub hidden_size: usize,
+    pub eps: f32,
+    pub post_input_tensor_scale: f32,
+    pub attention_output_tensor_scale: f32,
+    pub o_alpha: f32,
+    pub attention_out: DevicePtr,
+    pub residual_in: DevicePtr,
+    pub o_proj_fp4: DevicePtr,
+    pub o_proj_scale: DevicePtr,
+    pub post_norm_weight: DevicePtr,
+    pub attention_quantized_fp4: DevicePtr,
+    pub attention_quantized_scale: DevicePtr,
+    pub o_proj_out: DevicePtr,
+    pub residual_out: DevicePtr,
+    pub post_normed_out: DevicePtr,
+    pub post_quantized_fp4: DevicePtr,
+    pub post_quantized_scale: DevicePtr,
+    pub barrier_state: DevicePtr,
+}
+
+/// Per-block megakernel Stage F.4: complete MLP block (gate+up GEMV +
+/// SwiGLU + NVFP4 quantize + down GEMV + optional residual add). Caller
+/// pre-zeroes `barrier_state` (≥ 32 bytes — 4 work counters interleaved
+/// with 4 phase barriers). Alignment: `hidden_size % 512 == 0`,
+/// `intermediate % 512 == 0`. Set `residual` to NULL to skip phase 3 —
+/// the engine integration passes NULL so the next layer's input-norm
+/// fuse handles the residual add, matching the standalone pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MegakernelFullAttnStageF4Spec {
+    pub intermediate: usize,
+    pub hidden_size: usize,
+    pub gate_up_alpha: f32,
+    pub down_alpha: f32,
+    pub down_input_tensor_scale: f32,
+    pub hidden_quantized_fp4: DevicePtr,
+    pub hidden_quantized_scale: DevicePtr,
+    pub mlp_gate_up_fp4: DevicePtr,
+    pub mlp_gate_up_scale: DevicePtr,
+    pub mlp_down_fp4: DevicePtr,
+    pub mlp_down_scale: DevicePtr,
+    pub gate_up_out: DevicePtr,
+    pub swiglu_fp4: DevicePtr,
+    pub swiglu_scale: DevicePtr,
+    pub down_out: DevicePtr,
+    pub residual: DevicePtr,
+    pub barrier_state: DevicePtr,
+}
