@@ -462,6 +462,82 @@ kernel launches and keeping activations in registers/SMEM between sub-ops
 (per-block megakernel), not from prefetch tricks adjacent to the existing
 flow.
 
+### 2026-05-23 — Per-block megakernel (Phase 2) — **NEGATIVE result, disabled by default**
+
+Phase 2 of the megakernel roadmap built the per-block megakernel pattern
+described by AlpinDale's RTX 5090 post: persistent grid + atomic
+work-stealing + inter-CTA spinlock barriers, fusing multiple sub-ops of a
+full-attn layer into single kernel launches. Six stages shipped byte-exact
+against the standalone reference (`./scripts/smoke_cuda.sh` covers all):
+
+- **Stage A** — skeleton + barrier infra (identity copy).
+- **Stage B.1 / B.2 / B.3** — RMSNorm → RMSNorm+quantize → +Q proj GEMV.
+- **Stage C** — Stage B.3 + K + V + partial RoPE.
+- **Stage E** — attn_out quantize → o_proj GEMV → residual + post-attn
+  RMSNorm + quantize.
+- **Stage F.1 / F.2 / F.4** — gate+up GEMV → +SwiGLU+quantize → +down
+  GEMV [+ optional residual add]. F.4 uses `cudaOccupancyMaxActiveBlocks
+  PerMultiprocessor`-driven grid sizing because register pressure
+  collapses occupancy and a hardcoded grid would deadlock the spinlock.
+
+Stage F.4 is wired into the MLP hot path behind
+`QWEN36_MEGAKERNEL_FULL_ATTN_STAGE_F4=1`. Parity gate (10/10 chat
+byte-exact across MTP={0..4} × {"hello", "hello world"}) passes.
+
+**Bench (RTX 5090 native Linux, median of 5, prompt=128 max-new=32)**:
+
+| Config | Baseline | `QWEN36_MEGAKERNEL_FULL_ATTN_STAGE_F4=1` | Δ |
+|---|---:|---:|---:|
+| `mtp=0` | 55.27 | 53.05 | **−4.0 %** |
+| `mtp=4` | 110.78 | 110.88 | +0.1 % |
+
+MTP=0 regresses; MTP=4 is noise. Same lesson as Phase 1: the captured
+decode CUDA graph already amortises kernel launches, so collapsing
+{gate+up cuBLASLt GEMM, swiglu_nvfp4_quantize, down NVFP4 GEMV} into one
+megakernel launch trades cuBLASLt's CUTLASS-tuned MLP GEMM for our
+hand-rolled GEMV — that's a worse trade on the intermediate shape where
+cuBLASLt wins. The megakernel's other potential benefit (keeping
+intermediates in SMEM/registers) doesn't materialise because we still
+write `gate_up_out` and `swiglu_fp4` to HBM between phases (their sizes
+exceed any single CTA's SMEM and they need to be visible across the
+persistent grid).
+
+**Status — kept opt-in, disabled by default**:
+
+- All ~8 stage kernels stay shipped + smoke-validated.
+  `kernels-cuda/megakernel/full_attn_block_sm120.cu` is the canonical
+  reference for the persistent + work-stealing + barrier pattern; the
+  inter-phase spinlock requires every CTA to be concurrently scheduled,
+  so future re-use should either run on a dedicated GPU or switch to
+  `cudaLaunchCooperativeKernel`.
+- `QWEN36_MEGAKERNEL_FULL_ATTN_STAGE_F4=1` activates the MLP fast path
+  in `run_mlp_with_quantized_input`. Off by default. Stage E + Stage
+  B.3 also have Rust FFI shipped but no engine call site (the residual
+  fusion contract of the standard rmsnorm_nvfp4_quantize doesn't compose
+  cleanly with Stage E without a wider refactor).
+- Two bugs caught during bring-up are worth remembering:
+  1. **Hardcoded persistent grid deadlocks under register pressure.**
+     A "safe-looking" 256-CTA grid for Stage F.2/F.4 actually exceeds
+     the per-SM occupancy ceiling once the kernel inlines two GEMV
+     bodies + SwiGLU, so the spinlock waits forever. Fix:
+     `cudaOccupancyMaxActiveBlocksPerMultiprocessor` × SM count.
+  2. **Conditional `__shfl_sync` with full warp mask is UB.** The
+     SwiGLU quantize helper had `__shfl_sync(0xffffffff, ..., lane*2)`
+     inside `if (lane < 8u)` — only 8 lanes called it but the mask
+     promised all 32. On SM_120 the warp deadlocked. Fix: hoist the
+     shuffles to unconditional, use the result only on lanes 0..7.
+
+**Stage D (attention) deferred.** The 24-CTA attention body uses
+`__syncthreads` internally; inlining it into a 256-CTA persistent grid
+where 232 CTAs idle at the barrier is straightforward but not worth
+implementing given Phase 2's negative perf result.
+
+**Lesson for Phase 3+**: the captured graph + cuBLASLt's CUTLASS MLP
+kernel already win the decode hot path on this engine. Further decode
+gains need to attack different bottlenecks — KV-cache quantization
+(B1), attention algorithm changes (Sage2++ retry, EAGLE-3), or weight
+layout — not kernel fusion.
+
 ### Mirage megakernel branch (`feat/mirage-megakernel`) — **dead code, kept for reference**
 
 > **WARNING:** the file `kernels-cuda/megakernel/nvfp4_matvec_sm120.cu` does not actually run its CUTLASS path. It guards the SM120 body with `#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)` but never includes `<cutlass/arch/config.h>` (the header that defines the macro). So the `#if` evaluates to false at preprocessing and the function returns `NOT_IMPLEMENTED` for every shape, falling back to cuBLASLt silently. The parity claims below were never actually testing the megakernel — they were testing cuBLASLt twice. Discovered 2026-05-04 during Direction B development; documented in `docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md`. Direction B uses a hand-rolled gemv kernel (`kernels-cuda/decode_gemv/`) with verified parity instead. The megakernel scaffolding is left in place because the existing dispatch wiring + CUTLASS dependency are reusable for any future CUTLASS-based experiment, but **do not trust the "validated parity" claim below without re-running the gate.**
