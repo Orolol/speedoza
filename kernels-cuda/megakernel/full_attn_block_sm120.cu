@@ -474,13 +474,22 @@ qwen36_full_attn_block_swiglu_quantize_warp_one_group(
   const float decoded_scale =
       __shfl_sync(0xffffffffu, decoded_scale_at_lane0, 0);
 
+  // Gather y[2i] and y[2i+1] via warp shuffles. ALL 32 lanes must call
+  // __shfl_sync to satisfy the full-warp mask (0xffffffff); the gather
+  // index lane*2 + {0,1} is computed on every lane and the result is
+  // simply ignored on lanes ≥ 8 below. Calling shfl conditionally
+  // inside the `if (lane < 8u)` block silently deadlocked the warp on
+  // SM_120 (UB per the CUDA contract).
+  const uint32_t partner_lo = (lane * 2u) & 31u;
+  const uint32_t partner_hi = ((lane * 2u) + 1u) & 31u;
+  const float y_low = __shfl_sync(0xffffffffu, y, partner_lo);
+  const float y_high = __shfl_sync(0xffffffffu, y, partner_hi);
+
   if (lane < 8u) {
     const uint32_t col = start + lane * 2u;
     if (col < intermediate) {
-      const float y_low = __shfl_sync(0xffffffffu, y, lane * 2u);
       uint8_t packed = encode_e2m1(y_low / decoded_scale);
       if (col + 1u < intermediate) {
-        const float y_high = __shfl_sync(0xffffffffu, y, lane * 2u + 1u);
         packed |= static_cast<uint8_t>(
             encode_e2m1(y_high / decoded_scale) << 4);
       }
@@ -1000,24 +1009,26 @@ qwen36_full_attn_block_stage_f2_kernel(
   // up from gate_up_out[intermediate..). 1 warp per group; CTA claims
   // 8 groups per atomicAdd. Tail warps with group_idx ≥ total_groups
   // exit inside the warp helper (early return on `start >= intermediate`).
-  const __nv_bfloat16 *gate_ptr = gate_up_out;
-  const __nv_bfloat16 *up_ptr = gate_up_out + intermediate;
-  const uint32_t warp_id = threadIdx.x >> 5;
-  const uint32_t lane = threadIdx.x & 31u;
-  for (;;) {
-    if (threadIdx.x == 0) {
-      shared_work = atomicAdd(&barrier_state[2], 8u);
+  {
+    const __nv_bfloat16 *gate_ptr = gate_up_out;
+    const __nv_bfloat16 *up_ptr = gate_up_out + intermediate;
+    const uint32_t warp_id = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    for (;;) {
+      if (threadIdx.x == 0) {
+        shared_work = atomicAdd(&barrier_state[2], 8u);
+      }
+      __syncthreads();
+      const uint32_t cta_group_base = shared_work;
+      if (cta_group_base >= total_groups) {
+        break;
+      }
+      const uint32_t group_idx = cta_group_base + warp_id;
+      qwen36_full_attn_block_swiglu_quantize_warp_one_group(
+          gate_ptr, up_ptr, swiglu_fp4, swiglu_scale, group_idx,
+          intermediate, lane, down_input_tensor_scale);
+      __syncthreads();
     }
-    __syncthreads();
-    const uint32_t cta_group_base = shared_work;
-    if (cta_group_base >= total_groups) {
-      break;
-    }
-    const uint32_t group_idx = cta_group_base + warp_id;
-    qwen36_full_attn_block_swiglu_quantize_warp_one_group(
-        gate_ptr, up_ptr, swiglu_fp4, swiglu_scale, group_idx,
-        intermediate, lane, down_input_tensor_scale);
-    __syncthreads();
   }
   phase_barrier(&barrier_state[3], gridDim.x);
 }
