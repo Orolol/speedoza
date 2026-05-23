@@ -1661,20 +1661,12 @@ extern "C" int qwen36_full_attn_block_stage_f2_gate_up_swiglu(
   extern cudaStream_t qwen36_internal_active_stream();
   cudaStream_t stream = qwen36_internal_active_stream();
 
-  // Persistent grid same as F.1 (256 CTAs ≤ concurrent capacity).
-  // total_m_tiles drives phase 0 work-stealing; total_groups drives
-  // phase 1. Choose grid_ctas to cover the wider of the two so a
-  // single CTA can always make progress on either phase (the per-phase
-  // loop's early-exit handles tail CTAs when the phase is narrower).
-  constexpr unsigned kPersistentGridCtas = 256u;
   const unsigned total_m_tiles =
       static_cast<unsigned>(two_intermediate / qwen36_gemv::kRowsPerBlock);
   const unsigned total_groups =
       static_cast<unsigned>((intermediate + 15u) / 16u);
   const unsigned widest_work =
       total_m_tiles > total_groups ? total_m_tiles : total_groups;
-  const unsigned grid_ctas =
-      kPersistentGridCtas < widest_work ? kPersistentGridCtas : widest_work;
 
   constexpr unsigned kWarps = 8;
   const size_t k_over_2 = hidden_size / 2;
@@ -1689,6 +1681,31 @@ extern "C" int qwen36_full_attn_block_stage_f2_gate_up_swiglu(
       sf_scale_cols;
   const size_t smem_bytes =
       k_over_2 + a_tile_bytes + reduction_bytes + sf_staging_bytes;
+
+  // Persistent kernel — the cross-phase spinlock requires every CTA in
+  // the grid to be concurrently scheduled. Query the actual occupancy
+  // for this specific kernel + launch shape rather than guessing,
+  // otherwise high register pressure can collapse occupancy to 1 CTA
+  // per SM and a "safe-looking" 256-CTA grid deadlocks on the barrier
+  // (this happened to F.2 during initial bring-up — 256 CTAs >
+  // 170-SM × 1-CTA/SM concurrent slots).
+  int max_active_blocks_per_sm = 0;
+  cudaError_t occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &max_active_blocks_per_sm, qwen36_full_attn_block_stage_f2_kernel,
+      QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS, smem_bytes);
+  if (occ_err != cudaSuccess || max_active_blocks_per_sm <= 0) {
+    return QWEN36_STATUS_CUDA_ERROR;
+  }
+  int sm_count = 0;
+  occ_err = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+                                   0);
+  if (occ_err != cudaSuccess || sm_count <= 0) {
+    return QWEN36_STATUS_CUDA_ERROR;
+  }
+  const unsigned safe_grid =
+      static_cast<unsigned>(max_active_blocks_per_sm * sm_count);
+  const unsigned grid_ctas =
+      safe_grid < widest_work ? safe_grid : widest_work;
 
   qwen36_full_attn_block_stage_f2_kernel<<<
       grid_ctas, QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS, smem_bytes,
@@ -1750,7 +1767,6 @@ extern "C" int qwen36_full_attn_block_stage_f4_mlp_block(
   extern cudaStream_t qwen36_internal_active_stream();
   cudaStream_t stream = qwen36_internal_active_stream();
 
-  constexpr unsigned kPersistentGridCtas = 256u;
   const unsigned gate_up_m_tiles =
       static_cast<unsigned>(two_intermediate / qwen36_gemv::kRowsPerBlock);
   const unsigned swiglu_groups =
@@ -1764,8 +1780,6 @@ extern "C" int qwen36_full_attn_block_stage_f4_mlp_block(
   if (down_m_tiles > widest) {
     widest = down_m_tiles;
   }
-  const unsigned grid_ctas =
-      kPersistentGridCtas < widest ? kPersistentGridCtas : widest;
 
   // SMEM sized to the widest phase. The gate+up GEMV needs B-staging
   // for K=hidden_size; the down GEMV needs B-staging for K=intermediate
@@ -1786,6 +1800,27 @@ extern "C" int qwen36_full_attn_block_stage_f4_mlp_block(
       sf_scale_cols;
   const size_t smem_bytes =
       k_over_2 + a_tile_bytes + reduction_bytes + sf_staging_bytes;
+
+  // Persistent grid sized to actual occupancy (see Stage F.2 wrapper
+  // for rationale): Stage F.4 has even higher register pressure than
+  // F.2 because it inlines two GEMV bodies + SwiGLU + residual_add
+  // into one kernel.
+  int max_active_blocks_per_sm = 0;
+  cudaError_t occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &max_active_blocks_per_sm, qwen36_full_attn_block_stage_f4_kernel,
+      QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS, smem_bytes);
+  if (occ_err != cudaSuccess || max_active_blocks_per_sm <= 0) {
+    return QWEN36_STATUS_CUDA_ERROR;
+  }
+  int sm_count = 0;
+  occ_err = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+                                   0);
+  if (occ_err != cudaSuccess || sm_count <= 0) {
+    return QWEN36_STATUS_CUDA_ERROR;
+  }
+  const unsigned safe_grid =
+      static_cast<unsigned>(max_active_blocks_per_sm * sm_count);
+  const unsigned grid_ctas = safe_grid < widest ? safe_grid : widest;
 
   qwen36_full_attn_block_stage_f4_kernel<<<
       grid_ctas, QWEN36_MEGAKERNEL_FULL_ATTN_BLOCK_THREADS, smem_bytes,
