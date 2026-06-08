@@ -106,6 +106,90 @@ void expect_close(float actual, float expected, float tolerance,
 } // namespace
 
 int main() {
+  qwen36_device_ptr_t interpreter_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(3);
+  qwen36_device_ptr_t interpreter_counters = dev_alloc<int32_t>(4);
+  qwen36_interpreter_instruction_t interpreter_program_host[3]{};
+  interpreter_program_host[0].opcode = 1; // FALLBACK_TRAMPOLINE
+  interpreter_program_host[0].publishes_counter = 0;
+  interpreter_program_host[0].publish_value = 1;
+  interpreter_program_host[0].arrival_counter = 2;
+  interpreter_program_host[1].opcode = 1; // FALLBACK_TRAMPOLINE
+  interpreter_program_host[1].dep_count = 1;
+  interpreter_program_host[1].deps[0] = qwen36_interpreter_dep_t{0, 1};
+  interpreter_program_host[1].publishes_counter = 1;
+  interpreter_program_host[1].publish_value = 1;
+  interpreter_program_host[1].arrival_counter = 3;
+  interpreter_program_host[2].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interpreter_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interpreter_program_host, interpreter_program_host + 3));
+  must_cuda<int32_t>(cudaMemset(reinterpret_cast<void *>(interpreter_counters.ptr),
+                                0, 4 * sizeof(int32_t)),
+                     "cudaMemset interpreter counters");
+  qwen36_interpreter_program_t interpreter_spec{};
+  interpreter_spec.instructions = interpreter_instructions;
+  interpreter_spec.instruction_count = 3;
+  interpreter_spec.counters_i32 = interpreter_counters;
+  interpreter_spec.counter_count = 4;
+  interpreter_spec.cta_count = 1;
+  must_status(qwen36_interpreter_decode_sm120(&interpreter_spec),
+              "interpreter decode stage0");
+  std::vector<int32_t> interpreter_counter_values =
+      read_raw<int32_t>(interpreter_counters, 2);
+  if (interpreter_counter_values[0] != 1 ||
+      interpreter_counter_values[1] != 1) {
+    fprintf(stderr, "interpreter counters expected [1, 1] got [%d, %d]\n",
+            interpreter_counter_values[0], interpreter_counter_values[1]);
+    exit(1);
+  }
+
+  qwen36_device_ptr_t residual_add_input = dev_alloc<__nv_bfloat16>(8);
+  qwen36_device_ptr_t residual_add_residual = dev_alloc<__nv_bfloat16>(8);
+  qwen36_device_ptr_t residual_add_output = dev_alloc<__nv_bfloat16>(8);
+  qwen36_device_ptr_t residual_add_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(2);
+  qwen36_device_ptr_t residual_add_counters = dev_alloc<int32_t>(2);
+  copy_bf16(residual_add_input,
+            {1.0f, 2.0f, -3.0f, 4.0f, 0.5f, -0.5f, 8.0f, -8.0f});
+  copy_bf16(residual_add_residual,
+            {0.5f, -2.0f, 3.5f, 1.0f, 0.25f, 0.75f, -4.0f, 4.0f});
+  qwen36_interpreter_instruction_t residual_add_program_host[2]{};
+  residual_add_program_host[0].opcode = 8; // RESIDUAL_ADD
+  residual_add_program_host[0].publishes_counter = 0;
+  residual_add_program_host[0].publish_value = 1;
+  residual_add_program_host[0].arrival_counter = 1;
+  residual_add_program_host[0].payload[0] = 8;
+  residual_add_program_host[0].payload[1] = residual_add_input.ptr;
+  residual_add_program_host[0].payload[2] = residual_add_residual.ptr;
+  residual_add_program_host[0].payload[3] = residual_add_output.ptr;
+  residual_add_program_host[1].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      residual_add_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          residual_add_program_host, residual_add_program_host + 2));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(residual_add_counters.ptr), 0,
+                 2 * sizeof(int32_t)),
+      "cudaMemset residual_add counters");
+  qwen36_interpreter_program_t residual_add_spec{};
+  residual_add_spec.instructions = residual_add_instructions;
+  residual_add_spec.instruction_count = 2;
+  residual_add_spec.counters_i32 = residual_add_counters;
+  residual_add_spec.counter_count = 2;
+  residual_add_spec.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&residual_add_spec),
+              "interpreter residual_add");
+  std::vector<float> residual_add_values =
+      read_bf16(residual_add_output, 8);
+  const float residual_add_expected[8] = {1.5f, 0.0f, 0.5f, 5.0f,
+                                          0.75f, 0.25f, 4.0f, -4.0f};
+  for (size_t i = 0; i < 8; ++i) {
+    expect_close(residual_add_values[i], residual_add_expected[i], 0.02f,
+                 "interpreter residual_add");
+  }
+
   qwen36_attention_shape_t attn{2, 1, 8, 0};
   const size_t q_values = attn.q_heads * attn.head_dim;
   const size_t kv_values = attn.kv_heads * attn.head_dim;
@@ -443,6 +527,77 @@ int main() {
     exit(1);
   }
 
+  qwen36_device_ptr_t interp_norm_out = dev_alloc<__nv_bfloat16>(16);
+  qwen36_device_ptr_t interp_norm_fp4 = dev_alloc<uint8_t>(8);
+  qwen36_device_ptr_t interp_norm_scale = dev_alloc<uint8_t>(512);
+  qwen36_device_ptr_t interp_norm_global = dev_alloc<float>(1);
+  qwen36_device_ptr_t interp_norm_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(2);
+  qwen36_device_ptr_t interp_norm_counters = dev_alloc<int32_t>(2);
+  union F32Bits {
+    float f;
+    uint32_t u;
+  };
+  F32Bits eps_bits{1.0e-6f};
+  F32Bits scale_bits{1.0f};
+  qwen36_interpreter_instruction_t interp_norm_program_host[2]{};
+  interp_norm_program_host[0].opcode = 2; // RMSNORM_NVFP4_QUANT
+  interp_norm_program_host[0].publishes_counter = 0;
+  interp_norm_program_host[0].publish_value = 1;
+  interp_norm_program_host[0].arrival_counter = 1;
+  interp_norm_program_host[0].payload[0] = 16;
+  interp_norm_program_host[0].payload[1] = fused_norm_in.ptr;
+  interp_norm_program_host[0].payload[2] = fused_norm_weight.ptr;
+  interp_norm_program_host[0].payload[3] = 0;
+  interp_norm_program_host[0].payload[4] = 0;
+  interp_norm_program_host[0].payload[5] = interp_norm_out.ptr;
+  interp_norm_program_host[0].payload[6] = interp_norm_fp4.ptr;
+  interp_norm_program_host[0].payload[7] = interp_norm_scale.ptr;
+  interp_norm_program_host[0].payload[8] = interp_norm_global.ptr;
+  interp_norm_program_host[0].payload[9] =
+      static_cast<uint64_t>(eps_bits.u) |
+      (static_cast<uint64_t>(scale_bits.u) << 32);
+  interp_norm_program_host[1].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_norm_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_norm_program_host, interp_norm_program_host + 2));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_norm_counters.ptr), 0,
+                 2 * sizeof(int32_t)),
+      "cudaMemset interp rmsnorm counters");
+  qwen36_interpreter_program_t interp_norm_spec{};
+  interp_norm_spec.instructions = interp_norm_instructions;
+  interp_norm_spec.instruction_count = 2;
+  interp_norm_spec.counters_i32 = interp_norm_counters;
+  interp_norm_spec.counter_count = 2;
+  interp_norm_spec.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_norm_spec),
+              "interpreter rmsnorm nvfp4 quantize");
+  std::vector<float> interp_norm_values = read_bf16(interp_norm_out, 16);
+  std::vector<uint8_t> interp_norm_packed =
+      read_raw<uint8_t>(interp_norm_fp4, 8);
+  const uint8_t ref_scale0 = read_one<uint8_t>(fused_norm_scale);
+  const uint8_t interp_scale0 = read_one<uint8_t>(interp_norm_scale);
+  for (size_t i = 0; i < 16; ++i) {
+    expect_close(interp_norm_values[i], fused_norm_values[i], 0.0f,
+                 "interpreter rmsnorm bf16");
+  }
+  for (size_t i = 0; i < 8; ++i) {
+    if (interp_norm_packed[i] != fused_norm_packed[i]) {
+      fprintf(stderr, "interpreter rmsnorm fp4 byte %zu expected 0x%02x got 0x%02x\n",
+              i, fused_norm_packed[i], interp_norm_packed[i]);
+      exit(1);
+    }
+  }
+  if (interp_scale0 != ref_scale0) {
+    fprintf(stderr, "interpreter rmsnorm scale expected 0x%02x got 0x%02x\n",
+            ref_scale0, interp_scale0);
+    exit(1);
+  }
+  expect_close(read_one<float>(interp_norm_global), 1.0f, 0.0f,
+               "interpreter rmsnorm tensor scale");
+
   qwen36_device_ptr_t rope_pos = dev_alloc<int32_t>(1);
   qwen36_device_ptr_t rope_q = dev_alloc<__nv_bfloat16>(6);
   qwen36_device_ptr_t rope_k = dev_alloc<__nv_bfloat16>(6);
@@ -470,6 +625,84 @@ int main() {
   expect_close(rope_k_values[0], -sinf(1.0f), 0.02f, "rope k[0]");
   expect_close(rope_k_values[2], cosf(1.0f), 0.02f, "rope k[2]");
 
+  qwen36_device_ptr_t interp_rope_q_ref = dev_alloc<__nv_bfloat16>(12);
+  qwen36_device_ptr_t interp_rope_k_ref = dev_alloc<__nv_bfloat16>(12);
+  qwen36_device_ptr_t interp_rope_q = dev_alloc<__nv_bfloat16>(12);
+  qwen36_device_ptr_t interp_rope_k = dev_alloc<__nv_bfloat16>(12);
+  qwen36_device_ptr_t interp_rope_pos = dev_alloc<int32_t>(2);
+  qwen36_device_ptr_t interp_rope_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(2);
+  qwen36_device_ptr_t interp_rope_counters = dev_alloc<int32_t>(2);
+  const std::vector<float> rope_q_init = {1.0f, 2.0f, 0.0f, 0.0f,
+                                          9.0f, 9.0f, 0.5f, -1.0f,
+                                          2.0f, 3.0f, 7.0f, 8.0f};
+  const std::vector<float> rope_k_init = {0.0f, 0.0f, 1.0f, 2.0f,
+                                          8.0f, 8.0f, -2.0f, 4.0f,
+                                          0.25f, 0.75f, 6.0f, 5.0f};
+  copy_raw<int32_t>(interp_rope_pos, {1, 3});
+  copy_bf16(interp_rope_q_ref, rope_q_init);
+  copy_bf16(interp_rope_k_ref, rope_k_init);
+  copy_bf16(interp_rope_q, rope_q_init);
+  copy_bf16(interp_rope_k, rope_k_init);
+  qwen36_partial_rope_spec_t interp_rope_ref_spec{};
+  interp_rope_ref_spec.tokens = 2;
+  interp_rope_ref_spec.q_heads = 1;
+  interp_rope_ref_spec.kv_heads = 1;
+  interp_rope_ref_spec.head_dim = 6;
+  interp_rope_ref_spec.rope_dims = 4;
+  interp_rope_ref_spec.base_theta = 10000.0;
+  interp_rope_ref_spec.positions_i32 = interp_rope_pos;
+  interp_rope_ref_spec.q_bf16 = interp_rope_q_ref;
+  interp_rope_ref_spec.k_bf16 = interp_rope_k_ref;
+  must_status(qwen36_partial_rope(&interp_rope_ref_spec),
+              "interpreter rope reference");
+  F32Bits rope_base_bits{10000.0f};
+  qwen36_interpreter_instruction_t interp_rope_program_host[2]{};
+  interp_rope_program_host[0].opcode = 5; // ROPE_PARTIAL
+  interp_rope_program_host[0].publishes_counter = 0;
+  interp_rope_program_host[0].publish_value = 1;
+  interp_rope_program_host[0].arrival_counter = 1;
+  interp_rope_program_host[0].payload[0] = 2;
+  interp_rope_program_host[0].payload[1] = 1;
+  interp_rope_program_host[0].payload[2] = 1;
+  interp_rope_program_host[0].payload[3] = 6;
+  interp_rope_program_host[0].payload[4] = 4;
+  interp_rope_program_host[0].payload[5] = rope_base_bits.u;
+  interp_rope_program_host[0].payload[6] = 0;
+  interp_rope_program_host[0].payload[7] = interp_rope_pos.ptr;
+  interp_rope_program_host[0].payload[8] = interp_rope_q.ptr;
+  interp_rope_program_host[0].payload[9] = interp_rope_k.ptr;
+  interp_rope_program_host[0].payload[10] = 0;
+  interp_rope_program_host[1].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_rope_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_rope_program_host, interp_rope_program_host + 2));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_rope_counters.ptr), 0,
+                 2 * sizeof(int32_t)),
+      "cudaMemset interp rope counters");
+  qwen36_interpreter_program_t interp_rope_spec{};
+  interp_rope_spec.instructions = interp_rope_instructions;
+  interp_rope_spec.instruction_count = 2;
+  interp_rope_spec.counters_i32 = interp_rope_counters;
+  interp_rope_spec.counter_count = 2;
+  interp_rope_spec.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_rope_spec),
+              "interpreter rope partial");
+  std::vector<float> interp_rope_q_ref_values =
+      read_bf16(interp_rope_q_ref, 12);
+  std::vector<float> interp_rope_k_ref_values =
+      read_bf16(interp_rope_k_ref, 12);
+  std::vector<float> interp_rope_q_values = read_bf16(interp_rope_q, 12);
+  std::vector<float> interp_rope_k_values = read_bf16(interp_rope_k, 12);
+  for (size_t i = 0; i < 12; ++i) {
+    expect_close(interp_rope_q_values[i], interp_rope_q_ref_values[i], 0.0f,
+                 "interpreter rope q");
+    expect_close(interp_rope_k_values[i], interp_rope_k_ref_values[i], 0.0f,
+                 "interpreter rope k");
+  }
+
   qwen36_device_ptr_t swiglu_gate = dev_alloc<__nv_bfloat16>(4);
   qwen36_device_ptr_t swiglu_up = dev_alloc<__nv_bfloat16>(4);
   qwen36_device_ptr_t swiglu_out = dev_alloc<__nv_bfloat16>(4);
@@ -486,6 +719,112 @@ int main() {
   expect_close(swiglu_values[0], 0.0f, 0.02f, "swiglu[0]");
   expect_close(swiglu_values[1], 2.0f / (1.0f + expf(-1.0f)), 0.02f,
                "swiglu[1]");
+
+  const size_t interp_swiglu_values_count = 33;
+  const size_t interp_swiglu_fp4_bytes = (interp_swiglu_values_count + 1) / 2;
+  qwen36_device_ptr_t interp_swiglu_gate =
+      dev_alloc<__nv_bfloat16>(interp_swiglu_values_count);
+  qwen36_device_ptr_t interp_swiglu_up =
+      dev_alloc<__nv_bfloat16>(interp_swiglu_values_count);
+  qwen36_device_ptr_t interp_swiglu_fp4_ref =
+      dev_alloc<uint8_t>(interp_swiglu_fp4_bytes);
+  qwen36_device_ptr_t interp_swiglu_scale_ref = dev_alloc<uint8_t>(512);
+  qwen36_device_ptr_t interp_swiglu_global_ref = dev_alloc<float>(1);
+  qwen36_device_ptr_t interp_swiglu_fp4 =
+      dev_alloc<uint8_t>(interp_swiglu_fp4_bytes);
+  qwen36_device_ptr_t interp_swiglu_scale = dev_alloc<uint8_t>(512);
+  qwen36_device_ptr_t interp_swiglu_global = dev_alloc<float>(1);
+  qwen36_device_ptr_t interp_swiglu_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(2);
+  qwen36_device_ptr_t interp_swiglu_counters = dev_alloc<int32_t>(2);
+  std::vector<float> interp_swiglu_gate_values(interp_swiglu_values_count);
+  std::vector<float> interp_swiglu_up_values(interp_swiglu_values_count);
+  for (size_t i = 0; i < interp_swiglu_values_count; ++i) {
+    interp_swiglu_gate_values[i] = (static_cast<int>(i % 9) - 4) * 0.25f;
+    interp_swiglu_up_values[i] = 0.5f + static_cast<float>(i % 7) * 0.125f;
+  }
+  copy_bf16(interp_swiglu_gate, interp_swiglu_gate_values);
+  copy_bf16(interp_swiglu_up, interp_swiglu_up_values);
+  must_cuda<uint8_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_swiglu_fp4_ref.ptr), 0,
+                 interp_swiglu_fp4_bytes),
+      "cudaMemset swiglu fp4 ref");
+  must_cuda<uint8_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_swiglu_scale_ref.ptr), 0, 512),
+      "cudaMemset swiglu scale ref");
+  must_cuda<uint8_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_swiglu_fp4.ptr), 0,
+                 interp_swiglu_fp4_bytes),
+      "cudaMemset swiglu fp4");
+  must_cuda<uint8_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_swiglu_scale.ptr), 0, 512),
+      "cudaMemset swiglu scale");
+  qwen36_swiglu_nvfp4_quantize_spec_t interp_swiglu_ref_spec{};
+  interp_swiglu_ref_spec.intermediate = interp_swiglu_values_count;
+  interp_swiglu_ref_spec.gate_bf16 = interp_swiglu_gate;
+  interp_swiglu_ref_spec.up_bf16 = interp_swiglu_up;
+  interp_swiglu_ref_spec.output_fp4 = interp_swiglu_fp4_ref;
+  interp_swiglu_ref_spec.output_scale_e4m3 = interp_swiglu_scale_ref;
+  interp_swiglu_ref_spec.output_tensor_scale_f32 = interp_swiglu_global_ref;
+  interp_swiglu_ref_spec.input_tensor_scale_f32 = 1.0f;
+  must_status(qwen36_swiglu_nvfp4_quantize(&interp_swiglu_ref_spec),
+              "interpreter swiglu reference");
+  F32Bits swiglu_scale_bits{1.0f};
+  qwen36_interpreter_instruction_t interp_swiglu_program_host[2]{};
+  interp_swiglu_program_host[0].opcode = 4; // SWIGLU_NVFP4_QUANT
+  interp_swiglu_program_host[0].publishes_counter = 0;
+  interp_swiglu_program_host[0].publish_value = 1;
+  interp_swiglu_program_host[0].arrival_counter = 1;
+  interp_swiglu_program_host[0].payload[0] = interp_swiglu_values_count;
+  interp_swiglu_program_host[0].payload[1] = interp_swiglu_gate.ptr;
+  interp_swiglu_program_host[0].payload[2] = interp_swiglu_up.ptr;
+  interp_swiglu_program_host[0].payload[3] = interp_swiglu_fp4.ptr;
+  interp_swiglu_program_host[0].payload[4] = interp_swiglu_scale.ptr;
+  interp_swiglu_program_host[0].payload[5] = interp_swiglu_global.ptr;
+  interp_swiglu_program_host[0].payload[6] = swiglu_scale_bits.u;
+  interp_swiglu_program_host[1].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_swiglu_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_swiglu_program_host, interp_swiglu_program_host + 2));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_swiglu_counters.ptr), 0,
+                 2 * sizeof(int32_t)),
+      "cudaMemset interp swiglu counters");
+  qwen36_interpreter_program_t interp_swiglu_spec{};
+  interp_swiglu_spec.instructions = interp_swiglu_instructions;
+  interp_swiglu_spec.instruction_count = 2;
+  interp_swiglu_spec.counters_i32 = interp_swiglu_counters;
+  interp_swiglu_spec.counter_count = 2;
+  interp_swiglu_spec.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_swiglu_spec),
+              "interpreter swiglu nvfp4 quantize");
+  std::vector<uint8_t> interp_swiglu_fp4_ref_values =
+      read_raw<uint8_t>(interp_swiglu_fp4_ref, interp_swiglu_fp4_bytes);
+  std::vector<uint8_t> interp_swiglu_fp4_values =
+      read_raw<uint8_t>(interp_swiglu_fp4, interp_swiglu_fp4_bytes);
+  std::vector<uint8_t> interp_swiglu_scale_ref_values =
+      read_raw<uint8_t>(interp_swiglu_scale_ref, 512);
+  std::vector<uint8_t> interp_swiglu_scale_values =
+      read_raw<uint8_t>(interp_swiglu_scale, 512);
+  for (size_t i = 0; i < interp_swiglu_fp4_bytes; ++i) {
+    if (interp_swiglu_fp4_values[i] != interp_swiglu_fp4_ref_values[i]) {
+      fprintf(stderr, "interpreter swiglu fp4 byte %zu expected 0x%02x got 0x%02x\n",
+              i, interp_swiglu_fp4_ref_values[i], interp_swiglu_fp4_values[i]);
+      exit(1);
+    }
+  }
+  for (size_t i = 0; i < 512; ++i) {
+    if (interp_swiglu_scale_values[i] != interp_swiglu_scale_ref_values[i]) {
+      fprintf(stderr, "interpreter swiglu scale byte %zu expected 0x%02x got 0x%02x\n",
+              i, interp_swiglu_scale_ref_values[i],
+              interp_swiglu_scale_values[i]);
+      exit(1);
+    }
+  }
+  expect_close(read_one<float>(interp_swiglu_global),
+               read_one<float>(interp_swiglu_global_ref), 0.0f,
+               "interpreter swiglu tensor scale");
 
   qwen36_device_ptr_t logits = dev_alloc<__nv_bfloat16>(4);
   qwen36_device_ptr_t sampled = dev_alloc<uint32_t>(1);
@@ -671,6 +1010,85 @@ int main() {
             "shape, got %d\n",
             gemv_b1_code);
     return 1;
+  }
+
+  const size_t interp_gemv_m = 16;
+  const size_t interp_gemv_k = 1024;
+  const size_t interp_gemv_scale_bytes = 8192;
+  qwen36_device_ptr_t interp_gemv_a_fp4 =
+      dev_alloc<uint8_t>(interp_gemv_m * interp_gemv_k / 2);
+  qwen36_device_ptr_t interp_gemv_a_scale =
+      dev_alloc<uint8_t>(interp_gemv_scale_bytes);
+  qwen36_device_ptr_t interp_gemv_b_fp4 =
+      dev_alloc<uint8_t>(interp_gemv_k / 2);
+  qwen36_device_ptr_t interp_gemv_b_scale =
+      dev_alloc<uint8_t>(interp_gemv_scale_bytes);
+  qwen36_device_ptr_t interp_gemv_out_ref =
+      dev_alloc<__nv_bfloat16>(interp_gemv_m);
+  qwen36_device_ptr_t interp_gemv_out =
+      dev_alloc<__nv_bfloat16>(interp_gemv_m);
+  qwen36_device_ptr_t interp_gemv_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(2);
+  qwen36_device_ptr_t interp_gemv_counters = dev_alloc<int32_t>(2);
+  copy_raw<uint8_t>(
+      interp_gemv_a_fp4,
+      std::vector<uint8_t>(interp_gemv_m * interp_gemv_k / 2, 0x22));
+  copy_raw<uint8_t>(interp_gemv_a_scale,
+                    std::vector<uint8_t>(interp_gemv_scale_bytes, 0x38));
+  copy_raw<uint8_t>(interp_gemv_b_fp4,
+                    std::vector<uint8_t>(interp_gemv_k / 2, 0x22));
+  copy_raw<uint8_t>(interp_gemv_b_scale,
+                    std::vector<uint8_t>(interp_gemv_scale_bytes, 0x38));
+  qwen36_nvfp4_gemm_spec_t interp_gemv_ref_spec{};
+  interp_gemv_ref_spec.m = interp_gemv_m;
+  interp_gemv_ref_spec.n = 1;
+  interp_gemv_ref_spec.k = interp_gemv_k;
+  interp_gemv_ref_spec.a_fp4 = interp_gemv_a_fp4;
+  interp_gemv_ref_spec.a_scale = interp_gemv_a_scale;
+  interp_gemv_ref_spec.b_fp4 = interp_gemv_b_fp4;
+  interp_gemv_ref_spec.b_scale = interp_gemv_b_scale;
+  interp_gemv_ref_spec.c_bf16 = interp_gemv_out_ref;
+  interp_gemv_ref_spec.alpha = 1.0f;
+  must_status(qwen36_decode_nvfp4_gemv(&interp_gemv_ref_spec),
+              "interpreter gemv reference");
+  F32Bits interp_gemv_alpha_bits{1.0f};
+  qwen36_interpreter_instruction_t interp_gemv_program_host[2]{};
+  interp_gemv_program_host[0].opcode = 3; // NVFP4_GEMV
+  interp_gemv_program_host[0].publishes_counter = 0;
+  interp_gemv_program_host[0].publish_value = 1;
+  interp_gemv_program_host[0].arrival_counter = 1;
+  interp_gemv_program_host[0].payload[0] = interp_gemv_m;
+  interp_gemv_program_host[0].payload[1] = interp_gemv_k;
+  interp_gemv_program_host[0].payload[2] = interp_gemv_a_fp4.ptr;
+  interp_gemv_program_host[0].payload[3] = interp_gemv_a_scale.ptr;
+  interp_gemv_program_host[0].payload[4] = interp_gemv_b_fp4.ptr;
+  interp_gemv_program_host[0].payload[5] = interp_gemv_b_scale.ptr;
+  interp_gemv_program_host[0].payload[6] = interp_gemv_out.ptr;
+  interp_gemv_program_host[0].payload[7] = interp_gemv_alpha_bits.u;
+  interp_gemv_program_host[1].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_gemv_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_gemv_program_host, interp_gemv_program_host + 2));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_gemv_counters.ptr), 0,
+                 2 * sizeof(int32_t)),
+      "cudaMemset interp gemv counters");
+  qwen36_interpreter_program_t interp_gemv_spec{};
+  interp_gemv_spec.instructions = interp_gemv_instructions;
+  interp_gemv_spec.instruction_count = 2;
+  interp_gemv_spec.counters_i32 = interp_gemv_counters;
+  interp_gemv_spec.counter_count = 2;
+  interp_gemv_spec.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_gemv_spec),
+              "interpreter nvfp4 gemv");
+  std::vector<float> interp_gemv_ref_values =
+      read_bf16(interp_gemv_out_ref, interp_gemv_m);
+  std::vector<float> interp_gemv_values =
+      read_bf16(interp_gemv_out, interp_gemv_m);
+  for (size_t i = 0; i < interp_gemv_m; ++i) {
+    expect_close(interp_gemv_values[i], interp_gemv_ref_values[i], 0.0f,
+                 "interpreter nvfp4 gemv");
   }
 
   qwen36_device_ptr_t conv_input = dev_alloc<__nv_bfloat16>(1);
@@ -911,12 +1329,35 @@ int main() {
   dev_free<uint8_t>(fused_norm_fp4);
   dev_free<uint8_t>(fused_norm_scale);
   dev_free<float>(fused_norm_global);
+  dev_free<__nv_bfloat16>(interp_norm_out);
+  dev_free<uint8_t>(interp_norm_fp4);
+  dev_free<uint8_t>(interp_norm_scale);
+  dev_free<float>(interp_norm_global);
+  dev_free<qwen36_interpreter_instruction_t>(interp_norm_instructions);
+  dev_free<int32_t>(interp_norm_counters);
   dev_free<int32_t>(rope_pos);
   dev_free<__nv_bfloat16>(rope_q);
   dev_free<__nv_bfloat16>(rope_k);
+  dev_free<__nv_bfloat16>(interp_rope_q_ref);
+  dev_free<__nv_bfloat16>(interp_rope_k_ref);
+  dev_free<__nv_bfloat16>(interp_rope_q);
+  dev_free<__nv_bfloat16>(interp_rope_k);
+  dev_free<int32_t>(interp_rope_pos);
+  dev_free<qwen36_interpreter_instruction_t>(interp_rope_instructions);
+  dev_free<int32_t>(interp_rope_counters);
   dev_free<__nv_bfloat16>(swiglu_gate);
   dev_free<__nv_bfloat16>(swiglu_up);
   dev_free<__nv_bfloat16>(swiglu_out);
+  dev_free<__nv_bfloat16>(interp_swiglu_gate);
+  dev_free<__nv_bfloat16>(interp_swiglu_up);
+  dev_free<uint8_t>(interp_swiglu_fp4_ref);
+  dev_free<uint8_t>(interp_swiglu_scale_ref);
+  dev_free<float>(interp_swiglu_global_ref);
+  dev_free<uint8_t>(interp_swiglu_fp4);
+  dev_free<uint8_t>(interp_swiglu_scale);
+  dev_free<float>(interp_swiglu_global);
+  dev_free<qwen36_interpreter_instruction_t>(interp_swiglu_instructions);
+  dev_free<int32_t>(interp_swiglu_counters);
   dev_free<__nv_bfloat16>(logits);
   dev_free<uint32_t>(sampled);
   dev_free<uint32_t>(sampled_mirror);
@@ -946,6 +1387,14 @@ int main() {
   dev_free<uint8_t>(gemm_scale);
   dev_free<__nv_bfloat16>(gemm_out);
   dev_free<uint8_t>(gemm_workspace);
+  dev_free<uint8_t>(interp_gemv_a_fp4);
+  dev_free<uint8_t>(interp_gemv_a_scale);
+  dev_free<uint8_t>(interp_gemv_b_fp4);
+  dev_free<uint8_t>(interp_gemv_b_scale);
+  dev_free<__nv_bfloat16>(interp_gemv_out_ref);
+  dev_free<__nv_bfloat16>(interp_gemv_out);
+  dev_free<qwen36_interpreter_instruction_t>(interp_gemv_instructions);
+  dev_free<int32_t>(interp_gemv_counters);
   dev_free<__nv_bfloat16>(conv_input);
   dev_free<__nv_bfloat16>(conv_history);
   dev_free<__nv_bfloat16>(conv_weight);
@@ -2536,6 +2985,119 @@ int main() {
     dev_free<uint8_t>(buf_a);
     dev_free<uint8_t>(buf_b);
     dev_free<uint8_t>(buf_c);
+  }
+
+  // ------------------------------------------------------------------
+  // DFlash drafter attention (Phase C v1) smoke
+  // ------------------------------------------------------------------
+  // Tiny shapes vs a CPU reference. Goal: catch obvious bugs in the
+  // online-softmax accumulation, the GQA broadcast, and the SWA mask.
+  // The kernel currently only specialises head_dim=128 so we have to
+  // exercise it at that head_dim — q_len/kv_seq_len/heads stay small to
+  // keep the host reference cheap (one or two ms).
+  {
+    const int q_len = 2;
+    const int kv_seq_len = 5;
+    const int q_heads = 4;
+    const int kv_heads = 2;
+    const int head_dim = 128;
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+    std::mt19937 rng(424242);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+
+    std::vector<float> q_host(q_len * q_heads * head_dim);
+    std::vector<float> k_host(kv_seq_len * kv_heads * head_dim);
+    std::vector<float> v_host(kv_seq_len * kv_heads * head_dim);
+    for (auto &x : q_host) x = dist(rng);
+    for (auto &x : k_host) x = dist(rng);
+    for (auto &x : v_host) x = dist(rng);
+
+    // Host reference: full attention, online softmax in fp32, BF16
+    // round-trip on Q/K/V to match what the kernel sees.
+    auto bf16_round = [](float x) {
+      return __bfloat162float(__float2bfloat16(x));
+    };
+    std::vector<float> ref(q_len * q_heads * head_dim, 0.0f);
+    for (int qp = 0; qp < q_len; ++qp) {
+      for (int qh = 0; qh < q_heads; ++qh) {
+        const int kvh = (qh * kv_heads) / q_heads;
+        std::vector<float> scores(kv_seq_len, 0.0f);
+        for (int j = 0; j < kv_seq_len; ++j) {
+          float dot = 0.0f;
+          for (int d = 0; d < head_dim; ++d) {
+            float q = bf16_round(q_host[(qp * q_heads + qh) * head_dim + d]);
+            float k = bf16_round(k_host[(j * kv_heads + kvh) * head_dim + d]);
+            dot += q * k;
+          }
+          scores[j] = dot * scale;
+        }
+        float m = -INFINITY;
+        for (float s : scores) m = fmaxf(m, s);
+        float sum = 0.0f;
+        for (float &s : scores) {
+          s = expf(s - m);
+          sum += s;
+        }
+        for (int d = 0; d < head_dim; ++d) {
+          float acc = 0.0f;
+          for (int j = 0; j < kv_seq_len; ++j) {
+            float v = bf16_round(v_host[(j * kv_heads + kvh) * head_dim + d]);
+            acc += scores[j] * v;
+          }
+          ref[(qp * q_heads + qh) * head_dim + d] = acc / sum;
+        }
+      }
+    }
+
+    qwen36_device_ptr_t q_dev = dev_alloc<__nv_bfloat16>(q_host.size());
+    qwen36_device_ptr_t k_dev = dev_alloc<__nv_bfloat16>(k_host.size());
+    qwen36_device_ptr_t v_dev = dev_alloc<__nv_bfloat16>(v_host.size());
+    qwen36_device_ptr_t out_dev = dev_alloc<__nv_bfloat16>(ref.size());
+    copy_bf16(q_dev, q_host);
+    copy_bf16(k_dev, k_host);
+    copy_bf16(v_dev, v_host);
+
+    qwen36_drafter_attention_block_spec_t spec{};
+    spec.q_bf16 = q_dev;
+    spec.k_bf16 = k_dev;
+    spec.v_bf16 = v_dev;
+    spec.output_bf16 = out_dev;
+    spec.q_len = q_len;
+    spec.kv_seq_len = kv_seq_len;
+    spec.q_heads = q_heads;
+    spec.kv_heads = kv_heads;
+    spec.head_dim = head_dim;
+    spec.sliding_window = 0;
+
+    must_status(qwen36_drafter_attention_block_bf16(&spec),
+                "drafter_attention_block_bf16 full");
+
+    std::vector<float> got = read_bf16(out_dev, ref.size());
+    double num = 0.0, denom_a = 0.0, denom_b = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+      num += static_cast<double>(got[i]) * static_cast<double>(ref[i]);
+      denom_a += static_cast<double>(got[i]) * static_cast<double>(got[i]);
+      denom_b += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+    }
+    double cos = num / sqrt(denom_a * denom_b);
+    if (cos < 0.998) {
+      fprintf(stderr, "drafter attention full cos sim %.6f < 0.998\n", cos);
+      exit(1);
+    }
+    printf("drafter attention full cos sim %.6f\n", cos);
+
+    // NOT_IMPLEMENTED smoke: head_dim != 128 should soft-fall back.
+    qwen36_drafter_attention_block_spec_t bad = spec;
+    bad.head_dim = 64;
+    expect_status(qwen36_drafter_attention_block_bf16(&bad),
+                  QWEN36_STATUS_NOT_IMPLEMENTED,
+                  "drafter_attention_block_bf16 head_dim=64");
+
+    dev_free<__nv_bfloat16>(q_dev);
+    dev_free<__nv_bfloat16>(k_dev);
+    dev_free<__nv_bfloat16>(v_dev);
+    dev_free<__nv_bfloat16>(out_dev);
   }
 
   printf("qwen36 CUDA smoke test passed\n");

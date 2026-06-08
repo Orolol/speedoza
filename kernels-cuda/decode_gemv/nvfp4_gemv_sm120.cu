@@ -167,30 +167,11 @@ extern "C" int qwen36_decode_nvfp4_gemv(
   const dim3 grid(static_cast<unsigned>(gemv_div_ceil(M, kRowsPerBlock)), 1, 1);
   cudaStream_t stream = qwen36_internal_active_stream();
 
-  // Smem footprint (parameterized on chosen_warps):
-  //   - K/2 bytes activation column (B operand, CTA-shared).
-  //   - chosen_warps * 2 * 512 bytes per-warp double-buffered A tile.
-  //   - 2 * 16 * chosen_warps * 4 bytes cross-warp reduction scratch.
-  //   - (SF SMEM staging only) 16 * (K/16) bytes SFA + (K/16) bytes SFB.
-  // E.g. K=5120, chosen_warps=16, SF staging on:
-  //        2560 + 16384 + 2048 + 5120 + 320 = 26432 B (~26 KiB).
-  //      K=34816, chosen_warps=16, SF staging on:
-  //       17408 + 16384 + 2048 + 34816 + 2176 = 72832 B (~71 KiB).
-  // Both under the 100 KiB sm_120 dynamic per-block max.
-  const size_t a_tile_bytes = static_cast<size_t>(chosen_warps) * 2u *
-                              static_cast<size_t>(kATilePerWarpBytes);
-  const size_t reduction_bytes =
-      2u * static_cast<size_t>(kRowsPerBlock) *
-      static_cast<size_t>(chosen_warps) * sizeof(float);
-#if QWEN36_DECODE_GEMV_SF_SMEM
-  const size_t sf_scale_cols = K / 16;
-  const size_t sf_staging_bytes =
-      static_cast<size_t>(kRowsPerBlock) * sf_scale_cols + sf_scale_cols;
-#else
-  const size_t sf_staging_bytes = 0;
-#endif
+  // Smem footprint lives in the shared body helper so standalone and
+  // interpreter call sites stay ABI-equivalent.
   const size_t smem_bytes =
-      K / 2 + a_tile_bytes + reduction_bytes + sf_staging_bytes;
+      chosen_warps == 16 ? qwen36_gemv::nvfp4_gemv_mma_smem_bytes<16>(K)
+                         : qwen36_gemv::nvfp4_gemv_mma_smem_bytes<8>(K);
 
   if (chosen_warps == 16) {
     const dim3 block(16u * 32u, 1, 1);

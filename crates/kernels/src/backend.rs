@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::attention::{AttentionDecodeSpec, AttentionPrefillSpec};
 use crate::deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec};
+use crate::drafter_attention::DrafterAttentionBlockSpec;
+use crate::interpreter::InterpreterProgramSpec;
 use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
     Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, Conv1dUpdateSpec,
@@ -191,6 +193,21 @@ pub trait KernelBackend: Send + Sync {
         Err(CoreError::UnsupportedNoCuda(
             "megakernel_full_attn_stage_f4_mlp_block",
         ))
+    }
+
+    /// Stage-0 decode interpreter shell. This is intentionally opt-in/API
+    /// level until real opcode bodies are ported into the interpreter.
+    fn interpreter_decode_sm120(&self, _spec: &InterpreterProgramSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("interpreter_decode_sm120"))
+    }
+
+    /// DFlash drafter attention (Phase C v1): non-causal BF16 attention
+    /// with caller-managed KV cache (K = [k_ctx; k_noise], V same).
+    fn drafter_attention_block_bf16(
+        &self,
+        _spec: &DrafterAttentionBlockSpec,
+    ) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("drafter_attention_block_bf16"))
     }
 }
 
@@ -526,6 +543,23 @@ impl KernelBackend for CudaBackend {
             )
         })
     }
+
+    fn interpreter_decode_sm120(&self, spec: &InterpreterProgramSpec) -> Result<()> {
+        let ffi_spec = ffi::InterpreterProgramSpec::from(spec);
+        check("qwen36_interpreter_decode_sm120", unsafe {
+            ffi::qwen36_interpreter_decode_sm120(&ffi_spec)
+        })
+    }
+
+    fn drafter_attention_block_bf16(
+        &self,
+        spec: &DrafterAttentionBlockSpec,
+    ) -> Result<()> {
+        let ffi_spec = ffi::DrafterAttentionBlockSpec::from(spec);
+        check("qwen36_drafter_attention_block_bf16", unsafe {
+            ffi::qwen36_drafter_attention_block_bf16(&ffi_spec)
+        })
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -551,11 +585,7 @@ pub(crate) fn check(kernel: &'static str, code: i32) -> Result<()> {
 /// it directly. Used by the megakernel integration path so the barrier
 /// reset survives CUDA-graph capture.
 #[cfg(feature = "cuda")]
-pub(crate) unsafe fn qwen36_cuda_memset_async_raw(
-    dst: DevicePtr,
-    value: i32,
-    bytes: usize,
-) -> i32 {
+pub(crate) unsafe fn qwen36_cuda_memset_async_raw(dst: DevicePtr, value: i32, bytes: usize) -> i32 {
     unsafe { ffi::qwen36_cuda_memset_async(dst, value, bytes) }
 }
 
@@ -1547,6 +1577,62 @@ mod ffi {
         }
     }
 
+    #[repr(C)]
+    pub struct InterpreterProgramSpec {
+        pub instructions: DevicePtr,
+        pub instruction_count: usize,
+        pub counters_i32: DevicePtr,
+        pub counter_count: usize,
+        pub cta_count: u32,
+        pub flags: u32,
+    }
+
+    impl From<&crate::interpreter::InterpreterProgramSpec> for InterpreterProgramSpec {
+        fn from(value: &crate::interpreter::InterpreterProgramSpec) -> Self {
+            Self {
+                instructions: value.instructions,
+                instruction_count: value.instruction_count,
+                counters_i32: value.counters_i32,
+                counter_count: value.counter_count,
+                cta_count: value.cta_count,
+                flags: value.flags,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct DrafterAttentionBlockSpec {
+        pub q_bf16: DevicePtr,
+        pub k_bf16: DevicePtr,
+        pub v_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+        pub q_len: usize,
+        pub kv_seq_len: usize,
+        pub q_heads: usize,
+        pub kv_heads: usize,
+        pub head_dim: usize,
+        pub sliding_window: usize,
+    }
+
+    impl From<&crate::drafter_attention::DrafterAttentionBlockSpec>
+        for DrafterAttentionBlockSpec
+    {
+        fn from(value: &crate::drafter_attention::DrafterAttentionBlockSpec) -> Self {
+            Self {
+                q_bf16: value.q_bf16,
+                k_bf16: value.k_bf16,
+                v_bf16: value.v_bf16,
+                output_bf16: value.output_bf16,
+                q_len: value.q_len,
+                kv_seq_len: value.kv_seq_len,
+                q_heads: value.q_heads,
+                kv_heads: value.kv_heads,
+                head_dim: value.head_dim,
+                sliding_window: value.sliding_window,
+            }
+        }
+    }
+
     #[link(name = "qwen36_fp4_kernels")]
     unsafe extern "C" {
         pub fn qwen36_nvfp4_gemm(spec: *const Nvfp4GemmSpec) -> i32;
@@ -1582,6 +1668,10 @@ mod ffi {
         pub fn qwen36_q_proj_deinterleave(spec: *const QProjDeinterleaveSpec) -> i32;
         pub fn qwen36_q_proj_sigmoid_gate(spec: *const QProjSigmoidGateSpec) -> i32;
         pub fn qwen36_copy_strided_rows(spec: *const CopyStridedRowsSpec) -> i32;
+        pub fn qwen36_interpreter_decode_sm120(spec: *const InterpreterProgramSpec) -> i32;
+        pub fn qwen36_drafter_attention_block_bf16(
+            spec: *const DrafterAttentionBlockSpec,
+        ) -> i32;
 
         // Per-block megakernel Stage B.3: RMSNorm + NVFP4 quantize + Q proj
         // GEMV fused into one launch. C ABI declared in

@@ -485,6 +485,40 @@ typedef struct {
   qwen36_device_ptr_t output_bf16;
 } qwen36_copy_strided_rows_spec_t;
 
+#define QWEN36_INTERPRETER_MAX_DEPS 4
+#define QWEN36_INTERPRETER_PAYLOAD_U64S 12
+
+typedef struct {
+  uint32_t counter_id;
+  uint32_t target;
+} qwen36_interpreter_dep_t;
+
+typedef struct {
+  uint16_t opcode;
+  uint16_t flags;
+  uint16_t dep_count;
+  uint16_t reserved;
+  uint32_t publishes_counter;
+  uint32_t publish_value;
+  // Per-instruction arrival slot. Every CTA increments this after executing
+  // the opcode body; only the last CTA publishes `publishes_counter`.
+  uint32_t arrival_counter;
+  qwen36_interpreter_dep_t deps[QWEN36_INTERPRETER_MAX_DEPS];
+  // Opaque per-opcode payload. Stage 0 only dispatches fallback/no-op
+  // instructions; future inline opcode bodies reinterpret these slots.
+  uint64_t payload[QWEN36_INTERPRETER_PAYLOAD_U64S];
+} qwen36_interpreter_instruction_t;
+
+typedef struct {
+  qwen36_device_ptr_t instructions;
+  size_t instruction_count;
+  qwen36_device_ptr_t counters_i32;
+  size_t counter_count;
+  // 0 means derive from cudaOccupancyMaxActiveBlocksPerMultiprocessor.
+  uint32_t cta_count;
+  uint32_t flags;
+} qwen36_interpreter_program_t;
+
 int qwen36_cuda_malloc(qwen36_device_allocation_t *out, size_t bytes);
 int qwen36_cuda_free(qwen36_device_ptr_t ptr);
 int qwen36_cuda_memcpy_h2d(qwen36_device_ptr_t dst, const void *src,
@@ -678,6 +712,12 @@ int qwen36_full_attn_block_stage_f4_mlp_block(
 
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 
+// Stage-0 interpreter shell for decode. It executes a static instruction
+// stream, waits/publishes GMEM counters, initialises the SMEM page allocator,
+// and routes known non-EXIT opcodes through a device-side fallback no-op.
+// Real opcode bodies are added behind the same ABI in later stages.
+int qwen36_interpreter_decode_sm120(const qwen36_interpreter_program_t *program);
+
 // Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot
 // decode shapes (M » N=1, K=hidden) on Blackwell SM120. Uses the same
 // Nvfp4GemmSpec contract as `qwen36_nvfp4_gemm` so callers can A/B route
@@ -700,6 +740,31 @@ int qwen36_attention_sage_prefill(const qwen36_attention_prefill_spec_t *spec);
 int qwen36_deltanet_decode(const qwen36_deltanet_decode_spec_t *spec);
 int qwen36_deltanet_prefill(const qwen36_deltanet_prefill_spec_t *spec);
 int qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec);
+
+// DFlash drafter attention (Phase C v1): non-causal BF16 attention with
+// GQA. Caller pre-concatenates K = [k_ctx; k_noise] and V = [v_ctx;
+// v_noise] as a single contiguous buffer of length `kv_seq_len`. No KV
+// cache management inside the kernel; the controller manages append/crop
+// at the Rust layer. `sliding_window = 0` selects full attention; non-
+// zero applies a symmetric SWA mask centred on the query's absolute
+// position (key absolute position is `j`, query absolute position is
+// `kv_seq_len - q_len + q_pos`).
+typedef struct {
+  qwen36_device_ptr_t q_bf16;        // [q_len, q_heads, head_dim]
+  qwen36_device_ptr_t k_bf16;        // [kv_seq_len, kv_heads, head_dim]
+  qwen36_device_ptr_t v_bf16;        // [kv_seq_len, kv_heads, head_dim]
+  qwen36_device_ptr_t output_bf16;   // [q_len, q_heads, head_dim]
+  size_t q_len;
+  size_t kv_seq_len;
+  size_t q_heads;
+  size_t kv_heads;
+  size_t head_dim;
+  size_t sliding_window;             // 0 = full attention
+} qwen36_drafter_attention_block_spec_t;
+
+int qwen36_drafter_attention_block_bf16(
+    const qwen36_drafter_attention_block_spec_t *spec);
+
 int qwen36_turboquant_encode_kv(const qwen36_turboquant_encode_spec_t *spec);
 int qwen36_turboquant_attention(const qwen36_turboquant_attention_spec_t *spec);
 int qwen36_rmsnorm(const qwen36_rmsnorm_spec_t *spec);

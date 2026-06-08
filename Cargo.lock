@@ -651,6 +651,7 @@ dependencies = [
  "anyhow",
  "memmap2",
  "qwen36-fp4-core",
+ "qwen36-fp4-kernels",
  "qwen36-fp4-loader",
  "safetensors",
  "serde",

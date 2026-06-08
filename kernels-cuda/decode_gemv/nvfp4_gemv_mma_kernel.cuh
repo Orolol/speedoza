@@ -36,13 +36,29 @@
 namespace qwen36_gemv {
 
 template <int kWarpsPerBlockTpl>
-__device__ inline void
-nvfp4_gemv_mma_body(unsigned m_tile_idx,
-                    const uint8_t *__restrict__ a_fp4,
-                    const uint8_t *__restrict__ a_scale,
-                    const uint8_t *__restrict__ b_fp4,
-                    const uint8_t *__restrict__ b_scale, float alpha,
-                    __nv_bfloat16 *__restrict__ output, size_t M, size_t K) {
+__host__ __device__ inline size_t nvfp4_gemv_mma_smem_bytes(size_t K) {
+  constexpr int kWarpsPerBlock = kWarpsPerBlockTpl;
+  const size_t a_tile_bytes = static_cast<size_t>(kWarpsPerBlock) * 2u *
+                              static_cast<size_t>(kATilePerWarpBytes);
+  const size_t reduction_bytes =
+      2u * static_cast<size_t>(kRowsPerBlock) *
+      static_cast<size_t>(kWarpsPerBlock) * sizeof(float);
+#if QWEN36_DECODE_GEMV_SF_SMEM
+  const size_t sf_scale_cols = K / 16;
+  const size_t sf_staging_bytes =
+      static_cast<size_t>(kRowsPerBlock) * sf_scale_cols + sf_scale_cols;
+#else
+  const size_t sf_staging_bytes = 0;
+#endif
+  return K / 2 + a_tile_bytes + reduction_bytes + sf_staging_bytes;
+}
+
+template <int kWarpsPerBlockTpl>
+__device__ inline void nvfp4_gemv_mma_body_with_smem(
+    unsigned m_tile_idx, const uint8_t *__restrict__ a_fp4,
+    const uint8_t *__restrict__ a_scale, const uint8_t *__restrict__ b_fp4,
+    const uint8_t *__restrict__ b_scale, float alpha,
+    __nv_bfloat16 *__restrict__ output, size_t M, size_t K, uint8_t *smem) {
   constexpr int kWarpsPerBlock = kWarpsPerBlockTpl;
   constexpr int kThreadsPerBlock = kWarpsPerBlock * 32;
   constexpr int kKShardChunkAlign = kWarpsPerBlock * kKPerMma;
@@ -61,7 +77,6 @@ nvfp4_gemv_mma_body(unsigned m_tile_idx,
   constexpr unsigned kReductionBytes =
       2u * static_cast<unsigned>(kRowsPerBlock) *
       static_cast<unsigned>(kWarpsPerBlock) * sizeof(float);
-  extern __shared__ uint8_t smem[];
   uint8_t *smem_b_fp4 = smem;
   uint8_t *smem_a_base = smem + K / 2;
   uint8_t *const smem_a_buf_w0 =
@@ -254,6 +269,19 @@ nvfp4_gemv_mma_body(unsigned m_tile_idx,
       output[row_hi] = __float2bfloat16(sum_hi * alpha);
     }
   }
+}
+
+template <int kWarpsPerBlockTpl>
+__device__ inline void
+nvfp4_gemv_mma_body(unsigned m_tile_idx,
+                    const uint8_t *__restrict__ a_fp4,
+                    const uint8_t *__restrict__ a_scale,
+                    const uint8_t *__restrict__ b_fp4,
+                    const uint8_t *__restrict__ b_scale, float alpha,
+                    __nv_bfloat16 *__restrict__ output, size_t M, size_t K) {
+  extern __shared__ uint8_t smem[];
+  nvfp4_gemv_mma_body_with_smem<kWarpsPerBlockTpl>(
+      m_tile_idx, a_fp4, a_scale, b_fp4, b_scale, alpha, output, M, K, smem);
 }
 
 } // namespace qwen36_gemv
