@@ -17,6 +17,7 @@ cuda = ["qwen36-fp4-runtime/cuda"]
 anyhow.workspace = true
 clap.workspace = true
 qwen36-fp4-core = { path = "../core" }
+qwen36-fp4-drafter = { path = "../drafter" }
 qwen36-fp4-loader = { path = "../loader" }
 qwen36-fp4-runtime = { path = "../runtime" }
 qwen36-fp4-tokenizer = { path = "../tokenizer" }

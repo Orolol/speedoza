@@ -9,6 +9,7 @@ use anyhow::Result;
 use anyhow::bail;
 use clap::{Parser, Subcommand, ValueEnum};
 use qwen36_fp4_core::{KvCacheDtype, MemoryBudget, ModelTopology, QWEN36_TEXT_NVFP4_MTP_MODEL_ID};
+use qwen36_fp4_drafter::DFlashDrafter;
 use qwen36_fp4_loader::{
     MappedModel, discover_model_layout_with_id, read_topology, write_model_layout_json,
 };
@@ -123,6 +124,13 @@ enum Command {
     ValidateWeights {
         #[arg(long)]
         model_dir: PathBuf,
+    },
+    /// Validate a z-lab DFlash drafter checkpoint (e.g.
+    /// `z-lab/Qwen3.6-27B-DFlash`) against the expected tensor manifest
+    /// derived from its `config.json`.
+    ValidateDrafter {
+        #[arg(long)]
+        drafter_dir: PathBuf,
     },
     GpuLoad {
         #[arg(long)]
@@ -260,6 +268,40 @@ fn main() -> Result<()> {
             let tokenizer = QwenTokenizer::from_model_dir(model_dir)?;
             let tokens = tokenizer.encode(&text, add_special_tokens)?;
             println!("{}", serde_json::to_string(&tokens)?);
+        }
+        Command::ValidateDrafter { drafter_dir } => {
+            let drafter = DFlashDrafter::open(&drafter_dir)?;
+            let config = &drafter.config;
+            let sliding_layers = config
+                .layer_types
+                .iter()
+                .filter(|kind| kind.as_str() == "sliding_attention")
+                .count();
+            let full_layers = config.layer_types.len() - sliding_layers;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "drafter_dir": drafter.drafter_dir.display().to_string(),
+                    "hidden_size": config.hidden_size,
+                    "intermediate_size": config.intermediate_size,
+                    "num_hidden_layers": config.num_hidden_layers,
+                    "sliding_attention_layers": sliding_layers,
+                    "full_attention_layers": full_layers,
+                    "sliding_window": config.sliding_window,
+                    "num_attention_heads": config.num_attention_heads,
+                    "num_key_value_heads": config.num_key_value_heads,
+                    "head_dim": config.head_dim,
+                    "vocab_size": config.vocab_size,
+                    "block_size": config.block_size,
+                    "mask_token_id": config.dflash_config.mask_token_id,
+                    "target_layer_ids": config.dflash_config.target_layer_ids,
+                    "target_hidden_indices": config.target_hidden_indices(),
+                    "num_target_layers": config.num_target_layers,
+                    "tensors_validated": drafter.manifest.tensor_count(),
+                    "fc_shape": drafter.manifest.fc.shape,
+                    "fc_in_features": config.fc_in_features(),
+                }))?,
+            );
         }
         Command::ValidateWeights { model_dir } => {
             let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;

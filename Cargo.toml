@@ -6,6 +6,7 @@ members = [
     "crates/kernels",
     "crates/runtime",
     "crates/mtp",
+    "crates/drafter",
     "crates/cli",
 ]
 resolver = "2"
