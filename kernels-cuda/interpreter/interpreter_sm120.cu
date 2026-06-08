@@ -1,5 +1,7 @@
 #include "instruction.h"
 #include "counters.cuh"
+#include "opcodes/attn_decode_full.cuh"
+#include "opcodes/deltanet_recur.cuh"
 #include "opcodes/fallback_trampoline.cuh"
 #include "opcodes/nvfp4_gemv.cuh"
 #include "opcodes/residual_add.cuh"
@@ -41,7 +43,10 @@ __device__ inline void
 dispatch_instruction(const qwen36_interpreter_instruction_t &insn,
                      qwen36_interpreter::PageAllocator &pages,
                      InterpreterState &state, float *scratch,
-                     float *swiglu_decoded_scale, float *swiglu_staged) {
+                     float *swiglu_decoded_scale, float *swiglu_staged,
+                     qwen36_interpreter::DeltaNetScratch &deltanet_scratch,
+                     qwen36_interpreter::AttentionDecodeScratch
+                         &attention_scratch) {
   if (!qwen36_interpreter_opcode_known(insn.opcode)) {
     if (threadIdx.x == 0) {
       atomicAdd(&state.error_count, 1u);
@@ -51,8 +56,6 @@ dispatch_instruction(const qwen36_interpreter_instruction_t &insn,
 
   switch (insn.opcode) {
   case QWEN36_INTERPRETER_OPCODE_FALLBACK_TRAMPOLINE:
-  case QWEN36_INTERPRETER_OPCODE_ATTN_DECODE_FULL:
-  case QWEN36_INTERPRETER_OPCODE_DELTANET_RECUR:
   case QWEN36_INTERPRETER_OPCODE_LM_HEAD_TILED:
     qwen36_interpreter::exec_fallback_trampoline(insn, pages);
     break;
@@ -68,6 +71,12 @@ dispatch_instruction(const qwen36_interpreter_instruction_t &insn,
     break;
   case QWEN36_INTERPRETER_OPCODE_ROPE_PARTIAL:
     qwen36_interpreter::exec_rope_partial(insn, pages);
+    break;
+  case QWEN36_INTERPRETER_OPCODE_DELTANET_RECUR:
+    qwen36_interpreter::exec_deltanet_recur(insn, pages, deltanet_scratch);
+    break;
+  case QWEN36_INTERPRETER_OPCODE_ATTN_DECODE_FULL:
+    qwen36_interpreter::exec_attn_decode_full(insn, pages, attention_scratch);
     break;
   case QWEN36_INTERPRETER_OPCODE_RESIDUAL_ADD:
     qwen36_interpreter::exec_residual_add(insn, pages);
@@ -88,6 +97,8 @@ __global__ void __launch_bounds__(QWEN36_INTERPRETER_THREADS)
   __shared__ float scratch[QWEN36_INTERPRETER_THREADS];
   __shared__ float swiglu_decoded_scale;
   __shared__ float swiglu_staged[16];
+  __shared__ qwen36_interpreter::DeltaNetScratch deltanet_scratch;
+  __shared__ qwen36_interpreter::AttentionDecodeScratch attention_scratch;
 
   if (threadIdx.x == 0) {
     state.pc = 0;
@@ -120,7 +131,7 @@ __global__ void __launch_bounds__(QWEN36_INTERPRETER_THREADS)
     }
 
     dispatch_instruction(insn, pages, state, scratch, &swiglu_decoded_scale,
-                         swiglu_staged);
+                         swiglu_staged, deltanet_scratch, attention_scratch);
     __syncthreads();
 
     if (threadIdx.x == 0) {

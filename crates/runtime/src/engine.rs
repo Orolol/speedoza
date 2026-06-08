@@ -20,9 +20,9 @@ use qwen36_fp4_loader::MappedModel;
 use crate::cuda_graph::CudaGraphPlan;
 #[cfg(feature = "cuda")]
 use crate::gpu::{
-    ATTN_MIN_SPLIT_TIMESTEPS_PER_BLOCK, GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers,
-    GpuWeightStore, LinearAttnInProjFused, LinearAttnInProjFusedStore,
-    MEGAKERNEL_BARRIER_STAGE_B_Q_PROJ_BYTES, MlpFusedLayer, MlpFusedStore, MtpKvSnapshotLayout,
+    GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers, GpuWeightStore, LinearAttnInProjFused,
+    LinearAttnInProjFusedStore, MlpFusedLayer, MlpFusedStore, MtpKvSnapshotLayout,
+    ATTN_MIN_SPLIT_TIMESTEPS_PER_BLOCK, MEGAKERNEL_BARRIER_STAGE_B_Q_PROJ_BYTES,
 };
 use crate::kv_cache::KvCachePlan;
 use crate::state::{DeltaNetStatePlan, RuntimeState};
@@ -93,10 +93,7 @@ fn megakernel_full_attn_stage_b_enabled() -> bool {
 /// gate keeps the path safe if someone configures a non-standard topology).
 #[cfg(feature = "cuda")]
 fn megakernel_full_attn_stage_b_supports(hidden_size: usize, q_features: usize) -> bool {
-    hidden_size > 0
-        && q_features > 0
-        && hidden_size & 511 == 0
-        && q_features & 15 == 0
+    hidden_size > 0 && q_features > 0 && hidden_size & 511 == 0 && q_features & 15 == 0
 }
 
 /// Gate for the per-block megakernel Stage F.4 (full MLP block) in the
@@ -120,10 +117,7 @@ fn megakernel_full_attn_stage_f4_enabled() -> bool {
 /// (hidden=5120, intermediate=17408 — divisible by 512).
 #[cfg(feature = "cuda")]
 fn megakernel_full_attn_stage_f4_supports(hidden_size: usize, intermediate: usize) -> bool {
-    hidden_size > 0
-        && intermediate > 0
-        && hidden_size & 511 == 0
-        && intermediate & 511 == 0
+    hidden_size > 0 && intermediate > 0 && hidden_size & 511 == 0 && intermediate & 511 == 0
 }
 
 #[cfg(feature = "cuda")]
@@ -2625,7 +2619,7 @@ impl<B: KernelBackend> Engine<B> {
         leaf_tokens: &[u32],
         next_draft_count: usize,
     ) -> Result<qwen36_fp4_mtp::TreeVerifyResult> {
-        use qwen36_fp4_mtp::{MTP_TREE_MAX_LEAVES, TreeDraft, walk_tree_acceptance};
+        use qwen36_fp4_mtp::{walk_tree_acceptance, TreeDraft, MTP_TREE_MAX_LEAVES};
 
         if leaf_tokens.is_empty() {
             return Err(CoreError::Runtime(
@@ -6457,7 +6451,11 @@ impl<B: KernelBackend> Engine<B> {
         let n_splits = context_limit
             .max(1)
             .div_ceil(self.attention_split_timesteps_per_block_for(context_limit));
-        if n_splits >= 2 { n_splits } else { 0 }
+        if n_splits >= 2 {
+            n_splits
+        } else {
+            0
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -6477,7 +6475,11 @@ impl<B: KernelBackend> Engine<B> {
             return value;
         }
         let n_splits = context.div_ceil(self.attention_split_timesteps_per_block_for(context));
-        if n_splits >= 2 { n_splits } else { 0 }
+        if n_splits >= 2 {
+            n_splits
+        } else {
+            0
+        }
     }
 
     #[cfg(feature = "cuda")]

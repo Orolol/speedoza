@@ -26,6 +26,10 @@ pub struct DevicePtr(pub u64);
 impl DevicePtr {
     pub const NULL: Self = Self(0);
 
+    pub const fn null() -> Self {
+        Self::NULL
+    }
+
     pub fn offset_bytes(self, bytes: usize) -> Option<Self> {
         self.0.checked_add(bytes as u64).map(Self)
     }
@@ -203,10 +207,7 @@ pub trait KernelBackend: Send + Sync {
 
     /// DFlash drafter attention (Phase C v1): non-causal BF16 attention
     /// with caller-managed KV cache (K = [k_ctx; k_noise], V same).
-    fn drafter_attention_block_bf16(
-        &self,
-        _spec: &DrafterAttentionBlockSpec,
-    ) -> Result<()> {
+    fn drafter_attention_block_bf16(&self, _spec: &DrafterAttentionBlockSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("drafter_attention_block_bf16"))
     }
 }
@@ -551,10 +552,7 @@ impl KernelBackend for CudaBackend {
         })
     }
 
-    fn drafter_attention_block_bf16(
-        &self,
-        spec: &DrafterAttentionBlockSpec,
-    ) -> Result<()> {
+    fn drafter_attention_block_bf16(&self, spec: &DrafterAttentionBlockSpec) -> Result<()> {
         let ffi_spec = ffi::DrafterAttentionBlockSpec::from(spec);
         check("qwen36_drafter_attention_block_bf16", unsafe {
             ffi::qwen36_drafter_attention_block_bf16(&ffi_spec)
@@ -1614,9 +1612,7 @@ mod ffi {
         pub sliding_window: usize,
     }
 
-    impl From<&crate::drafter_attention::DrafterAttentionBlockSpec>
-        for DrafterAttentionBlockSpec
-    {
+    impl From<&crate::drafter_attention::DrafterAttentionBlockSpec> for DrafterAttentionBlockSpec {
         fn from(value: &crate::drafter_attention::DrafterAttentionBlockSpec) -> Self {
             Self {
                 q_bf16: value.q_bf16,
@@ -1669,9 +1665,7 @@ mod ffi {
         pub fn qwen36_q_proj_sigmoid_gate(spec: *const QProjSigmoidGateSpec) -> i32;
         pub fn qwen36_copy_strided_rows(spec: *const CopyStridedRowsSpec) -> i32;
         pub fn qwen36_interpreter_decode_sm120(spec: *const InterpreterProgramSpec) -> i32;
-        pub fn qwen36_drafter_attention_block_bf16(
-            spec: *const DrafterAttentionBlockSpec,
-        ) -> i32;
+        pub fn qwen36_drafter_attention_block_bf16(spec: *const DrafterAttentionBlockSpec) -> i32;
 
         // Per-block megakernel Stage B.3: RMSNorm + NVFP4 quantize + Q proj
         // GEMV fused into one launch. C ABI declared in

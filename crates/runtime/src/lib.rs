@@ -23,7 +23,8 @@ pub use kv_cache::{KvCacheLayout, KvCachePlan};
 #[cfg(feature = "cuda")]
 pub use qwen36_fp4_kernels::{
     cuda_counters_read, cuda_counters_reset, cuda_diagnostics, cuda_synchronize, CudaBackend,
-    CudaCounters, CudaDiagnostics,
+    CudaCounters, CudaDeviceBuffer, CudaDiagnostics,
 };
+pub use qwen36_fp4_kernels::{DevicePtr, KernelBackend};
 pub use state::{DeltaNetStatePlan, RuntimeState};
 pub use weights::{LayerWeights, LinearWeightBinding, ModelWeightsManifest};

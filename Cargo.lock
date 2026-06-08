@@ -629,6 +629,7 @@ dependencies = [
  "clap",
  "qwen36-fp4-core",
  "qwen36-fp4-drafter",
+ "qwen36-fp4-kernels",
  "qwen36-fp4-loader",
  "qwen36-fp4-runtime",
  "qwen36-fp4-tokenizer",

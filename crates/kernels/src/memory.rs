@@ -54,6 +54,13 @@ pub struct CudaCounters {
 
 #[cfg(feature = "cuda")]
 impl CudaDeviceBuffer {
+    /// Wrap an existing device allocation without taking ownership of its
+    /// lifetime. Callers must `mem::forget` the returned value after using it
+    /// as a temporary view, otherwise `Drop` will free the raw pointer.
+    pub unsafe fn from_raw_ptr(ptr: DevicePtr, bytes: usize) -> Self {
+        Self { ptr, bytes }
+    }
+
     pub fn alloc(bytes: usize) -> Result<Self> {
         if bytes == 0 {
             return Err(CoreError::Runtime(
@@ -242,11 +249,7 @@ impl CudaDeviceBuffer {
     /// without breaking decode-time graph capture.
     pub fn memset_async(&self, value: u8) -> Result<()> {
         check("qwen36_cuda_memset_async", unsafe {
-            crate::backend::qwen36_cuda_memset_async_raw(
-                self.ptr,
-                i32::from(value),
-                self.bytes,
-            )
+            crate::backend::qwen36_cuda_memset_async_raw(self.ptr, i32::from(value), self.bytes)
         })
     }
 }

@@ -216,6 +216,91 @@ int main() {
   attention_spec.shape = attn;
   must_status(qwen36_attention_decode(&attention_spec), "attention");
 
+  qwen36_device_ptr_t interp_attn_cache_k_ref =
+      dev_alloc<__nv_bfloat16>(kv_values * 2);
+  qwen36_device_ptr_t interp_attn_cache_v_ref =
+      dev_alloc<__nv_bfloat16>(kv_values * 2);
+  qwen36_device_ptr_t interp_attn_out_ref =
+      dev_alloc<__nv_bfloat16>(q_values);
+  qwen36_device_ptr_t interp_attn_cache_k =
+      dev_alloc<__nv_bfloat16>(kv_values * 2);
+  qwen36_device_ptr_t interp_attn_cache_v =
+      dev_alloc<__nv_bfloat16>(kv_values * 2);
+  qwen36_device_ptr_t interp_attn_out = dev_alloc<__nv_bfloat16>(q_values);
+  qwen36_device_ptr_t interp_attn_spec_device =
+      dev_alloc<qwen36_attention_decode_spec_t>(1);
+  qwen36_device_ptr_t interp_attn_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(2);
+  qwen36_device_ptr_t interp_attn_counters = dev_alloc<int32_t>(2);
+  copy_bf16(interp_attn_cache_k_ref,
+            std::vector<float>(kv_values * 2, 0.25f));
+  copy_bf16(interp_attn_cache_v_ref,
+            std::vector<float>(kv_values * 2, 0.75f));
+  copy_bf16(interp_attn_cache_k, std::vector<float>(kv_values * 2, 0.25f));
+  copy_bf16(interp_attn_cache_v, std::vector<float>(kv_values * 2, 0.75f));
+  qwen36_attention_decode_spec_t interp_attn_spec_host{};
+  interp_attn_spec_host.position = 1;
+  interp_attn_spec_host.q_bf16 = q;
+  interp_attn_spec_host.k_bf16 = k;
+  interp_attn_spec_host.v_bf16 = v;
+  interp_attn_spec_host.kv_cache_k = interp_attn_cache_k_ref;
+  interp_attn_spec_host.kv_cache_v = interp_attn_cache_v_ref;
+  interp_attn_spec_host.output_bf16 = interp_attn_out_ref;
+  interp_attn_spec_host.shape = attn;
+  must_status(qwen36_attention_decode(&interp_attn_spec_host),
+              "interpreter attention reference");
+  interp_attn_spec_host.kv_cache_k = interp_attn_cache_k;
+  interp_attn_spec_host.kv_cache_v = interp_attn_cache_v;
+  interp_attn_spec_host.output_bf16 = interp_attn_out;
+  copy_raw<qwen36_attention_decode_spec_t>(interp_attn_spec_device,
+                                           {interp_attn_spec_host});
+  qwen36_interpreter_instruction_t interp_attn_program_host[2]{};
+  interp_attn_program_host[0].opcode = 6; // ATTN_DECODE_FULL
+  interp_attn_program_host[0].publishes_counter = 0;
+  interp_attn_program_host[0].publish_value = 1;
+  interp_attn_program_host[0].arrival_counter = 1;
+  interp_attn_program_host[0].payload[0] = interp_attn_spec_device.ptr;
+  interp_attn_program_host[1].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_attn_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_attn_program_host, interp_attn_program_host + 2));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_attn_counters.ptr), 0,
+                 2 * sizeof(int32_t)),
+      "cudaMemset interp attn counters");
+  qwen36_interpreter_program_t interp_attn_program{};
+  interp_attn_program.instructions = interp_attn_instructions;
+  interp_attn_program.instruction_count = 2;
+  interp_attn_program.counters_i32 = interp_attn_counters;
+  interp_attn_program.counter_count = 2;
+  interp_attn_program.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_attn_program),
+              "interpreter attention decode");
+  std::vector<float> interp_attn_ref_values =
+      read_bf16(interp_attn_out_ref, q_values);
+  std::vector<float> interp_attn_values = read_bf16(interp_attn_out, q_values);
+  std::vector<float> interp_attn_cache_k_ref_values =
+      read_bf16(interp_attn_cache_k_ref, kv_values * 2);
+  std::vector<float> interp_attn_cache_v_ref_values =
+      read_bf16(interp_attn_cache_v_ref, kv_values * 2);
+  std::vector<float> interp_attn_cache_k_values =
+      read_bf16(interp_attn_cache_k, kv_values * 2);
+  std::vector<float> interp_attn_cache_v_values =
+      read_bf16(interp_attn_cache_v, kv_values * 2);
+  for (size_t i = 0; i < q_values; ++i) {
+    expect_close(interp_attn_values[i], interp_attn_ref_values[i], 0.0f,
+                 "interpreter attention output");
+  }
+  for (size_t i = 0; i < kv_values * 2; ++i) {
+    expect_close(interp_attn_cache_k_values[i],
+                 interp_attn_cache_k_ref_values[i], 0.0f,
+                 "interpreter attention cache k");
+    expect_close(interp_attn_cache_v_values[i],
+                 interp_attn_cache_v_ref_values[i], 0.0f,
+                 "interpreter attention cache v");
+  }
+
   constexpr size_t split_position = 513;
   constexpr size_t split_n_splits = 2;
   qwen36_device_ptr_t split_cache_k =
@@ -472,6 +557,66 @@ int main() {
                "deltanet exact[2]");
   expect_close(exact_delta_values[3], 1.0f * exact_scale, 0.02f,
                "deltanet exact[3]");
+
+  qwen36_device_ptr_t interp_delta_state = dev_alloc<__nv_bfloat16>(
+      delta_shape.v_heads * delta_shape.value_dim * delta_shape.key_dim);
+  qwen36_device_ptr_t interp_delta_out =
+      dev_alloc<__nv_bfloat16>(delta_shape.v_heads * delta_shape.value_dim);
+  qwen36_device_ptr_t interp_delta_spec_device =
+      dev_alloc<qwen36_deltanet_decode_spec_t>(1);
+  qwen36_device_ptr_t interp_delta_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(2);
+  qwen36_device_ptr_t interp_delta_counters = dev_alloc<int32_t>(2);
+  must_cuda<__nv_bfloat16>(
+      cudaMemset(reinterpret_cast<void *>(interp_delta_state.ptr), 0,
+                 delta_shape.v_heads * delta_shape.value_dim *
+                     delta_shape.key_dim * sizeof(__nv_bfloat16)),
+      "cudaMemset interpreter delta state");
+  qwen36_deltanet_decode_spec_t interp_delta_spec_host = exact_delta_spec;
+  interp_delta_spec_host.state_bf16 = interp_delta_state;
+  interp_delta_spec_host.output_bf16 = interp_delta_out;
+  copy_raw<qwen36_deltanet_decode_spec_t>(interp_delta_spec_device,
+                                          {interp_delta_spec_host});
+  qwen36_interpreter_instruction_t interp_delta_program_host[2]{};
+  interp_delta_program_host[0].opcode = 7; // DELTANET_RECUR
+  interp_delta_program_host[0].publishes_counter = 0;
+  interp_delta_program_host[0].publish_value = 1;
+  interp_delta_program_host[0].arrival_counter = 1;
+  interp_delta_program_host[0].payload[0] = interp_delta_spec_device.ptr;
+  interp_delta_program_host[1].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_delta_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_delta_program_host, interp_delta_program_host + 2));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_delta_counters.ptr), 0,
+                 2 * sizeof(int32_t)),
+      "cudaMemset interp deltanet counters");
+  qwen36_interpreter_program_t interp_delta_program{};
+  interp_delta_program.instructions = interp_delta_instructions;
+  interp_delta_program.instruction_count = 2;
+  interp_delta_program.counters_i32 = interp_delta_counters;
+  interp_delta_program.counter_count = 2;
+  interp_delta_program.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_delta_program),
+              "interpreter deltanet recur");
+  std::vector<float> interp_delta_values = read_bf16(interp_delta_out, 4);
+  std::vector<float> interp_delta_state_values =
+      read_bf16(interp_delta_state,
+                delta_shape.v_heads * delta_shape.value_dim *
+                    delta_shape.key_dim);
+  std::vector<float> exact_delta_state_values =
+      read_bf16(exact_state, delta_shape.v_heads * delta_shape.value_dim *
+                                 delta_shape.key_dim);
+  for (size_t i = 0; i < interp_delta_values.size(); ++i) {
+    expect_close(interp_delta_values[i], exact_delta_values[i], 0.0f,
+                 "interpreter deltanet output");
+  }
+  for (size_t i = 0; i < interp_delta_state_values.size(); ++i) {
+    expect_close(interp_delta_state_values[i], exact_delta_state_values[i], 0.0f,
+                 "interpreter deltanet state");
+  }
+
   qwen36_deltanet_decode_spec_t invalid_delta_spec = delta_spec;
   invalid_delta_spec.shape.key_dim = 257;
   expect_status(qwen36_deltanet_decode(&invalid_delta_spec),
@@ -1291,6 +1436,15 @@ int main() {
   dev_free<__nv_bfloat16>(cache_k);
   dev_free<__nv_bfloat16>(cache_v);
   dev_free<__nv_bfloat16>(out);
+  dev_free<__nv_bfloat16>(interp_attn_cache_k_ref);
+  dev_free<__nv_bfloat16>(interp_attn_cache_v_ref);
+  dev_free<__nv_bfloat16>(interp_attn_out_ref);
+  dev_free<__nv_bfloat16>(interp_attn_cache_k);
+  dev_free<__nv_bfloat16>(interp_attn_cache_v);
+  dev_free<__nv_bfloat16>(interp_attn_out);
+  dev_free<qwen36_attention_decode_spec_t>(interp_attn_spec_device);
+  dev_free<qwen36_interpreter_instruction_t>(interp_attn_instructions);
+  dev_free<int32_t>(interp_attn_counters);
   dev_free<__nv_bfloat16>(split_cache_k);
   dev_free<__nv_bfloat16>(split_cache_v);
   dev_free<__nv_bfloat16>(split_out);
@@ -1319,6 +1473,11 @@ int main() {
   dev_free<__nv_bfloat16>(exact_out);
   dev_free<float>(exact_gate);
   dev_free<float>(exact_beta);
+  dev_free<__nv_bfloat16>(interp_delta_state);
+  dev_free<__nv_bfloat16>(interp_delta_out);
+  dev_free<qwen36_deltanet_decode_spec_t>(interp_delta_spec_device);
+  dev_free<qwen36_interpreter_instruction_t>(interp_delta_instructions);
+  dev_free<int32_t>(interp_delta_counters);
   dev_free<__nv_bfloat16>(norm_in);
   dev_free<__nv_bfloat16>(norm_weight);
   dev_free<__nv_bfloat16>(norm_residual);

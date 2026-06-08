@@ -1,5 +1,6 @@
 #include "qwen36_fp4.h"
 #include "active_stream.h"
+#include "interpreter/opcodes/attn_decode_full.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -996,6 +997,17 @@ __global__ void attention_decode_kernel(
                         v_new[kvh * shape.head_dim + d]);
     }
   }
+}
+
+__global__ void attention_decode_bf16_shared_kernel(
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k_new,
+    const __nv_bfloat16 *v_new, __nv_bfloat16 *cache_k,
+    __nv_bfloat16 *cache_v, __nv_bfloat16 *output, size_t position_scalar,
+    const int32_t *position_device, qwen36_attention_shape_t shape) {
+  __shared__ qwen36_interpreter::AttentionDecodeScratch scratch;
+  qwen36_interpreter::attention_decode_bf16_body(
+      blockIdx.x, q, k_new, v_new, cache_k, cache_v, output, position_scalar,
+      position_device, shape, scratch);
 }
 
 // Shared-memory bounds for the GQA-aware prefill kernel below. The current
@@ -2729,15 +2741,28 @@ qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec) {
   } else if (threads > 256u) {
     threads = 256u;
   }
-  attention_decode_kernel<<<static_cast<unsigned int>(spec->shape.q_heads),
-                            threads, 0, qwen36_internal_active_stream()>>>(
-      ptr<const __nv_bfloat16>(spec->q_bf16),
-      ptr<const __nv_bfloat16>(spec->k_bf16),
-      ptr<const __nv_bfloat16>(spec->v_bf16),
-      ptr<void>(spec->kv_cache_k), ptr<void>(spec->kv_cache_v),
-      ptr<float>(spec->kv_cache_metadata),
-      spec->kv_cache_dtype, ptr<__nv_bfloat16>(spec->output_bf16), spec->position,
-      ptr<const int32_t>(spec->position_device_i32), spec->shape);
+  if (spec->kv_cache_dtype == kKvCacheBf16) {
+    attention_decode_bf16_shared_kernel<<<
+        static_cast<unsigned int>(spec->shape.q_heads), threads, 0,
+        qwen36_internal_active_stream()>>>(
+        ptr<const __nv_bfloat16>(spec->q_bf16),
+        ptr<const __nv_bfloat16>(spec->k_bf16),
+        ptr<const __nv_bfloat16>(spec->v_bf16),
+        ptr<__nv_bfloat16>(spec->kv_cache_k),
+        ptr<__nv_bfloat16>(spec->kv_cache_v),
+        ptr<__nv_bfloat16>(spec->output_bf16), spec->position,
+        ptr<const int32_t>(spec->position_device_i32), spec->shape);
+  } else {
+    attention_decode_kernel<<<static_cast<unsigned int>(spec->shape.q_heads),
+                              threads, 0, qwen36_internal_active_stream()>>>(
+        ptr<const __nv_bfloat16>(spec->q_bf16),
+        ptr<const __nv_bfloat16>(spec->k_bf16),
+        ptr<const __nv_bfloat16>(spec->v_bf16),
+        ptr<void>(spec->kv_cache_k), ptr<void>(spec->kv_cache_v),
+        ptr<float>(spec->kv_cache_metadata), spec->kv_cache_dtype,
+        ptr<__nv_bfloat16>(spec->output_bf16), spec->position,
+        ptr<const int32_t>(spec->position_device_i32), spec->shape);
+  }
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }

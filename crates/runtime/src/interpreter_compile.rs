@@ -1,20 +1,19 @@
 #[cfg(feature = "cuda")]
 use qwen36_fp4_core::Result;
 use qwen36_fp4_core::{LayerType, ModelTopology};
-use qwen36_fp4_kernels::{
-    interpreter_opcodes_enabled_from_env, InterpreterInstruction, InterpreterOpcode,
-    InterpreterProgram, InterpreterProgramSpec,
-};
 #[cfg(feature = "cuda")]
 use qwen36_fp4_kernels::{CudaDeviceBuffer, KernelBackend};
+use qwen36_fp4_kernels::{
+    InterpreterInstruction, InterpreterOpcode, InterpreterProgram, InterpreterProgramSpec,
+};
 
 /// Host-side compiler for the decode interpreter instruction stream.
 ///
-/// Stage 0 emits the same static shape as the planned megakernel, but opcodes
-/// not enabled by `QWEN36_INTERPRETER_OPCODES_ENABLED` are rewritten to
-/// `FALLBACK_TRAMPOLINE`. The CUDA interpreter currently routes all non-EXIT
-/// opcodes through that no-op fallback; later stages can port one opcode at a
-/// time without changing this program ABI.
+/// Stage 0 emits the same static shape as the planned megakernel and records
+/// the requested opcode in each payload. These topology-only instructions do
+/// not own real tensor/weight pointers, so they are always routed to
+/// `FALLBACK_TRAMPOLINE`; concrete per-op instructions are built with the
+/// typed constructors in `qwen36_fp4_kernels::interpreter`.
 #[derive(Debug, Clone)]
 pub struct DecodeInterpreterProgram {
     pub program: InterpreterProgram,
@@ -22,7 +21,6 @@ pub struct DecodeInterpreterProgram {
 
 impl DecodeInterpreterProgram {
     pub fn compile(topology: &ModelTopology) -> Self {
-        let enabled = interpreter_opcodes_enabled_from_env();
         let mut compiler = DecodeInterpreterCompiler {
             program: InterpreterProgram::new(),
             next_counter: 0,
@@ -30,38 +28,36 @@ impl DecodeInterpreterProgram {
         };
 
         for (layer_idx, layer_type) in topology.layer_types.iter().copied().enumerate() {
-            compiler.push(layer_idx, 0, InterpreterOpcode::RmsNormNvfp4Quant, &enabled);
+            compiler.push(layer_idx, 0, InterpreterOpcode::RmsNormNvfp4Quant);
             match layer_type {
                 LayerType::LinearAttention => {
-                    compiler.push(layer_idx, 1, InterpreterOpcode::Nvfp4Gemv, &enabled);
-                    compiler.push(layer_idx, 2, InterpreterOpcode::DeltaNetRecur, &enabled);
-                    compiler.push(layer_idx, 3, InterpreterOpcode::Nvfp4Gemv, &enabled);
+                    compiler.push(layer_idx, 1, InterpreterOpcode::Nvfp4Gemv);
+                    compiler.push(layer_idx, 2, InterpreterOpcode::DeltaNetRecur);
+                    compiler.push(layer_idx, 3, InterpreterOpcode::Nvfp4Gemv);
                 }
                 LayerType::FullAttention => {
-                    compiler.push(layer_idx, 1, InterpreterOpcode::Nvfp4Gemv, &enabled);
-                    compiler.push(layer_idx, 2, InterpreterOpcode::RopePartial, &enabled);
-                    compiler.push(layer_idx, 3, InterpreterOpcode::AttnDecodeFull, &enabled);
-                    compiler.push(layer_idx, 4, InterpreterOpcode::Nvfp4Gemv, &enabled);
+                    compiler.push(layer_idx, 1, InterpreterOpcode::Nvfp4Gemv);
+                    compiler.push(layer_idx, 2, InterpreterOpcode::RopePartial);
+                    compiler.push(layer_idx, 3, InterpreterOpcode::AttnDecodeFull);
+                    compiler.push(layer_idx, 4, InterpreterOpcode::Nvfp4Gemv);
                 }
             }
-            compiler.push(layer_idx, 5, InterpreterOpcode::ResidualAdd, &enabled);
-            compiler.push(layer_idx, 6, InterpreterOpcode::RmsNormNvfp4Quant, &enabled);
-            compiler.push(layer_idx, 7, InterpreterOpcode::Nvfp4Gemv, &enabled);
-            compiler.push(layer_idx, 8, InterpreterOpcode::SwiGluNvfp4Quant, &enabled);
-            compiler.push(layer_idx, 9, InterpreterOpcode::Nvfp4Gemv, &enabled);
+            compiler.push(layer_idx, 5, InterpreterOpcode::ResidualAdd);
+            compiler.push(layer_idx, 6, InterpreterOpcode::RmsNormNvfp4Quant);
+            compiler.push(layer_idx, 7, InterpreterOpcode::Nvfp4Gemv);
+            compiler.push(layer_idx, 8, InterpreterOpcode::SwiGluNvfp4Quant);
+            compiler.push(layer_idx, 9, InterpreterOpcode::Nvfp4Gemv);
         }
 
         compiler.push(
             topology.num_hidden_layers,
             0,
             InterpreterOpcode::RmsNormNvfp4Quant,
-            &enabled,
         );
         compiler.push(
             topology.num_hidden_layers,
             1,
             InterpreterOpcode::LmHeadTiled,
-            &enabled,
         );
 
         Self {
@@ -144,18 +140,8 @@ struct DecodeInterpreterCompiler {
 }
 
 impl DecodeInterpreterCompiler {
-    fn push(
-        &mut self,
-        layer_idx: usize,
-        op_ordinal: u64,
-        opcode: InterpreterOpcode,
-        enabled: &qwen36_fp4_kernels::InterpreterOpcodeSet,
-    ) {
-        let routed_opcode = if enabled.contains(opcode) {
-            opcode
-        } else {
-            InterpreterOpcode::FallbackTrampoline
-        };
+    fn push(&mut self, layer_idx: usize, op_ordinal: u64, opcode: InterpreterOpcode) {
+        let routed_opcode = InterpreterOpcode::FallbackTrampoline;
         let publish_counter = self.next_counter;
         let arrival_counter = self.next_counter + 1;
         self.next_counter += 2;
@@ -187,5 +173,23 @@ mod tests {
         // final RMSNorm + lm_head.
         assert_eq!(non_exit, 48 * 9 + 16 * 10 + 2);
         assert_eq!(compiled.program.counter_count, non_exit * 2);
+    }
+
+    #[test]
+    fn topology_placeholder_program_routes_everything_to_fallback() {
+        let topology = ModelTopology::expected_qwen36_text_mtp();
+        let compiled = DecodeInterpreterProgram::compile(&topology);
+        for instruction in compiled
+            .program
+            .instructions
+            .iter()
+            .take(compiled.program.instructions.len().saturating_sub(1))
+        {
+            assert_eq!(
+                instruction.opcode(),
+                Some(InterpreterOpcode::FallbackTrampoline)
+            );
+            assert!(InterpreterOpcode::from_code(instruction.payload[2] as u16).is_some());
+        }
     }
 }

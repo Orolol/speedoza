@@ -138,6 +138,20 @@ enum Command {
         #[arg(long)]
         drafter_dir: PathBuf,
     },
+    /// Run one DFlash drafter forward on synthetic random inputs and
+    /// report basic sanity (finite values, deterministic). No parity
+    /// against a reference yet — that lands when Phase E plumbs target
+    /// hidden states.
+    DrafterForwardSmoke {
+        #[arg(long)]
+        drafter_dir: PathBuf,
+        #[arg(long, default_value_t = 16)]
+        q_len: usize,
+        #[arg(long, default_value_t = 16)]
+        ctx_len: usize,
+        #[arg(long, default_value_t = 2)]
+        iterations: usize,
+    },
     GpuLoad {
         #[arg(long)]
         model_dir: PathBuf,
@@ -350,6 +364,24 @@ fn main() -> Result<()> {
                 let _ = drafter_dir;
                 anyhow::bail!(
                     "drafter-load requires the cuda feature; rebuild with --features cuda"
+                );
+            }
+        }
+        Command::DrafterForwardSmoke {
+            drafter_dir,
+            q_len,
+            ctx_len,
+            iterations,
+        } => {
+            #[cfg(feature = "cuda")]
+            {
+                drafter_forward_smoke(drafter_dir, q_len, ctx_len, iterations)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (drafter_dir, q_len, ctx_len, iterations);
+                anyhow::bail!(
+                    "drafter-forward-smoke requires the cuda feature; rebuild with --features cuda"
                 );
             }
         }
@@ -1805,6 +1837,145 @@ fn drafter_load(drafter_dir: PathBuf) -> Result<()> {
             "total_gib": bytes_to_gib(report.total_bytes as u64),
             "block_size": drafter.config.block_size,
             "target_layer_ids": drafter.config.dflash_config.target_layer_ids,
+        }))?,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn drafter_forward_smoke(
+    drafter_dir: PathBuf,
+    q_len: usize,
+    ctx_len: usize,
+    iterations: usize,
+) -> Result<()> {
+    use qwen36_fp4_drafter::{
+        DFlashDrafter, DFlashDrafterDevice, DrafterForward, DrafterForwardWorkspace,
+    };
+    use qwen36_fp4_kernels::{CudaBackend, CudaDeviceBuffer, DevicePtr};
+
+    if q_len == 0 || iterations == 0 {
+        anyhow::bail!("q_len and iterations must be > 0");
+    }
+
+    let drafter = DFlashDrafter::open(&drafter_dir)?;
+    if drafter.config.head_dim != 128 {
+        anyhow::bail!(
+            "drafter-forward-smoke v1 only supports head_dim=128, got {}",
+            drafter.config.head_dim,
+        );
+    }
+    let device = DFlashDrafterDevice::upload(&drafter)?;
+    let workspace = DrafterForwardWorkspace::alloc(&drafter.config, q_len, ctx_len)?;
+    let report = workspace.report();
+
+    let hidden = drafter.config.hidden_size;
+    let kv_seq_len = ctx_len + q_len;
+
+    // Synthetic BF16 inputs: small deterministic LCG so two runs of
+    // the same command produce identical bytes. Range ~[-0.5, 0.5).
+    let mut rng_state: u32 = 0x9E37_79B9;
+    let next_u16 = |state: &mut u32| -> u16 {
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (*state >> 16) as u16
+    };
+    let bf16_random = |state: &mut u32| -> [u8; 2] {
+        let raw = next_u16(state);
+        let mantissa = (raw & 0x007F) as u32;
+        let exp_bias_127 = 125u32;
+        let sign = ((raw >> 15) & 1) as u32;
+        let bits = (sign << 15) | (exp_bias_127 << 7) | mantissa;
+        (bits as u16).to_le_bytes()
+    };
+
+    let mut noise_bytes = vec![0u8; q_len * hidden * 2];
+    for i in 0..(q_len * hidden) {
+        let b = bf16_random(&mut rng_state);
+        noise_bytes[i * 2] = b[0];
+        noise_bytes[i * 2 + 1] = b[1];
+    }
+    let mut target_bytes = vec![0u8; ctx_len.max(1) * hidden * 2];
+    for i in 0..(ctx_len * hidden) {
+        let b = bf16_random(&mut rng_state);
+        target_bytes[i * 2] = b[0];
+        target_bytes[i * 2 + 1] = b[1];
+    }
+
+    let noise_buf = CudaDeviceBuffer::alloc(q_len * hidden * 2)?;
+    noise_buf.copy_from_host(&noise_bytes)?;
+    let target_buf = if ctx_len > 0 {
+        let buf = CudaDeviceBuffer::alloc(ctx_len * hidden * 2)?;
+        buf.copy_from_host(&target_bytes)?;
+        Some(buf)
+    } else {
+        None
+    };
+    let target_ptr = target_buf.as_ref().map(|b| b.ptr()).unwrap_or(DevicePtr::NULL);
+
+    // Pre-fill position_ids on device.
+    let positions: Vec<i32> = (0..kv_seq_len as i32).collect();
+    let pos_bytes = unsafe {
+        std::slice::from_raw_parts(
+            positions.as_ptr() as *const u8,
+            std::mem::size_of_val(positions.as_slice()),
+        )
+    };
+    workspace.position_ids_buffer().copy_from_host(pos_bytes)?;
+
+    let backend = CudaBackend;
+    let mut forward = DrafterForward::new(&device, &drafter.config, workspace)?;
+
+    let mut first_output: Option<Vec<u8>> = None;
+    let mut all_finite = true;
+    for iter in 0..iterations {
+        forward.forward(&backend, noise_buf.ptr(), target_ptr, q_len, ctx_len)?;
+        qwen36_fp4_runtime::cuda_synchronize()?;
+        let mut out_bytes = vec![0u8; q_len * hidden * 2];
+        forward
+            .workspace()
+            .output_buffer()
+            .copy_to_host(&mut out_bytes)?;
+
+        // Finite check (sample): every 16th BF16, decode to f32 and
+        // bail if non-finite. Sample stride keeps the loop O(hidden).
+        let mut local_finite = true;
+        for chunk in out_bytes.chunks_exact(2).step_by(16) {
+            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            let f32_bits = (bits as u32) << 16;
+            let value = f32::from_bits(f32_bits);
+            if !value.is_finite() {
+                local_finite = false;
+                break;
+            }
+        }
+        all_finite &= local_finite;
+
+        if iter == 0 {
+            first_output = Some(out_bytes);
+        } else if let Some(prev) = &first_output {
+            if prev != &out_bytes {
+                anyhow::bail!(
+                    "drafter forward is non-deterministic across iterations \
+                     (iteration {iter} bytes differ from iteration 0)"
+                );
+            }
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "drafter_dir": drafter.drafter_dir.display().to_string(),
+            "q_len": q_len,
+            "ctx_len": ctx_len,
+            "kv_seq_len": kv_seq_len,
+            "iterations": iterations,
+            "workspace_total_bytes": report.total_bytes,
+            "workspace_total_gib": bytes_to_gib(report.total_bytes as u64),
+            "drafter_vram_bytes": device.report(&drafter.manifest).total_bytes,
+            "output_bytes": q_len * hidden * 2,
+            "finite": all_finite,
+            "deterministic": true,
         }))?,
     );
     Ok(())

@@ -504,18 +504,14 @@ mod tests {
             manifest.mtp.as_ref().and_then(|mtp| mtp.layer(0)),
             Some(layer) if matches!(layer.q_proj, LinearWeightBinding::Bf16 { .. })
         ));
-        assert!(
-            manifest
-                .tensor_infos()
-                .iter()
-                .any(|tensor| tensor.name.starts_with("mtp."))
-        );
-        assert!(
-            !manifest
-                .tensor_infos_for_upload(false)
-                .iter()
-                .any(|tensor| tensor.name.starts_with("mtp."))
-        );
+        assert!(manifest
+            .tensor_infos()
+            .iter()
+            .any(|tensor| tensor.name.starts_with("mtp.")));
+        assert!(!manifest
+            .tensor_infos_for_upload(false)
+            .iter()
+            .any(|tensor| tensor.name.starts_with("mtp.")));
         assert!(matches!(
             &manifest.layers[0],
             LayerWeights::LinearAttention(layer) if layer.in_proj_qkv.is_nvfp4()

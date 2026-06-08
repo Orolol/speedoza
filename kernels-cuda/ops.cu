@@ -21,14 +21,6 @@ __device__ bool better_score(float candidate, uint32_t candidate_idx,
          (candidate == current && candidate_idx < current_idx);
 }
 
-__device__ float decode_e2m1(uint8_t packed, bool high_nibble) {
-  const uint8_t code = high_nibble ? (packed >> 4) : (packed & 0x0f);
-  const float values[8] = {0.0f, 0.5f, 1.0f, 1.5f,
-                           2.0f, 3.0f, 4.0f, 6.0f};
-  const float magnitude = values[code & 0x07];
-  return (code & 0x08) != 0 ? -magnitude : magnitude;
-}
-
 __device__ float decode_e4m3(uint8_t code) {
   const int sign = (code & 0x80) != 0 ? -1 : 1;
   const int exponent = (code >> 3) & 0x0f;

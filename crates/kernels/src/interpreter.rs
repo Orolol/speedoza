@@ -251,6 +251,18 @@ impl InterpreterInstruction {
         instruction
     }
 
+    pub fn deltanet_recur_spec(spec: DevicePtr) -> Self {
+        let mut instruction = Self::new(InterpreterOpcode::DeltaNetRecur);
+        instruction.payload[0] = spec.0;
+        instruction
+    }
+
+    pub fn attn_decode_full_spec(spec: DevicePtr) -> Self {
+        let mut instruction = Self::new(InterpreterOpcode::AttnDecodeFull);
+        instruction.payload[0] = spec.0;
+        instruction
+    }
+
     pub fn rope_partial(
         tokens: usize,
         q_heads: usize,
@@ -446,6 +458,14 @@ mod tests {
         assert_eq!(gemv.payload[0], 16);
         assert_eq!(gemv.payload[1], 1024);
         assert_eq!(gemv.payload[7] as u32, 0.5f32.to_bits());
+
+        let deltanet = InterpreterInstruction::deltanet_recur_spec(DevicePtr(30));
+        assert_eq!(deltanet.opcode(), Some(InterpreterOpcode::DeltaNetRecur));
+        assert_eq!(deltanet.payload[0], 30);
+
+        let attn = InterpreterInstruction::attn_decode_full_spec(DevicePtr(31));
+        assert_eq!(attn.opcode(), Some(InterpreterOpcode::AttnDecodeFull));
+        assert_eq!(attn.payload[0], 31);
 
         let swiglu = InterpreterInstruction::swiglu_nvfp4_quant(
             17,

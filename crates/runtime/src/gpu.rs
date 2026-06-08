@@ -3,7 +3,7 @@ use std::mem::size_of;
 
 use qwen36_fp4_core::{CoreError, ModelTopology, Result, TensorDtype, TensorInfo, TensorRole};
 use qwen36_fp4_kernels::{
-    CudaDeviceBuffer, DevicePtr, Nvfp4RetileScalesSpec, cuda_synchronize, nvfp4_retile_scales,
+    cuda_synchronize, nvfp4_retile_scales, CudaDeviceBuffer, DevicePtr, Nvfp4RetileScalesSpec,
 };
 use qwen36_fp4_loader::MappedModel;
 use qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES;
