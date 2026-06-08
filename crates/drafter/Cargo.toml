@@ -9,8 +9,13 @@ license.workspace = true
 name = "qwen36_fp4_drafter"
 path = "src/lib.rs"
 
+[features]
+default = []
+cuda = ["qwen36-fp4-kernels/cuda"]
+
 [dependencies]
 qwen36-fp4-core = { path = "../core" }
+qwen36-fp4-kernels = { path = "../kernels" }
 qwen36-fp4-loader = { path = "../loader" }
 anyhow.workspace = true
 memmap2.workspace = true

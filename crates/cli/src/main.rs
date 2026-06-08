@@ -132,6 +132,12 @@ enum Command {
         #[arg(long)]
         drafter_dir: PathBuf,
     },
+    /// Upload a DFlash drafter checkpoint to the GPU and report per-tensor
+    /// VRAM usage. Smoke for the drafter device path; no forward pass yet.
+    DrafterLoad {
+        #[arg(long)]
+        drafter_dir: PathBuf,
+    },
     GpuLoad {
         #[arg(long)]
         model_dir: PathBuf,
@@ -333,6 +339,19 @@ fn main() -> Result<()> {
             max_context,
         } => {
             gpu_load(model_dir, max_context)?;
+        }
+        Command::DrafterLoad { drafter_dir } => {
+            #[cfg(feature = "cuda")]
+            {
+                drafter_load(drafter_dir)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = drafter_dir;
+                anyhow::bail!(
+                    "drafter-load requires the cuda feature; rebuild with --features cuda"
+                );
+            }
         }
         Command::Chat {
             model_dir,
@@ -1750,6 +1769,45 @@ fn gpu_load(model_dir: PathBuf, max_context: usize) -> Result<()> {
 #[cfg(not(feature = "cuda"))]
 fn gpu_load(_model_dir: PathBuf, _max_context: usize) -> Result<()> {
     bail!("gpu-load requires rebuilding qwen36 with --features cuda and the CUDA shared library")
+}
+
+#[cfg(feature = "cuda")]
+fn drafter_load(drafter_dir: PathBuf) -> Result<()> {
+    use qwen36_fp4_drafter::{DFlashDrafterDevice, DFlashDrafter};
+
+    let drafter = DFlashDrafter::open(&drafter_dir)?;
+    let manifest = drafter.manifest.clone();
+    let device = DFlashDrafterDevice::upload(&drafter)?;
+    let report = device.report(&manifest);
+    qwen36_fp4_runtime::cuda_synchronize()?;
+
+    let sliding_layers = drafter
+        .config
+        .layer_types
+        .iter()
+        .filter(|kind| kind.as_str() == "sliding_attention")
+        .count();
+    let full_layers = drafter.config.layer_types.len() - sliding_layers;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "drafter_dir": drafter.drafter_dir.display().to_string(),
+            "num_hidden_layers": drafter.config.num_hidden_layers,
+            "sliding_attention_layers": sliding_layers,
+            "full_attention_layers": full_layers,
+            "tensors_uploaded": report.tensor_count,
+            "layer_bytes": report.layer_bytes,
+            "fc_bytes": report.fc_bytes,
+            "hidden_norm_bytes": report.hidden_norm_bytes,
+            "norm_bytes": report.norm_bytes,
+            "total_bytes": report.total_bytes,
+            "total_gib": bytes_to_gib(report.total_bytes as u64),
+            "block_size": drafter.config.block_size,
+            "target_layer_ids": drafter.config.dflash_config.target_layer_ids,
+        }))?,
+    );
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
