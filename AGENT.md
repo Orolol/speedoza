@@ -861,6 +861,44 @@ the GPU; partial softmax per split + a reduction. Reuses the
 ~2.5–4×. Parity gated by a smoke cos≥0.998 (modeled on P0a) + the
 no-fork end-to-end check.
 
+### 2026-06-09 — P2 probe: existing split-K GQA at q=16 — 5× at 7K but lossy
+
+The full_attn bottleneck (200ms = 89% of verify) is the q=16 scalar GQA
+path. The codebase already has a Flash-Decoding split-K GQA kernel
+(`attention_prefill_split_gqa_kernel` + `attention_decode_reduce_kernel`)
+used for MTP 1-2 token chunks, gated off above 8 tokens
+(`kPrefillSplitLongChunkMaxTokens=8`). Enabling it for the 16-token
+verify chunk is pure env tuning:
+`QWEN36_PREFILL_SPLIT_MAX_TOKENS=16 QWEN36_PREFILL_SPLIT_MIN_SPLITS=32`.
+
+**Measured (7K ctx, drafter-chat-smoke):**
+- full_attn per chunk: **201.7 → 36.5 ms (5.5×)**; chunk wall 226 → 61 ms
+- end-to-end DFlash: **13.97 → 71.22 tok/s (5.1×)**
+
+**But it is not parity-clean:**
+- 3K coherent prompt: AL **9.18 → 4.17**, tok/s **69 → 63 (regresses)**.
+  full_attn is a smaller fraction at 3K, so the kernel speedup no longer
+  offsets the AL hit.
+- The split-K kernel is FP32-correct per call (online softmax FP32, same
+  structure as scalar; the reduce is a correct log-sum-exp merge). A
+  chunk=16 whole-prompt dump-logits stress test showed cos 0.989, but
+  that **compounds** the per-call divergence over ~300 split chunks ×
+  16 layers — per-call divergence is ~0.99996. The split-K is
+  numerically ~right.
+- The problem is **speculative amplification**: DFlash verify is meant
+  to be lossless w.r.t. the scalar target. Changing the verify attention
+  shifts the target's greedy argmax slightly, which the draft→verify→
+  capture-hidden→draft loop amplifies into an AL swing (same chaotic
+  sensitivity as the Phase-1 FA drafter). It helps at 7K (full_attn
+  dominates) and hurts at 3K.
+
+**Decision pending (asked user):** ship env split-K context-gated to
+long ctx (≥5K, 5× win, no short-ctx regression because gated, but a
+slightly different/lossy verify output) vs build the proper FA-2 wmma
+split-K tile (correct-at-all-ctx by construction, ~1 week, reuses the
+attention_flash_prefill.cu tile + the existing reduction). No code
+committed for P2 yet — env tuning only, nothing shipped.
+
 ### 2026-06-09 — DFlash megakernel roadmap Phase 1 (FA-tile drafter attn) — neutral, off by default
 
 Pivot: the user committed to "Option A" of the long-context roadmap
