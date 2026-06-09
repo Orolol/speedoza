@@ -227,10 +227,10 @@ fn decode_interpreter_mlp_enabled(master_enabled: bool) -> bool {
 fn decode_interpreter_mlp_chunked_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
+        let opcodes = decode_interpreter_opcodes_enabled();
         cuda_env_bool("QWEN36_INTERPRETER_MLP_CHUNKED")
-            && decode_interpreter_opcodes_enabled()
-                .contains(InterpreterOpcode::SwiGluNvfp4QuantChunk)
-            && decode_interpreter_opcodes_enabled().contains(InterpreterOpcode::Nvfp4GemvChunkAccum)
+            && opcodes.contains(InterpreterOpcode::SwiGluNvfp4QuantChunk)
+            && opcodes.contains(InterpreterOpcode::Nvfp4GemvChunkAccum)
     })
 }
 
