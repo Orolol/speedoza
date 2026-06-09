@@ -139,9 +139,9 @@ enum Command {
         drafter_dir: PathBuf,
     },
     /// Run one DFlash drafter forward on synthetic random inputs and
-    /// report basic sanity (finite values, deterministic). No parity
-    /// against a reference yet — that lands when Phase E plumbs target
-    /// hidden states.
+    /// report basic sanity (finite values, deterministic). With
+    /// --fixture-dir, load inputs + expected output from a fixture
+    /// produced by `scripts/dflash_parity.py` and compare via cos sim.
     DrafterForwardSmoke {
         #[arg(long)]
         drafter_dir: PathBuf,
@@ -151,6 +151,12 @@ enum Command {
         ctx_len: usize,
         #[arg(long, default_value_t = 2)]
         iterations: usize,
+        /// Fixture directory containing noise.bf16, target_collapsed.bf16,
+        /// positions.i32, expected_output.bf16, config.json. When set,
+        /// inputs are loaded from disk and the output is parity-checked
+        /// against expected_output.bf16 (cos sim ≥ 0.998).
+        #[arg(long)]
+        fixture_dir: Option<PathBuf>,
     },
     GpuLoad {
         #[arg(long)]
@@ -372,14 +378,15 @@ fn main() -> Result<()> {
             q_len,
             ctx_len,
             iterations,
+            fixture_dir,
         } => {
             #[cfg(feature = "cuda")]
             {
-                drafter_forward_smoke(drafter_dir, q_len, ctx_len, iterations)?;
+                drafter_forward_smoke(drafter_dir, q_len, ctx_len, iterations, fixture_dir)?;
             }
             #[cfg(not(feature = "cuda"))]
             {
-                let _ = (drafter_dir, q_len, ctx_len, iterations);
+                let _ = (drafter_dir, q_len, ctx_len, iterations, fixture_dir);
                 anyhow::bail!(
                     "drafter-forward-smoke requires the cuda feature; rebuild with --features cuda"
                 );
@@ -1845,17 +1852,18 @@ fn drafter_load(drafter_dir: PathBuf) -> Result<()> {
 #[cfg(feature = "cuda")]
 fn drafter_forward_smoke(
     drafter_dir: PathBuf,
-    q_len: usize,
-    ctx_len: usize,
+    q_len_arg: usize,
+    ctx_len_arg: usize,
     iterations: usize,
+    fixture_dir: Option<PathBuf>,
 ) -> Result<()> {
     use qwen36_fp4_drafter::{
         DFlashDrafter, DFlashDrafterDevice, DrafterForward, DrafterForwardWorkspace,
     };
     use qwen36_fp4_kernels::{CudaBackend, CudaDeviceBuffer, DevicePtr};
 
-    if q_len == 0 || iterations == 0 {
-        anyhow::bail!("q_len and iterations must be > 0");
+    if iterations == 0 {
+        anyhow::bail!("iterations must be > 0");
     }
 
     let drafter = DFlashDrafter::open(&drafter_dir)?;
@@ -1865,41 +1873,46 @@ fn drafter_forward_smoke(
             drafter.config.head_dim,
         );
     }
+    let hidden = drafter.config.hidden_size;
+
+    // Decide inputs: fixture vs synthetic deterministic LCG. The
+    // fixture path lets us parity-check against the Python reference
+    // produced by `scripts/dflash_parity.py`.
+    let (q_len, ctx_len, noise_bytes, target_bytes, position_bytes, expected_output) =
+        if let Some(dir) = fixture_dir.as_ref() {
+            load_fixture(dir)?
+        } else {
+            if q_len_arg == 0 {
+                anyhow::bail!("q_len must be > 0 in synthetic mode");
+            }
+            let (n, t) = synthesize_inputs(q_len_arg, ctx_len_arg, hidden);
+            let kv = ctx_len_arg + q_len_arg;
+            let mut pos_bytes = Vec::with_capacity(kv * 4);
+            for p in 0..kv {
+                pos_bytes.extend_from_slice(&(p as i32).to_le_bytes());
+            }
+            (q_len_arg, ctx_len_arg, n, t, pos_bytes, None)
+        };
+
+    if q_len * hidden * 2 != noise_bytes.len() {
+        anyhow::bail!(
+            "noise input size {} bytes does not match q_len*hidden*2 = {}",
+            noise_bytes.len(),
+            q_len * hidden * 2,
+        );
+    }
+    if ctx_len > 0 && ctx_len * hidden * 2 != target_bytes.len() {
+        anyhow::bail!(
+            "target_collapsed input size {} bytes does not match ctx_len*hidden*2 = {}",
+            target_bytes.len(),
+            ctx_len * hidden * 2,
+        );
+    }
+
     let device = DFlashDrafterDevice::upload(&drafter)?;
     let workspace = DrafterForwardWorkspace::alloc(&drafter.config, q_len, ctx_len)?;
     let report = workspace.report();
-
-    let hidden = drafter.config.hidden_size;
     let kv_seq_len = ctx_len + q_len;
-
-    // Synthetic BF16 inputs: small deterministic LCG so two runs of
-    // the same command produce identical bytes. Range ~[-0.5, 0.5).
-    let mut rng_state: u32 = 0x9E37_79B9;
-    let next_u16 = |state: &mut u32| -> u16 {
-        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        (*state >> 16) as u16
-    };
-    let bf16_random = |state: &mut u32| -> [u8; 2] {
-        let raw = next_u16(state);
-        let mantissa = (raw & 0x007F) as u32;
-        let exp_bias_127 = 125u32;
-        let sign = ((raw >> 15) & 1) as u32;
-        let bits = (sign << 15) | (exp_bias_127 << 7) | mantissa;
-        (bits as u16).to_le_bytes()
-    };
-
-    let mut noise_bytes = vec![0u8; q_len * hidden * 2];
-    for i in 0..(q_len * hidden) {
-        let b = bf16_random(&mut rng_state);
-        noise_bytes[i * 2] = b[0];
-        noise_bytes[i * 2 + 1] = b[1];
-    }
-    let mut target_bytes = vec![0u8; ctx_len.max(1) * hidden * 2];
-    for i in 0..(ctx_len * hidden) {
-        let b = bf16_random(&mut rng_state);
-        target_bytes[i * 2] = b[0];
-        target_bytes[i * 2 + 1] = b[1];
-    }
 
     let noise_buf = CudaDeviceBuffer::alloc(q_len * hidden * 2)?;
     noise_buf.copy_from_host(&noise_bytes)?;
@@ -1911,16 +1924,7 @@ fn drafter_forward_smoke(
         None
     };
     let target_ptr = target_buf.as_ref().map(|b| b.ptr()).unwrap_or(DevicePtr::NULL);
-
-    // Pre-fill position_ids on device.
-    let positions: Vec<i32> = (0..kv_seq_len as i32).collect();
-    let pos_bytes = unsafe {
-        std::slice::from_raw_parts(
-            positions.as_ptr() as *const u8,
-            std::mem::size_of_val(positions.as_slice()),
-        )
-    };
-    workspace.position_ids_buffer().copy_from_host(pos_bytes)?;
+    workspace.position_ids_buffer().copy_from_host(&position_bytes)?;
 
     let backend = CudaBackend;
     let mut forward = DrafterForward::new(&device, &drafter.config, workspace)?;
@@ -1936,8 +1940,6 @@ fn drafter_forward_smoke(
             .output_buffer()
             .copy_to_host(&mut out_bytes)?;
 
-        // Finite check (sample): every 16th BF16, decode to f32 and
-        // bail if non-finite. Sample stride keeps the loop O(hidden).
         let mut local_finite = true;
         for chunk in out_bytes.chunks_exact(2).step_by(16) {
             let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
@@ -1962,10 +1964,16 @@ fn drafter_forward_smoke(
         }
     }
 
+    let cos_sim = expected_output.as_ref().map(|expected| {
+        let got = first_output.as_ref().expect("ran at least one iteration");
+        bf16_cosine_similarity(got, expected)
+    });
+
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "drafter_dir": drafter.drafter_dir.display().to_string(),
+            "fixture_dir": fixture_dir.as_ref().map(|p| p.display().to_string()),
             "q_len": q_len,
             "ctx_len": ctx_len,
             "kv_seq_len": kv_seq_len,
@@ -1976,9 +1984,100 @@ fn drafter_forward_smoke(
             "output_bytes": q_len * hidden * 2,
             "finite": all_finite,
             "deterministic": true,
+            "cos_sim_vs_reference": cos_sim,
         }))?,
     );
+
+    if let Some(cos) = cos_sim {
+        const FLOOR: f64 = 0.998;
+        if cos < FLOOR {
+            anyhow::bail!(
+                "drafter forward cos sim {cos:.6} < floor {FLOOR}; parity regression"
+            );
+        }
+    }
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn synthesize_inputs(q_len: usize, ctx_len: usize, hidden: usize) -> (Vec<u8>, Vec<u8>) {
+    // Small deterministic LCG. Range ~[-0.5, 0.5) via BF16 with
+    // exponent forced to 125 (≈ 2^-2).
+    let mut rng_state: u32 = 0x9E37_79B9;
+    let next_u16 = |state: &mut u32| -> u16 {
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (*state >> 16) as u16
+    };
+    let bf16_random = |state: &mut u32| -> [u8; 2] {
+        let raw = next_u16(state);
+        let mantissa = (raw & 0x007F) as u32;
+        let exp_bias_127 = 125u32;
+        let sign = ((raw >> 15) & 1) as u32;
+        let bits = (sign << 15) | (exp_bias_127 << 7) | mantissa;
+        (bits as u16).to_le_bytes()
+    };
+    let mut noise = vec![0u8; q_len * hidden * 2];
+    for i in 0..(q_len * hidden) {
+        let b = bf16_random(&mut rng_state);
+        noise[i * 2] = b[0];
+        noise[i * 2 + 1] = b[1];
+    }
+    let mut target = vec![0u8; ctx_len.max(1) * hidden * 2];
+    for i in 0..(ctx_len * hidden) {
+        let b = bf16_random(&mut rng_state);
+        target[i * 2] = b[0];
+        target[i * 2 + 1] = b[1];
+    }
+    (noise, target)
+}
+
+#[cfg(feature = "cuda")]
+fn load_fixture(
+    dir: &std::path::Path,
+) -> Result<(usize, usize, Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+    let config_path = dir.join("config.json");
+    let config_bytes = std::fs::read(&config_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", config_path.display()))?;
+    let config: serde_json::Value = serde_json::from_slice(&config_bytes)?;
+    let q_len = config["q_len"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("fixture config.json missing q_len"))?
+        as usize;
+    let ctx_len = config["ctx_len"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("fixture config.json missing ctx_len"))?
+        as usize;
+    let noise = std::fs::read(dir.join("noise.bf16"))?;
+    let target = std::fs::read(dir.join("target_collapsed.bf16"))?;
+    let positions = std::fs::read(dir.join("positions.i32"))?;
+    let expected = std::fs::read(dir.join("expected_output.bf16"))?;
+    Ok((q_len, ctx_len, noise, target, positions, Some(expected)))
+}
+
+#[cfg(feature = "cuda")]
+fn bf16_cosine_similarity(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let mut dot = 0.0_f64;
+    let mut na = 0.0_f64;
+    let mut nb = 0.0_f64;
+    for (ca, cb) in a.chunks_exact(2).zip(b.chunks_exact(2)) {
+        let av = bf16_bytes_to_f32(ca);
+        let bv = bf16_bytes_to_f32(cb);
+        dot += av as f64 * bv as f64;
+        na += av as f64 * av as f64;
+        nb += bv as f64 * bv as f64;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+#[cfg(feature = "cuda")]
+fn bf16_bytes_to_f32(bytes: &[u8]) -> f32 {
+    let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let f32_bits = (bits as u32) << 16;
+    f32::from_bits(f32_bits)
 }
 
 #[cfg(feature = "cuda")]

@@ -1,5 +1,6 @@
 #include "qwen36_fp4.h"
 #include "active_stream.h"
+#include "interpreter/opcodes/lm_head_tiled.cuh"
 #include "interpreter/opcodes/rmsnorm_nvfp4_quant.cuh"
 #include "interpreter/opcodes/rope_partial.cuh"
 #include "interpreter/opcodes/swiglu_nvfp4_quant.cuh"
@@ -431,23 +432,8 @@ __global__ void bf16_matvec_kernel(const __nv_bfloat16 *input,
                                    const __nv_bfloat16 *weight,
                                    __nv_bfloat16 *output, size_t in_features) {
   extern __shared__ float scratch[];
-  const size_t row = blockIdx.x;
-  float sum = 0.0f;
-  const __nv_bfloat16 *row_weight = weight + row * in_features;
-  for (size_t col = threadIdx.x; col < in_features; col += blockDim.x) {
-    sum += __bfloat162float(input[col]) * __bfloat162float(row_weight[col]);
-  }
-  scratch[threadIdx.x] = sum;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-    }
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) {
-    output[row] = __float2bfloat16(scratch[0]);
-  }
+  qwen36_interpreter::bf16_matvec_row_body(blockIdx.x, input, weight, output,
+                                           in_features, scratch, blockDim.x);
 }
 
 // Lookup table for E2M1 (FP4) decode. Index 0..7 = positive magnitudes,

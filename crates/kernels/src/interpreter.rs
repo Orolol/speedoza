@@ -263,6 +263,22 @@ impl InterpreterInstruction {
         instruction
     }
 
+    pub fn lm_head_tiled(
+        out_features: usize,
+        in_features: usize,
+        input_bf16: DevicePtr,
+        weight_bf16: DevicePtr,
+        output_bf16: DevicePtr,
+    ) -> Self {
+        let mut instruction = Self::new(InterpreterOpcode::LmHeadTiled);
+        instruction.payload[0] = out_features as u64;
+        instruction.payload[1] = in_features as u64;
+        instruction.payload[2] = input_bf16.0;
+        instruction.payload[3] = weight_bf16.0;
+        instruction.payload[4] = output_bf16.0;
+        instruction
+    }
+
     pub fn rope_partial(
         tokens: usize,
         q_heads: usize,
@@ -466,6 +482,18 @@ mod tests {
         let attn = InterpreterInstruction::attn_decode_full_spec(DevicePtr(31));
         assert_eq!(attn.opcode(), Some(InterpreterOpcode::AttnDecodeFull));
         assert_eq!(attn.payload[0], 31);
+
+        let lm_head = InterpreterInstruction::lm_head_tiled(
+            4,
+            8,
+            DevicePtr(32),
+            DevicePtr(33),
+            DevicePtr(34),
+        );
+        assert_eq!(lm_head.opcode(), Some(InterpreterOpcode::LmHeadTiled));
+        assert_eq!(lm_head.payload[0], 4);
+        assert_eq!(lm_head.payload[1], 8);
+        assert_eq!(lm_head.payload[4], 34);
 
         let swiglu = InterpreterInstruction::swiglu_nvfp4_quant(
             17,

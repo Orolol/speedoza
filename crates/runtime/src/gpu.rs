@@ -3,7 +3,8 @@ use std::mem::size_of;
 
 use qwen36_fp4_core::{CoreError, ModelTopology, Result, TensorDtype, TensorInfo, TensorRole};
 use qwen36_fp4_kernels::{
-    cuda_synchronize, nvfp4_retile_scales, CudaDeviceBuffer, DevicePtr, Nvfp4RetileScalesSpec,
+    cuda_synchronize, nvfp4_retile_scales, CudaDeviceBuffer, DevicePtr, InterpreterInstruction,
+    Nvfp4RetileScalesSpec,
 };
 use qwen36_fp4_loader::MappedModel;
 use qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES;
@@ -573,6 +574,11 @@ pub struct GpuForwardBuffers {
     /// active prefix on the active stream (`memset_async`) before each
     /// launch — kernels do not self-clear so they stay graph-captureable.
     pub megakernel_barrier_state: CudaDeviceBuffer,
+    /// Reusable instruction buffer for the opt-in decode-interpreter final
+    /// logits program (`final RMSNorm + LM_HEAD_TILED`).
+    pub interpreter_logits_instructions: CudaDeviceBuffer,
+    /// Reusable counter buffer for `interpreter_logits_instructions`.
+    pub interpreter_logits_counters: CudaDeviceBuffer,
 }
 
 /// Per-launch barrier-state byte count consumed by the full-attn
@@ -846,6 +852,10 @@ impl GpuForwardBuffers {
             // launch sees a clean barrier even on the cold path; per-launch
             // resets after that use the async path on the active stream.
             megakernel_barrier_state: CudaDeviceBuffer::zeroed(MEGAKERNEL_BARRIER_STATE_BYTES)?,
+            interpreter_logits_instructions: CudaDeviceBuffer::alloc(
+                3 * size_of::<InterpreterInstruction>(),
+            )?,
+            interpreter_logits_counters: CudaDeviceBuffer::zeroed(4 * size_of::<i32>())?,
         })
     }
 
@@ -876,6 +886,8 @@ impl GpuForwardBuffers {
             self.attn_partial_max.bytes(),
             self.attn_partial_denom.bytes(),
             self.megakernel_barrier_state.bytes(),
+            self.interpreter_logits_instructions.bytes(),
+            self.interpreter_logits_counters.bytes(),
         ]
         .into_iter()
         .map(|bytes| bytes as u64)

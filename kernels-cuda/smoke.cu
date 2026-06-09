@@ -1043,6 +1043,43 @@ int main() {
   expect_close(matvec_values[0], 5.0f, 0.02f, "bf16 matvec[0]");
   expect_close(matvec_values[1], 5.0f, 0.02f, "bf16 matvec[1]");
 
+  qwen36_device_ptr_t interp_lm_out = dev_alloc<__nv_bfloat16>(2);
+  qwen36_device_ptr_t interp_lm_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(2);
+  qwen36_device_ptr_t interp_lm_counters = dev_alloc<int32_t>(2);
+  qwen36_interpreter_instruction_t interp_lm_program_host[2]{};
+  interp_lm_program_host[0].opcode = 9; // LM_HEAD_TILED
+  interp_lm_program_host[0].publishes_counter = 0;
+  interp_lm_program_host[0].publish_value = 1;
+  interp_lm_program_host[0].arrival_counter = 1;
+  interp_lm_program_host[0].payload[0] = 2;
+  interp_lm_program_host[0].payload[1] = 4;
+  interp_lm_program_host[0].payload[2] = matvec_input.ptr;
+  interp_lm_program_host[0].payload[3] = matvec_weight.ptr;
+  interp_lm_program_host[0].payload[4] = interp_lm_out.ptr;
+  interp_lm_program_host[1].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_lm_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_lm_program_host, interp_lm_program_host + 2));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_lm_counters.ptr), 0,
+                 2 * sizeof(int32_t)),
+      "cudaMemset interp lm_head counters");
+  qwen36_interpreter_program_t interp_lm_program{};
+  interp_lm_program.instructions = interp_lm_instructions;
+  interp_lm_program.instruction_count = 2;
+  interp_lm_program.counters_i32 = interp_lm_counters;
+  interp_lm_program.counter_count = 2;
+  interp_lm_program.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_lm_program),
+              "interpreter lm_head tiled");
+  std::vector<float> interp_lm_values = read_bf16(interp_lm_out, 2);
+  for (size_t i = 0; i < 2; ++i) {
+    expect_close(interp_lm_values[i], matvec_values[i], 0.0f,
+                 "interpreter lm_head tiled");
+  }
+
   qwen36_device_ptr_t bf16_gemm_input = dev_alloc<__nv_bfloat16>(128);
   qwen36_device_ptr_t bf16_gemm_weight = dev_alloc<__nv_bfloat16>(128 * 128);
   qwen36_device_ptr_t bf16_gemm_out = dev_alloc<__nv_bfloat16>(128);
@@ -1529,6 +1566,9 @@ int main() {
   dev_free<__nv_bfloat16>(matvec_input);
   dev_free<__nv_bfloat16>(matvec_weight);
   dev_free<__nv_bfloat16>(matvec_out);
+  dev_free<__nv_bfloat16>(interp_lm_out);
+  dev_free<qwen36_interpreter_instruction_t>(interp_lm_instructions);
+  dev_free<int32_t>(interp_lm_counters);
   dev_free<__nv_bfloat16>(bf16_gemm_input);
   dev_free<__nv_bfloat16>(bf16_gemm_weight);
   dev_free<__nv_bfloat16>(bf16_gemm_out);

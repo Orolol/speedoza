@@ -3,6 +3,7 @@
 #include "opcodes/attn_decode_full.cuh"
 #include "opcodes/deltanet_recur.cuh"
 #include "opcodes/fallback_trampoline.cuh"
+#include "opcodes/lm_head_tiled.cuh"
 #include "opcodes/nvfp4_gemv.cuh"
 #include "opcodes/residual_add.cuh"
 #include "opcodes/rmsnorm_nvfp4_quant.cuh"
@@ -56,7 +57,6 @@ dispatch_instruction(const qwen36_interpreter_instruction_t &insn,
 
   switch (insn.opcode) {
   case QWEN36_INTERPRETER_OPCODE_FALLBACK_TRAMPOLINE:
-  case QWEN36_INTERPRETER_OPCODE_LM_HEAD_TILED:
     qwen36_interpreter::exec_fallback_trampoline(insn, pages);
     break;
   case QWEN36_INTERPRETER_OPCODE_RMSNORM_NVFP4_QUANT:
@@ -77,6 +77,9 @@ dispatch_instruction(const qwen36_interpreter_instruction_t &insn,
     break;
   case QWEN36_INTERPRETER_OPCODE_ATTN_DECODE_FULL:
     qwen36_interpreter::exec_attn_decode_full(insn, pages, attention_scratch);
+    break;
+  case QWEN36_INTERPRETER_OPCODE_LM_HEAD_TILED:
+    qwen36_interpreter::exec_lm_head_tiled(insn, pages, scratch);
     break;
   case QWEN36_INTERPRETER_OPCODE_RESIDUAL_ADD:
     qwen36_interpreter::exec_residual_add(insn, pages);

@@ -9,6 +9,8 @@
 
 namespace qwen36_interpreter {
 
+constexpr unsigned int kRmsNormLogicalThreads = 256;
+
 __host__ __device__ inline size_t div_ceil_size(size_t value, size_t divisor) {
   return (value + divisor - 1) / divisor;
 }
@@ -115,7 +117,13 @@ __device__ inline void rmsnorm_nvfp4_quantize_body(
     __nv_bfloat16 *__restrict__ residual_out,
     __nv_bfloat16 *__restrict__ output_bf16, uint8_t *__restrict__ output_fp4,
     uint8_t *__restrict__ output_scale, float *__restrict__ tensor_scale,
-    size_t hidden, float eps, float input_tensor_scale, float *scratch) {
+    size_t hidden, float eps, float input_tensor_scale, float *scratch,
+    unsigned int logical_threads = blockDim.x) {
+  const unsigned int logical =
+      (logical_threads == 0 || logical_threads > blockDim.x)
+          ? static_cast<unsigned int>(blockDim.x)
+          : logical_threads;
+  const bool active = threadIdx.x < logical;
   float local_sum = 0.0f;
 
   const size_t pairs = hidden / 2;
@@ -124,16 +132,18 @@ __device__ inline void rmsnorm_nvfp4_quantize_body(
   const __nv_bfloat162 *residual2 =
       residual != nullptr ? reinterpret_cast<const __nv_bfloat162 *>(residual)
                           : nullptr;
-  for (size_t p = threadIdx.x; p < pairs; p += blockDim.x) {
-    const __nv_bfloat162 vp = input2[p];
-    float a = __low2float(vp);
-    float b = __high2float(vp);
-    if (residual2 != nullptr) {
-      const __nv_bfloat162 rp = residual2[p];
-      a += __low2float(rp);
-      b += __high2float(rp);
+  if (active) {
+    for (size_t p = threadIdx.x; p < pairs; p += logical) {
+      const __nv_bfloat162 vp = input2[p];
+      float a = __low2float(vp);
+      float b = __high2float(vp);
+      if (residual2 != nullptr) {
+        const __nv_bfloat162 rp = residual2[p];
+        a += __low2float(rp);
+        b += __high2float(rp);
+      }
+      local_sum += a * a + b * b;
     }
-    local_sum += a * a + b * b;
   }
   if ((hidden & 1u) != 0u && threadIdx.x == 0u) {
     const size_t d = hidden - 1;
@@ -144,9 +154,11 @@ __device__ inline void rmsnorm_nvfp4_quantize_body(
     local_sum += value * value;
   }
 
-  scratch[threadIdx.x] = local_sum;
+  if (active) {
+    scratch[threadIdx.x] = local_sum;
+  }
   __syncthreads();
-  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+  for (unsigned int stride = logical / 2; stride > 0; stride >>= 1) {
     if (threadIdx.x < stride) {
       scratch[threadIdx.x] += scratch[threadIdx.x + stride];
     }
@@ -160,7 +172,8 @@ __device__ inline void rmsnorm_nvfp4_quantize_body(
   const float global_scale =
       input_tensor_scale > 0.0f ? input_tensor_scale : 1.0f;
 
-  for (size_t group = threadIdx.x; group < groups; group += blockDim.x) {
+  for (size_t group = threadIdx.x; active && group < groups;
+       group += logical) {
     const size_t start = group * 16;
     float amax = 0.0f;
     float residual_values[16];
@@ -300,7 +313,7 @@ exec_rmsnorm_nvfp4_quant(const qwen36_interpreter_instruction_t &insn,
   rmsnorm_nvfp4_quantize_body(input, weight, residual, residual_out,
                               output_bf16, output_fp4, output_scale,
                               tensor_scale, hidden, eps, input_tensor_scale,
-                              scratch);
+                              scratch, kRmsNormLogicalThreads);
 }
 
 } // namespace qwen36_interpreter
