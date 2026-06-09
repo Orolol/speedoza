@@ -706,6 +706,138 @@ impl<B: KernelBackend> Engine<B> {
         }
     }
 
+    /// Batched verify forward for a block of `tokens` at the current
+    /// `state.position`. Advances state by `tokens.len()`, runs one
+    /// prefill chunk through the full target stack, then per-position
+    /// final RMSNorm + lm_head + greedy argmax, returning the `k`
+    /// argmax token ids. Caller checks them against the drafted block
+    /// to find the accepted prefix. ~10× cheaper than `k` sequential
+    /// `prefill(&[t])` calls because the per-token forward share one
+    /// batched layer pass.
+    #[cfg(feature = "cuda")]
+    pub fn verify_block_batched(&mut self, tokens: &[u32]) -> Result<Vec<u32>> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let k = tokens.len();
+        let prefill_cap = self.cuda_prefill()?.capacity;
+        if k > prefill_cap {
+            return Err(CoreError::Runtime(format!(
+                "verify_block_batched: block size {k} exceeds prefill capacity {prefill_cap}"
+            )));
+        }
+
+        // Run prefill on the block. State advances by k; prefill.hidden
+        // and prefill.residual now hold the pre-final-norm hidden/
+        // residual for each of the k positions at offsets
+        // `[0, k * hidden * 2)`.
+        self.prefill(tokens)?;
+
+        let final_norm_weight = {
+            let manifest = self.weights.as_ref().ok_or_else(|| {
+                CoreError::Runtime(
+                    "verify_block_batched: missing weights manifest".to_owned(),
+                )
+            })?;
+            let weights = self.cuda_weights()?;
+            self.tensor_ptr(weights, &manifest.final_norm)?
+        };
+        let lm_head_weight = {
+            let manifest = self.weights.as_ref().ok_or_else(|| {
+                CoreError::Runtime(
+                    "verify_block_batched: missing weights manifest".to_owned(),
+                )
+            })?;
+            let weights = self.cuda_weights()?;
+            self.tensor_ptr(weights, &manifest.lm_head)?
+        };
+
+        let hidden = self.topology.hidden_size;
+        let vocab = self.topology.vocab_size;
+        let (workspace, workspace_bytes) = {
+            let runtime = self.cuda_runtime()?;
+            let ws = runtime
+                .workspace
+                .as_ref()
+                .map(|b| b.ptr())
+                .unwrap_or(DevicePtr::NULL);
+            let wsb = runtime.workspace.as_ref().map(|b| b.bytes()).unwrap_or(0);
+            (ws, wsb)
+        };
+        let (prefill_hidden_ptr, prefill_residual_ptr, prefill_normed_ptr) = {
+            let prefill = self.cuda_prefill()?;
+            (
+                prefill.hidden.ptr(),
+                prefill.residual.ptr(),
+                prefill.normed.ptr(),
+            )
+        };
+
+        let logits_buf = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(k * vocab * 2)?;
+        let tokens_buf = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(k * 4)?;
+
+        self.backend.rmsnorm(&RmsNormSpec {
+            rows: k,
+            hidden,
+            eps: 1.0e-6,
+            input_bf16: prefill_hidden_ptr,
+            weight_bf16: final_norm_weight,
+            residual_bf16: prefill_residual_ptr,
+            residual_out_bf16: DevicePtr::NULL,
+            output_bf16: prefill_normed_ptr,
+            direct_weight: false,
+        })?;
+
+        self.backend.bf16_gemm(&Bf16GemmSpec {
+            m: vocab,
+            n: k,
+            k: hidden,
+            a_bf16: lm_head_weight,
+            b_bf16: prefill_normed_ptr,
+            c_bf16: logits_buf.ptr(),
+            workspace,
+            workspace_bytes,
+        })?;
+
+        self.backend
+            .sample_rows(&qwen36_fp4_kernels::SamplingRowsSpec {
+                rows: k,
+                vocab_size: vocab,
+                logits_bf16: logits_buf.ptr(),
+                output_token_u32: tokens_buf.ptr(),
+                mirror_last_output_token_u32: DevicePtr::NULL,
+                temperature: 0.0,
+            })?;
+
+        qwen36_fp4_kernels::cuda_synchronize()?;
+
+        let mut bytes = vec![0u8; k * 4];
+        tokens_buf.copy_to_host(&mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    /// Truncate `state.position` to `new_position` (must be ≤ current).
+    /// The target KV cache data past `new_position` is left in place
+    /// but will be overwritten by the next forward write. Companion to
+    /// `verify_block_batched` for speculative decoding: after the
+    /// batched verify advances state by `k`, the controller calls
+    /// `crop_state_position(prompt + accepted + 1)` to discard the
+    /// rejected speculative tail.
+    #[cfg(feature = "cuda")]
+    pub fn crop_state_position(&mut self, new_position: usize) -> Result<()> {
+        if new_position > self.state.position {
+            return Err(CoreError::Runtime(format!(
+                "crop_state_position: new {new_position} > current {}",
+                self.state.position,
+            )));
+        }
+        self.state.position = new_position;
+        Ok(())
+    }
+
     pub fn decode_one(&mut self, token: u32) -> Result<ForwardOutput> {
         self.decode_one_with_sync(token, true)
     }

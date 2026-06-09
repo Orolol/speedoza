@@ -2456,38 +2456,44 @@ fn drafter_chat_smoke(
 
         // Verify via sequential decode_one with per-decode capture
         // write_row updates so each decode lands at a fresh row.
+        // Batched verify: one prefill of [seed, drafts[0]..drafts[k-1]]
+        // produces argmaxes at every input position in a single forward
+        // pass through the target. ~10× fewer target forwards per
+        // iteration than the sequential `engine.prefill(&[t])` chain.
+        // The Phase E hook fires once per layer with tokens=k+1, writing
+        // capture rows [0, k+1).
+        capture.set_write_row(0);
+        let mut verify_input = Vec::with_capacity(drafts.len() + 1);
+        verify_input.push(seed_token);
+        verify_input.extend_from_slice(&drafts);
+        let argmaxes = engine.verify_block_batched(&verify_input)?;
+
         let mut accepted = 0_usize;
-        let mut prev = seed_token;
         let mut bonus_token: u32 = 0;
-        // NOTE: we use engine.prefill(&[t]) instead of
-        // decode_one_queued(t). On NVFP4, the decode kernel path
-        // produces logits with cos sim 0.76–0.81 (sometimes negative)
-        // vs the prefill kernel path on the same input — a real engine
-        // bug surfaced by `decode-vs-prefill-check`. prefill of a
-        // single token at the current state.position advances state
-        // by 1 the same way decode_one does, but routes through the
-        // numerically correct prefill kernels.
         for (i, &drafted) in drafts.iter().enumerate() {
-            capture.set_write_row(i);
-            engine.prefill(&[prev])?;
-            engine.queue_sample_greedy_to_current_token()?;
-            qwen36_fp4_runtime::cuda_synchronize()?;
-            let target_argmax = engine.read_current_token()?;
+            // argmaxes[i] is the target's prediction for the token at
+            // position i+1 given inputs [verify_input[0..=i]] — i.e.
+            // "what should follow verify_input[i]". We compare to
+            // drafts[i].
+            let target_argmax = argmaxes[i];
             if target_argmax == drafted {
                 accepted += 1;
-                prev = drafted;
             } else {
                 bonus_token = target_argmax;
                 break;
             }
         }
         if accepted == drafts.len() {
-            capture.set_write_row(accepted);
-            engine.prefill(&[prev])?;
-            engine.queue_sample_greedy_to_current_token()?;
-            qwen36_fp4_runtime::cuda_synchronize()?;
-            bonus_token = engine.read_current_token()?;
+            bonus_token = argmaxes[drafts.len()];
         }
+
+        // Rollback target state for rejected speculative tail. Batched
+        // verify advanced state by `verify_input.len() = drafts.len() +
+        // 1`; only `accepted + 1` of those entries (seed + accepted
+        // drafts) belong in the committed prefix. Crop state back so
+        // the next iter's verify writes at the correct positions.
+        let committed_target_position = prompt_len + total_committed_after_prompt + accepted + 1;
+        engine.crop_state_position(committed_target_position)?;
 
         // Commit accepted drafts + bonus. The seed itself was committed
         // by the PREVIOUS iter as its bonus (or sampled from prefill
