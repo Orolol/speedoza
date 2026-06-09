@@ -151,6 +151,13 @@ __global__ void drafter_attention_block_v1_kernel(
 
 } // namespace
 
+// Forward declaration: FA-tiled kernel entry from drafter_attention_flash.cu.
+// Returns QWEN36_STATUS_NOT_IMPLEMENTED for shapes outside its specialised
+// (head_dim=128, q_len=16) gate, in which case we fall back to the v1
+// per-key inner-loop kernel below.
+extern "C" int qwen36_drafter_attention_block_flash_bf16(
+    const qwen36_drafter_attention_block_spec_t *spec);
+
 extern "C" int qwen36_drafter_attention_block_bf16(
     const qwen36_drafter_attention_block_spec_t *spec) {
   if (spec == nullptr) {
@@ -172,6 +179,19 @@ extern "C" int qwen36_drafter_attention_block_bf16(
     // only head_dim). Other values fall back via the dispatcher.
     return QWEN36_STATUS_NOT_IMPLEMENTED;
   }
+
+  // Try the FA-tiled kernel first for the common shape (q_len=16). It
+  // returns NOT_IMPLEMENTED on shape mismatch or when
+  // QWEN36_DRAFTER_ATTENTION_DISABLE_FLASH=1; either way we fall back to
+  // the v1 reference kernel that handles every shape.
+  const int flash_status = qwen36_drafter_attention_block_flash_bf16(spec);
+  if (flash_status == QWEN36_STATUS_SUCCESS ||
+      flash_status == QWEN36_STATUS_CUDA_ERROR ||
+      flash_status == QWEN36_STATUS_NULL_POINTER ||
+      flash_status == QWEN36_STATUS_INVALID_ARGUMENT) {
+    return flash_status;
+  }
+  // flash_status == QWEN36_STATUS_NOT_IMPLEMENTED → fall back.
 
   const float scale = 1.0f / sqrtf(static_cast<float>(spec->head_dim));
 

@@ -802,6 +802,73 @@ QWEN36_LONG_CONTEXT_MODE=1 \
     --mtp-speculative-tokens <0|4>
 ```
 
+### 2026-06-09 — DFlash megakernel roadmap Phase 1 (FA-tile drafter attn) — neutral, off by default
+
+Pivot: the user committed to "Option A" of the long-context roadmap
+(full TileRT-style megakernel), retargeted at DFlash instead of MTP.
+Phase 1 was the cheapest entry — FA-tile the naive drafter attention
+kernel. Spec + bench in
+`docs/superpowers/specs/2026-06-09-dflash-fa-drafter-attention.md`.
+
+**What shipped:** `kernels-cuda/drafter_attention_flash.cu` (~330 LoC),
+wmma m16n16k16 BF16 + FP32 accum, online softmax, 4-warp split (warps
+own 1 n-tile each for QK^T and 2 d-tiles each for PV). Dispatcher in
+`drafter_attention.cu` tries FA first, falls back to v1 on
+`NOT_IMPLEMENTED`. Build added to `scripts/build_cuda.sh`.
+
+**Bench (DFlash chat smoke, max-new=256, `QWEN36_LONG_CONTEXT_MODE=1`,
+same session):**
+
+| Prompt | ctx | FA tok/s | v1 tok/s | FA AL | v1 AL | per-iter FA | per-iter v1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| AGENT.md head:150 | 3262 | 34.5 | 54.7 | 4.87 | 7.76 | **141 ms** | **142 ms** |
+| AGENT.md head:300 | 7058 | 18.8 | 21.2 | 4.81 | 5.43 | **256 ms** | **256 ms** |
+
+**Two clean findings, both consequential for the rest of the roadmap:**
+
+1. **Per-iter wall time is bit-identical** between FA and v1. The
+   drafter forward at long ctx is *not* compute-bound on these shapes
+   (q_len=16, q_heads=32, head_dim=128). The FA kernel's 32 CTAs
+   (one per q_head) under-use the 192 SMs; v1's 640 CTAs (q_len ×
+   q_heads) saturate better. The wmma tensor-core advantage doesn't
+   matter at these shapes — both are launch/per-call-overhead bound
+   at the same point. The throughput delta we see is entirely AL
+   delta, not kernel speed.
+2. **Numerical drift at ctx ≈ 120+.** Parity passes bit-exact at
+   short ctx (33 tokens generated identical). At ~180-token ctx the
+   generations fork. Source not yet diagnosed; candidates are online
+   softmax accumulation drift across many K-tiles, tail-tile
+   masking boundary, or PV BF16 cast precision.
+
+**Decision: opt-in default off.** Env gate is now
+`QWEN36_DRAFTER_ATTENTION_FLASH=1` (positive, opt-in). Absence
+keeps the v1 path. The FA code stays in tree as substrate for Phase
+4 (verify megakernel), where q=16 is actually the prefill compute-
+bound regime that wmma tiling does win on.
+
+**Roadmap rebalance:** the drafter attn kernel is *not* the long-
+context bottleneck we thought. The verify step is. Phase 2 (NVFP4
+KV cache + BitDecoding port — attacks verify's full-KV bandwidth)
+and Phase 4 (verify megakernel — attacks per-iter launch overhead)
+should drive the next investments, in that order. Phase 1's
+substrate (cooperative load pattern, wmma layout, online softmax)
+folds directly into Phase 4. See
+`docs/superpowers/specs/2026-06-09-dflash-fa-drafter-attention.md`
+§ 11 for the full outcome.
+
+Reproduce:
+
+```bash
+QWEN36_FP4_KERNEL_LIB_DIR=$PWD/target/cuda \
+LD_LIBRARY_PATH=$PWD/target/cuda:${LD_LIBRARY_PATH:-} \
+QWEN36_LONG_CONTEXT_MODE=1 \
+[QWEN36_DRAFTER_ATTENTION_FLASH=1] \
+  target/release/qwen36 drafter-chat-smoke \
+    --model-dir ~/models/Qwen3.6-27B-Text-NVFP4-MTP \
+    --drafter-dir ~/models/Qwen3.6-27B-DFlash \
+    --prompt "$(head -150 AGENT.md)" --max-new-tokens 256
+```
+
 ### 2026-06-09 — DFlash speculative decoding (`chat --drafter dflash`) — opt-in fast path, 1.8× MTP=3 geo-mean
 
 Phase F.2 shipped. End-to-end speculative loop using

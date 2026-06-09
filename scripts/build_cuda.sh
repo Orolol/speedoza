@@ -30,8 +30,9 @@ EXTRA_SRC+=(kernels-cuda/decode_gemv/l2_prefetch.cu)
 EXTRA_SRC+=(kernels-cuda/megakernel/full_attn_block_sm120.cu)
 # Stage-0 decode interpreter substrate — pure CUDA, no CUTLASS dep.
 EXTRA_SRC+=(kernels-cuda/interpreter/interpreter_sm120.cu)
-# DFlash drafter attention (Phase C v1) — pure CUDA, no CUTLASS dep.
+# DFlash drafter attention (Phase C v1 + Phase 1 FA-tiled) — pure CUDA.
 EXTRA_SRC+=(kernels-cuda/drafter_attention.cu)
+EXTRA_SRC+=(kernels-cuda/drafter_attention_flash.cu)
 
 "${NVCC}" \
   -std=c++17 \
