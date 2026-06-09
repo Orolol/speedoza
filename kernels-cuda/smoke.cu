@@ -16,6 +16,12 @@
 extern "C" int qwen36_drafter_attention_block_flash_bf16(
     const qwen36_drafter_attention_block_spec_t *spec);
 
+// Flash-Decoding split-K prefill entry (P2). Not in the public header;
+// declared here so the parity gate can compare it against the scalar GQA
+// reference (qwen36_attention_prefill) at the q=16 verify shape.
+extern "C" int qwen36_attention_flash_splitk_prefill_bf16(
+    const qwen36_attention_prefill_spec_t *spec, int n_splits);
+
 namespace {
 
 template <typename T> void must_cuda(cudaError_t err, const char *what) {
@@ -4287,6 +4293,117 @@ int main() {
       }
     }
     printf("drafter FA parity gate passed (%d cases, q_len=16)\n", cases);
+  }
+
+  // ------------------------------------------------------------------
+  // Flash-Decoding split-K prefill parity gate (P2).
+  // ------------------------------------------------------------------
+  // Compares the q=16 split-K flash kernel against the scalar GQA prefill
+  // (qwen36_attention_prefill, the production reference at tokens<1024)
+  // at the real verify shape (q_heads=24, kv_heads=4, head_dim=256), over
+  // several start_positions and split counts. The split-K must be a
+  // numerically faithful (cos>=0.998) drop-in for the scalar attention —
+  // unlike the scalar split-GQA path, which drifts under speculative
+  // amplification. BF16 KV cache (FP8 shares the identical dequant path).
+  {
+    const int q_heads = 24;
+    const int kv_heads = 4;
+    const int head_dim = 256;
+    const int tokens = 16;
+    const int starts[] = {0, 64, 2048};
+    const int split_counts[] = {1, 4, 48};
+
+    qwen36_attention_shape_t shape{};
+    shape.q_heads = q_heads;
+    shape.kv_heads = kv_heads;
+    shape.head_dim = head_dim;
+    shape.rope_dims = 0;
+
+    auto cos_sim = [](const std::vector<float> &a,
+                      const std::vector<float> &b) -> double {
+      double num = 0.0, da = 0.0, db = 0.0;
+      for (size_t i = 0; i < a.size(); ++i) {
+        num += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+        da += static_cast<double>(a[i]) * static_cast<double>(a[i]);
+        db += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+      }
+      return num / sqrt(da * db);
+    };
+
+    std::mt19937 rng(515151);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    int cases = 0;
+
+    for (int start_position : starts) {
+      const int ctx = start_position + tokens;
+      const size_t q_total = (size_t)tokens * q_heads * head_dim;
+      const size_t kv_total = (size_t)ctx * kv_heads * head_dim;
+      const size_t blk = (size_t)tokens * kv_heads * head_dim;
+
+      std::vector<float> q_host(q_total), ck_host(kv_total), cv_host(kv_total);
+      for (auto &x : q_host) x = dist(rng);
+      for (auto &x : ck_host) x = dist(rng);
+      for (auto &x : cv_host) x = dist(rng);
+
+      qwen36_device_ptr_t q_dev = dev_alloc<__nv_bfloat16>(q_total);
+      qwen36_device_ptr_t ck_dev = dev_alloc<__nv_bfloat16>(kv_total);
+      qwen36_device_ptr_t cv_dev = dev_alloc<__nv_bfloat16>(kv_total);
+      qwen36_device_ptr_t kblk_dev = dev_alloc<__nv_bfloat16>(blk);
+      qwen36_device_ptr_t vblk_dev = dev_alloc<__nv_bfloat16>(blk);
+      qwen36_device_ptr_t out_ref = dev_alloc<__nv_bfloat16>(q_total);
+      qwen36_device_ptr_t out_sk = dev_alloc<__nv_bfloat16>(q_total);
+      copy_bf16(q_dev, q_host);
+      copy_bf16(ck_dev, ck_host);
+      copy_bf16(cv_dev, cv_host);
+      // The new block's K/V mirror the tail of the cache.
+      std::vector<float> kblk(ck_host.end() - blk, ck_host.end());
+      std::vector<float> vblk(cv_host.end() - blk, cv_host.end());
+      copy_bf16(kblk_dev, kblk);
+      copy_bf16(vblk_dev, vblk);
+
+      qwen36_attention_prefill_spec_t spec{};
+      spec.start_position = start_position;
+      spec.tokens = tokens;
+      spec.q_bf16 = q_dev;
+      spec.k_bf16 = kblk_dev;
+      spec.v_bf16 = vblk_dev;
+      spec.kv_cache_k = ck_dev;
+      spec.kv_cache_v = cv_dev;
+      spec.shape = shape;
+      spec.kv_cache_dtype = 0; // bf16
+
+      // Reference: scalar GQA (partials NULL -> no split path at tokens=16).
+      spec.output_bf16 = out_ref;
+      must_status(qwen36_attention_prefill(&spec),
+                  "splitk parity: scalar GQA reference");
+      std::vector<float> ref = read_bf16(out_ref, q_total);
+
+      for (int n_splits : split_counts) {
+        spec.output_bf16 = out_sk;
+        must_status(qwen36_attention_flash_splitk_prefill_bf16(&spec, n_splits),
+                    "splitk parity: flash split-K");
+        std::vector<float> got = read_bf16(out_sk, q_total);
+        const double cos = cos_sim(got, ref);
+        if (cos < 0.998) {
+          fprintf(stderr,
+                  "flash split-K parity FAIL [start=%d n_splits=%d]: "
+                  "cos=%.6f < 0.998\n",
+                  start_position, n_splits, cos);
+          exit(1);
+        }
+        ++cases;
+      }
+
+      dev_free<__nv_bfloat16>(q_dev);
+      dev_free<__nv_bfloat16>(ck_dev);
+      dev_free<__nv_bfloat16>(cv_dev);
+      dev_free<__nv_bfloat16>(kblk_dev);
+      dev_free<__nv_bfloat16>(vblk_dev);
+      dev_free<__nv_bfloat16>(out_ref);
+      dev_free<__nv_bfloat16>(out_sk);
+    }
+    printf("flash split-K parity gate passed (%d cases, q=16 head_dim=256)\n",
+           cases);
   }
 
   printf("qwen36 CUDA smoke test passed\n");

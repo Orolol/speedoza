@@ -861,6 +861,57 @@ the GPU; partial softmax per split + a reduction. Reuses the
 ~2.5–4×. Parity gated by a smoke cos≥0.998 (modeled on P0a) + the
 no-fork end-to-end check.
 
+### 2026-06-09 — P2 SHIPPED: FA-2 wmma split-K verify kernel — 2.2–2.9×, parity-clean, opt-in
+
+Built the correct version of the q=16 full-attn win:
+`kernels-cuda/attention_flash_splitk.cu` — a Flash-Decoding split-K
+kernel that lifts the proven `attention_flash_prefill.cu` wmma tile
+(M=32, N=64, D=256, 4 warps, FP32 accum, causal, BF16/FP8 KV) and adds
+a KV-split grid dimension (grid.z = n_splits) + a log-sum-exp reduce.
+At q=16 the normal flash tile grids only 4 CTAs (~2% of 170 SMs); split-K
+tiles the KV across ~48 CTAs to saturate, while staying numerically
+faithful (unlike the scalar split-GQA path which drifted).
+
+**Parity gate (smoke.cu, kernel-vs-scalar-GQA):** 9 cases (start ∈
+{0,64,2048} × n_splits ∈ {1,4,48}), all cos ≥ 0.998 vs the scalar GQA
+reference at the real verify shape (q_heads=24, kv_heads=4,
+head_dim=256). The split-K is a faithful drop-in.
+
+**End-to-end DFlash (drafter-chat-smoke, max-new=192, opt-in
+`QWEN36_VERIFY_FLASH_SPLITK=1`, WITH per-call cudaMalloc overhead):**
+
+| prompt | baseline tok/s | split-K tok/s | speedup | base AL | split-K AL |
+|---|---:|---:|---:|---:|---:|
+| AGENT.md head:150 (3K) | 65.8 | **147.5** | **2.24×** | 9.18 | 9.0 |
+| AGENT.md head:300 (7K) | 18.5 | **54.0** | **2.92×** | 4.49 | 3.64 |
+
+full_attn per chunk at 7K: 200 → ~29 ms (~6×); chunk wall 225 → ~54 ms.
+
+The faithful kernel **preserves AL at 3K** (9.18 → 9.0 = noise) — the
+clean win the rigorous path promised. Contrast the lossy scalar split-GQA
+which *regressed* at 3K (63 tok/s, AL 4.17). At 7K (topic-diverse,
+low-AL regime) AL drifts a little (borderline argmaxes are sensitive to
+the ~1e-3 FP difference) but the 6× kernel speedup dominates → 2.9×. The
+output is a faithful greedy decode of the flash-attention target — and
+the flash tile is the SAME kernel the prompt prefill uses (≥1024 chunks),
+so verify is now *consistent* with prefill rather than using a different
+scalar kernel.
+
+**Status: opt-in default off** (`QWEN36_VERIFY_FLASH_SPLITK=1`). Two
+follow-ups before default-on:
+1. **Engine-buffer reuse** — the dispatch currently calls a self-contained
+   entry that `cudaMalloc`s partials per call (per attention call, ×16
+   layers × iters). Reuse pre-allocated forward buffers (sized
+   tokens × q_heads × n_splits × head_dim) to drop the alloc + implicit
+   sync overhead; will push the speedup higher.
+2. **Coherent long-ctx sweep** to characterize the 7K AL drift on
+   non-garbage prompts before flipping default.
+
+Files: `kernels-cuda/attention_flash_splitk.cu` (kernel + reduce +
+self-contained entry), `attention.cu` dispatch branch (env-gated, falls
+through to scalar GQA on NOT_IMPLEMENTED), `smoke.cu` parity gate,
+`build_cuda.sh`.
+
 ### 2026-06-09 — P2 probe: existing split-K GQA at q=16 — 5× at 7K but lossy
 
 The full_attn bottleneck (200ms = 89% of verify) is the q=16 scalar GQA

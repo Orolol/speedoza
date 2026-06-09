@@ -48,6 +48,7 @@ EXTRA_SRC+=(kernels-cuda/drafter_attention_flash.cu)
   kernels-cuda/deltanet_prefill.cu \
   kernels-cuda/attention.cu \
   kernels-cuda/attention_flash_prefill.cu \
+  kernels-cuda/attention_flash_splitk.cu \
   kernels-cuda/attention_sage_prefill.cu \
   kernels-cuda/turboquant.cu \
   kernels-cuda/ops.cu \

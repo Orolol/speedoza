@@ -2362,6 +2362,12 @@ __global__ void attention_prefill_kernel(
 
 } // namespace
 
+// Flash-Decoding split-K prefill (kernels-cuda/attention_flash_splitk.cu).
+// Correct (cos>=0.998 vs scalar GQA, smoke-gated) and saturates the GPU at
+// q<=32 / head_dim=256 / long-KV where the normal flash tile under-grids.
+extern "C" int qwen36_attention_flash_splitk_prefill_bf16(
+    const qwen36_attention_prefill_spec_t *spec, int n_splits);
+
 extern "C" int
 qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
   if (spec == nullptr) {
@@ -2590,6 +2596,30 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
     }
     cudaError_t err = cudaGetLastError();
     return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+  }
+  // Flash-Decoding split-K for the small-q / long-KV verify shape
+  // (DFlash q=16 full-attn). Opt-in via QWEN36_VERIFY_FLASH_SPLITK; the
+  // normal flash tile is gated off below 1024 tokens because it under-grids
+  // (4 CTAs at q=16), and the scalar GQA re-reads the full KV per token.
+  // This path tiles the KV across n_splits CTAs to saturate the GPU while
+  // staying numerically faithful (FP32 accum, cos>=0.998 vs scalar).
+  if (!tree_mask_present && env_bool_or("QWEN36_VERIFY_FLASH_SPLITK", false) &&
+      spec->tokens >= 2 && spec->tokens <= 32 && spec->shape.head_dim == 256 &&
+      !is_tq_cache_dtype(spec->kv_cache_dtype) && q_per_kv > 1) {
+    const size_t total_k_iters = (spec->start_position + spec->tokens + 63) / 64;
+    int n_splits = static_cast<int>(total_k_iters);
+    if (n_splits > 48) {
+      n_splits = 48;
+    }
+    if (n_splits < 1) {
+      n_splits = 1;
+    }
+    const int rc = qwen36_attention_flash_splitk_prefill_bf16(spec, n_splits);
+    if (rc != QWEN36_STATUS_NOT_IMPLEMENTED &&
+        rc != QWEN36_STATUS_INVALID_ARGUMENT) {
+      return rc;
+    }
+    // else fall through to the scalar GQA path.
   }
   if (gqa_eligible) {
     if (tree_mask_present) {
