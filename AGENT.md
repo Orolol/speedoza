@@ -966,22 +966,48 @@ verification + Opus synthesis):
   cos ≥ 0.998.
 
 DFlash default (no env) measured 143.9 tok/s at 3K (2.2× vs scalar
-baseline 65). Remaining polish (not gating; tracked #55):
-1. **Engine-owned scratch** — the entry currently uses a process-global
-   grow-on-demand scratch (capture-guarded: a mid-capture grow falls
-   through to scalar GQA; in steady state the eager q=16 calls pre-grow
-   it so no alloc happens during capture). The robustness completion is
-   to pre-reserve the partials in the engine at init (worst case from
-   `config.max_context`: n_splits≤48, tokens≤32, q_heads, head_dim+2)
-   and pass them via the spec, mirroring the decode split-KV path at
-   `attention.cu:2687-2719`. Removes even the first eager alloc and lets
-   future captured [9,32] chunks use split-K instead of falling through.
+baseline 65).
 
-Files: `kernels-cuda/attention_flash_splitk.cu` (kernel + reduce +
-persistent-scratch entry with `cudaStreamIsCapturing` guard),
-`attention.cu` dispatch branch (default-on, falls through to scalar GQA
-on NOT_IMPLEMENTED incl. mid-capture grow), `smoke.cu` parity gate
-(72 cases BF16+FP8), `build_cuda.sh`.
+**#55 DONE (9af1c81) — engine-owned partials.** The split-K entry now
+consumes the prefill spec's `partial_acc/max/denom_f32` (the engine
+already allocated and passed them — the entry was ignoring them). `gpu.rs`
+sizes the shared split-KV partial buffers to `max(decode, verify)` where
+verify = 32 tokens × q_heads × 48 splits × head_dim (~38 MB). No
+cudaMalloc in the production verify hot path → fully capture-safe (a
+future captured [9,32] chunk uses split-K with no mid-capture alloc); the
+process-global scratch stays only as the smoke/NULL-spec fallback. Smoke
+parity now **144 cases** (BF16+FP8 × tokens{9,16,32} ×
+starts{0,64,2048,4096} × splits{1,8,48} × **both scratch+engine paths**),
+all cos ≥ 0.998. Perf gate: DFlash 3K 143.6 (split-K) vs 60.9 (off) =
+2.36×, AL preserved; MTP=0/4 no capture error, no regression.
+
+**M=16 tile + DeltaNet opt — DROPPED by measurement** (design workflow
+wf_96d7d3e6-c03). An empirical paired microbench built a correct
+M=16/D=256 split-K prototype and timed it head-to-head at the verify
+shape (q=16, ctx=7000, FP8, n_splits=48): **1.22 vs 1.34 ms/layer =
+~8 % on the kernel, ~3-4 % on the 49 ms chunk** — NOT the ~2× the
+MMA-count model predicted. The kernel is latency-bound (32768 branchy
+FP8 ldexpf decodes/K-iter, serial per-row softmax, 5 syncthreads) and
+occupancy is 1 CTA/SM for BOTH M=16 and M=32 (the 64 KB sm_K+sm_V
+dominates the 99 KB budget), so halving MMA count doesn't help. DeltaNet
+self-assessed win=no: the scan is 3.1 ms (6.3 % of chunk); 64 % of the
+9.9 ms linear-attn bucket is out-of-scope NVFP4 GEMMs. Both below the
+15 % bar — skipped (~17 h for ~6 %). The real remaining full_attn levers
+(vectorized/LUT FP8 decode, raise occupancy by shrinking the KV SMEM
+tile / double-buffering, fix the ~11-of-48 empty-split load imbalance at
+7K) are bigger separately-scoped efforts; the chunk is near-optimal for
+the cheap wins.
+
+**The DFlash verify lane (P0 → P2.1 + #55) is COMPLETE:** 4.6× chunk
+speedup banked (225 → 49 ms), 2.2–4.3× end-to-end, parity-clean
+(144-case gate), default-on, adversarial-review-cleared, capture-safe.
+The remaining megakernel work is the interpreter decode path (Codex's
+lane: auto-policy landed 5111903, then MLP chunking + SMEM prefetch).
+
+Files: `kernels-cuda/attention_flash_splitk.cu` (M=32 wmma split-K +
+reduce + engine-partials entry with `cudaStreamIsCapturing` fallback),
+`attention.cu` dispatch (default-on), `crates/runtime/src/gpu.rs`
+(partial sizing), `smoke.cu` (144-case gate), `scripts/verify_perf_gate.sh`.
 
 ### 2026-06-09 — P2 probe: existing split-K GQA at q=16 — 5× at 7K but lossy
 
