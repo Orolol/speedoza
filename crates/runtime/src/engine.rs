@@ -214,6 +214,7 @@ fn decode_interpreter_mlp_enabled(master_enabled: bool) -> bool {
         master_enabled,
         "QWEN36_INTERPRETER_MLP",
         &[
+            InterpreterOpcode::Nvfp4GemvPair,
             InterpreterOpcode::Nvfp4Gemv,
             InterpreterOpcode::SwiGluNvfp4Quant,
         ],
@@ -227,6 +228,7 @@ fn decode_interpreter_norm_mlp_enabled(master_enabled: bool) -> bool {
         "QWEN36_INTERPRETER_NORM_MLP",
         &[
             InterpreterOpcode::RmsNormNvfp4Quant,
+            InterpreterOpcode::Nvfp4GemvPair,
             InterpreterOpcode::Nvfp4Gemv,
             InterpreterOpcode::SwiGluNvfp4Quant,
         ],
@@ -336,6 +338,7 @@ fn decode_interpreter_full_transformer_layer_enabled(master_enabled: bool) -> bo
             InterpreterOpcode::AttnDecodeFull,
             InterpreterOpcode::QProjSigmoidGate,
             InterpreterOpcode::Nvfp4Quantize,
+            InterpreterOpcode::Nvfp4GemvPair,
             InterpreterOpcode::SwiGluNvfp4Quant,
         ],
     )
@@ -426,6 +429,7 @@ fn decode_interpreter_linear_transformer_layer_enabled(master_enabled: bool) -> 
             InterpreterOpcode::RmsNormBf16,
             InterpreterOpcode::SwiGluBf16,
             InterpreterOpcode::Nvfp4Quantize,
+            InterpreterOpcode::Nvfp4GemvPair,
             InterpreterOpcode::SwiGluNvfp4Quant,
         ],
     )

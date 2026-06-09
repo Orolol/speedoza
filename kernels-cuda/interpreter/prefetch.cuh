@@ -68,6 +68,25 @@ prefetch_next_instruction_weights(const qwen36_interpreter_instruction_t &next) 
     prefetch_range_l2(base, to_fetch);
     break;
   }
+  case QWEN36_INTERPRETER_OPCODE_NVFP4_GEMV_PAIR: {
+    // payload[2]/[4] are the two FP4 weight matrices. Split the small
+    // lookahead budget so both first tiles can land warm when prefetch is
+    // explicitly enabled.
+    const auto m = static_cast<uint64_t>(next.payload[0]);
+    const auto k = static_cast<uint64_t>(next.payload[1]);
+    const uint64_t weight_bytes = (m * k) / 2u;
+    const uint32_t half_budget = kPrefetchBudgetBytes / 2u;
+    const uint32_t to_fetch =
+        weight_bytes > half_budget ? half_budget
+                                   : static_cast<uint32_t>(weight_bytes);
+    const auto *gate_base =
+        reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(next.payload[2]));
+    const auto *up_base =
+        reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(next.payload[4]));
+    prefetch_range_l2(gate_base, to_fetch);
+    prefetch_range_l2(up_base, to_fetch);
+    break;
+  }
   case QWEN36_INTERPRETER_OPCODE_LM_HEAD_TILED: {
     // payload[0] = out_features, payload[1] = in_features,
     // payload[3] = weight_bf16. We only prime the first slice — the head is

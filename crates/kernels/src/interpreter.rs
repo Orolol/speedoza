@@ -4,7 +4,7 @@ use crate::backend::DevicePtr;
 
 pub const INTERPRETER_MAX_DEPS: usize = 4;
 pub const INTERPRETER_PAYLOAD_U64S: usize = 12;
-pub const INTERPRETER_OPCODE_COUNT: usize = 16;
+pub const INTERPRETER_OPCODE_COUNT: usize = 17;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InterpreterOpcode {
@@ -24,10 +24,11 @@ pub enum InterpreterOpcode {
     Nvfp4Quantize,
     SwiGluBf16,
     Conv1dGdnGateFused,
+    Nvfp4GemvPair,
 }
 
 impl InterpreterOpcode {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Exit,
         Self::FallbackTrampoline,
         Self::RmsNormNvfp4Quant,
@@ -44,6 +45,7 @@ impl InterpreterOpcode {
         Self::Nvfp4Quantize,
         Self::SwiGluBf16,
         Self::Conv1dGdnGateFused,
+        Self::Nvfp4GemvPair,
     ];
 
     pub fn code(self) -> u16 {
@@ -64,6 +66,7 @@ impl InterpreterOpcode {
             Self::Nvfp4Quantize => 13,
             Self::SwiGluBf16 => 14,
             Self::Conv1dGdnGateFused => 15,
+            Self::Nvfp4GemvPair => 16,
         }
     }
 
@@ -85,6 +88,7 @@ impl InterpreterOpcode {
             13 => Self::Nvfp4Quantize,
             14 => Self::SwiGluBf16,
             15 => Self::Conv1dGdnGateFused,
+            16 => Self::Nvfp4GemvPair,
             _ => return None,
         })
     }
@@ -107,6 +111,7 @@ impl InterpreterOpcode {
             Self::Nvfp4Quantize => "NVFP4_QUANTIZE",
             Self::SwiGluBf16 => "SWIGLU_BF16",
             Self::Conv1dGdnGateFused => "CONV1D_GDN_GATE_FUSED",
+            Self::Nvfp4GemvPair => "NVFP4_GEMV_PAIR",
         }
     }
 
@@ -374,6 +379,37 @@ impl InterpreterInstruction {
         instruction
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvfp4_gemv_pair(
+        m: usize,
+        k: usize,
+        gate_alpha: f32,
+        gate_a_fp4: DevicePtr,
+        gate_a_scale: DevicePtr,
+        gate_c_bf16: DevicePtr,
+        up_alpha: f32,
+        up_a_fp4: DevicePtr,
+        up_a_scale: DevicePtr,
+        up_c_bf16: DevicePtr,
+        b_fp4: DevicePtr,
+        b_scale: DevicePtr,
+    ) -> Self {
+        let mut instruction = Self::new(InterpreterOpcode::Nvfp4GemvPair);
+        instruction.payload[0] = m as u64;
+        instruction.payload[1] = k as u64;
+        instruction.payload[2] = gate_a_fp4.0;
+        instruction.payload[3] = gate_a_scale.0;
+        instruction.payload[4] = up_a_fp4.0;
+        instruction.payload[5] = up_a_scale.0;
+        instruction.payload[6] = b_fp4.0;
+        instruction.payload[7] = b_scale.0;
+        instruction.payload[8] = gate_c_bf16.0;
+        instruction.payload[9] = up_c_bf16.0;
+        instruction.payload[10] = u64::from(gate_alpha.to_bits());
+        instruction.payload[11] = u64::from(up_alpha.to_bits());
+        instruction
+    }
+
     pub fn deltanet_recur_spec(spec: DevicePtr) -> Self {
         let mut instruction = Self::new(InterpreterOpcode::DeltaNetRecur);
         instruction.payload[0] = spec.0;
@@ -632,6 +668,31 @@ mod tests {
         assert_eq!(gemv.payload[0], 16);
         assert_eq!(gemv.payload[1], 1024);
         assert_eq!(gemv.payload[7] as u32, 0.5f32.to_bits());
+
+        let gemv_pair = InterpreterInstruction::nvfp4_gemv_pair(
+            32,
+            2048,
+            0.25,
+            DevicePtr(40),
+            DevicePtr(41),
+            DevicePtr(42),
+            0.75,
+            DevicePtr(43),
+            DevicePtr(44),
+            DevicePtr(45),
+            DevicePtr(46),
+            DevicePtr(47),
+        );
+        assert_eq!(gemv_pair.opcode(), Some(InterpreterOpcode::Nvfp4GemvPair));
+        assert_eq!(gemv_pair.payload[0], 32);
+        assert_eq!(gemv_pair.payload[1], 2048);
+        assert_eq!(gemv_pair.payload[2], 40);
+        assert_eq!(gemv_pair.payload[4], 43);
+        assert_eq!(gemv_pair.payload[6], 46);
+        assert_eq!(gemv_pair.payload[8], 42);
+        assert_eq!(gemv_pair.payload[9], 45);
+        assert_eq!(gemv_pair.payload[10] as u32, 0.25f32.to_bits());
+        assert_eq!(gemv_pair.payload[11] as u32, 0.75f32.to_bits());
 
         let deltanet = InterpreterInstruction::deltanet_recur_spec(DevicePtr(30));
         assert_eq!(deltanet.opcode(), Some(InterpreterOpcode::DeltaNetRecur));

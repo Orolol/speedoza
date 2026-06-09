@@ -272,6 +272,74 @@ pub struct DecodeInterpreterLinearTransformerLayerParams {
 }
 
 impl DecodeInterpreterProgram {
+    fn maybe_dep(
+        instruction: InterpreterInstruction,
+        dep_counter: Option<u32>,
+    ) -> InterpreterInstruction {
+        match dep_counter {
+            Some(counter) => instruction.with_dep(counter, 1),
+            None => instruction,
+        }
+    }
+
+    fn push_mlp_sequence(
+        program: &mut InterpreterProgram,
+        params: DecodeInterpreterMlpParams,
+        dep_counter: Option<u32>,
+        publish_base: u32,
+    ) {
+        program.push(
+            Self::maybe_dep(
+                InterpreterInstruction::nvfp4_gemv_pair(
+                    params.intermediate,
+                    params.hidden,
+                    params.gate_alpha,
+                    params.gate_weight_fp4,
+                    params.gate_weight_scale_e4m3,
+                    params.gate_out_bf16,
+                    params.up_alpha,
+                    params.up_weight_fp4,
+                    params.up_weight_scale_e4m3,
+                    params.up_out_bf16,
+                    params.input_fp4,
+                    params.input_scale_e4m3,
+                ),
+                dep_counter,
+            )
+            .with_publish(publish_base, 1)
+            .with_arrival_counter(publish_base + 1),
+        );
+        program.push(
+            InterpreterInstruction::swiglu_nvfp4_quant(
+                params.intermediate,
+                params.down_input_tensor_scale,
+                params.gate_out_bf16,
+                params.up_out_bf16,
+                params.swiglu_fp4,
+                params.swiglu_scale_e4m3,
+                params.swiglu_tensor_scale_f32,
+            )
+            .with_dep(publish_base, 1)
+            .with_publish(publish_base + 2, 1)
+            .with_arrival_counter(publish_base + 3),
+        );
+        program.push(
+            InterpreterInstruction::nvfp4_gemv(
+                params.hidden,
+                params.intermediate,
+                params.down_alpha,
+                params.down_weight_fp4,
+                params.down_weight_scale_e4m3,
+                params.swiglu_fp4,
+                params.swiglu_scale_e4m3,
+                params.output_bf16,
+            )
+            .with_dep(publish_base + 2, 1)
+            .with_publish(publish_base + 4, 1)
+            .with_arrival_counter(publish_base + 5),
+        );
+    }
+
     pub fn compile(topology: &ModelTopology) -> Self {
         let mut compiler = DecodeInterpreterCompiler {
             program: InterpreterProgram::new(),
@@ -360,64 +428,7 @@ impl DecodeInterpreterProgram {
     /// already NVFP4-quantized by the preceding post-attention RMSNorm.
     pub fn compile_mlp(params: DecodeInterpreterMlpParams) -> Self {
         let mut program = InterpreterProgram::new();
-        program.push(
-            InterpreterInstruction::nvfp4_gemv(
-                params.intermediate,
-                params.hidden,
-                params.gate_alpha,
-                params.gate_weight_fp4,
-                params.gate_weight_scale_e4m3,
-                params.input_fp4,
-                params.input_scale_e4m3,
-                params.gate_out_bf16,
-            )
-            .with_publish(0, 1)
-            .with_arrival_counter(1),
-        );
-        program.push(
-            InterpreterInstruction::nvfp4_gemv(
-                params.intermediate,
-                params.hidden,
-                params.up_alpha,
-                params.up_weight_fp4,
-                params.up_weight_scale_e4m3,
-                params.input_fp4,
-                params.input_scale_e4m3,
-                params.up_out_bf16,
-            )
-            .with_dep(0, 1)
-            .with_publish(2, 1)
-            .with_arrival_counter(3),
-        );
-        program.push(
-            InterpreterInstruction::swiglu_nvfp4_quant(
-                params.intermediate,
-                params.down_input_tensor_scale,
-                params.gate_out_bf16,
-                params.up_out_bf16,
-                params.swiglu_fp4,
-                params.swiglu_scale_e4m3,
-                params.swiglu_tensor_scale_f32,
-            )
-            .with_dep(2, 1)
-            .with_publish(4, 1)
-            .with_arrival_counter(5),
-        );
-        program.push(
-            InterpreterInstruction::nvfp4_gemv(
-                params.hidden,
-                params.intermediate,
-                params.down_alpha,
-                params.down_weight_fp4,
-                params.down_weight_scale_e4m3,
-                params.swiglu_fp4,
-                params.swiglu_scale_e4m3,
-                params.output_bf16,
-            )
-            .with_dep(4, 1)
-            .with_publish(6, 1)
-            .with_arrival_counter(7),
-        );
+        Self::push_mlp_sequence(&mut program, params, None, 0);
         Self {
             program: program.finish(),
         }
@@ -466,65 +477,7 @@ impl DecodeInterpreterProgram {
             .with_publish(0, 1)
             .with_arrival_counter(1),
         );
-        program.push(
-            InterpreterInstruction::nvfp4_gemv(
-                params.mlp.intermediate,
-                params.mlp.hidden,
-                params.mlp.gate_alpha,
-                params.mlp.gate_weight_fp4,
-                params.mlp.gate_weight_scale_e4m3,
-                params.mlp.input_fp4,
-                params.mlp.input_scale_e4m3,
-                params.mlp.gate_out_bf16,
-            )
-            .with_dep(0, 1)
-            .with_publish(2, 1)
-            .with_arrival_counter(3),
-        );
-        program.push(
-            InterpreterInstruction::nvfp4_gemv(
-                params.mlp.intermediate,
-                params.mlp.hidden,
-                params.mlp.up_alpha,
-                params.mlp.up_weight_fp4,
-                params.mlp.up_weight_scale_e4m3,
-                params.mlp.input_fp4,
-                params.mlp.input_scale_e4m3,
-                params.mlp.up_out_bf16,
-            )
-            .with_dep(2, 1)
-            .with_publish(4, 1)
-            .with_arrival_counter(5),
-        );
-        program.push(
-            InterpreterInstruction::swiglu_nvfp4_quant(
-                params.mlp.intermediate,
-                params.mlp.down_input_tensor_scale,
-                params.mlp.gate_out_bf16,
-                params.mlp.up_out_bf16,
-                params.mlp.swiglu_fp4,
-                params.mlp.swiglu_scale_e4m3,
-                params.mlp.swiglu_tensor_scale_f32,
-            )
-            .with_dep(4, 1)
-            .with_publish(6, 1)
-            .with_arrival_counter(7),
-        );
-        program.push(
-            InterpreterInstruction::nvfp4_gemv(
-                params.mlp.hidden,
-                params.mlp.intermediate,
-                params.mlp.down_alpha,
-                params.mlp.down_weight_fp4,
-                params.mlp.down_weight_scale_e4m3,
-                params.mlp.swiglu_fp4,
-                params.mlp.swiglu_scale_e4m3,
-                params.mlp.output_bf16,
-            )
-            .with_dep(6, 1)
-            .with_publish(8, 1)
-            .with_arrival_counter(9),
-        );
+        Self::push_mlp_sequence(&mut program, params.mlp, Some(0), 2);
         Self {
             program: program.finish(),
         }
@@ -1165,65 +1118,7 @@ impl DecodeInterpreterProgram {
             .with_publish(24, 1)
             .with_arrival_counter(25),
         );
-        program.push(
-            InterpreterInstruction::nvfp4_gemv(
-                params.post.mlp.intermediate,
-                params.post.mlp.hidden,
-                params.post.mlp.gate_alpha,
-                params.post.mlp.gate_weight_fp4,
-                params.post.mlp.gate_weight_scale_e4m3,
-                params.post.mlp.input_fp4,
-                params.post.mlp.input_scale_e4m3,
-                params.post.mlp.gate_out_bf16,
-            )
-            .with_dep(24, 1)
-            .with_publish(26, 1)
-            .with_arrival_counter(27),
-        );
-        program.push(
-            InterpreterInstruction::nvfp4_gemv(
-                params.post.mlp.intermediate,
-                params.post.mlp.hidden,
-                params.post.mlp.up_alpha,
-                params.post.mlp.up_weight_fp4,
-                params.post.mlp.up_weight_scale_e4m3,
-                params.post.mlp.input_fp4,
-                params.post.mlp.input_scale_e4m3,
-                params.post.mlp.up_out_bf16,
-            )
-            .with_dep(26, 1)
-            .with_publish(28, 1)
-            .with_arrival_counter(29),
-        );
-        program.push(
-            InterpreterInstruction::swiglu_nvfp4_quant(
-                params.post.mlp.intermediate,
-                params.post.mlp.down_input_tensor_scale,
-                params.post.mlp.gate_out_bf16,
-                params.post.mlp.up_out_bf16,
-                params.post.mlp.swiglu_fp4,
-                params.post.mlp.swiglu_scale_e4m3,
-                params.post.mlp.swiglu_tensor_scale_f32,
-            )
-            .with_dep(28, 1)
-            .with_publish(30, 1)
-            .with_arrival_counter(31),
-        );
-        program.push(
-            InterpreterInstruction::nvfp4_gemv(
-                params.post.mlp.hidden,
-                params.post.mlp.intermediate,
-                params.post.mlp.down_alpha,
-                params.post.mlp.down_weight_fp4,
-                params.post.mlp.down_weight_scale_e4m3,
-                params.post.mlp.swiglu_fp4,
-                params.post.mlp.swiglu_scale_e4m3,
-                params.post.mlp.output_bf16,
-            )
-            .with_dep(30, 1)
-            .with_publish(32, 1)
-            .with_arrival_counter(33),
-        );
+        Self::push_mlp_sequence(&mut program, params.post.mlp, Some(24), 26);
         Self {
             program: program.finish(),
         }
@@ -1790,65 +1685,7 @@ impl DecodeInterpreterProgram {
             .with_publish(16, 1)
             .with_arrival_counter(17),
         );
-        program.push(
-            InterpreterInstruction::nvfp4_gemv(
-                params.post.mlp.intermediate,
-                params.post.mlp.hidden,
-                params.post.mlp.gate_alpha,
-                params.post.mlp.gate_weight_fp4,
-                params.post.mlp.gate_weight_scale_e4m3,
-                params.post.mlp.input_fp4,
-                params.post.mlp.input_scale_e4m3,
-                params.post.mlp.gate_out_bf16,
-            )
-            .with_dep(16, 1)
-            .with_publish(18, 1)
-            .with_arrival_counter(19),
-        );
-        program.push(
-            InterpreterInstruction::nvfp4_gemv(
-                params.post.mlp.intermediate,
-                params.post.mlp.hidden,
-                params.post.mlp.up_alpha,
-                params.post.mlp.up_weight_fp4,
-                params.post.mlp.up_weight_scale_e4m3,
-                params.post.mlp.input_fp4,
-                params.post.mlp.input_scale_e4m3,
-                params.post.mlp.up_out_bf16,
-            )
-            .with_dep(18, 1)
-            .with_publish(20, 1)
-            .with_arrival_counter(21),
-        );
-        program.push(
-            InterpreterInstruction::swiglu_nvfp4_quant(
-                params.post.mlp.intermediate,
-                params.post.mlp.down_input_tensor_scale,
-                params.post.mlp.gate_out_bf16,
-                params.post.mlp.up_out_bf16,
-                params.post.mlp.swiglu_fp4,
-                params.post.mlp.swiglu_scale_e4m3,
-                params.post.mlp.swiglu_tensor_scale_f32,
-            )
-            .with_dep(20, 1)
-            .with_publish(22, 1)
-            .with_arrival_counter(23),
-        );
-        program.push(
-            InterpreterInstruction::nvfp4_gemv(
-                params.post.mlp.hidden,
-                params.post.mlp.intermediate,
-                params.post.mlp.down_alpha,
-                params.post.mlp.down_weight_fp4,
-                params.post.mlp.down_weight_scale_e4m3,
-                params.post.mlp.swiglu_fp4,
-                params.post.mlp.swiglu_scale_e4m3,
-                params.post.mlp.output_bf16,
-            )
-            .with_dep(22, 1)
-            .with_publish(24, 1)
-            .with_arrival_counter(25),
-        );
+        Self::push_mlp_sequence(&mut program, params.post.mlp, Some(16), 18);
         Self {
             program: program.finish(),
         }
@@ -2022,29 +1859,24 @@ mod tests {
             down_alpha: 1.5,
             output_bf16: DevicePtr(33),
         });
-        assert_eq!(compiled.program.instructions.len(), 5);
-        assert_eq!(compiled.program.counter_count, 8);
+        assert_eq!(compiled.program.instructions.len(), 4);
+        assert_eq!(compiled.program.counter_count, 6);
         assert_eq!(
             compiled.program.instructions[0].opcode(),
-            Some(InterpreterOpcode::Nvfp4Gemv)
+            Some(InterpreterOpcode::Nvfp4GemvPair)
         );
         assert_eq!(
             compiled.program.instructions[1].opcode(),
-            Some(InterpreterOpcode::Nvfp4Gemv)
-        );
-        assert_eq!(
-            compiled.program.instructions[2].opcode(),
             Some(InterpreterOpcode::SwiGluNvfp4Quant)
         );
         assert_eq!(
-            compiled.program.instructions[3].opcode(),
+            compiled.program.instructions[2].opcode(),
             Some(InterpreterOpcode::Nvfp4Gemv)
         );
         assert_eq!(compiled.program.instructions[1].deps[0].counter_id, 0);
         assert_eq!(compiled.program.instructions[2].deps[0].counter_id, 2);
-        assert_eq!(compiled.program.instructions[3].deps[0].counter_id, 4);
         assert_eq!(
-            compiled.program.instructions[4].opcode(),
+            compiled.program.instructions[3].opcode(),
             Some(InterpreterOpcode::Exit)
         );
     }
@@ -2089,34 +1921,29 @@ mod tests {
                     output_bf16: DevicePtr(31),
                 },
             });
-        assert_eq!(compiled.program.instructions.len(), 6);
-        assert_eq!(compiled.program.counter_count, 10);
+        assert_eq!(compiled.program.instructions.len(), 5);
+        assert_eq!(compiled.program.counter_count, 8);
         assert_eq!(
             compiled.program.instructions[0].opcode(),
             Some(InterpreterOpcode::RmsNormNvfp4Quant)
         );
         assert_eq!(
             compiled.program.instructions[1].opcode(),
-            Some(InterpreterOpcode::Nvfp4Gemv)
+            Some(InterpreterOpcode::Nvfp4GemvPair)
         );
         assert_eq!(
             compiled.program.instructions[2].opcode(),
-            Some(InterpreterOpcode::Nvfp4Gemv)
-        );
-        assert_eq!(
-            compiled.program.instructions[3].opcode(),
             Some(InterpreterOpcode::SwiGluNvfp4Quant)
         );
         assert_eq!(
-            compiled.program.instructions[4].opcode(),
+            compiled.program.instructions[3].opcode(),
             Some(InterpreterOpcode::Nvfp4Gemv)
         );
         assert_eq!(compiled.program.instructions[1].deps[0].counter_id, 0);
         assert_eq!(compiled.program.instructions[2].deps[0].counter_id, 2);
         assert_eq!(compiled.program.instructions[3].deps[0].counter_id, 4);
-        assert_eq!(compiled.program.instructions[4].deps[0].counter_id, 6);
         assert_eq!(
-            compiled.program.instructions[5].opcode(),
+            compiled.program.instructions[4].opcode(),
             Some(InterpreterOpcode::Exit)
         );
     }
@@ -2664,8 +2491,8 @@ mod tests {
                 },
             },
         );
-        assert_eq!(compiled.program.instructions.len(), 18);
-        assert_eq!(compiled.program.counter_count, 34);
+        assert_eq!(compiled.program.instructions.len(), 17);
+        assert_eq!(compiled.program.counter_count, 32);
         let opcodes: Vec<_> = compiled
             .program
             .instructions
@@ -2688,14 +2515,13 @@ mod tests {
                 Some(InterpreterOpcode::Nvfp4Quantize),
                 Some(InterpreterOpcode::Nvfp4Gemv),
                 Some(InterpreterOpcode::RmsNormNvfp4Quant),
-                Some(InterpreterOpcode::Nvfp4Gemv),
-                Some(InterpreterOpcode::Nvfp4Gemv),
+                Some(InterpreterOpcode::Nvfp4GemvPair),
                 Some(InterpreterOpcode::SwiGluNvfp4Quant),
                 Some(InterpreterOpcode::Nvfp4Gemv),
                 Some(InterpreterOpcode::Exit),
             ]
         );
-        for (idx, instruction) in compiled.program.instructions.iter().take(17).enumerate() {
+        for (idx, instruction) in compiled.program.instructions.iter().take(16).enumerate() {
             assert_eq!(instruction.publishes_counter, (idx * 2) as u32);
             assert_eq!(instruction.arrival_counter, (idx * 2 + 1) as u32);
             if idx > 0 {
@@ -3222,8 +3048,8 @@ mod tests {
                 },
             },
         );
-        assert_eq!(compiled.program.instructions.len(), 14);
-        assert_eq!(compiled.program.counter_count, 26);
+        assert_eq!(compiled.program.instructions.len(), 13);
+        assert_eq!(compiled.program.counter_count, 24);
         let opcodes: Vec<_> = compiled
             .program
             .instructions
@@ -3242,14 +3068,13 @@ mod tests {
                 Some(InterpreterOpcode::Nvfp4Quantize),
                 Some(InterpreterOpcode::Nvfp4Gemv),
                 Some(InterpreterOpcode::RmsNormNvfp4Quant),
-                Some(InterpreterOpcode::Nvfp4Gemv),
-                Some(InterpreterOpcode::Nvfp4Gemv),
+                Some(InterpreterOpcode::Nvfp4GemvPair),
                 Some(InterpreterOpcode::SwiGluNvfp4Quant),
                 Some(InterpreterOpcode::Nvfp4Gemv),
                 Some(InterpreterOpcode::Exit),
             ]
         );
-        for (idx, instruction) in compiled.program.instructions.iter().take(13).enumerate() {
+        for (idx, instruction) in compiled.program.instructions.iter().take(12).enumerate() {
             assert_eq!(instruction.publishes_counter, (idx * 2) as u32);
             assert_eq!(instruction.arrival_counter, (idx * 2 + 1) as u32);
             if idx > 0 {

@@ -48,4 +48,50 @@ exec_nvfp4_gemv(const qwen36_interpreter_instruction_t &insn,
   }
 }
 
+__device__ inline void
+exec_nvfp4_gemv_pair(const qwen36_interpreter_instruction_t &insn,
+                     PageAllocator &pages) {
+  const size_t m = static_cast<size_t>(insn.payload[0]);
+  const size_t k = static_cast<size_t>(insn.payload[1]);
+  const uint8_t *gate_a_fp4 = payload_ptr<const uint8_t>(insn.payload[2]);
+  const uint8_t *gate_a_scale = payload_ptr<const uint8_t>(insn.payload[3]);
+  const uint8_t *up_a_fp4 = payload_ptr<const uint8_t>(insn.payload[4]);
+  const uint8_t *up_a_scale = payload_ptr<const uint8_t>(insn.payload[5]);
+  const uint8_t *b_fp4 = payload_ptr<const uint8_t>(insn.payload[6]);
+  const uint8_t *b_scale = payload_ptr<const uint8_t>(insn.payload[7]);
+  __nv_bfloat16 *gate_output =
+      payload_ptr<__nv_bfloat16>(insn.payload[8]);
+  __nv_bfloat16 *up_output = payload_ptr<__nv_bfloat16>(insn.payload[9]);
+  const float gate_alpha = unpack_gemv_alpha_f32(insn.payload[10]);
+  const float up_alpha = unpack_gemv_alpha_f32(insn.payload[11]);
+
+  constexpr size_t kAlign16 =
+      16u * static_cast<size_t>(qwen36_gemv::kKPerMma);
+  if (m == 0 || k == 0 || (m % qwen36_gemv::kRowsPerBlock) != 0 ||
+      (k % kAlign16) != 0 || gate_a_fp4 == nullptr ||
+      gate_a_scale == nullptr || up_a_fp4 == nullptr ||
+      up_a_scale == nullptr || b_fp4 == nullptr || b_scale == nullptr ||
+      gate_output == nullptr || up_output == nullptr) {
+    return;
+  }
+
+  const size_t smem_needed = qwen36_gemv::nvfp4_gemv_mma_smem_bytes<16>(k);
+  if (smem_needed > pages.total_bytes || pages.base == nullptr) {
+    return;
+  }
+
+  const size_t tiles = qwen36_gemv::gemv_div_ceil(
+      m, static_cast<size_t>(qwen36_gemv::kRowsPerBlock));
+  for (size_t tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
+    qwen36_gemv::nvfp4_gemv_mma_body_with_smem<16>(
+        static_cast<unsigned>(tile), gate_a_fp4, gate_a_scale, b_fp4,
+        b_scale, gate_alpha, gate_output, m, k, pages.base);
+    __syncthreads();
+    qwen36_gemv::nvfp4_gemv_mma_body_with_smem<16>(
+        static_cast<unsigned>(tile), up_a_fp4, up_a_scale, b_fp4, b_scale,
+        up_alpha, up_output, m, k, pages.base);
+    __syncthreads();
+  }
+}
+
 } // namespace qwen36_interpreter

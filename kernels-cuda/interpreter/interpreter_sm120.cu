@@ -109,6 +109,9 @@ dispatch_instruction(const qwen36_interpreter_instruction_t &insn,
   case QWEN36_INTERPRETER_OPCODE_CONV1D_GDN_GATE_FUSED:
     qwen36_interpreter::exec_conv1d_gdn_gate_fused(insn, pages);
     break;
+  case QWEN36_INTERPRETER_OPCODE_NVFP4_GEMV_PAIR:
+    qwen36_interpreter::exec_nvfp4_gemv_pair(insn, pages);
+    break;
   default:
     break;
   }

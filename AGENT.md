@@ -792,6 +792,24 @@ prompt=128, max-new=32, median of 5:
   `QWEN36_INTERPRETER_DECODE=0` produced identical 12-token text
   prefixes.
 
+**Codex follow-up (2026-06-09, MLP gate/up pair opcode landed):**
+
+- Interpreter MLP programs now fuse the independent gate/up NVFP4 GEMVs
+  into `NVFP4_GEMV_PAIR`, reducing each MLP sequence by one interpreter
+  instruction and two counter slots while preserving the same GEMV body.
+  Full MLP chunking remains deferred because the down-proj needs K-sliced
+  FP32 accumulation to be correct.
+- Validation on RTX 5090: `scripts/build_cuda.sh`, `scripts/smoke_cuda.sh`,
+  `cargo test -p qwen36-fp4-kernels interpreter --lib`,
+  `cargo test -p qwen36-fp4-runtime interpreter_compile --lib --features cuda`,
+  `cargo check --release -p qwen36-fp4 --features cuda`, and
+  `cargo build --release -p qwen36-fp4 --features cuda` all passed.
+- `scripts/verify_perf_gate.sh --quick`, `QWEN36_LONG_CONTEXT_MODE=1`:
+  DFlash 3K split-K default 143.18 tok/s vs forced-off 60.60 tok/s;
+  MTP=0 auto 49.24 tok/s; MTP=4 auto 95.85 tok/s vs interpreter
+  forced-off 95.60 tok/s. Targeted chat parity for `hello` and
+  `hello world`, MTP=4 auto vs forced-off, remained byte-for-byte.
+
 **Codex hand-off (updated):** the prefetch infra (`prefetch.cuh`,
 flags plumbing) is the substrate for any further weight-warmup
 experiments — adjust `kPrefetchBudgetBytes`, narrow the opcode
