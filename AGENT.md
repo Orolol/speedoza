@@ -903,6 +903,31 @@ the GPU; partial softmax per split + a reduction. Reuses the
 ~2.5–4×. Parity gated by a smoke cos≥0.998 (modeled on P0a) + the
 no-fork end-to-end check.
 
+### 2026-06-09 — Base decode (MTP=0) long-context slide: root-caused, fix scoped
+
+User flagged that base decode drops too much with context vs classic
+engines. Confirmed and root-caused — full analysis in
+`docs/superpowers/notes/2026-06-09-decode-longctx-investigation.md`.
+
+Curve (MTP=0): 49.7 (128) → 43.1 (8K) → 36.2 (16K) → 32.3 (24K) =
+−35%. Per-layer profile: linear_attn / mlp / lm_head are **flat**; ALL
+growth is the 16 full-attn layers (6.1 → 12.7 ms/token). At 24K the KV
+bandwidth floor is 0.45 ms vs 12.7 measured = **28× off bandwidth** —
+the decode split-GQA kernel is latency-bound (serial per-timestep loop,
+1-byte loads, 6 shuffle-reduces + syncs per position), same disease the
+P2 wmma split-K fixed for verify. Split-granularity probe: bigger
+blocks strictly worse → inner loop dominates, not the reduce.
+Secondary: fusion auto-off ≥8K costs only −3.6%; default config OOMs
+at ctx 2048–4096 on a 29.5 GB-free GPU (fused stores don't fit below
+the auto threshold — usability trap, use `QWEN36_LONG_CONTEXT_MODE=1`).
+
+Fix scoped (not implemented): register-tiled multi-timestep inner loop
+(T=8–16 positions/iter, 128-bit vectorized loads, LUT FP8 decode,
+sync amortization), keeping split topology + reduce + graph capture
+unchanged. Projected full_attn 12.7 → 2–4 ms @24K → ~45–48 tok/s
+(near-flat ~50 → ~47 through 32K). Context-flat ceiling is ~52 tok/s
+(linear_attn+mlp+lm_head ≈ 18.3 ms). Est. 2–4 days incl. parity.
+
 ### 2026-06-09 — Long-context AL lane: eval battery built, window knob dead, AL variance is the real finding
 
 Follow-up to the strategic assessment (AL is the binding constraint at
