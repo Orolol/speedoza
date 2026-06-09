@@ -1064,15 +1064,18 @@ fn upload_tensor(model: &MappedModel, info: TensorInfo) -> Result<UploadedTensor
                 .then(|| f32::from_le_bytes(data.try_into().expect("four bytes were checked")));
             let mut staging = None;
             let buffer = if info.role == TensorRole::Nvfp4BlockScale {
-                let upload = upload_retiled_scales(&info, data)?;
+                let upload = upload_retiled_scales(&info, data).map_err(|err| {
+                    anyhow::anyhow!("upload retiled scales for {}: {err}", info.name)
+                })?;
                 staging = Some(upload.staging);
                 upload.tiled
             } else {
-                let buffer = CudaDeviceBuffer::alloc(data.len())
-                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                let buffer = CudaDeviceBuffer::alloc(data.len()).map_err(|err| {
+                    anyhow::anyhow!("upload tensor {} ({} bytes): {err}", info.name, data.len())
+                })?;
                 buffer
                     .copy_from_host(data)
-                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                    .map_err(|err| anyhow::anyhow!("copy tensor {}: {err}", info.name))?;
                 buffer
             };
             Ok(UploadedTensor {

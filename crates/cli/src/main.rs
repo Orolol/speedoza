@@ -239,6 +239,8 @@ enum Command {
         model_dir: PathBuf,
         #[arg(long, default_value_t = 2256)]
         max_context: usize,
+        #[arg(long, default_value_t = 0)]
+        mtp_speculative_tokens: usize,
     },
     Chat {
         #[arg(long)]
@@ -451,8 +453,9 @@ fn main() -> Result<()> {
         Command::GpuLoad {
             model_dir,
             max_context,
+            mtp_speculative_tokens,
         } => {
-            gpu_load(model_dir, max_context)?;
+            gpu_load(model_dir, max_context, mtp_speculative_tokens)?;
         }
         Command::DrafterLoad { drafter_dir } => {
             #[cfg(feature = "cuda")]
@@ -1975,12 +1978,13 @@ fn run_bench(
 }
 
 #[cfg(feature = "cuda")]
-fn gpu_load(model_dir: PathBuf, max_context: usize) -> Result<()> {
+fn gpu_load(model_dir: PathBuf, max_context: usize, mtp_speculative_tokens: usize) -> Result<()> {
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
     let config = EngineConfig {
         max_context,
         kv_cache_dtype: cuda_kv_cache_dtype(EngineConfig::default().kv_cache_dtype),
+        mtp_speculative_tokens,
         ..EngineConfig::default()
     };
     let engine = Engine::cuda_with_mapped_weights(&mapped_model, config)?;
@@ -2011,7 +2015,11 @@ fn gpu_load(model_dir: PathBuf, max_context: usize) -> Result<()> {
 }
 
 #[cfg(not(feature = "cuda"))]
-fn gpu_load(_model_dir: PathBuf, _max_context: usize) -> Result<()> {
+fn gpu_load(
+    _model_dir: PathBuf,
+    _max_context: usize,
+    _mtp_speculative_tokens: usize,
+) -> Result<()> {
     bail!("gpu-load requires rebuilding qwen36 with --features cuda and the CUDA shared library")
 }
 

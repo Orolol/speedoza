@@ -10887,6 +10887,22 @@ impl Engine<CudaBackend> {
                     .map(|buffer| buffer.bytes() as u64)
                     .unwrap_or(0),
             ),
+            item(
+                "deltanet_leaf_checkpoints",
+                runtime
+                    .deltanet_leaf_checkpoints
+                    .iter()
+                    .map(|buffer| buffer.bytes() as u64)
+                    .sum(),
+            ),
+            item(
+                "conv_history_leaf_checkpoints",
+                runtime
+                    .conv_history_leaf_checkpoints
+                    .iter()
+                    .map(|buffer| buffer.bytes() as u64)
+                    .sum(),
+            ),
         ]);
 
         let forward_group = group(vec![
