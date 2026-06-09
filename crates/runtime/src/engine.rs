@@ -10,12 +10,11 @@ use qwen36_fp4_kernels::{
     AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
     Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode,
     CudaBackend, DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape, DevicePtr,
-    EmbeddingLookupSpec, GdnGateSpec, InterpreterOpcode, InterpreterProgramSpec,
-    MegakernelFullAttnStageBQProjSpec, Nvfp4GemmSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
-    PartialRopeSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec,
-    RmsNormSpec, SamplingRowsSpec, SamplingSpec, SwiGluNvfp4QuantizeSpec, SwiGluSpec,
-    attention_decode_spec_abi_bytes, deltanet_decode_spec_abi_bytes,
-    interpreter_opcodes_enabled_from_env,
+    EmbeddingLookupSpec, GdnGateSpec, InterpreterOpcode, InterpreterProgramSpec, Nvfp4GemmSpec,
+    Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec, QProjDeinterleaveSpec,
+    QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec, SamplingRowsSpec, SamplingSpec,
+    SwiGluNvfp4QuantizeSpec, SwiGluSpec, attention_decode_spec_abi_bytes,
+    deltanet_decode_spec_abi_bytes, interpreter_opcodes_enabled_from_env,
 };
 use qwen36_fp4_kernels::{KernelBackend, NoCudaBackend};
 #[cfg(feature = "cuda")]
@@ -25,14 +24,17 @@ use crate::cuda_graph::CudaGraphPlan;
 #[cfg(feature = "cuda")]
 use crate::gpu::{
     ATTN_MIN_SPLIT_TIMESTEPS_PER_BLOCK, GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers,
-    GpuWeightStore, LinearAttnInProjFused, LinearAttnInProjFusedStore,
-    MEGAKERNEL_BARRIER_STAGE_B_Q_PROJ_BYTES, MlpFusedLayer, MlpFusedStore, MtpKvSnapshotLayout,
+    GpuWeightStore, LinearAttnInProjFused, LinearAttnInProjFusedStore, MlpFusedLayer,
+    MlpFusedStore, MtpKvSnapshotLayout,
 };
 #[cfg(feature = "cuda")]
 use crate::interpreter_compile::{
     DecodeInterpreterAttentionParams, DecodeInterpreterDeltaNetParams,
-    DecodeInterpreterLogitsParams, DecodeInterpreterMlpParams, DecodeInterpreterNormMlpParams,
-    DecodeInterpreterProgram, DecodeInterpreterRmsNormNvfp4QuantParams,
+    DecodeInterpreterFullAttentionLayerParams, DecodeInterpreterLogitsParams,
+    DecodeInterpreterMlpParams, DecodeInterpreterNormMlpParams, DecodeInterpreterNvfp4GemvParams,
+    DecodeInterpreterNvfp4QuantizeParams, DecodeInterpreterProgram,
+    DecodeInterpreterQProjDeinterleaveParams, DecodeInterpreterQProjSigmoidGateParams,
+    DecodeInterpreterRmsNormBf16Params, DecodeInterpreterRmsNormNvfp4QuantParams,
     DecodeInterpreterRopeAttentionParams, DecodeInterpreterRopeParams, instructions_as_bytes,
 };
 use crate::kv_cache::KvCachePlan;
@@ -86,32 +88,6 @@ fn decode_interpreter_decode_enabled() -> bool {
 #[cfg(feature = "cuda")]
 fn productive_spin_enabled() -> bool {
     cuda_env_bool("QWEN36_PRODUCTIVE_SPIN")
-}
-
-/// Gate for the per-block megakernel Stage B.3 integration in the full-attn
-/// decode hot path. When ON, `run_full_attention_layer` replaces the
-/// standalone `rmsnorm_nvfp4_quantize` + Q-projection NVFP4 GEMV pair with
-/// a single fused `qwen36_full_attn_block_stage_b_q_proj` launch. K/V
-/// projections, q/k_norm, partial RoPE, and the attention itself stay on
-/// the existing kernel paths because Stage B.3 stops at Q (the
-/// Qwen3.6-specific q_proj_deinterleave + q_norm/k_norm steps live between
-/// the Q linear and RoPE, so the bigger Stage C fusion is not directly
-/// engine-droppable today). Cached once so the dispatch hot path does not
-/// re-parse the environment per layer.
-#[cfg(feature = "cuda")]
-fn megakernel_full_attn_stage_b_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| cuda_env_bool("QWEN36_MEGAKERNEL_FULL_ATTN_STAGE_B"))
-}
-
-/// Stage B.3 requires `hidden_size % 512 == 0` and `q_features % 16 == 0`.
-/// The runtime falls back to the existing standalone path when these
-/// alignments do not hold (defensive — Qwen3.6 satisfies both, but the
-/// gate keeps the path safe if someone configures a non-standard topology).
-#[cfg(feature = "cuda")]
-fn megakernel_full_attn_stage_b_supports(hidden_size: usize, q_features: usize) -> bool {
-    hidden_size > 0 && q_features > 0 && hidden_size & 511 == 0 && q_features & 15 == 0
 }
 
 /// Gate for the per-block megakernel Stage F.4 (full MLP block) in the
@@ -248,14 +224,40 @@ fn decode_interpreter_full_attention_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_mlp_supports(hidden: usize, intermediate: usize) -> bool {
+fn decode_interpreter_full_attention_layer_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !decode_interpreter_decode_enabled()
+            && !cuda_env_bool("QWEN36_INTERPRETER_FULL_ATTN_LAYER")
+        {
+            return false;
+        }
+        let opcodes = interpreter_opcodes_enabled_from_env();
+        opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
+            && opcodes.contains(InterpreterOpcode::QProjDeinterleave)
+            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
+            && opcodes.contains(InterpreterOpcode::RopePartial)
+            && opcodes.contains(InterpreterOpcode::AttnDecodeFull)
+            && opcodes.contains(InterpreterOpcode::QProjSigmoidGate)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_nvfp4_gemv_supports(m: usize, k: usize) -> bool {
     const GEMV_K_ALIGNMENT: usize = 1024;
+    m > 0 && k > 0 && m % 16 == 0 && k % GEMV_K_ALIGNMENT == 0
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_mlp_supports(hidden: usize, intermediate: usize) -> bool {
     hidden > 0
         && intermediate > 0
         && hidden % 16 == 0
         && intermediate % 16 == 0
-        && hidden % GEMV_K_ALIGNMENT == 0
-        && intermediate % GEMV_K_ALIGNMENT == 0
+        && decode_interpreter_nvfp4_gemv_supports(intermediate, hidden)
+        && decode_interpreter_nvfp4_gemv_supports(hidden, intermediate)
 }
 
 #[cfg(feature = "cuda")]
@@ -4434,6 +4436,19 @@ impl<B: KernelBackend> Engine<B> {
                 ))
             })?;
 
+        if let Some(quantized) = prequantized_normed {
+            if self.run_interpreter_full_attention_layer_decode(
+                layer,
+                runtime,
+                forward,
+                position,
+                position_device_i32,
+                quantized,
+            )? {
+                return Ok(());
+            }
+        }
+
         let qkv_linears = [
             (&layer.q_proj, forward.qkv.ptr()),
             (&layer.k_proj, forward.aux.ptr()),
@@ -6753,6 +6768,312 @@ impl<B: KernelBackend> Engine<B> {
                 cta_count: 0,
                 flags: 0,
             })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn decode_interpreter_nvfp4_gemv_params(
+        &self,
+        binding: &LinearWeightBinding,
+        quantized: Nvfp4ActivationQuant<'_>,
+        input_fp4: DevicePtr,
+        input_scale_e4m3: DevicePtr,
+        output_bf16: DevicePtr,
+    ) -> Result<Option<DecodeInterpreterNvfp4GemvParams>> {
+        let LinearWeightBinding::Nvfp4 {
+            weight,
+            block_scale,
+            tensor_scale,
+            input_scale,
+        } = binding
+        else {
+            return Ok(None);
+        };
+
+        let in_features = Self::nvfp4_in_features(weight)?;
+        if in_features != quantized.in_features {
+            return Ok(None);
+        }
+        let out_features = *weight
+            .shape
+            .first()
+            .ok_or_else(|| CoreError::Runtime(format!("tensor {} has empty shape", weight.name)))?;
+        if !decode_interpreter_nvfp4_gemv_supports(out_features, in_features) {
+            return Ok(None);
+        }
+
+        self.validate_nvfp4_input_scale(weight, quantized.input_scale, input_scale)?;
+        let weights = self.cuda_weights()?;
+        Ok(Some(DecodeInterpreterNvfp4GemvParams {
+            m: out_features,
+            k: in_features,
+            alpha: self.tensor_scalar_f32(weights, tensor_scale)?
+                * self.tensor_scalar_f32(weights, quantized.input_scale)?,
+            a_fp4: self.tensor_ptr(weights, weight)?,
+            a_scale_e4m3: self.tensor_ptr(weights, block_scale)?,
+            b_fp4: input_fp4,
+            b_scale_e4m3: input_scale_e4m3,
+            c_bf16: output_bf16,
+        }))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_interpreter_full_attention_layer_decode(
+        &self,
+        layer: &FullAttentionLayerWeights,
+        runtime: &GpuRuntimeBuffers,
+        forward: &GpuForwardBuffers,
+        position: usize,
+        position_device_i32: DevicePtr,
+        quantized: Nvfp4ActivationQuant<'_>,
+    ) -> Result<bool> {
+        if !decode_interpreter_full_attention_layer_enabled()
+            || position_device_i32 != DevicePtr::NULL
+        {
+            return Ok(false);
+        }
+
+        let bf16_kv_cache_dtype = Self::attention_kv_cache_dtype_code(KvCacheDtype::Bf16)?;
+        let configured_kv_cache_dtype =
+            Self::attention_kv_cache_dtype_code(self.config.kv_cache_dtype)?;
+        if configured_kv_cache_dtype != bf16_kv_cache_dtype {
+            return Ok(false);
+        }
+
+        let cache = runtime
+            .kv_cache
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("KV cache was not allocated".to_owned()))?;
+        let layout = self
+            .state
+            .kv_cache
+            .layers
+            .iter()
+            .find(|layout| layout.global_layer_index == layer.layer_index)
+            .ok_or_else(|| {
+                CoreError::Runtime(format!(
+                    "missing KV-cache layout for layer {}",
+                    layer.layer_index
+                ))
+            })?;
+
+        let q_values = self.topology.attention_num_heads * self.topology.attention_head_dim;
+        let kv_values = self.topology.attention_num_kv_heads * self.topology.attention_head_dim;
+        let hidden = self.topology.hidden_size;
+        let input_fp4 = forward.activation_fp4.ptr();
+        let input_scale_e4m3 = forward.activation_scale.ptr();
+
+        let Some(q_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.q_proj,
+            quantized,
+            input_fp4,
+            input_scale_e4m3,
+            forward.qkv.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        let Some(k_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.k_proj,
+            quantized,
+            input_fp4,
+            input_scale_e4m3,
+            forward.aux.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        let Some(v_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.v_proj,
+            quantized,
+            input_fp4,
+            input_scale_e4m3,
+            forward.aux2.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if q_proj.m != q_values * 2
+            || q_proj.k != hidden
+            || k_proj.m != kv_values
+            || k_proj.k != hidden
+            || v_proj.m != kv_values
+            || v_proj.k != hidden
+        {
+            return Ok(false);
+        }
+
+        let LinearWeightBinding::Nvfp4 {
+            input_scale: o_input_scale,
+            ..
+        } = &layer.o_proj
+        else {
+            return Ok(false);
+        };
+        let o_quantized = Nvfp4ActivationQuant {
+            in_features: q_values,
+            input_scale: o_input_scale,
+        };
+        let Some(o_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.o_proj,
+            o_quantized,
+            forward.activation_fp4.ptr(),
+            forward.activation_scale.ptr(),
+            forward.block_out.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if o_proj.m != hidden || o_proj.k != q_values {
+            return Ok(false);
+        }
+
+        let attention_context_limit = self.decode_attention_context_limit_for_position(position);
+        let decode_n_splits =
+            self.decode_attention_n_splits_for_context_limit(attention_context_limit);
+        if decode_n_splits > 1 {
+            return Ok(false);
+        }
+
+        let mut attention_spec = AttentionDecodeSpec {
+            layer_index: layer.layer_index,
+            position,
+            q_bf16: forward.aux3.ptr(),
+            k_bf16: forward.aux.ptr(),
+            v_bf16: forward.aux2.ptr(),
+            kv_cache_k: cache.ptr_at(layout.k_offset_bytes as usize)?,
+            kv_cache_v: cache.ptr_at(layout.v_offset_bytes as usize)?,
+            kv_cache_metadata: DevicePtr::NULL,
+            output_bf16: forward.aux3.ptr(),
+            shape: AttentionShape {
+                q_heads: self.topology.attention_num_heads,
+                kv_heads: self.topology.attention_num_kv_heads,
+                head_dim: self.topology.attention_head_dim,
+                rope_dims: self.topology.attention_rope_dims(),
+            },
+            kv_cache_dtype: bf16_kv_cache_dtype,
+            position_device_i32: DevicePtr::NULL,
+            partial_acc_f32: DevicePtr::NULL,
+            partial_max_f32: DevicePtr::NULL,
+            partial_denom_f32: DevicePtr::NULL,
+            decode_n_splits,
+            split_timesteps_per_block: 0,
+        };
+        attention_spec.decode_n_splits = attention_spec.decode_n_splits.min(1);
+
+        let spec_bytes = attention_decode_spec_abi_bytes(&attention_spec);
+        if spec_bytes.len() > forward.interpreter_attention_spec.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter full-attn layer spec needs {} bytes but buffer has {}",
+                spec_bytes.len(),
+                forward.interpreter_attention_spec.bytes()
+            )));
+        }
+        forward
+            .interpreter_attention_spec
+            .copy_from_host(&spec_bytes)?;
+
+        let weights = self.cuda_weights()?;
+        let o_input_tensor_scale_f32 = self.tensor_scalar_f32(weights, o_input_scale)?;
+        let compiled = DecodeInterpreterProgram::compile_full_attention_layer_decode(
+            DecodeInterpreterFullAttentionLayerParams {
+                q_proj,
+                k_proj,
+                v_proj,
+                q_proj_deinterleave: DecodeInterpreterQProjDeinterleaveParams {
+                    rows: 1,
+                    heads: self.topology.attention_num_heads,
+                    head_dim: self.topology.attention_head_dim,
+                    input_bf16: forward.qkv.ptr(),
+                    output_bf16: forward.aux3.ptr(),
+                },
+                q_norm: DecodeInterpreterRmsNormBf16Params {
+                    rows: self.topology.attention_num_heads,
+                    hidden: self.topology.attention_head_dim,
+                    eps: 1.0e-6,
+                    direct_weight: false,
+                    input_bf16: forward.aux3.ptr(),
+                    weight_bf16: self.tensor_ptr(weights, &layer.q_norm)?,
+                    residual_bf16: DevicePtr::NULL,
+                    residual_out_bf16: DevicePtr::NULL,
+                    output_bf16: forward.aux3.ptr(),
+                },
+                k_norm: DecodeInterpreterRmsNormBf16Params {
+                    rows: self.topology.attention_num_kv_heads,
+                    hidden: self.topology.attention_head_dim,
+                    eps: 1.0e-6,
+                    direct_weight: false,
+                    input_bf16: forward.aux.ptr(),
+                    weight_bf16: self.tensor_ptr(weights, &layer.k_norm)?,
+                    residual_bf16: DevicePtr::NULL,
+                    residual_out_bf16: DevicePtr::NULL,
+                    output_bf16: forward.aux.ptr(),
+                },
+                rope: DecodeInterpreterRopeParams {
+                    tokens: 1,
+                    q_heads: self.topology.attention_num_heads,
+                    kv_heads: self.topology.attention_num_kv_heads,
+                    head_dim: self.topology.attention_head_dim,
+                    rope_dims: self.topology.attention_rope_dims(),
+                    base_theta: self.topology.rope_theta,
+                    position_i32: position as i32,
+                    use_scalar_position: true,
+                    positions_i32: DevicePtr::NULL,
+                    q_bf16: forward.aux3.ptr(),
+                    k_bf16: forward.aux.ptr(),
+                    scalar_position_device_i32: DevicePtr::NULL,
+                },
+                attention: DecodeInterpreterAttentionParams {
+                    spec: forward.interpreter_attention_spec.ptr(),
+                },
+                q_proj_gate: DecodeInterpreterQProjSigmoidGateParams {
+                    rows: 1,
+                    heads: self.topology.attention_num_heads,
+                    head_dim: self.topology.attention_head_dim,
+                    gate_bf16: forward.qkv.ptr(),
+                    input_bf16: forward.aux3.ptr(),
+                    output_bf16: forward.aux3.ptr(),
+                },
+                o_input_quant: DecodeInterpreterNvfp4QuantizeParams {
+                    values: q_values,
+                    input_tensor_scale_f32: o_input_tensor_scale_f32,
+                    input_bf16: forward.aux3.ptr(),
+                    output_fp4: forward.activation_fp4.ptr(),
+                    output_scale_e4m3: forward.activation_scale.ptr(),
+                    output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                },
+                o_proj,
+            },
+        );
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_attention_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter full-attn layer program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_attention_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_attention_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter full-attn layer program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_attention_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_attention_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_attention_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_attention_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_attention_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: 0,
+            })?;
+        Ok(true)
     }
 
     #[cfg(feature = "cuda")]

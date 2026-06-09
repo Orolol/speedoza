@@ -201,6 +201,19 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         max_new_tokens: usize,
     },
+    /// Diagnostic: compare the engine's decode vs prefill numerics at
+    /// the same input. Session A = prefill(prompt) then decode_one(seed);
+    /// session B = prefill(prompt+[seed]). Both sessions reload the
+    /// engine. Reports per-session argmax and cosine similarity of
+    /// full BF16 logits. Used to test whether the decode kernel path
+    /// drifts numerically from the prefill kernel path on NVFP4
+    /// (low-AL diagnostic for Phase F.2 follow-up).
+    DecodeVsPrefillCheck {
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long, default_value = "The quick brown fox jumps over the")]
+        prompt: String,
+    },
     /// Run one DFlash drafter forward on synthetic random inputs and
     /// report basic sanity (finite values, deterministic). With
     /// --fixture-dir, load inputs + expected output from a fixture
@@ -469,6 +482,19 @@ fn main() -> Result<()> {
                 let _ = (model_dir, drafter_dir, prompt, chat_template);
                 anyhow::bail!(
                     "drafter-iter-smoke requires the cuda feature; rebuild with --features cuda"
+                );
+            }
+        }
+        Command::DecodeVsPrefillCheck { model_dir, prompt } => {
+            #[cfg(feature = "cuda")]
+            {
+                decode_vs_prefill_check(model_dir, prompt)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (model_dir, prompt);
+                anyhow::bail!(
+                    "decode-vs-prefill-check requires the cuda feature; rebuild with --features cuda"
                 );
             }
         }
@@ -2159,6 +2185,103 @@ fn drafter_step_smoke(
 }
 
 #[cfg(feature = "cuda")]
+fn decode_vs_prefill_check(model_dir: PathBuf, prompt: String) -> Result<()> {
+    let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
+    let prompt_tokens = tokenizer.encode(&prompt, true)?;
+    if prompt_tokens.is_empty() {
+        anyhow::bail!("prompt produced 0 tokens");
+    }
+
+    let make_engine = || -> Result<Engine<qwen36_fp4_kernels::CudaBackend>> {
+        let layout =
+            discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+        let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
+        let config = EngineConfig {
+            max_context: prompt_tokens.len().saturating_add(16).max(256),
+            kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Fp8),
+            ..EngineConfig::default()
+        };
+        Ok(Engine::cuda_with_mapped_weights(&mapped_model, config)?)
+    };
+
+    let read_logits =
+        |engine: &Engine<qwen36_fp4_kernels::CudaBackend>, vocab: usize| -> Result<Vec<u8>> {
+            let forward = engine
+                .gpu_forward
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("engine has no gpu_forward buffers"))?;
+            let mut buf = vec![0u8; vocab * 2];
+            forward.logits.copy_to_host(&mut buf)?;
+            Ok(buf)
+        };
+
+    let vocab_size = {
+        let layout =
+            discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+        layout.topology.vocab_size
+    };
+
+    // --- Session A: prefill + decode_one(seed) ---------------------
+    eprintln!("[A] loading engine for decode path...");
+    let (seed, argmax_decode, logits_decode) = {
+        let mut engine = make_engine()?;
+        engine.prefill(&prompt_tokens)?;
+        qwen36_fp4_runtime::cuda_synchronize()?;
+        engine.queue_sample_greedy_to_current_token()?;
+        qwen36_fp4_runtime::cuda_synchronize()?;
+        let seed = engine.read_current_token()?;
+
+        engine.decode_one_queued(seed)?;
+        engine.queue_sample_greedy()?;
+        qwen36_fp4_runtime::cuda_synchronize()?;
+        let argmax = engine.read_sampled_token()?;
+        let logits = read_logits(&engine, vocab_size)?;
+        (seed, argmax, logits)
+    };
+    eprintln!("[A] seed={seed} argmax_decode={argmax_decode}");
+
+    // --- Session B: prefill(prompt + [seed]) -----------------------
+    eprintln!("[B] loading engine for prefill path...");
+    let (argmax_prefill, logits_prefill) = {
+        let mut engine = make_engine()?;
+        let mut tokens = prompt_tokens.clone();
+        tokens.push(seed);
+        engine.prefill(&tokens)?;
+        qwen36_fp4_runtime::cuda_synchronize()?;
+        engine.queue_sample_greedy_to_current_token()?;
+        qwen36_fp4_runtime::cuda_synchronize()?;
+        let argmax = engine.read_current_token()?;
+        let logits = read_logits(&engine, vocab_size)?;
+        (argmax, logits)
+    };
+    eprintln!("[B] argmax_prefill={argmax_prefill}");
+
+    let cos_sim = bf16_cosine_similarity(&logits_decode, &logits_prefill);
+    let decode_text = tokenizer.decode(&[argmax_decode], true).unwrap_or_default();
+    let prefill_text = tokenizer.decode(&[argmax_prefill], true).unwrap_or_default();
+    let seed_text = tokenizer.decode(&[seed], true).unwrap_or_default();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "model_dir": model_dir.display().to_string(),
+            "prompt": prompt,
+            "prompt_tokens": prompt_tokens.len(),
+            "vocab_size": vocab_size,
+            "seed_token": seed,
+            "seed_decoded": seed_text,
+            "argmax_via_decode": argmax_decode,
+            "argmax_via_decode_decoded": decode_text,
+            "argmax_via_prefill": argmax_prefill,
+            "argmax_via_prefill_decoded": prefill_text,
+            "argmax_match": argmax_decode == argmax_prefill,
+            "logits_cos_sim": cos_sim,
+        }))?,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn drafter_chat_smoke(
     model_dir: PathBuf,
     drafter_dir: PathBuf,
@@ -2326,12 +2449,20 @@ fn drafter_chat_smoke(
         let mut accepted = 0_usize;
         let mut prev = seed_token;
         let mut bonus_token: u32 = 0;
+        // NOTE: we use engine.prefill(&[t]) instead of
+        // decode_one_queued(t). On NVFP4, the decode kernel path
+        // produces logits with cos sim 0.76–0.81 (sometimes negative)
+        // vs the prefill kernel path on the same input — a real engine
+        // bug surfaced by `decode-vs-prefill-check`. prefill of a
+        // single token at the current state.position advances state
+        // by 1 the same way decode_one does, but routes through the
+        // numerically correct prefill kernels.
         for (i, &drafted) in drafts.iter().enumerate() {
             capture.set_write_row(i);
-            engine.decode_one_queued(prev)?;
-            engine.queue_sample_greedy()?;
+            engine.prefill(&[prev])?;
+            engine.queue_sample_greedy_to_current_token()?;
             qwen36_fp4_runtime::cuda_synchronize()?;
-            let target_argmax = engine.read_sampled_token()?;
+            let target_argmax = engine.read_current_token()?;
             if target_argmax == drafted {
                 accepted += 1;
                 prev = drafted;
@@ -2342,10 +2473,10 @@ fn drafter_chat_smoke(
         }
         if accepted == drafts.len() {
             capture.set_write_row(accepted);
-            engine.decode_one_queued(prev)?;
-            engine.queue_sample_greedy()?;
+            engine.prefill(&[prev])?;
+            engine.queue_sample_greedy_to_current_token()?;
             qwen36_fp4_runtime::cuda_synchronize()?;
-            bonus_token = engine.read_sampled_token()?;
+            bonus_token = engine.read_current_token()?;
         }
 
         // Commit accepted drafts + bonus. The seed itself was committed
@@ -2541,22 +2672,23 @@ fn drafter_iter_smoke(
     // itself); the dflash protocol uses proposed[1..] as the drafts.
     let drafts: Vec<u32> = proposed_tokens[1..].to_vec();
 
-    // === Verify via sequential decode_one ===========================
+    // === Verify via sequential prefill chunks ========================
     // Walk the target through [seed, drafts[0], drafts[1], …,
-    // drafts[k-2]] one token at a time. After each decode the target's
-    // sampled argmax is the prediction for the NEXT position; compare
-    // to the drafted token at that next position. On mismatch the
-    // sampled argmax becomes the bonus and we stop.
+    // drafts[k-2]] one token at a time. We use engine.prefill(&[t])
+    // rather than decode_one because the decode kernel path diverges
+    // numerically from prefill on NVFP4 (cos sim 0.76–0.81 on the
+    // logits — surfaced by `decode-vs-prefill-check`). Same state
+    // advance, correct kernel.
     let mut accepted = 0_usize;
     let mut prev = seed_token;
     let mut bonus_token: u32 = 0;
     let mut comparisons: Vec<serde_json::Value> = Vec::with_capacity(drafts.len());
 
     for (idx, &drafted) in drafts.iter().enumerate() {
-        engine.decode_one_queued(prev)?;
-        engine.queue_sample_greedy()?;
+        engine.prefill(&[prev])?;
+        engine.queue_sample_greedy_to_current_token()?;
         qwen36_fp4_runtime::cuda_synchronize()?;
-        let target_argmax = engine.read_sampled_token()?;
+        let target_argmax = engine.read_current_token()?;
         comparisons.push(serde_json::json!({
             "block_pos": idx + 1,
             "drafted": drafted,
@@ -2572,12 +2704,12 @@ fn drafter_iter_smoke(
         }
     }
     if accepted == drafts.len() {
-        // Full accept: one more decode for the bonus prediction
+        // Full accept: one more prefill for the bonus prediction
         // beyond the last accepted draft.
-        engine.decode_one_queued(prev)?;
-        engine.queue_sample_greedy()?;
+        engine.prefill(&[prev])?;
+        engine.queue_sample_greedy_to_current_token()?;
         qwen36_fp4_runtime::cuda_synchronize()?;
-        bonus_token = engine.read_sampled_token()?;
+        bonus_token = engine.read_current_token()?;
     }
 
     let committed: Vec<u32> = std::iter::once(seed_token)

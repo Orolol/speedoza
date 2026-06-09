@@ -5,7 +5,10 @@
 #include "opcodes/fallback_trampoline.cuh"
 #include "opcodes/lm_head_tiled.cuh"
 #include "opcodes/nvfp4_gemv.cuh"
+#include "opcodes/nvfp4_quantize.cuh"
+#include "opcodes/q_proj_full_attn.cuh"
 #include "opcodes/residual_add.cuh"
+#include "opcodes/rmsnorm_bf16.cuh"
 #include "opcodes/rmsnorm_nvfp4_quant.cuh"
 #include "opcodes/rope_partial.cuh"
 #include "opcodes/swiglu_nvfp4_quant.cuh"
@@ -83,6 +86,19 @@ dispatch_instruction(const qwen36_interpreter_instruction_t &insn,
     break;
   case QWEN36_INTERPRETER_OPCODE_RESIDUAL_ADD:
     qwen36_interpreter::exec_residual_add(insn, pages);
+    break;
+  case QWEN36_INTERPRETER_OPCODE_RMSNORM_BF16:
+    qwen36_interpreter::exec_rmsnorm_bf16(insn, pages, scratch);
+    break;
+  case QWEN36_INTERPRETER_OPCODE_Q_PROJ_DEINTERLEAVE:
+    qwen36_interpreter::exec_q_proj_deinterleave(insn, pages);
+    break;
+  case QWEN36_INTERPRETER_OPCODE_Q_PROJ_SIGMOID_GATE:
+    qwen36_interpreter::exec_q_proj_sigmoid_gate(insn, pages);
+    break;
+  case QWEN36_INTERPRETER_OPCODE_NVFP4_QUANTIZE:
+    qwen36_interpreter::exec_nvfp4_quantize(
+        insn, pages, scratch, swiglu_decoded_scale, swiglu_staged);
     break;
   default:
     break;

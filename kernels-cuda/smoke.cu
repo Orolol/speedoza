@@ -743,6 +743,297 @@ int main() {
   expect_close(read_one<float>(interp_norm_global), 1.0f, 0.0f,
                "interpreter rmsnorm tensor scale");
 
+  const size_t interp_rms_bf16_rows = 2;
+  const size_t interp_rms_bf16_hidden = 8;
+  const size_t interp_rms_bf16_value_count =
+      interp_rms_bf16_rows * interp_rms_bf16_hidden;
+  qwen36_device_ptr_t interp_rms_bf16_input =
+      dev_alloc<__nv_bfloat16>(interp_rms_bf16_value_count);
+  qwen36_device_ptr_t interp_rms_bf16_weight =
+      dev_alloc<__nv_bfloat16>(interp_rms_bf16_hidden);
+  qwen36_device_ptr_t interp_rms_bf16_residual =
+      dev_alloc<__nv_bfloat16>(interp_rms_bf16_value_count);
+  qwen36_device_ptr_t interp_rms_bf16_residual_ref =
+      dev_alloc<__nv_bfloat16>(interp_rms_bf16_value_count);
+  qwen36_device_ptr_t interp_rms_bf16_residual_out =
+      dev_alloc<__nv_bfloat16>(interp_rms_bf16_value_count);
+  qwen36_device_ptr_t interp_rms_bf16_out_ref =
+      dev_alloc<__nv_bfloat16>(interp_rms_bf16_value_count);
+  qwen36_device_ptr_t interp_rms_bf16_out =
+      dev_alloc<__nv_bfloat16>(interp_rms_bf16_value_count);
+  qwen36_device_ptr_t interp_rms_bf16_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(2);
+  qwen36_device_ptr_t interp_rms_bf16_counters = dev_alloc<int32_t>(2);
+  std::vector<float> interp_rms_bf16_input_values(interp_rms_bf16_value_count);
+  std::vector<float> interp_rms_bf16_residual_values(
+      interp_rms_bf16_value_count);
+  for (size_t i = 0; i < interp_rms_bf16_value_count; ++i) {
+    interp_rms_bf16_input_values[i] = (static_cast<int>(i % 11) - 5) * 0.125f;
+    interp_rms_bf16_residual_values[i] =
+        (static_cast<int>(i % 7) - 3) * 0.0625f;
+  }
+  copy_bf16(interp_rms_bf16_input, interp_rms_bf16_input_values);
+  copy_bf16(interp_rms_bf16_residual, interp_rms_bf16_residual_values);
+  copy_bf16(interp_rms_bf16_weight,
+            {-0.125f, 0.0f, 0.125f, 0.25f, -0.25f, 0.5f, -0.5f, 0.75f});
+  qwen36_rmsnorm_spec_t interp_rms_bf16_ref_spec{};
+  interp_rms_bf16_ref_spec.rows = interp_rms_bf16_rows;
+  interp_rms_bf16_ref_spec.hidden = interp_rms_bf16_hidden;
+  interp_rms_bf16_ref_spec.eps = 1.0e-6f;
+  interp_rms_bf16_ref_spec.input_bf16 = interp_rms_bf16_input;
+  interp_rms_bf16_ref_spec.weight_bf16 = interp_rms_bf16_weight;
+  interp_rms_bf16_ref_spec.residual_bf16 = interp_rms_bf16_residual;
+  interp_rms_bf16_ref_spec.residual_out_bf16 = interp_rms_bf16_residual_ref;
+  interp_rms_bf16_ref_spec.output_bf16 = interp_rms_bf16_out_ref;
+  interp_rms_bf16_ref_spec.direct_weight = 0;
+  must_status(qwen36_rmsnorm(&interp_rms_bf16_ref_spec),
+              "interpreter rmsnorm bf16 reference");
+  qwen36_interpreter_instruction_t interp_rms_bf16_program_host[2]{};
+  interp_rms_bf16_program_host[0].opcode = 10; // RMSNORM_BF16
+  interp_rms_bf16_program_host[0].publishes_counter = 0;
+  interp_rms_bf16_program_host[0].publish_value = 1;
+  interp_rms_bf16_program_host[0].arrival_counter = 1;
+  interp_rms_bf16_program_host[0].payload[0] = interp_rms_bf16_rows;
+  interp_rms_bf16_program_host[0].payload[1] = interp_rms_bf16_hidden;
+  interp_rms_bf16_program_host[0].payload[2] = interp_rms_bf16_input.ptr;
+  interp_rms_bf16_program_host[0].payload[3] = interp_rms_bf16_weight.ptr;
+  interp_rms_bf16_program_host[0].payload[4] = interp_rms_bf16_residual.ptr;
+  interp_rms_bf16_program_host[0].payload[5] = interp_rms_bf16_residual_out.ptr;
+  interp_rms_bf16_program_host[0].payload[6] = interp_rms_bf16_out.ptr;
+  interp_rms_bf16_program_host[0].payload[7] = eps_bits.u;
+  interp_rms_bf16_program_host[1].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_rms_bf16_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_rms_bf16_program_host, interp_rms_bf16_program_host + 2));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_rms_bf16_counters.ptr), 0,
+                 2 * sizeof(int32_t)),
+      "cudaMemset interp rmsnorm bf16 counters");
+  qwen36_interpreter_program_t interp_rms_bf16_spec{};
+  interp_rms_bf16_spec.instructions = interp_rms_bf16_instructions;
+  interp_rms_bf16_spec.instruction_count = 2;
+  interp_rms_bf16_spec.counters_i32 = interp_rms_bf16_counters;
+  interp_rms_bf16_spec.counter_count = 2;
+  interp_rms_bf16_spec.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_rms_bf16_spec),
+              "interpreter rmsnorm bf16");
+  std::vector<float> interp_rms_bf16_ref_values =
+      read_bf16(interp_rms_bf16_out_ref, interp_rms_bf16_value_count);
+  std::vector<float> interp_rms_bf16_values =
+      read_bf16(interp_rms_bf16_out, interp_rms_bf16_value_count);
+  std::vector<float> interp_rms_bf16_residual_ref_values =
+      read_bf16(interp_rms_bf16_residual_ref, interp_rms_bf16_value_count);
+  std::vector<float> interp_rms_bf16_residual_out_values =
+      read_bf16(interp_rms_bf16_residual_out, interp_rms_bf16_value_count);
+  for (size_t i = 0; i < interp_rms_bf16_values.size(); ++i) {
+    expect_close(interp_rms_bf16_values[i], interp_rms_bf16_ref_values[i],
+                 0.0f, "interpreter rmsnorm bf16 out");
+    expect_close(interp_rms_bf16_residual_out_values[i],
+                 interp_rms_bf16_residual_ref_values[i], 0.0f,
+                 "interpreter rmsnorm bf16 residual");
+  }
+
+  const size_t interp_quant_values = 33;
+  const size_t interp_quant_fp4_bytes = (interp_quant_values + 1) / 2;
+  qwen36_device_ptr_t interp_quant_input =
+      dev_alloc<__nv_bfloat16>(interp_quant_values);
+  qwen36_device_ptr_t interp_quant_fp4_ref =
+      dev_alloc<uint8_t>(interp_quant_fp4_bytes);
+  qwen36_device_ptr_t interp_quant_scale_ref = dev_alloc<uint8_t>(512);
+  qwen36_device_ptr_t interp_quant_global_ref = dev_alloc<float>(1);
+  qwen36_device_ptr_t interp_quant_fp4 =
+      dev_alloc<uint8_t>(interp_quant_fp4_bytes);
+  qwen36_device_ptr_t interp_quant_scale = dev_alloc<uint8_t>(512);
+  qwen36_device_ptr_t interp_quant_global = dev_alloc<float>(1);
+  qwen36_device_ptr_t interp_quant_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(2);
+  qwen36_device_ptr_t interp_quant_counters = dev_alloc<int32_t>(2);
+  std::vector<float> interp_quant_input_values(interp_quant_values);
+  for (size_t i = 0; i < interp_quant_values; ++i) {
+    interp_quant_input_values[i] = (static_cast<int>(i % 13) - 6) * 0.1875f;
+  }
+  copy_bf16(interp_quant_input, interp_quant_input_values);
+  must_cuda<uint8_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_quant_fp4_ref.ptr), 0,
+                 interp_quant_fp4_bytes),
+      "cudaMemset nvfp4 quant fp4 ref");
+  must_cuda<uint8_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_quant_scale_ref.ptr), 0, 512),
+      "cudaMemset nvfp4 quant scale ref");
+  must_cuda<uint8_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_quant_fp4.ptr), 0,
+                 interp_quant_fp4_bytes),
+      "cudaMemset nvfp4 quant fp4");
+  must_cuda<uint8_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_quant_scale.ptr), 0, 512),
+      "cudaMemset nvfp4 quant scale");
+  qwen36_nvfp4_quantize_spec_t interp_quant_ref_spec{};
+  interp_quant_ref_spec.values = interp_quant_values;
+  interp_quant_ref_spec.input_bf16 = interp_quant_input;
+  interp_quant_ref_spec.output_fp4 = interp_quant_fp4_ref;
+  interp_quant_ref_spec.output_scale_e4m3 = interp_quant_scale_ref;
+  interp_quant_ref_spec.output_tensor_scale_f32 = interp_quant_global_ref;
+  interp_quant_ref_spec.input_tensor_scale_f32 = 1.25f;
+  must_status(qwen36_nvfp4_quantize_bf16(&interp_quant_ref_spec),
+              "interpreter nvfp4 quantize reference");
+  F32Bits interp_quant_scale_bits{1.25f};
+  qwen36_interpreter_instruction_t interp_quant_program_host[2]{};
+  interp_quant_program_host[0].opcode = 13; // NVFP4_QUANTIZE
+  interp_quant_program_host[0].publishes_counter = 0;
+  interp_quant_program_host[0].publish_value = 1;
+  interp_quant_program_host[0].arrival_counter = 1;
+  interp_quant_program_host[0].payload[0] = interp_quant_values;
+  interp_quant_program_host[0].payload[1] = interp_quant_input.ptr;
+  interp_quant_program_host[0].payload[2] = interp_quant_fp4.ptr;
+  interp_quant_program_host[0].payload[3] = interp_quant_scale.ptr;
+  interp_quant_program_host[0].payload[4] = interp_quant_global.ptr;
+  interp_quant_program_host[0].payload[5] = interp_quant_scale_bits.u;
+  interp_quant_program_host[1].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_quant_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_quant_program_host, interp_quant_program_host + 2));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_quant_counters.ptr), 0,
+                 2 * sizeof(int32_t)),
+      "cudaMemset interp nvfp4 quant counters");
+  qwen36_interpreter_program_t interp_quant_spec{};
+  interp_quant_spec.instructions = interp_quant_instructions;
+  interp_quant_spec.instruction_count = 2;
+  interp_quant_spec.counters_i32 = interp_quant_counters;
+  interp_quant_spec.counter_count = 2;
+  interp_quant_spec.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_quant_spec),
+              "interpreter nvfp4 quantize");
+  std::vector<uint8_t> interp_quant_fp4_ref_values =
+      read_raw<uint8_t>(interp_quant_fp4_ref, interp_quant_fp4_bytes);
+  std::vector<uint8_t> interp_quant_fp4_values =
+      read_raw<uint8_t>(interp_quant_fp4, interp_quant_fp4_bytes);
+  std::vector<uint8_t> interp_quant_scale_ref_values =
+      read_raw<uint8_t>(interp_quant_scale_ref, 512);
+  std::vector<uint8_t> interp_quant_scale_values =
+      read_raw<uint8_t>(interp_quant_scale, 512);
+  for (size_t i = 0; i < interp_quant_fp4_bytes; ++i) {
+    if (interp_quant_fp4_values[i] != interp_quant_fp4_ref_values[i]) {
+      fprintf(stderr, "interpreter nvfp4 quant fp4 byte %zu expected 0x%02x got 0x%02x\n",
+              i, interp_quant_fp4_ref_values[i], interp_quant_fp4_values[i]);
+      exit(1);
+    }
+  }
+  for (size_t i = 0; i < 512; ++i) {
+    if (interp_quant_scale_values[i] != interp_quant_scale_ref_values[i]) {
+      fprintf(stderr, "interpreter nvfp4 quant scale byte %zu expected 0x%02x got 0x%02x\n",
+              i, interp_quant_scale_ref_values[i],
+              interp_quant_scale_values[i]);
+      exit(1);
+    }
+  }
+  expect_close(read_one<float>(interp_quant_global),
+               read_one<float>(interp_quant_global_ref), 0.0f,
+               "interpreter nvfp4 quant tensor scale");
+
+  const size_t interp_qproj_rows = 2;
+  const size_t interp_qproj_heads = 2;
+  const size_t interp_qproj_head_dim = 4;
+  const size_t interp_qproj_q_values =
+      interp_qproj_heads * interp_qproj_head_dim;
+  const size_t interp_qproj_raw_values =
+      interp_qproj_rows * interp_qproj_q_values * 2;
+  qwen36_device_ptr_t interp_qproj_raw =
+      dev_alloc<__nv_bfloat16>(interp_qproj_raw_values);
+  qwen36_device_ptr_t interp_qproj_deint_ref =
+      dev_alloc<__nv_bfloat16>(interp_qproj_rows * interp_qproj_q_values);
+  qwen36_device_ptr_t interp_qproj_deint =
+      dev_alloc<__nv_bfloat16>(interp_qproj_rows * interp_qproj_q_values);
+  qwen36_device_ptr_t interp_qproj_gate_ref =
+      dev_alloc<__nv_bfloat16>(interp_qproj_rows * interp_qproj_q_values);
+  qwen36_device_ptr_t interp_qproj_gate =
+      dev_alloc<__nv_bfloat16>(interp_qproj_rows * interp_qproj_q_values);
+  qwen36_device_ptr_t interp_qproj_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(3);
+  qwen36_device_ptr_t interp_qproj_counters = dev_alloc<int32_t>(4);
+  std::vector<float> interp_qproj_raw_values_host(interp_qproj_raw_values);
+  for (size_t i = 0; i < interp_qproj_raw_values; ++i) {
+    interp_qproj_raw_values_host[i] =
+        (static_cast<int>(i % 17) - 8) * 0.125f;
+  }
+  copy_bf16(interp_qproj_raw, interp_qproj_raw_values_host);
+  qwen36_q_proj_deinterleave_spec_t interp_qproj_deint_ref_spec{};
+  interp_qproj_deint_ref_spec.rows = interp_qproj_rows;
+  interp_qproj_deint_ref_spec.heads = interp_qproj_heads;
+  interp_qproj_deint_ref_spec.head_dim = interp_qproj_head_dim;
+  interp_qproj_deint_ref_spec.input_bf16 = interp_qproj_raw;
+  interp_qproj_deint_ref_spec.output_bf16 = interp_qproj_deint_ref;
+  must_status(qwen36_q_proj_deinterleave(&interp_qproj_deint_ref_spec),
+              "interpreter q_proj deinterleave reference");
+  qwen36_q_proj_sigmoid_gate_spec_t interp_qproj_gate_ref_spec{};
+  interp_qproj_gate_ref_spec.rows = interp_qproj_rows;
+  interp_qproj_gate_ref_spec.heads = interp_qproj_heads;
+  interp_qproj_gate_ref_spec.head_dim = interp_qproj_head_dim;
+  interp_qproj_gate_ref_spec.gate_bf16 = interp_qproj_raw;
+  interp_qproj_gate_ref_spec.input_bf16 = interp_qproj_deint_ref;
+  interp_qproj_gate_ref_spec.output_bf16 = interp_qproj_gate_ref;
+  must_status(qwen36_q_proj_sigmoid_gate(&interp_qproj_gate_ref_spec),
+              "interpreter q_proj sigmoid gate reference");
+  qwen36_interpreter_instruction_t interp_qproj_program_host[3]{};
+  interp_qproj_program_host[0].opcode = 11; // Q_PROJ_DEINTERLEAVE
+  interp_qproj_program_host[0].publishes_counter = 0;
+  interp_qproj_program_host[0].publish_value = 1;
+  interp_qproj_program_host[0].arrival_counter = 1;
+  interp_qproj_program_host[0].payload[0] = interp_qproj_rows;
+  interp_qproj_program_host[0].payload[1] = interp_qproj_heads;
+  interp_qproj_program_host[0].payload[2] = interp_qproj_head_dim;
+  interp_qproj_program_host[0].payload[3] = interp_qproj_raw.ptr;
+  interp_qproj_program_host[0].payload[4] = interp_qproj_deint.ptr;
+  interp_qproj_program_host[1].opcode = 12; // Q_PROJ_SIGMOID_GATE
+  interp_qproj_program_host[1].dep_count = 1;
+  interp_qproj_program_host[1].deps[0] = qwen36_interpreter_dep_t{0, 1};
+  interp_qproj_program_host[1].publishes_counter = 2;
+  interp_qproj_program_host[1].publish_value = 1;
+  interp_qproj_program_host[1].arrival_counter = 3;
+  interp_qproj_program_host[1].payload[0] = interp_qproj_rows;
+  interp_qproj_program_host[1].payload[1] = interp_qproj_heads;
+  interp_qproj_program_host[1].payload[2] = interp_qproj_head_dim;
+  interp_qproj_program_host[1].payload[3] = interp_qproj_raw.ptr;
+  interp_qproj_program_host[1].payload[4] = interp_qproj_deint.ptr;
+  interp_qproj_program_host[1].payload[5] = interp_qproj_gate.ptr;
+  interp_qproj_program_host[2].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_qproj_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_qproj_program_host, interp_qproj_program_host + 3));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_qproj_counters.ptr), 0,
+                 4 * sizeof(int32_t)),
+      "cudaMemset interp q_proj counters");
+  qwen36_interpreter_program_t interp_qproj_spec{};
+  interp_qproj_spec.instructions = interp_qproj_instructions;
+  interp_qproj_spec.instruction_count = 3;
+  interp_qproj_spec.counters_i32 = interp_qproj_counters;
+  interp_qproj_spec.counter_count = 4;
+  interp_qproj_spec.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_qproj_spec),
+              "interpreter q_proj deinterleave+gate");
+  std::vector<float> interp_qproj_deint_ref_values =
+      read_bf16(interp_qproj_deint_ref,
+                interp_qproj_rows * interp_qproj_q_values);
+  std::vector<float> interp_qproj_deint_values =
+      read_bf16(interp_qproj_deint,
+                interp_qproj_rows * interp_qproj_q_values);
+  std::vector<float> interp_qproj_gate_ref_values =
+      read_bf16(interp_qproj_gate_ref,
+                interp_qproj_rows * interp_qproj_q_values);
+  std::vector<float> interp_qproj_gate_values =
+      read_bf16(interp_qproj_gate,
+                interp_qproj_rows * interp_qproj_q_values);
+  for (size_t i = 0; i < interp_qproj_rows * interp_qproj_q_values; ++i) {
+    expect_close(interp_qproj_deint_values[i], interp_qproj_deint_ref_values[i],
+                 0.0f, "interpreter q_proj deinterleave");
+    expect_close(interp_qproj_gate_values[i], interp_qproj_gate_ref_values[i],
+                 0.0f, "interpreter q_proj sigmoid gate");
+  }
+
   qwen36_device_ptr_t rope_pos = dev_alloc<int32_t>(1);
   qwen36_device_ptr_t rope_q = dev_alloc<__nv_bfloat16>(6);
   qwen36_device_ptr_t rope_k = dev_alloc<__nv_bfloat16>(6);

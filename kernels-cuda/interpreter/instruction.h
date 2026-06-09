@@ -23,6 +23,10 @@ enum qwen36_interpreter_opcode : uint16_t {
   QWEN36_INTERPRETER_OPCODE_DELTANET_RECUR = 7,
   QWEN36_INTERPRETER_OPCODE_RESIDUAL_ADD = 8,
   QWEN36_INTERPRETER_OPCODE_LM_HEAD_TILED = 9,
+  QWEN36_INTERPRETER_OPCODE_RMSNORM_BF16 = 10,
+  QWEN36_INTERPRETER_OPCODE_Q_PROJ_DEINTERLEAVE = 11,
+  QWEN36_INTERPRETER_OPCODE_Q_PROJ_SIGMOID_GATE = 12,
+  QWEN36_INTERPRETER_OPCODE_NVFP4_QUANTIZE = 13,
 };
 
 static_assert(sizeof(qwen36_interpreter_dep_t) == 8,
@@ -34,7 +38,7 @@ static_assert(sizeof(qwen36_interpreter_program_t) == 40,
 
 __host__ __device__ inline bool
 qwen36_interpreter_opcode_known(uint16_t opcode) {
-  return opcode <= QWEN36_INTERPRETER_OPCODE_LM_HEAD_TILED;
+  return opcode <= QWEN36_INTERPRETER_OPCODE_NVFP4_QUANTIZE;
 }
 
 namespace qwen36_interpreter {

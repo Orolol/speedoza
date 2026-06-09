@@ -4,7 +4,7 @@ use crate::backend::DevicePtr;
 
 pub const INTERPRETER_MAX_DEPS: usize = 4;
 pub const INTERPRETER_PAYLOAD_U64S: usize = 12;
-pub const INTERPRETER_OPCODE_COUNT: usize = 10;
+pub const INTERPRETER_OPCODE_COUNT: usize = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InterpreterOpcode {
@@ -18,10 +18,14 @@ pub enum InterpreterOpcode {
     DeltaNetRecur,
     ResidualAdd,
     LmHeadTiled,
+    RmsNormBf16,
+    QProjDeinterleave,
+    QProjSigmoidGate,
+    Nvfp4Quantize,
 }
 
 impl InterpreterOpcode {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 14] = [
         Self::Exit,
         Self::FallbackTrampoline,
         Self::RmsNormNvfp4Quant,
@@ -32,6 +36,10 @@ impl InterpreterOpcode {
         Self::DeltaNetRecur,
         Self::ResidualAdd,
         Self::LmHeadTiled,
+        Self::RmsNormBf16,
+        Self::QProjDeinterleave,
+        Self::QProjSigmoidGate,
+        Self::Nvfp4Quantize,
     ];
 
     pub fn code(self) -> u16 {
@@ -46,6 +54,10 @@ impl InterpreterOpcode {
             Self::DeltaNetRecur => 7,
             Self::ResidualAdd => 8,
             Self::LmHeadTiled => 9,
+            Self::RmsNormBf16 => 10,
+            Self::QProjDeinterleave => 11,
+            Self::QProjSigmoidGate => 12,
+            Self::Nvfp4Quantize => 13,
         }
     }
 
@@ -61,6 +73,10 @@ impl InterpreterOpcode {
             7 => Self::DeltaNetRecur,
             8 => Self::ResidualAdd,
             9 => Self::LmHeadTiled,
+            10 => Self::RmsNormBf16,
+            11 => Self::QProjDeinterleave,
+            12 => Self::QProjSigmoidGate,
+            13 => Self::Nvfp4Quantize,
             _ => return None,
         })
     }
@@ -77,6 +93,10 @@ impl InterpreterOpcode {
             Self::DeltaNetRecur => "DELTANET_RECUR",
             Self::ResidualAdd => "RESIDUAL_ADD",
             Self::LmHeadTiled => "LM_HEAD_TILED",
+            Self::RmsNormBf16 => "RMSNORM_BF16",
+            Self::QProjDeinterleave => "Q_PROJ_DEINTERLEAVE",
+            Self::QProjSigmoidGate => "Q_PROJ_SIGMOID_GATE",
+            Self::Nvfp4Quantize => "NVFP4_QUANTIZE",
         }
     }
 
@@ -181,6 +201,31 @@ impl InterpreterInstruction {
         instruction
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_bf16(
+        rows: usize,
+        hidden: usize,
+        eps: f32,
+        direct_weight: bool,
+        input_bf16: DevicePtr,
+        weight_bf16: DevicePtr,
+        residual_bf16: DevicePtr,
+        residual_out_bf16: DevicePtr,
+        output_bf16: DevicePtr,
+    ) -> Self {
+        let mut instruction = Self::new(InterpreterOpcode::RmsNormBf16);
+        instruction.payload[0] = rows as u64;
+        instruction.payload[1] = hidden as u64;
+        instruction.payload[2] = input_bf16.0;
+        instruction.payload[3] = weight_bf16.0;
+        instruction.payload[4] = residual_bf16.0;
+        instruction.payload[5] = residual_out_bf16.0;
+        instruction.payload[6] = output_bf16.0;
+        instruction.payload[7] =
+            u64::from(eps.to_bits()) | (u64::from(u32::from(direct_weight)) << 32);
+        instruction
+    }
+
     pub fn rmsnorm_nvfp4_quant(
         hidden: usize,
         eps: f32,
@@ -226,6 +271,24 @@ impl InterpreterInstruction {
         instruction.payload[4] = output_scale_e4m3.0;
         instruction.payload[5] = output_tensor_scale_f32.0;
         instruction.payload[6] = u64::from(input_tensor_scale_f32.to_bits());
+        instruction
+    }
+
+    pub fn nvfp4_quantize(
+        values: usize,
+        input_tensor_scale_f32: f32,
+        input_bf16: DevicePtr,
+        output_fp4: DevicePtr,
+        output_scale_e4m3: DevicePtr,
+        output_tensor_scale_f32: DevicePtr,
+    ) -> Self {
+        let mut instruction = Self::new(InterpreterOpcode::Nvfp4Quantize);
+        instruction.payload[0] = values as u64;
+        instruction.payload[1] = input_bf16.0;
+        instruction.payload[2] = output_fp4.0;
+        instruction.payload[3] = output_scale_e4m3.0;
+        instruction.payload[4] = output_tensor_scale_f32.0;
+        instruction.payload[5] = u64::from(input_tensor_scale_f32.to_bits());
         instruction
     }
 
@@ -276,6 +339,40 @@ impl InterpreterInstruction {
         instruction.payload[2] = input_bf16.0;
         instruction.payload[3] = weight_bf16.0;
         instruction.payload[4] = output_bf16.0;
+        instruction
+    }
+
+    pub fn q_proj_deinterleave(
+        rows: usize,
+        heads: usize,
+        head_dim: usize,
+        input_bf16: DevicePtr,
+        output_bf16: DevicePtr,
+    ) -> Self {
+        let mut instruction = Self::new(InterpreterOpcode::QProjDeinterleave);
+        instruction.payload[0] = rows as u64;
+        instruction.payload[1] = heads as u64;
+        instruction.payload[2] = head_dim as u64;
+        instruction.payload[3] = input_bf16.0;
+        instruction.payload[4] = output_bf16.0;
+        instruction
+    }
+
+    pub fn q_proj_sigmoid_gate(
+        rows: usize,
+        heads: usize,
+        head_dim: usize,
+        gate_bf16: DevicePtr,
+        input_bf16: DevicePtr,
+        output_bf16: DevicePtr,
+    ) -> Self {
+        let mut instruction = Self::new(InterpreterOpcode::QProjSigmoidGate);
+        instruction.payload[0] = rows as u64;
+        instruction.payload[1] = heads as u64;
+        instruction.payload[2] = head_dim as u64;
+        instruction.payload[3] = gate_bf16.0;
+        instruction.payload[4] = input_bf16.0;
+        instruction.payload[5] = output_bf16.0;
         instruction
     }
 

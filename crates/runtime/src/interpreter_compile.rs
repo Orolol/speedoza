@@ -120,6 +120,75 @@ pub struct DecodeInterpreterRopeAttentionParams {
     pub attention: DecodeInterpreterAttentionParams,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeInterpreterNvfp4GemvParams {
+    pub m: usize,
+    pub k: usize,
+    pub alpha: f32,
+    pub a_fp4: DevicePtr,
+    pub a_scale_e4m3: DevicePtr,
+    pub b_fp4: DevicePtr,
+    pub b_scale_e4m3: DevicePtr,
+    pub c_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeInterpreterRmsNormBf16Params {
+    pub rows: usize,
+    pub hidden: usize,
+    pub eps: f32,
+    pub direct_weight: bool,
+    pub input_bf16: DevicePtr,
+    pub weight_bf16: DevicePtr,
+    pub residual_bf16: DevicePtr,
+    pub residual_out_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeInterpreterNvfp4QuantizeParams {
+    pub values: usize,
+    pub input_tensor_scale_f32: f32,
+    pub input_bf16: DevicePtr,
+    pub output_fp4: DevicePtr,
+    pub output_scale_e4m3: DevicePtr,
+    pub output_tensor_scale_f32: DevicePtr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeInterpreterQProjDeinterleaveParams {
+    pub rows: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub input_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeInterpreterQProjSigmoidGateParams {
+    pub rows: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub gate_bf16: DevicePtr,
+    pub input_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeInterpreterFullAttentionLayerParams {
+    pub q_proj: DecodeInterpreterNvfp4GemvParams,
+    pub k_proj: DecodeInterpreterNvfp4GemvParams,
+    pub v_proj: DecodeInterpreterNvfp4GemvParams,
+    pub q_proj_deinterleave: DecodeInterpreterQProjDeinterleaveParams,
+    pub q_norm: DecodeInterpreterRmsNormBf16Params,
+    pub k_norm: DecodeInterpreterRmsNormBf16Params,
+    pub rope: DecodeInterpreterRopeParams,
+    pub attention: DecodeInterpreterAttentionParams,
+    pub q_proj_gate: DecodeInterpreterQProjSigmoidGateParams,
+    pub o_input_quant: DecodeInterpreterNvfp4QuantizeParams,
+    pub o_proj: DecodeInterpreterNvfp4GemvParams,
+}
+
 impl DecodeInterpreterProgram {
     pub fn compile(topology: &ModelTopology) -> Self {
         let mut compiler = DecodeInterpreterCompiler {
@@ -470,6 +539,169 @@ impl DecodeInterpreterProgram {
                 .with_dep(0, 1)
                 .with_publish(2, 1)
                 .with_arrival_counter(3),
+        );
+        Self {
+            program: program.finish(),
+        }
+    }
+
+    pub fn compile_full_attention_layer_decode(
+        params: DecodeInterpreterFullAttentionLayerParams,
+    ) -> Self {
+        let mut program = InterpreterProgram::new();
+        program.push(
+            InterpreterInstruction::nvfp4_gemv(
+                params.q_proj.m,
+                params.q_proj.k,
+                params.q_proj.alpha,
+                params.q_proj.a_fp4,
+                params.q_proj.a_scale_e4m3,
+                params.q_proj.b_fp4,
+                params.q_proj.b_scale_e4m3,
+                params.q_proj.c_bf16,
+            )
+            .with_publish(0, 1)
+            .with_arrival_counter(1),
+        );
+        program.push(
+            InterpreterInstruction::nvfp4_gemv(
+                params.k_proj.m,
+                params.k_proj.k,
+                params.k_proj.alpha,
+                params.k_proj.a_fp4,
+                params.k_proj.a_scale_e4m3,
+                params.k_proj.b_fp4,
+                params.k_proj.b_scale_e4m3,
+                params.k_proj.c_bf16,
+            )
+            .with_dep(0, 1)
+            .with_publish(2, 1)
+            .with_arrival_counter(3),
+        );
+        program.push(
+            InterpreterInstruction::nvfp4_gemv(
+                params.v_proj.m,
+                params.v_proj.k,
+                params.v_proj.alpha,
+                params.v_proj.a_fp4,
+                params.v_proj.a_scale_e4m3,
+                params.v_proj.b_fp4,
+                params.v_proj.b_scale_e4m3,
+                params.v_proj.c_bf16,
+            )
+            .with_dep(2, 1)
+            .with_publish(4, 1)
+            .with_arrival_counter(5),
+        );
+        program.push(
+            InterpreterInstruction::q_proj_deinterleave(
+                params.q_proj_deinterleave.rows,
+                params.q_proj_deinterleave.heads,
+                params.q_proj_deinterleave.head_dim,
+                params.q_proj_deinterleave.input_bf16,
+                params.q_proj_deinterleave.output_bf16,
+            )
+            .with_dep(4, 1)
+            .with_publish(6, 1)
+            .with_arrival_counter(7),
+        );
+        program.push(
+            InterpreterInstruction::rmsnorm_bf16(
+                params.q_norm.rows,
+                params.q_norm.hidden,
+                params.q_norm.eps,
+                params.q_norm.direct_weight,
+                params.q_norm.input_bf16,
+                params.q_norm.weight_bf16,
+                params.q_norm.residual_bf16,
+                params.q_norm.residual_out_bf16,
+                params.q_norm.output_bf16,
+            )
+            .with_dep(6, 1)
+            .with_publish(8, 1)
+            .with_arrival_counter(9),
+        );
+        program.push(
+            InterpreterInstruction::rmsnorm_bf16(
+                params.k_norm.rows,
+                params.k_norm.hidden,
+                params.k_norm.eps,
+                params.k_norm.direct_weight,
+                params.k_norm.input_bf16,
+                params.k_norm.weight_bf16,
+                params.k_norm.residual_bf16,
+                params.k_norm.residual_out_bf16,
+                params.k_norm.output_bf16,
+            )
+            .with_dep(8, 1)
+            .with_publish(10, 1)
+            .with_arrival_counter(11),
+        );
+        program.push(
+            InterpreterInstruction::rope_partial(
+                params.rope.tokens,
+                params.rope.q_heads,
+                params.rope.kv_heads,
+                params.rope.head_dim,
+                params.rope.rope_dims,
+                params.rope.base_theta,
+                params.rope.position_i32,
+                params.rope.use_scalar_position,
+                params.rope.positions_i32,
+                params.rope.q_bf16,
+                params.rope.k_bf16,
+                params.rope.scalar_position_device_i32,
+            )
+            .with_dep(10, 1)
+            .with_publish(12, 1)
+            .with_arrival_counter(13),
+        );
+        program.push(
+            InterpreterInstruction::attn_decode_full_spec(params.attention.spec)
+                .with_dep(12, 1)
+                .with_publish(14, 1)
+                .with_arrival_counter(15),
+        );
+        program.push(
+            InterpreterInstruction::q_proj_sigmoid_gate(
+                params.q_proj_gate.rows,
+                params.q_proj_gate.heads,
+                params.q_proj_gate.head_dim,
+                params.q_proj_gate.gate_bf16,
+                params.q_proj_gate.input_bf16,
+                params.q_proj_gate.output_bf16,
+            )
+            .with_dep(14, 1)
+            .with_publish(16, 1)
+            .with_arrival_counter(17),
+        );
+        program.push(
+            InterpreterInstruction::nvfp4_quantize(
+                params.o_input_quant.values,
+                params.o_input_quant.input_tensor_scale_f32,
+                params.o_input_quant.input_bf16,
+                params.o_input_quant.output_fp4,
+                params.o_input_quant.output_scale_e4m3,
+                params.o_input_quant.output_tensor_scale_f32,
+            )
+            .with_dep(16, 1)
+            .with_publish(18, 1)
+            .with_arrival_counter(19),
+        );
+        program.push(
+            InterpreterInstruction::nvfp4_gemv(
+                params.o_proj.m,
+                params.o_proj.k,
+                params.o_proj.alpha,
+                params.o_proj.a_fp4,
+                params.o_proj.a_scale_e4m3,
+                params.o_proj.b_fp4,
+                params.o_proj.b_scale_e4m3,
+                params.o_proj.c_bf16,
+            )
+            .with_dep(18, 1)
+            .with_publish(20, 1)
+            .with_arrival_counter(21),
         );
         Self {
             program: program.finish(),
@@ -925,6 +1157,114 @@ mod tests {
             compiled.program.instructions[2].opcode(),
             Some(InterpreterOpcode::Exit)
         );
+    }
+
+    #[test]
+    fn full_attention_layer_program_uses_real_opcodes_and_counters() {
+        let gemv = |m, k, a, b, c| DecodeInterpreterNvfp4GemvParams {
+            m,
+            k,
+            alpha: 0.5,
+            a_fp4: DevicePtr(a),
+            a_scale_e4m3: DevicePtr(a + 1),
+            b_fp4: DevicePtr(b),
+            b_scale_e4m3: DevicePtr(b + 1),
+            c_bf16: DevicePtr(c),
+        };
+        let norm = |rows, input, weight, output| DecodeInterpreterRmsNormBf16Params {
+            rows,
+            hidden: 256,
+            eps: 1.0e-6,
+            direct_weight: true,
+            input_bf16: DevicePtr(input),
+            weight_bf16: DevicePtr(weight),
+            residual_bf16: DevicePtr::NULL,
+            residual_out_bf16: DevicePtr::NULL,
+            output_bf16: DevicePtr(output),
+        };
+        let compiled = DecodeInterpreterProgram::compile_full_attention_layer_decode(
+            DecodeInterpreterFullAttentionLayerParams {
+                q_proj: gemv(12288, 5120, 10, 100, 200),
+                k_proj: gemv(1024, 5120, 20, 100, 201),
+                v_proj: gemv(1024, 5120, 30, 100, 202),
+                q_proj_deinterleave: DecodeInterpreterQProjDeinterleaveParams {
+                    rows: 1,
+                    heads: 24,
+                    head_dim: 256,
+                    input_bf16: DevicePtr(200),
+                    output_bf16: DevicePtr(203),
+                },
+                q_norm: norm(24, 203, 40, 203),
+                k_norm: norm(4, 201, 41, 201),
+                rope: DecodeInterpreterRopeParams {
+                    tokens: 1,
+                    q_heads: 24,
+                    kv_heads: 4,
+                    head_dim: 256,
+                    rope_dims: 64,
+                    base_theta: 10000.0,
+                    position_i32: 7,
+                    use_scalar_position: true,
+                    positions_i32: DevicePtr::NULL,
+                    q_bf16: DevicePtr(203),
+                    k_bf16: DevicePtr(201),
+                    scalar_position_device_i32: DevicePtr::NULL,
+                },
+                attention: DecodeInterpreterAttentionParams {
+                    spec: DevicePtr(300),
+                },
+                q_proj_gate: DecodeInterpreterQProjSigmoidGateParams {
+                    rows: 1,
+                    heads: 24,
+                    head_dim: 256,
+                    gate_bf16: DevicePtr(200),
+                    input_bf16: DevicePtr(203),
+                    output_bf16: DevicePtr(203),
+                },
+                o_input_quant: DecodeInterpreterNvfp4QuantizeParams {
+                    values: 6144,
+                    input_tensor_scale_f32: 1.25,
+                    input_bf16: DevicePtr(203),
+                    output_fp4: DevicePtr(100),
+                    output_scale_e4m3: DevicePtr(101),
+                    output_tensor_scale_f32: DevicePtr(102),
+                },
+                o_proj: gemv(5120, 6144, 50, 100, 204),
+            },
+        );
+        assert_eq!(compiled.program.instructions.len(), 12);
+        assert_eq!(compiled.program.counter_count, 22);
+        let opcodes: Vec<_> = compiled
+            .program
+            .instructions
+            .iter()
+            .map(InterpreterInstruction::opcode)
+            .collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                Some(InterpreterOpcode::Nvfp4Gemv),
+                Some(InterpreterOpcode::Nvfp4Gemv),
+                Some(InterpreterOpcode::Nvfp4Gemv),
+                Some(InterpreterOpcode::QProjDeinterleave),
+                Some(InterpreterOpcode::RmsNormBf16),
+                Some(InterpreterOpcode::RmsNormBf16),
+                Some(InterpreterOpcode::RopePartial),
+                Some(InterpreterOpcode::AttnDecodeFull),
+                Some(InterpreterOpcode::QProjSigmoidGate),
+                Some(InterpreterOpcode::Nvfp4Quantize),
+                Some(InterpreterOpcode::Nvfp4Gemv),
+                Some(InterpreterOpcode::Exit),
+            ]
+        );
+        for (idx, instruction) in compiled.program.instructions.iter().take(11).enumerate() {
+            assert_eq!(instruction.publishes_counter, (idx * 2) as u32);
+            assert_eq!(instruction.arrival_counter, (idx * 2 + 1) as u32);
+            if idx > 0 {
+                assert_eq!(instruction.deps[0].counter_id, ((idx - 1) * 2) as u32);
+                assert_eq!(instruction.deps[0].target, 1);
+            }
+        }
     }
 
     #[test]

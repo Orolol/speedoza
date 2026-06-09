@@ -906,9 +906,9 @@ impl GpuForwardBuffers {
             interpreter_deltanet_counters: CudaDeviceBuffer::zeroed(2 * size_of::<i32>())?,
             interpreter_attention_spec: CudaDeviceBuffer::alloc(attention_decode_spec_abi_size())?,
             interpreter_attention_instructions: CudaDeviceBuffer::alloc(
-                3 * size_of::<InterpreterInstruction>(),
+                12 * size_of::<InterpreterInstruction>(),
             )?,
-            interpreter_attention_counters: CudaDeviceBuffer::zeroed(4 * size_of::<i32>())?,
+            interpreter_attention_counters: CudaDeviceBuffer::zeroed(22 * size_of::<i32>())?,
         })
     }
 
