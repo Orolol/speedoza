@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "cuda")]
 use std::mem::size_of;
+#[cfg(feature = "cuda")]
+use std::sync::OnceLock;
 
 #[cfg(feature = "cuda")]
 use qwen36_fp4_core::TensorInfo;
@@ -219,6 +221,17 @@ fn decode_interpreter_mlp_enabled(master_enabled: bool) -> bool {
             InterpreterOpcode::SwiGluNvfp4Quant,
         ],
     )
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_mlp_chunked_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cuda_env_bool("QWEN36_INTERPRETER_MLP_CHUNKED")
+            && decode_interpreter_opcodes_enabled()
+                .contains(InterpreterOpcode::SwiGluNvfp4QuantChunk)
+            && decode_interpreter_opcodes_enabled().contains(InterpreterOpcode::Nvfp4GemvChunkAccum)
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -9768,6 +9781,14 @@ impl<B: KernelBackend> Engine<B> {
         let down_input_tensor_scale = self.tensor_scalar_f32(weights, down_input_scale)?;
         let down_alpha =
             self.tensor_scalar_f32(weights, down_tensor_scale)? * down_input_tensor_scale;
+        let (chunk_accum_f32, chunk_intermediate) = if decode_interpreter_mlp_chunked_enabled()
+            && forward.attn_partial_acc.bytes() >= hidden * size_of::<f32>()
+            && intermediate % 32 == 0
+        {
+            (forward.attn_partial_acc.ptr(), intermediate / 2)
+        } else {
+            (DevicePtr::NULL, 0)
+        };
 
         Ok(Some(DecodeInterpreterMlpParams {
             hidden,
@@ -9790,6 +9811,8 @@ impl<B: KernelBackend> Engine<B> {
             down_weight_scale_e4m3: self.tensor_ptr(weights, down_block_scale)?,
             down_alpha,
             output_bf16: forward.hidden.ptr(),
+            chunk_accum_f32,
+            chunk_intermediate,
         }))
     }
 

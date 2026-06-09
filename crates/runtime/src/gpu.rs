@@ -907,9 +907,9 @@ impl GpuForwardBuffers {
             )?,
             interpreter_norm_counters: CudaDeviceBuffer::zeroed(2 * size_of::<i32>())?,
             interpreter_mlp_instructions: CudaDeviceBuffer::alloc(
-                6 * size_of::<InterpreterInstruction>(),
+                7 * size_of::<InterpreterInstruction>(),
             )?,
-            interpreter_mlp_counters: CudaDeviceBuffer::zeroed(10 * size_of::<i32>())?,
+            interpreter_mlp_counters: CudaDeviceBuffer::zeroed(12 * size_of::<i32>())?,
             interpreter_rope_instructions: CudaDeviceBuffer::alloc(
                 2 * size_of::<InterpreterInstruction>(),
             )?,

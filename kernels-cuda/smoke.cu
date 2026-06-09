@@ -1790,9 +1790,21 @@ int main() {
   qwen36_device_ptr_t interp_mlp_swiglu_global = dev_alloc<float>(1);
   qwen36_device_ptr_t interp_mlp_out =
       dev_alloc<__nv_bfloat16>(interp_mlp_hidden);
+  qwen36_device_ptr_t interp_mlp_chunk_swiglu_fp4 =
+      dev_alloc<uint8_t>(interp_mlp_intermediate / 2);
+  qwen36_device_ptr_t interp_mlp_chunk_swiglu_scale =
+      dev_alloc<uint8_t>(interp_mlp_act_scale_bytes);
+  qwen36_device_ptr_t interp_mlp_chunk_swiglu_global = dev_alloc<float>(1);
+  qwen36_device_ptr_t interp_mlp_chunk_out =
+      dev_alloc<__nv_bfloat16>(interp_mlp_hidden);
+  qwen36_device_ptr_t interp_mlp_chunk_accum =
+      dev_alloc<float>(interp_mlp_hidden);
   qwen36_device_ptr_t interp_mlp_instructions =
       dev_alloc<qwen36_interpreter_instruction_t>(4);
   qwen36_device_ptr_t interp_mlp_counters = dev_alloc<int32_t>(6);
+  qwen36_device_ptr_t interp_mlp_chunk_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(6);
+  qwen36_device_ptr_t interp_mlp_chunk_counters = dev_alloc<int32_t>(10);
   copy_raw<uint8_t>(interp_mlp_input_fp4,
                     std::vector<uint8_t>(interp_mlp_hidden / 2, 0x22));
   copy_raw<uint8_t>(interp_mlp_input_scale,
@@ -1921,6 +1933,128 @@ int main() {
   for (size_t i = 0; i < interp_mlp_hidden; ++i) {
     expect_close(interp_mlp_values[i], interp_mlp_ref_values[i], 0.0f,
                  "interpreter MLP");
+  }
+
+  constexpr size_t interp_mlp_chunk_k = 512;
+  qwen36_interpreter_instruction_t interp_mlp_chunk_program_host[6]{};
+  interp_mlp_chunk_program_host[0] = interp_mlp_program_host[0];
+  interp_mlp_chunk_program_host[1].opcode =
+      17; // SWIGLU_NVFP4_QUANT_CHUNK
+  interp_mlp_chunk_program_host[1].dep_count = 1;
+  interp_mlp_chunk_program_host[1].deps[0] = qwen36_interpreter_dep_t{0, 1};
+  interp_mlp_chunk_program_host[1].publishes_counter = 2;
+  interp_mlp_chunk_program_host[1].publish_value = 1;
+  interp_mlp_chunk_program_host[1].arrival_counter = 3;
+  interp_mlp_chunk_program_host[1].payload[0] = 0;
+  interp_mlp_chunk_program_host[1].payload[1] = interp_mlp_chunk_k;
+  interp_mlp_chunk_program_host[1].payload[2] = interp_mlp_intermediate;
+  interp_mlp_chunk_program_host[1].payload[3] = interp_mlp_gate.ptr;
+  interp_mlp_chunk_program_host[1].payload[4] = interp_mlp_up.ptr;
+  interp_mlp_chunk_program_host[1].payload[5] =
+      interp_mlp_chunk_swiglu_fp4.ptr;
+  interp_mlp_chunk_program_host[1].payload[6] =
+      interp_mlp_chunk_swiglu_scale.ptr;
+  interp_mlp_chunk_program_host[1].payload[7] =
+      interp_mlp_chunk_swiglu_global.ptr;
+  interp_mlp_chunk_program_host[1].payload[8] = swiglu_scale_bits.u;
+  interp_mlp_chunk_program_host[2].opcode =
+      18; // NVFP4_GEMV_CHUNK_ACCUM
+  interp_mlp_chunk_program_host[2].dep_count = 1;
+  interp_mlp_chunk_program_host[2].deps[0] = qwen36_interpreter_dep_t{2, 1};
+  interp_mlp_chunk_program_host[2].publishes_counter = 4;
+  interp_mlp_chunk_program_host[2].publish_value = 1;
+  interp_mlp_chunk_program_host[2].arrival_counter = 5;
+  interp_mlp_chunk_program_host[2].payload[0] = interp_mlp_hidden;
+  interp_mlp_chunk_program_host[2].payload[1] = interp_mlp_intermediate;
+  interp_mlp_chunk_program_host[2].payload[2] = 0;
+  interp_mlp_chunk_program_host[2].payload[3] = interp_mlp_chunk_k;
+  interp_mlp_chunk_program_host[2].payload[4] = interp_mlp_down_w.ptr;
+  interp_mlp_chunk_program_host[2].payload[5] = interp_mlp_down_scale.ptr;
+  interp_mlp_chunk_program_host[2].payload[6] =
+      interp_mlp_chunk_swiglu_fp4.ptr;
+  interp_mlp_chunk_program_host[2].payload[7] =
+      interp_mlp_chunk_swiglu_scale.ptr;
+  interp_mlp_chunk_program_host[2].payload[8] = interp_mlp_chunk_accum.ptr;
+  interp_mlp_chunk_program_host[2].payload[9] = interp_mlp_chunk_out.ptr;
+  interp_mlp_chunk_program_host[2].payload[10] = interp_gemv_alpha_bits.u;
+  interp_mlp_chunk_program_host[2].payload[11] = 1; // reset accumulation
+  interp_mlp_chunk_program_host[3].opcode =
+      17; // SWIGLU_NVFP4_QUANT_CHUNK
+  interp_mlp_chunk_program_host[3].dep_count = 1;
+  interp_mlp_chunk_program_host[3].deps[0] = qwen36_interpreter_dep_t{4, 1};
+  interp_mlp_chunk_program_host[3].publishes_counter = 6;
+  interp_mlp_chunk_program_host[3].publish_value = 1;
+  interp_mlp_chunk_program_host[3].arrival_counter = 7;
+  interp_mlp_chunk_program_host[3].payload[0] = interp_mlp_chunk_k;
+  interp_mlp_chunk_program_host[3].payload[1] = interp_mlp_chunk_k;
+  interp_mlp_chunk_program_host[3].payload[2] = interp_mlp_intermediate;
+  interp_mlp_chunk_program_host[3].payload[3] = interp_mlp_gate.ptr;
+  interp_mlp_chunk_program_host[3].payload[4] = interp_mlp_up.ptr;
+  interp_mlp_chunk_program_host[3].payload[5] =
+      interp_mlp_chunk_swiglu_fp4.ptr;
+  interp_mlp_chunk_program_host[3].payload[6] =
+      interp_mlp_chunk_swiglu_scale.ptr;
+  interp_mlp_chunk_program_host[3].payload[7] =
+      interp_mlp_chunk_swiglu_global.ptr;
+  interp_mlp_chunk_program_host[3].payload[8] = swiglu_scale_bits.u;
+  interp_mlp_chunk_program_host[4].opcode =
+      18; // NVFP4_GEMV_CHUNK_ACCUM
+  interp_mlp_chunk_program_host[4].dep_count = 1;
+  interp_mlp_chunk_program_host[4].deps[0] = qwen36_interpreter_dep_t{6, 1};
+  interp_mlp_chunk_program_host[4].publishes_counter = 8;
+  interp_mlp_chunk_program_host[4].publish_value = 1;
+  interp_mlp_chunk_program_host[4].arrival_counter = 9;
+  interp_mlp_chunk_program_host[4].payload[0] = interp_mlp_hidden;
+  interp_mlp_chunk_program_host[4].payload[1] = interp_mlp_intermediate;
+  interp_mlp_chunk_program_host[4].payload[2] = interp_mlp_chunk_k;
+  interp_mlp_chunk_program_host[4].payload[3] = interp_mlp_chunk_k;
+  interp_mlp_chunk_program_host[4].payload[4] = interp_mlp_down_w.ptr;
+  interp_mlp_chunk_program_host[4].payload[5] = interp_mlp_down_scale.ptr;
+  interp_mlp_chunk_program_host[4].payload[6] =
+      interp_mlp_chunk_swiglu_fp4.ptr;
+  interp_mlp_chunk_program_host[4].payload[7] =
+      interp_mlp_chunk_swiglu_scale.ptr;
+  interp_mlp_chunk_program_host[4].payload[8] = interp_mlp_chunk_accum.ptr;
+  interp_mlp_chunk_program_host[4].payload[9] = interp_mlp_chunk_out.ptr;
+  interp_mlp_chunk_program_host[4].payload[10] = interp_gemv_alpha_bits.u;
+  interp_mlp_chunk_program_host[4].payload[11] = 2; // finalize output
+  interp_mlp_chunk_program_host[5].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_mlp_chunk_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_mlp_chunk_program_host, interp_mlp_chunk_program_host + 6));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_mlp_chunk_counters.ptr), 0,
+                 10 * sizeof(int32_t)),
+      "cudaMemset interp MLP chunk counters");
+  qwen36_interpreter_program_t interp_mlp_chunk_spec{};
+  interp_mlp_chunk_spec.instructions = interp_mlp_chunk_instructions;
+  interp_mlp_chunk_spec.instruction_count = 6;
+  interp_mlp_chunk_spec.counters_i32 = interp_mlp_chunk_counters;
+  interp_mlp_chunk_spec.counter_count = 10;
+  interp_mlp_chunk_spec.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_mlp_chunk_spec),
+              "interpreter MLP chunked");
+  std::vector<uint8_t> interp_mlp_chunk_fp4 =
+      read_raw<uint8_t>(interp_mlp_chunk_swiglu_fp4,
+                        interp_mlp_intermediate / 2);
+  std::vector<uint8_t> interp_mlp_ref_fp4 =
+      read_raw<uint8_t>(interp_mlp_swiglu_fp4_ref,
+                        interp_mlp_intermediate / 2);
+  for (size_t i = 0; i < interp_mlp_ref_fp4.size(); ++i) {
+    if (interp_mlp_chunk_fp4[i] != interp_mlp_ref_fp4[i]) {
+      fprintf(stderr,
+              "interpreter MLP chunked SwiGLU fp4 byte %zu expected %u got %u\n",
+              i, static_cast<unsigned>(interp_mlp_ref_fp4[i]),
+              static_cast<unsigned>(interp_mlp_chunk_fp4[i]));
+      exit(1);
+    }
+  }
+  std::vector<float> interp_mlp_chunk_values =
+      read_bf16(interp_mlp_chunk_out, interp_mlp_hidden);
+  for (size_t i = 0; i < interp_mlp_hidden; ++i) {
+    expect_close(interp_mlp_chunk_values[i], interp_mlp_ref_values[i],
+                 32768.0f, "interpreter MLP chunked");
   }
 
   qwen36_device_ptr_t conv_input = dev_alloc<__nv_bfloat16>(1);

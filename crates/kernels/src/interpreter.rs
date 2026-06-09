@@ -4,7 +4,7 @@ use crate::backend::DevicePtr;
 
 pub const INTERPRETER_MAX_DEPS: usize = 4;
 pub const INTERPRETER_PAYLOAD_U64S: usize = 12;
-pub const INTERPRETER_OPCODE_COUNT: usize = 17;
+pub const INTERPRETER_OPCODE_COUNT: usize = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InterpreterOpcode {
@@ -25,10 +25,12 @@ pub enum InterpreterOpcode {
     SwiGluBf16,
     Conv1dGdnGateFused,
     Nvfp4GemvPair,
+    SwiGluNvfp4QuantChunk,
+    Nvfp4GemvChunkAccum,
 }
 
 impl InterpreterOpcode {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 19] = [
         Self::Exit,
         Self::FallbackTrampoline,
         Self::RmsNormNvfp4Quant,
@@ -46,6 +48,8 @@ impl InterpreterOpcode {
         Self::SwiGluBf16,
         Self::Conv1dGdnGateFused,
         Self::Nvfp4GemvPair,
+        Self::SwiGluNvfp4QuantChunk,
+        Self::Nvfp4GemvChunkAccum,
     ];
 
     pub fn code(self) -> u16 {
@@ -67,6 +71,8 @@ impl InterpreterOpcode {
             Self::SwiGluBf16 => 14,
             Self::Conv1dGdnGateFused => 15,
             Self::Nvfp4GemvPair => 16,
+            Self::SwiGluNvfp4QuantChunk => 17,
+            Self::Nvfp4GemvChunkAccum => 18,
         }
     }
 
@@ -89,6 +95,8 @@ impl InterpreterOpcode {
             14 => Self::SwiGluBf16,
             15 => Self::Conv1dGdnGateFused,
             16 => Self::Nvfp4GemvPair,
+            17 => Self::SwiGluNvfp4QuantChunk,
+            18 => Self::Nvfp4GemvChunkAccum,
             _ => return None,
         })
     }
@@ -112,6 +120,8 @@ impl InterpreterOpcode {
             Self::SwiGluBf16 => "SWIGLU_BF16",
             Self::Conv1dGdnGateFused => "CONV1D_GDN_GATE_FUSED",
             Self::Nvfp4GemvPair => "NVFP4_GEMV_PAIR",
+            Self::SwiGluNvfp4QuantChunk => "SWIGLU_NVFP4_QUANT_CHUNK",
+            Self::Nvfp4GemvChunkAccum => "NVFP4_GEMV_CHUNK_ACCUM",
         }
     }
 
@@ -290,6 +300,31 @@ impl InterpreterInstruction {
         instruction
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_nvfp4_quant_chunk(
+        chunk_start: usize,
+        chunk_values: usize,
+        full_values: usize,
+        input_tensor_scale_f32: f32,
+        gate_bf16: DevicePtr,
+        up_bf16: DevicePtr,
+        output_fp4: DevicePtr,
+        output_scale_e4m3: DevicePtr,
+        output_tensor_scale_f32: DevicePtr,
+    ) -> Self {
+        let mut instruction = Self::new(InterpreterOpcode::SwiGluNvfp4QuantChunk);
+        instruction.payload[0] = chunk_start as u64;
+        instruction.payload[1] = chunk_values as u64;
+        instruction.payload[2] = full_values as u64;
+        instruction.payload[3] = gate_bf16.0;
+        instruction.payload[4] = up_bf16.0;
+        instruction.payload[5] = output_fp4.0;
+        instruction.payload[6] = output_scale_e4m3.0;
+        instruction.payload[7] = output_tensor_scale_f32.0;
+        instruction.payload[8] = u64::from(input_tensor_scale_f32.to_bits());
+        instruction
+    }
+
     pub fn swiglu_bf16(
         rows: usize,
         intermediate: usize,
@@ -407,6 +442,39 @@ impl InterpreterInstruction {
         instruction.payload[9] = up_c_bf16.0;
         instruction.payload[10] = u64::from(gate_alpha.to_bits());
         instruction.payload[11] = u64::from(up_alpha.to_bits());
+        instruction
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvfp4_gemv_chunk_accum(
+        m: usize,
+        full_k: usize,
+        chunk_start: usize,
+        chunk_k: usize,
+        alpha: f32,
+        a_fp4: DevicePtr,
+        a_scale: DevicePtr,
+        b_fp4: DevicePtr,
+        b_scale: DevicePtr,
+        accum_f32: DevicePtr,
+        output_bf16: DevicePtr,
+        reset_accum: bool,
+        finalize_output: bool,
+    ) -> Self {
+        let mut instruction = Self::new(InterpreterOpcode::Nvfp4GemvChunkAccum);
+        instruction.payload[0] = m as u64;
+        instruction.payload[1] = full_k as u64;
+        instruction.payload[2] = chunk_start as u64;
+        instruction.payload[3] = chunk_k as u64;
+        instruction.payload[4] = a_fp4.0;
+        instruction.payload[5] = a_scale.0;
+        instruction.payload[6] = b_fp4.0;
+        instruction.payload[7] = b_scale.0;
+        instruction.payload[8] = accum_f32.0;
+        instruction.payload[9] = output_bf16.0;
+        instruction.payload[10] = u64::from(alpha.to_bits());
+        instruction.payload[11] =
+            u64::from(u32::from(reset_accum)) | (u64::from(u32::from(finalize_output)) << 1);
         instruction
     }
 
@@ -693,6 +761,56 @@ mod tests {
         assert_eq!(gemv_pair.payload[9], 45);
         assert_eq!(gemv_pair.payload[10] as u32, 0.25f32.to_bits());
         assert_eq!(gemv_pair.payload[11] as u32, 0.75f32.to_bits());
+
+        let swiglu_chunk = InterpreterInstruction::swiglu_nvfp4_quant_chunk(
+            512,
+            512,
+            1024,
+            1.5,
+            DevicePtr(50),
+            DevicePtr(51),
+            DevicePtr(52),
+            DevicePtr(53),
+            DevicePtr(54),
+        );
+        assert_eq!(
+            swiglu_chunk.opcode(),
+            Some(InterpreterOpcode::SwiGluNvfp4QuantChunk)
+        );
+        assert_eq!(swiglu_chunk.payload[0], 512);
+        assert_eq!(swiglu_chunk.payload[1], 512);
+        assert_eq!(swiglu_chunk.payload[2], 1024);
+        assert_eq!(swiglu_chunk.payload[3], 50);
+        assert_eq!(swiglu_chunk.payload[8] as u32, 1.5f32.to_bits());
+
+        let gemv_chunk = InterpreterInstruction::nvfp4_gemv_chunk_accum(
+            1024,
+            4096,
+            512,
+            512,
+            0.125,
+            DevicePtr(60),
+            DevicePtr(61),
+            DevicePtr(62),
+            DevicePtr(63),
+            DevicePtr(64),
+            DevicePtr(65),
+            true,
+            false,
+        );
+        assert_eq!(
+            gemv_chunk.opcode(),
+            Some(InterpreterOpcode::Nvfp4GemvChunkAccum)
+        );
+        assert_eq!(gemv_chunk.payload[0], 1024);
+        assert_eq!(gemv_chunk.payload[1], 4096);
+        assert_eq!(gemv_chunk.payload[2], 512);
+        assert_eq!(gemv_chunk.payload[3], 512);
+        assert_eq!(gemv_chunk.payload[4], 60);
+        assert_eq!(gemv_chunk.payload[8], 64);
+        assert_eq!(gemv_chunk.payload[9], 65);
+        assert_eq!(gemv_chunk.payload[10] as u32, 0.125f32.to_bits());
+        assert_eq!(gemv_chunk.payload[11], 1);
 
         let deltanet = InterpreterInstruction::deltanet_recur_spec(DevicePtr(30));
         assert_eq!(deltanet.opcode(), Some(InterpreterOpcode::DeltaNetRecur));

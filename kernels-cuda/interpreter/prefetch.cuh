@@ -88,6 +88,27 @@ prefetch_next_instruction_weights(const qwen36_interpreter_instruction_t &next) 
     prefetch_range_l2(up_base, to_fetch);
     break;
   }
+  case QWEN36_INTERPRETER_OPCODE_NVFP4_GEMV_CHUNK_ACCUM: {
+    // payload[0] = m, payload[1] = full_k, payload[2] = chunk_start,
+    // payload[4] = a_fp4. The matrix keeps its full row stride; this primes
+    // the first chunk lines of the first rows.
+    const auto m = static_cast<uint64_t>(next.payload[0]);
+    const auto full_k = static_cast<uint64_t>(next.payload[1]);
+    const auto chunk_start = static_cast<uint64_t>(next.payload[2]);
+    const uint64_t weight_bytes = (m * full_k) / 2u;
+    const uint64_t chunk_byte_offset = chunk_start / 2u;
+    if (chunk_byte_offset < weight_bytes) {
+      const uint64_t remaining = weight_bytes - chunk_byte_offset;
+      const uint32_t to_fetch =
+          remaining > kPrefetchBudgetBytes
+              ? kPrefetchBudgetBytes
+              : static_cast<uint32_t>(remaining);
+      const auto *base = reinterpret_cast<const uint8_t *>(
+          static_cast<uintptr_t>(next.payload[4]));
+      prefetch_range_l2(base + chunk_byte_offset, to_fetch);
+    }
+    break;
+  }
   case QWEN36_INTERPRETER_OPCODE_LM_HEAD_TILED: {
     // payload[0] = out_features, payload[1] = in_features,
     // payload[3] = weight_bf16. We only prime the first slice — the head is

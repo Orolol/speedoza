@@ -30,6 +30,8 @@ enum qwen36_interpreter_opcode : uint16_t {
   QWEN36_INTERPRETER_OPCODE_SWIGLU_BF16 = 14,
   QWEN36_INTERPRETER_OPCODE_CONV1D_GDN_GATE_FUSED = 15,
   QWEN36_INTERPRETER_OPCODE_NVFP4_GEMV_PAIR = 16,
+  QWEN36_INTERPRETER_OPCODE_SWIGLU_NVFP4_QUANT_CHUNK = 17,
+  QWEN36_INTERPRETER_OPCODE_NVFP4_GEMV_CHUNK_ACCUM = 18,
 };
 
 static_assert(sizeof(qwen36_interpreter_dep_t) == 8,
@@ -41,7 +43,7 @@ static_assert(sizeof(qwen36_interpreter_program_t) == 40,
 
 __host__ __device__ inline bool
 qwen36_interpreter_opcode_known(uint16_t opcode) {
-  return opcode <= QWEN36_INTERPRETER_OPCODE_NVFP4_GEMV_PAIR;
+  return opcode <= QWEN36_INTERPRETER_OPCODE_NVFP4_GEMV_CHUNK_ACCUM;
 }
 
 namespace qwen36_interpreter {

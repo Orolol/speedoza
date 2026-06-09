@@ -57,6 +57,8 @@ pub struct DecodeInterpreterMlpParams {
     pub down_weight_scale_e4m3: DevicePtr,
     pub down_alpha: f32,
     pub output_bf16: DevicePtr,
+    pub chunk_accum_f32: DevicePtr,
+    pub chunk_intermediate: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -309,6 +311,85 @@ impl DecodeInterpreterProgram {
             .with_publish(publish_base, 1)
             .with_arrival_counter(publish_base + 1),
         );
+        if params.chunk_intermediate > 0
+            && params.chunk_accum_f32 != DevicePtr::NULL
+            && params.chunk_intermediate % 16 == 0
+            && params.intermediate == params.chunk_intermediate * 2
+        {
+            program.push(
+                InterpreterInstruction::swiglu_nvfp4_quant_chunk(
+                    0,
+                    params.chunk_intermediate,
+                    params.intermediate,
+                    params.down_input_tensor_scale,
+                    params.gate_out_bf16,
+                    params.up_out_bf16,
+                    params.swiglu_fp4,
+                    params.swiglu_scale_e4m3,
+                    params.swiglu_tensor_scale_f32,
+                )
+                .with_dep(publish_base, 1)
+                .with_publish(publish_base + 2, 1)
+                .with_arrival_counter(publish_base + 3),
+            );
+            program.push(
+                InterpreterInstruction::nvfp4_gemv_chunk_accum(
+                    params.hidden,
+                    params.intermediate,
+                    0,
+                    params.chunk_intermediate,
+                    params.down_alpha,
+                    params.down_weight_fp4,
+                    params.down_weight_scale_e4m3,
+                    params.swiglu_fp4,
+                    params.swiglu_scale_e4m3,
+                    params.chunk_accum_f32,
+                    params.output_bf16,
+                    true,
+                    false,
+                )
+                .with_dep(publish_base + 2, 1)
+                .with_publish(publish_base + 4, 1)
+                .with_arrival_counter(publish_base + 5),
+            );
+            program.push(
+                InterpreterInstruction::swiglu_nvfp4_quant_chunk(
+                    params.chunk_intermediate,
+                    params.chunk_intermediate,
+                    params.intermediate,
+                    params.down_input_tensor_scale,
+                    params.gate_out_bf16,
+                    params.up_out_bf16,
+                    params.swiglu_fp4,
+                    params.swiglu_scale_e4m3,
+                    params.swiglu_tensor_scale_f32,
+                )
+                .with_dep(publish_base + 4, 1)
+                .with_publish(publish_base + 6, 1)
+                .with_arrival_counter(publish_base + 7),
+            );
+            program.push(
+                InterpreterInstruction::nvfp4_gemv_chunk_accum(
+                    params.hidden,
+                    params.intermediate,
+                    params.chunk_intermediate,
+                    params.chunk_intermediate,
+                    params.down_alpha,
+                    params.down_weight_fp4,
+                    params.down_weight_scale_e4m3,
+                    params.swiglu_fp4,
+                    params.swiglu_scale_e4m3,
+                    params.chunk_accum_f32,
+                    params.output_bf16,
+                    false,
+                    true,
+                )
+                .with_dep(publish_base + 6, 1)
+                .with_publish(publish_base + 8, 1)
+                .with_arrival_counter(publish_base + 9),
+            );
+            return;
+        }
         program.push(
             InterpreterInstruction::swiglu_nvfp4_quant(
                 params.intermediate,
@@ -1858,6 +1939,8 @@ mod tests {
             down_weight_scale_e4m3: DevicePtr(32),
             down_alpha: 1.5,
             output_bf16: DevicePtr(33),
+            chunk_accum_f32: DevicePtr::NULL,
+            chunk_intermediate: 0,
         });
         assert_eq!(compiled.program.instructions.len(), 4);
         assert_eq!(compiled.program.counter_count, 6);
@@ -1877,6 +1960,66 @@ mod tests {
         assert_eq!(compiled.program.instructions[2].deps[0].counter_id, 2);
         assert_eq!(
             compiled.program.instructions[3].opcode(),
+            Some(InterpreterOpcode::Exit)
+        );
+    }
+
+    #[test]
+    fn mlp_chunked_program_uses_chunk_opcodes_and_counters() {
+        let compiled = DecodeInterpreterProgram::compile_mlp(DecodeInterpreterMlpParams {
+            hidden: 32,
+            intermediate: 64,
+            input_fp4: DevicePtr(20),
+            input_scale_e4m3: DevicePtr(21),
+            gate_weight_fp4: DevicePtr(22),
+            gate_weight_scale_e4m3: DevicePtr(23),
+            gate_alpha: 0.5,
+            gate_out_bf16: DevicePtr(24),
+            up_weight_fp4: DevicePtr(25),
+            up_weight_scale_e4m3: DevicePtr(26),
+            up_alpha: 0.75,
+            up_out_bf16: DevicePtr(27),
+            swiglu_fp4: DevicePtr(28),
+            swiglu_scale_e4m3: DevicePtr(29),
+            swiglu_tensor_scale_f32: DevicePtr(30),
+            down_input_tensor_scale: 1.25,
+            down_weight_fp4: DevicePtr(31),
+            down_weight_scale_e4m3: DevicePtr(32),
+            down_alpha: 1.5,
+            output_bf16: DevicePtr(33),
+            chunk_accum_f32: DevicePtr(34),
+            chunk_intermediate: 32,
+        });
+        assert_eq!(compiled.program.instructions.len(), 6);
+        assert_eq!(compiled.program.counter_count, 10);
+        assert_eq!(
+            compiled.program.instructions[0].opcode(),
+            Some(InterpreterOpcode::Nvfp4GemvPair)
+        );
+        assert_eq!(
+            compiled.program.instructions[1].opcode(),
+            Some(InterpreterOpcode::SwiGluNvfp4QuantChunk)
+        );
+        assert_eq!(
+            compiled.program.instructions[2].opcode(),
+            Some(InterpreterOpcode::Nvfp4GemvChunkAccum)
+        );
+        assert_eq!(
+            compiled.program.instructions[3].opcode(),
+            Some(InterpreterOpcode::SwiGluNvfp4QuantChunk)
+        );
+        assert_eq!(
+            compiled.program.instructions[4].opcode(),
+            Some(InterpreterOpcode::Nvfp4GemvChunkAccum)
+        );
+        assert_eq!(compiled.program.instructions[1].payload[0], 0);
+        assert_eq!(compiled.program.instructions[1].payload[1], 32);
+        assert_eq!(compiled.program.instructions[2].payload[11], 1);
+        assert_eq!(compiled.program.instructions[3].payload[0], 32);
+        assert_eq!(compiled.program.instructions[4].payload[11], 2);
+        assert_eq!(compiled.program.instructions[4].deps[0].counter_id, 6);
+        assert_eq!(
+            compiled.program.instructions[5].opcode(),
             Some(InterpreterOpcode::Exit)
         );
     }
@@ -1919,6 +2062,8 @@ mod tests {
                     down_weight_scale_e4m3: DevicePtr(30),
                     down_alpha: 1.5,
                     output_bf16: DevicePtr(31),
+                    chunk_accum_f32: DevicePtr::NULL,
+                    chunk_intermediate: 0,
                 },
             });
         assert_eq!(compiled.program.instructions.len(), 5);
@@ -2487,6 +2632,8 @@ mod tests {
                         down_weight_scale_e4m3: DevicePtr(405),
                         down_alpha: 0.75,
                         output_bf16: DevicePtr(600),
+                        chunk_accum_f32: DevicePtr::NULL,
+                        chunk_intermediate: 0,
                     },
                 },
             },
@@ -3044,6 +3191,8 @@ mod tests {
                         down_weight_scale_e4m3: DevicePtr(55),
                         down_alpha: 0.75,
                         output_bf16: DevicePtr(70),
+                        chunk_accum_f32: DevicePtr::NULL,
+                        chunk_intermediate: 0,
                     },
                 },
             },

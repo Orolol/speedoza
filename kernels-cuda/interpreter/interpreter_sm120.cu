@@ -112,6 +112,13 @@ dispatch_instruction(const qwen36_interpreter_instruction_t &insn,
   case QWEN36_INTERPRETER_OPCODE_NVFP4_GEMV_PAIR:
     qwen36_interpreter::exec_nvfp4_gemv_pair(insn, pages);
     break;
+  case QWEN36_INTERPRETER_OPCODE_SWIGLU_NVFP4_QUANT_CHUNK:
+    qwen36_interpreter::exec_swiglu_nvfp4_quant_chunk(
+        insn, pages, scratch, swiglu_decoded_scale, swiglu_staged);
+    break;
+  case QWEN36_INTERPRETER_OPCODE_NVFP4_GEMV_CHUNK_ACCUM:
+    qwen36_interpreter::exec_nvfp4_gemv_chunk_accum(insn, pages);
+    break;
   default:
     break;
   }
