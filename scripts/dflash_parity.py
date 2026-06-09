@@ -88,40 +88,25 @@ def main() -> int:
         * 0.05
     )
 
-    # Collapse target_hidden via the drafter's own fc + hidden_norm so
-    # the fixture matches what the Rust v1 forward consumes.
-    with torch.no_grad():
-        target_collapsed = model.hidden_norm(model.fc(target_raw))
-
-    # Position ids: absolute positions [0, ctx_len + q_len).
+    # Position ids: absolute positions [0, ctx_len + q_len). Phase D.3
+    # writes the new K/V entries at offset `current_kv_len` (0 here,
+    # iter-1 semantics) into a per-layer cache; the controller manages
+    # cropping for multi-iter runs.
     kv_seq_len = args.ctx_len + args.q_len
     position_ids = torch.arange(kv_seq_len, dtype=torch.int64, device=device).unsqueeze(0)
 
-    # Monkey-patch the drafter forward to skip the internal fc +
-    # hidden_norm (we feed it the already-collapsed tensor). Simplest
-    # patch: replace fc and hidden_norm with identity.
-    original_fc = model.fc
-    original_hidden_norm = model.hidden_norm
-    model.fc = torch.nn.Identity()
-    model.hidden_norm = torch.nn.Identity()
-
-    # Forward. The drafter expects `target_hidden` to be already
-    # collapsed-then-normalized (= what fc+hidden_norm would have
-    # produced), so we pass target_collapsed and rely on the
-    # identity-patched fc/hidden_norm to no-op.
+    # Phase D.2: feed target_hidden_raw directly; the drafter's own
+    # `fc` + `hidden_norm` apply internally, mirroring what the Rust
+    # forward now does at the top of its layer loop.
     with torch.no_grad():
         output = model(
             position_ids=position_ids,
             noise_embedding=noise,
-            target_hidden=target_collapsed,
+            target_hidden=target_raw,
             past_key_values=None,
             use_cache=False,
             attention_mask=None,
         )
-
-    # Restore in case the user re-uses the model in the same process.
-    model.fc = original_fc
-    model.hidden_norm = original_hidden_norm
 
     print(f"output shape: {tuple(output.shape)} dtype: {output.dtype}", flush=True)
     assert output.shape == (1, args.q_len, hidden), output.shape
@@ -134,12 +119,12 @@ def main() -> int:
         return 1
 
     # Dump fixture. Layouts match the Rust workspace:
-    #   noise.bf16:           [q_len, hidden]              row-major BF16
-    #   target_collapsed.bf16:[ctx_len, hidden]            row-major BF16
-    #   positions.i32:        [ctx_len + q_len]            i32
-    #   expected_output.bf16: [q_len, hidden]              row-major BF16
+    #   noise.bf16:           [q_len, hidden]                    row-major BF16
+    #   target_raw.bf16:      [ctx_len, hidden * n_target_layers] row-major BF16
+    #   positions.i32:        [ctx_len + q_len]                  i32
+    #   expected_output.bf16: [q_len, hidden]                    row-major BF16
     save_bf16(args.fixture_dir / "noise.bf16", noise.squeeze(0))
-    save_bf16(args.fixture_dir / "target_collapsed.bf16", target_collapsed.squeeze(0))
+    save_bf16(args.fixture_dir / "target_raw.bf16", target_raw.squeeze(0))
     save_i32(
         args.fixture_dir / "positions.i32",
         position_ids.squeeze(0).to(torch.int32),
@@ -155,7 +140,7 @@ def main() -> int:
         "num_target_layers": n_target,
         "seed": args.seed,
         "noise_bytes": args.q_len * hidden * 2,
-        "target_collapsed_bytes": args.ctx_len * hidden * 2,
+        "target_raw_bytes": args.ctx_len * hidden * n_target * 2,
         "positions_bytes": kv_seq_len * 4,
         "expected_output_bytes": args.q_len * hidden * 2,
     }

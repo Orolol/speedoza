@@ -1080,6 +1080,109 @@ int main() {
                  "interpreter lm_head tiled");
   }
 
+  qwen36_device_ptr_t interp_logits_hidden = dev_alloc<__nv_bfloat16>(16);
+  qwen36_device_ptr_t interp_logits_residual = dev_alloc<__nv_bfloat16>(16);
+  qwen36_device_ptr_t interp_logits_norm_weight = dev_alloc<__nv_bfloat16>(16);
+  qwen36_device_ptr_t interp_logits_lm_weight = dev_alloc<__nv_bfloat16>(32);
+  qwen36_device_ptr_t interp_logits_norm_ref = dev_alloc<__nv_bfloat16>(16);
+  qwen36_device_ptr_t interp_logits_ref = dev_alloc<__nv_bfloat16>(2);
+  qwen36_device_ptr_t interp_logits_norm = dev_alloc<__nv_bfloat16>(16);
+  qwen36_device_ptr_t interp_logits_out = dev_alloc<__nv_bfloat16>(2);
+  qwen36_device_ptr_t interp_logits_fp4 = dev_alloc<uint8_t>(8);
+  qwen36_device_ptr_t interp_logits_scale = dev_alloc<uint8_t>(512);
+  qwen36_device_ptr_t interp_logits_global = dev_alloc<float>(1);
+  qwen36_device_ptr_t interp_logits_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(3);
+  qwen36_device_ptr_t interp_logits_counters = dev_alloc<int32_t>(4);
+  copy_bf16(interp_logits_hidden,
+            {1.0f, -2.0f, 3.0f, -4.0f, 5.0f, -6.0f, 7.0f, -8.0f,
+             0.5f, -1.5f, 2.5f, -3.5f, 4.5f, -5.5f, 6.5f, -7.5f});
+  copy_bf16(interp_logits_residual,
+            {0.25f, 0.5f, -0.25f, -0.5f, 0.75f, -0.75f, 1.0f, -1.0f,
+             0.125f, -0.125f, 0.375f, -0.375f, 0.625f, -0.625f, 0.875f,
+             -0.875f});
+  copy_bf16(interp_logits_norm_weight,
+            {0.0f, 0.05f, -0.05f, 0.1f, -0.1f, 0.15f, -0.15f, 0.2f,
+             -0.2f, 0.25f, -0.25f, 0.3f, -0.3f, 0.35f, -0.35f, 0.4f});
+  copy_bf16(interp_logits_lm_weight,
+            {0.25f, -0.25f, 0.5f, -0.5f, 0.75f, -0.75f, 1.0f, -1.0f,
+             0.125f, -0.125f, 0.375f, -0.375f, 0.625f, -0.625f, 0.875f,
+             -0.875f,
+             -0.5f, 0.5f, -0.25f, 0.25f, -0.125f, 0.125f, -0.75f,
+             0.75f, -1.0f, 1.0f, -0.625f, 0.625f, -0.375f, 0.375f,
+             -0.875f, 0.875f});
+  qwen36_rmsnorm_spec_t interp_logits_norm_ref_spec{};
+  interp_logits_norm_ref_spec.rows = 1;
+  interp_logits_norm_ref_spec.hidden = 16;
+  interp_logits_norm_ref_spec.eps = 1.0e-6f;
+  interp_logits_norm_ref_spec.input_bf16 = interp_logits_hidden;
+  interp_logits_norm_ref_spec.weight_bf16 = interp_logits_norm_weight;
+  interp_logits_norm_ref_spec.residual_bf16 = interp_logits_residual;
+  interp_logits_norm_ref_spec.output_bf16 = interp_logits_norm_ref;
+  must_status(qwen36_rmsnorm(&interp_logits_norm_ref_spec),
+              "interpreter logits reference rmsnorm");
+  qwen36_bf16_matvec_spec_t interp_logits_ref_spec{};
+  interp_logits_ref_spec.out_features = 2;
+  interp_logits_ref_spec.in_features = 16;
+  interp_logits_ref_spec.input_bf16 = interp_logits_norm_ref;
+  interp_logits_ref_spec.weight_bf16 = interp_logits_lm_weight;
+  interp_logits_ref_spec.output_bf16 = interp_logits_ref;
+  must_status(qwen36_bf16_matvec(&interp_logits_ref_spec),
+              "interpreter logits reference lm_head");
+
+  qwen36_interpreter_instruction_t interp_logits_program_host[3]{};
+  interp_logits_program_host[0].opcode = 2; // RMSNORM_NVFP4_QUANT
+  interp_logits_program_host[0].publishes_counter = 0;
+  interp_logits_program_host[0].publish_value = 1;
+  interp_logits_program_host[0].arrival_counter = 1;
+  interp_logits_program_host[0].payload[0] = 16;
+  interp_logits_program_host[0].payload[1] = interp_logits_hidden.ptr;
+  interp_logits_program_host[0].payload[2] = interp_logits_norm_weight.ptr;
+  interp_logits_program_host[0].payload[3] = interp_logits_residual.ptr;
+  interp_logits_program_host[0].payload[4] = 0;
+  interp_logits_program_host[0].payload[5] = interp_logits_norm.ptr;
+  interp_logits_program_host[0].payload[6] = interp_logits_fp4.ptr;
+  interp_logits_program_host[0].payload[7] = interp_logits_scale.ptr;
+  interp_logits_program_host[0].payload[8] = interp_logits_global.ptr;
+  interp_logits_program_host[0].payload[9] =
+      static_cast<uint64_t>(eps_bits.u) |
+      (static_cast<uint64_t>(scale_bits.u) << 32);
+  interp_logits_program_host[1].opcode = 9; // LM_HEAD_TILED
+  interp_logits_program_host[1].dep_count = 1;
+  interp_logits_program_host[1].deps[0] = qwen36_interpreter_dep_t{0, 1};
+  interp_logits_program_host[1].publishes_counter = 2;
+  interp_logits_program_host[1].publish_value = 1;
+  interp_logits_program_host[1].arrival_counter = 3;
+  interp_logits_program_host[1].payload[0] = 2;
+  interp_logits_program_host[1].payload[1] = 16;
+  interp_logits_program_host[1].payload[2] = interp_logits_norm.ptr;
+  interp_logits_program_host[1].payload[3] = interp_logits_lm_weight.ptr;
+  interp_logits_program_host[1].payload[4] = interp_logits_out.ptr;
+  interp_logits_program_host[2].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_logits_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_logits_program_host, interp_logits_program_host + 3));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_logits_counters.ptr), 0,
+                 4 * sizeof(int32_t)),
+      "cudaMemset interp final logits counters");
+  qwen36_interpreter_program_t interp_logits_program{};
+  interp_logits_program.instructions = interp_logits_instructions;
+  interp_logits_program.instruction_count = 3;
+  interp_logits_program.counters_i32 = interp_logits_counters;
+  interp_logits_program.counter_count = 4;
+  interp_logits_program.cta_count = 3;
+  must_status(qwen36_interpreter_decode_sm120(&interp_logits_program),
+              "interpreter final logits");
+  std::vector<float> interp_logits_values = read_bf16(interp_logits_out, 2);
+  std::vector<float> interp_logits_ref_values =
+      read_bf16(interp_logits_ref, 2);
+  for (size_t i = 0; i < 2; ++i) {
+    expect_close(interp_logits_values[i], interp_logits_ref_values[i], 0.0f,
+                 "interpreter final logits");
+  }
+
   qwen36_device_ptr_t bf16_gemm_input = dev_alloc<__nv_bfloat16>(128);
   qwen36_device_ptr_t bf16_gemm_weight = dev_alloc<__nv_bfloat16>(128 * 128);
   qwen36_device_ptr_t bf16_gemm_out = dev_alloc<__nv_bfloat16>(128);
@@ -1569,6 +1672,19 @@ int main() {
   dev_free<__nv_bfloat16>(interp_lm_out);
   dev_free<qwen36_interpreter_instruction_t>(interp_lm_instructions);
   dev_free<int32_t>(interp_lm_counters);
+  dev_free<__nv_bfloat16>(interp_logits_hidden);
+  dev_free<__nv_bfloat16>(interp_logits_residual);
+  dev_free<__nv_bfloat16>(interp_logits_norm_weight);
+  dev_free<__nv_bfloat16>(interp_logits_lm_weight);
+  dev_free<__nv_bfloat16>(interp_logits_norm_ref);
+  dev_free<__nv_bfloat16>(interp_logits_ref);
+  dev_free<__nv_bfloat16>(interp_logits_norm);
+  dev_free<__nv_bfloat16>(interp_logits_out);
+  dev_free<uint8_t>(interp_logits_fp4);
+  dev_free<uint8_t>(interp_logits_scale);
+  dev_free<float>(interp_logits_global);
+  dev_free<qwen36_interpreter_instruction_t>(interp_logits_instructions);
+  dev_free<int32_t>(interp_logits_counters);
   dev_free<__nv_bfloat16>(bf16_gemm_input);
   dev_free<__nv_bfloat16>(bf16_gemm_weight);
   dev_free<__nv_bfloat16>(bf16_gemm_out);

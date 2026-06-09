@@ -4,7 +4,8 @@ use qwen36_fp4_core::{LayerType, ModelTopology};
 #[cfg(feature = "cuda")]
 use qwen36_fp4_kernels::{CudaDeviceBuffer, KernelBackend};
 use qwen36_fp4_kernels::{
-    InterpreterInstruction, InterpreterOpcode, InterpreterProgram, InterpreterProgramSpec,
+    DevicePtr, InterpreterInstruction, InterpreterOpcode, InterpreterProgram,
+    InterpreterProgramSpec,
 };
 
 /// Host-side compiler for the decode interpreter instruction stream.
@@ -17,6 +18,45 @@ use qwen36_fp4_kernels::{
 #[derive(Debug, Clone)]
 pub struct DecodeInterpreterProgram {
     pub program: InterpreterProgram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeInterpreterLogitsParams {
+    pub hidden: usize,
+    pub vocab_size: usize,
+    pub hidden_bf16: DevicePtr,
+    pub residual_bf16: DevicePtr,
+    pub final_norm_weight_bf16: DevicePtr,
+    pub normed_bf16: DevicePtr,
+    pub activation_fp4: DevicePtr,
+    pub activation_scale_e4m3: DevicePtr,
+    pub activation_tensor_scale_f32: DevicePtr,
+    pub lm_head_weight_bf16: DevicePtr,
+    pub logits_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeInterpreterMlpParams {
+    pub hidden: usize,
+    pub intermediate: usize,
+    pub input_fp4: DevicePtr,
+    pub input_scale_e4m3: DevicePtr,
+    pub gate_weight_fp4: DevicePtr,
+    pub gate_weight_scale_e4m3: DevicePtr,
+    pub gate_alpha: f32,
+    pub gate_out_bf16: DevicePtr,
+    pub up_weight_fp4: DevicePtr,
+    pub up_weight_scale_e4m3: DevicePtr,
+    pub up_alpha: f32,
+    pub up_out_bf16: DevicePtr,
+    pub swiglu_fp4: DevicePtr,
+    pub swiglu_scale_e4m3: DevicePtr,
+    pub swiglu_tensor_scale_f32: DevicePtr,
+    pub down_input_tensor_scale: f32,
+    pub down_weight_fp4: DevicePtr,
+    pub down_weight_scale_e4m3: DevicePtr,
+    pub down_alpha: f32,
+    pub output_bf16: DevicePtr,
 }
 
 impl DecodeInterpreterProgram {
@@ -62,6 +102,112 @@ impl DecodeInterpreterProgram {
 
         Self {
             program: compiler.program.finish(),
+        }
+    }
+
+    /// Compile the first runtime-backed slice of the decode interpreter:
+    /// final RMSNorm followed by tiled BF16 lm_head. The RMSNorm opcode also
+    /// emits FP4 scratch, but only its BF16 output feeds lm_head.
+    pub fn compile_final_logits(params: DecodeInterpreterLogitsParams) -> Self {
+        let mut program = InterpreterProgram::new();
+        program.push(
+            InterpreterInstruction::rmsnorm_nvfp4_quant(
+                params.hidden,
+                1.0e-6,
+                1.0,
+                params.hidden_bf16,
+                params.final_norm_weight_bf16,
+                params.residual_bf16,
+                DevicePtr::NULL,
+                params.normed_bf16,
+                params.activation_fp4,
+                params.activation_scale_e4m3,
+                params.activation_tensor_scale_f32,
+            )
+            .with_publish(0, 1)
+            .with_arrival_counter(1),
+        );
+        program.push(
+            InterpreterInstruction::lm_head_tiled(
+                params.vocab_size,
+                params.hidden,
+                params.normed_bf16,
+                params.lm_head_weight_bf16,
+                params.logits_bf16,
+            )
+            .with_dep(0, 1)
+            .with_publish(2, 1)
+            .with_arrival_counter(3),
+        );
+        Self {
+            program: program.finish(),
+        }
+    }
+
+    /// Compile the runtime-backed decode MLP slice. The input activation is
+    /// already NVFP4-quantized by the preceding post-attention RMSNorm.
+    pub fn compile_mlp(params: DecodeInterpreterMlpParams) -> Self {
+        let mut program = InterpreterProgram::new();
+        program.push(
+            InterpreterInstruction::nvfp4_gemv(
+                params.intermediate,
+                params.hidden,
+                params.gate_alpha,
+                params.gate_weight_fp4,
+                params.gate_weight_scale_e4m3,
+                params.input_fp4,
+                params.input_scale_e4m3,
+                params.gate_out_bf16,
+            )
+            .with_publish(0, 1)
+            .with_arrival_counter(1),
+        );
+        program.push(
+            InterpreterInstruction::nvfp4_gemv(
+                params.intermediate,
+                params.hidden,
+                params.up_alpha,
+                params.up_weight_fp4,
+                params.up_weight_scale_e4m3,
+                params.input_fp4,
+                params.input_scale_e4m3,
+                params.up_out_bf16,
+            )
+            .with_dep(0, 1)
+            .with_publish(2, 1)
+            .with_arrival_counter(3),
+        );
+        program.push(
+            InterpreterInstruction::swiglu_nvfp4_quant(
+                params.intermediate,
+                params.down_input_tensor_scale,
+                params.gate_out_bf16,
+                params.up_out_bf16,
+                params.swiglu_fp4,
+                params.swiglu_scale_e4m3,
+                params.swiglu_tensor_scale_f32,
+            )
+            .with_dep(2, 1)
+            .with_publish(4, 1)
+            .with_arrival_counter(5),
+        );
+        program.push(
+            InterpreterInstruction::nvfp4_gemv(
+                params.hidden,
+                params.intermediate,
+                params.down_alpha,
+                params.down_weight_fp4,
+                params.down_weight_scale_e4m3,
+                params.swiglu_fp4,
+                params.swiglu_scale_e4m3,
+                params.output_bf16,
+            )
+            .with_dep(4, 1)
+            .with_publish(6, 1)
+            .with_arrival_counter(7),
+        );
+        Self {
+            program: program.finish(),
         }
     }
 
@@ -124,7 +270,7 @@ impl CudaDecodeInterpreterProgram {
 }
 
 #[cfg(feature = "cuda")]
-fn instructions_as_bytes(instructions: &[InterpreterInstruction]) -> &[u8] {
+pub(crate) fn instructions_as_bytes(instructions: &[InterpreterInstruction]) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(
             instructions.as_ptr().cast::<u8>(),
@@ -173,6 +319,91 @@ mod tests {
         // final RMSNorm + lm_head.
         assert_eq!(non_exit, 48 * 9 + 16 * 10 + 2);
         assert_eq!(compiled.program.counter_count, non_exit * 2);
+    }
+
+    #[test]
+    fn final_logits_program_uses_real_opcodes_and_counters() {
+        let compiled =
+            DecodeInterpreterProgram::compile_final_logits(DecodeInterpreterLogitsParams {
+                hidden: 8,
+                vocab_size: 4,
+                hidden_bf16: DevicePtr(10),
+                residual_bf16: DevicePtr(11),
+                final_norm_weight_bf16: DevicePtr(12),
+                normed_bf16: DevicePtr(13),
+                activation_fp4: DevicePtr(14),
+                activation_scale_e4m3: DevicePtr(15),
+                activation_tensor_scale_f32: DevicePtr(16),
+                lm_head_weight_bf16: DevicePtr(17),
+                logits_bf16: DevicePtr(18),
+            });
+        assert_eq!(compiled.program.instructions.len(), 3);
+        assert_eq!(compiled.program.counter_count, 4);
+        assert_eq!(
+            compiled.program.instructions[0].opcode(),
+            Some(InterpreterOpcode::RmsNormNvfp4Quant)
+        );
+        assert_eq!(
+            compiled.program.instructions[1].opcode(),
+            Some(InterpreterOpcode::LmHeadTiled)
+        );
+        assert_eq!(compiled.program.instructions[1].deps[0].counter_id, 0);
+        assert_eq!(compiled.program.instructions[1].deps[0].target, 1);
+        assert_eq!(
+            compiled.program.instructions[2].opcode(),
+            Some(InterpreterOpcode::Exit)
+        );
+    }
+
+    #[test]
+    fn mlp_program_uses_real_opcodes_and_counters() {
+        let compiled = DecodeInterpreterProgram::compile_mlp(DecodeInterpreterMlpParams {
+            hidden: 8,
+            intermediate: 16,
+            input_fp4: DevicePtr(20),
+            input_scale_e4m3: DevicePtr(21),
+            gate_weight_fp4: DevicePtr(22),
+            gate_weight_scale_e4m3: DevicePtr(23),
+            gate_alpha: 0.5,
+            gate_out_bf16: DevicePtr(24),
+            up_weight_fp4: DevicePtr(25),
+            up_weight_scale_e4m3: DevicePtr(26),
+            up_alpha: 0.75,
+            up_out_bf16: DevicePtr(27),
+            swiglu_fp4: DevicePtr(28),
+            swiglu_scale_e4m3: DevicePtr(29),
+            swiglu_tensor_scale_f32: DevicePtr(30),
+            down_input_tensor_scale: 1.25,
+            down_weight_fp4: DevicePtr(31),
+            down_weight_scale_e4m3: DevicePtr(32),
+            down_alpha: 1.5,
+            output_bf16: DevicePtr(33),
+        });
+        assert_eq!(compiled.program.instructions.len(), 5);
+        assert_eq!(compiled.program.counter_count, 8);
+        assert_eq!(
+            compiled.program.instructions[0].opcode(),
+            Some(InterpreterOpcode::Nvfp4Gemv)
+        );
+        assert_eq!(
+            compiled.program.instructions[1].opcode(),
+            Some(InterpreterOpcode::Nvfp4Gemv)
+        );
+        assert_eq!(
+            compiled.program.instructions[2].opcode(),
+            Some(InterpreterOpcode::SwiGluNvfp4Quant)
+        );
+        assert_eq!(
+            compiled.program.instructions[3].opcode(),
+            Some(InterpreterOpcode::Nvfp4Gemv)
+        );
+        assert_eq!(compiled.program.instructions[1].deps[0].counter_id, 0);
+        assert_eq!(compiled.program.instructions[2].deps[0].counter_id, 2);
+        assert_eq!(compiled.program.instructions[3].deps[0].counter_id, 4);
+        assert_eq!(
+            compiled.program.instructions[4].opcode(),
+            Some(InterpreterOpcode::Exit)
+        );
     }
 
     #[test]

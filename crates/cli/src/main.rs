@@ -151,7 +151,7 @@ enum Command {
         ctx_len: usize,
         #[arg(long, default_value_t = 2)]
         iterations: usize,
-        /// Fixture directory containing noise.bf16, target_collapsed.bf16,
+        /// Fixture directory containing noise.bf16, target_raw.bf16,
         /// positions.i32, expected_output.bf16, config.json. When set,
         /// inputs are loaded from disk and the output is parity-checked
         /// against expected_output.bf16 (cos sim ≥ 0.998).
@@ -1874,6 +1874,8 @@ fn drafter_forward_smoke(
         );
     }
     let hidden = drafter.config.hidden_size;
+    let n_target_layers = drafter.config.dflash_config.target_layer_ids.len();
+    let target_raw_row_bytes = hidden * n_target_layers * 2;
 
     // Decide inputs: fixture vs synthetic deterministic LCG. The
     // fixture path lets us parity-check against the Python reference
@@ -1885,7 +1887,8 @@ fn drafter_forward_smoke(
             if q_len_arg == 0 {
                 anyhow::bail!("q_len must be > 0 in synthetic mode");
             }
-            let (n, t) = synthesize_inputs(q_len_arg, ctx_len_arg, hidden);
+            let (n, t) =
+                synthesize_inputs(q_len_arg, ctx_len_arg, hidden, n_target_layers);
             let kv = ctx_len_arg + q_len_arg;
             let mut pos_bytes = Vec::with_capacity(kv * 4);
             for p in 0..kv {
@@ -1901,23 +1904,25 @@ fn drafter_forward_smoke(
             q_len * hidden * 2,
         );
     }
-    if ctx_len > 0 && ctx_len * hidden * 2 != target_bytes.len() {
+    if ctx_len > 0 && ctx_len * target_raw_row_bytes != target_bytes.len() {
         anyhow::bail!(
-            "target_collapsed input size {} bytes does not match ctx_len*hidden*2 = {}",
+            "target_raw input size {} bytes does not match ctx_len*hidden*n_target_layers*2 = {}",
             target_bytes.len(),
-            ctx_len * hidden * 2,
+            ctx_len * target_raw_row_bytes,
         );
     }
 
     let device = DFlashDrafterDevice::upload(&drafter)?;
-    let workspace = DrafterForwardWorkspace::alloc(&drafter.config, q_len, ctx_len)?;
+    let kv_cache_max_len = (ctx_len + q_len).max(1);
+    let workspace =
+        DrafterForwardWorkspace::alloc(&drafter.config, q_len, ctx_len, kv_cache_max_len)?;
     let report = workspace.report();
     let kv_seq_len = ctx_len + q_len;
 
     let noise_buf = CudaDeviceBuffer::alloc(q_len * hidden * 2)?;
     noise_buf.copy_from_host(&noise_bytes)?;
     let target_buf = if ctx_len > 0 {
-        let buf = CudaDeviceBuffer::alloc(ctx_len * hidden * 2)?;
+        let buf = CudaDeviceBuffer::alloc(ctx_len * target_raw_row_bytes)?;
         buf.copy_from_host(&target_bytes)?;
         Some(buf)
     } else {
@@ -1932,6 +1937,10 @@ fn drafter_forward_smoke(
     let mut first_output: Option<Vec<u8>> = None;
     let mut all_finite = true;
     for iter in 0..iterations {
+        // Reset cache between iterations so each forward sees identical
+        // state (iter-1 semantics). A future controller drives this via
+        // `crop_kv_cache(accepted_prefix)` instead.
+        forward.reset_kv_cache();
         forward.forward(&backend, noise_buf.ptr(), target_ptr, q_len, ctx_len)?;
         qwen36_fp4_runtime::cuda_synchronize()?;
         let mut out_bytes = vec![0u8; q_len * hidden * 2];
@@ -2000,7 +2009,12 @@ fn drafter_forward_smoke(
 }
 
 #[cfg(feature = "cuda")]
-fn synthesize_inputs(q_len: usize, ctx_len: usize, hidden: usize) -> (Vec<u8>, Vec<u8>) {
+fn synthesize_inputs(
+    q_len: usize,
+    ctx_len: usize,
+    hidden: usize,
+    n_target_layers: usize,
+) -> (Vec<u8>, Vec<u8>) {
     // Small deterministic LCG. Range ~[-0.5, 0.5) via BF16 with
     // exponent forced to 125 (≈ 2^-2).
     let mut rng_state: u32 = 0x9E37_79B9;
@@ -2022,8 +2036,9 @@ fn synthesize_inputs(q_len: usize, ctx_len: usize, hidden: usize) -> (Vec<u8>, V
         noise[i * 2] = b[0];
         noise[i * 2 + 1] = b[1];
     }
-    let mut target = vec![0u8; ctx_len.max(1) * hidden * 2];
-    for i in 0..(ctx_len * hidden) {
+    let target_elems = ctx_len * hidden * n_target_layers;
+    let mut target = vec![0u8; ctx_len.max(1) * hidden * n_target_layers * 2];
+    for i in 0..target_elems {
         let b = bf16_random(&mut rng_state);
         target[i * 2] = b[0];
         target[i * 2 + 1] = b[1];
@@ -2048,7 +2063,7 @@ fn load_fixture(
         .ok_or_else(|| anyhow::anyhow!("fixture config.json missing ctx_len"))?
         as usize;
     let noise = std::fs::read(dir.join("noise.bf16"))?;
-    let target = std::fs::read(dir.join("target_collapsed.bf16"))?;
+    let target = std::fs::read(dir.join("target_raw.bf16"))?;
     let positions = std::fs::read(dir.join("positions.i32"))?;
     let expected = std::fs::read(dir.join("expected_output.bf16"))?;
     Ok((q_len, ctx_len, noise, target, positions, Some(expected)))

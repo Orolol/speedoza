@@ -579,6 +579,11 @@ pub struct GpuForwardBuffers {
     pub interpreter_logits_instructions: CudaDeviceBuffer,
     /// Reusable counter buffer for `interpreter_logits_instructions`.
     pub interpreter_logits_counters: CudaDeviceBuffer,
+    /// Reusable instruction buffer for the opt-in decode-interpreter MLP
+    /// program (`gate + up + SwiGLU + down`).
+    pub interpreter_mlp_instructions: CudaDeviceBuffer,
+    /// Reusable counter buffer for `interpreter_mlp_instructions`.
+    pub interpreter_mlp_counters: CudaDeviceBuffer,
 }
 
 /// Per-launch barrier-state byte count consumed by the full-attn
@@ -856,6 +861,10 @@ impl GpuForwardBuffers {
                 3 * size_of::<InterpreterInstruction>(),
             )?,
             interpreter_logits_counters: CudaDeviceBuffer::zeroed(4 * size_of::<i32>())?,
+            interpreter_mlp_instructions: CudaDeviceBuffer::alloc(
+                5 * size_of::<InterpreterInstruction>(),
+            )?,
+            interpreter_mlp_counters: CudaDeviceBuffer::zeroed(8 * size_of::<i32>())?,
         })
     }
 
@@ -888,6 +897,8 @@ impl GpuForwardBuffers {
             self.megakernel_barrier_state.bytes(),
             self.interpreter_logits_instructions.bytes(),
             self.interpreter_logits_counters.bytes(),
+            self.interpreter_mlp_instructions.bytes(),
+            self.interpreter_mlp_counters.bytes(),
         ]
         .into_iter()
         .map(|bytes| bytes as u64)

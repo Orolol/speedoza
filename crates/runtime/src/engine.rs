@@ -1,14 +1,17 @@
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "cuda")]
+use std::mem::size_of;
 
 #[cfg(feature = "cuda")]
 use qwen36_fp4_core::TensorInfo;
 use qwen36_fp4_core::{CoreError, KvCacheDtype, ModelLayout, ModelTopology, Result};
 #[cfg(feature = "cuda")]
 use qwen36_fp4_kernels::{
-    AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
-    Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode,
-    CudaBackend, DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape, DevicePtr,
-    EmbeddingLookupSpec, GdnGateSpec, MegakernelFullAttnStageBQProjSpec, Nvfp4GemmSpec,
+    interpreter_opcodes_enabled_from_env, AttentionDecodeSpec, AttentionPrefillSpec,
+    AttentionShape, Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec,
+    CopyStridedRowsSpec, CublasLtFp4ScaleMode, CudaBackend, DeltaNetDecodeSpec,
+    DeltaNetPrefillSpec, DeltaNetShape, DevicePtr, EmbeddingLookupSpec, GdnGateSpec,
+    InterpreterOpcode, InterpreterProgramSpec, MegakernelFullAttnStageBQProjSpec, Nvfp4GemmSpec,
     Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec, QProjDeinterleaveSpec,
     QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec, SamplingRowsSpec, SamplingSpec,
     SwiGluNvfp4QuantizeSpec, SwiGluSpec,
@@ -23,6 +26,11 @@ use crate::gpu::{
     GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers, GpuWeightStore, LinearAttnInProjFused,
     LinearAttnInProjFusedStore, MlpFusedLayer, MlpFusedStore, MtpKvSnapshotLayout,
     ATTN_MIN_SPLIT_TIMESTEPS_PER_BLOCK, MEGAKERNEL_BARRIER_STAGE_B_Q_PROJ_BYTES,
+};
+#[cfg(feature = "cuda")]
+use crate::interpreter_compile::{
+    instructions_as_bytes, DecodeInterpreterLogitsParams, DecodeInterpreterMlpParams,
+    DecodeInterpreterProgram,
 };
 use crate::kv_cache::KvCachePlan;
 use crate::state::{DeltaNetStatePlan, RuntimeState};
@@ -118,6 +126,49 @@ fn megakernel_full_attn_stage_f4_enabled() -> bool {
 #[cfg(feature = "cuda")]
 fn megakernel_full_attn_stage_f4_supports(hidden_size: usize, intermediate: usize) -> bool {
     hidden_size > 0 && intermediate > 0 && hidden_size & 511 == 0 && intermediate & 511 == 0
+}
+
+/// Gate for the first runtime-backed decode-interpreter slice. This replaces
+/// only the final RMSNorm + lm_head logits pair, stays outside CUDA Graph
+/// capture for now, and also respects the opcode allow-list used by op-level
+/// bring-up.
+#[cfg(feature = "cuda")]
+fn decode_interpreter_logits_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !cuda_env_bool("QWEN36_INTERPRETER_LOGITS") {
+            return false;
+        }
+        let opcodes = interpreter_opcodes_enabled_from_env();
+        opcodes.contains(InterpreterOpcode::RmsNormNvfp4Quant)
+            && opcodes.contains(InterpreterOpcode::LmHeadTiled)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_mlp_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !cuda_env_bool("QWEN36_INTERPRETER_MLP") {
+            return false;
+        }
+        let opcodes = interpreter_opcodes_enabled_from_env();
+        opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
+            && opcodes.contains(InterpreterOpcode::SwiGluNvfp4Quant)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_mlp_supports(hidden: usize, intermediate: usize) -> bool {
+    const GEMV_K_ALIGNMENT: usize = 1024;
+    hidden > 0
+        && intermediate > 0
+        && hidden % 16 == 0
+        && intermediate % 16 == 0
+        && hidden % GEMV_K_ALIGNMENT == 0
+        && intermediate % GEMV_K_ALIGNMENT == 0
 }
 
 #[cfg(feature = "cuda")]
@@ -3886,7 +3937,17 @@ impl<B: KernelBackend> Engine<B> {
                         self.topology.intermediate_size,
                     )
                     && self.mlp_fused_main_opt(layer_idx).is_some();
-                if f4_eligible {
+                let interpreter_mlp_eligible = decode_interpreter_mlp_enabled()
+                    && position_device_i32 == DevicePtr::NULL
+                    && decode_interpreter_mlp_supports(
+                        self.topology.hidden_size,
+                        self.topology.intermediate_size,
+                    );
+                if interpreter_mlp_eligible {
+                    self.run_interpreter_mlp_with_quantized_input(
+                        layer, forward, quantized,
+                    )?;
+                } else if f4_eligible {
                     self.run_mlp_megakernel_f4(layer, forward, quantized)?;
                 } else {
                     self.run_mlp_with_quantized_input(layer, forward, quantized)?;
@@ -3960,15 +4021,24 @@ impl<B: KernelBackend> Engine<B> {
 
         if emit_logits {
             let logits_start = profile_decode.then(std::time::Instant::now);
-            self.rmsnorm(
-                1,
-                self.topology.hidden_size,
-                forward.hidden.ptr(),
-                self.tensor_ptr(weights, &manifest.final_norm)?,
-                forward.residual.ptr(),
-                DevicePtr::NULL,
-                forward.normed.ptr(),
-            )?;
+            if decode_interpreter_logits_enabled() && position_device_i32 == DevicePtr::NULL {
+                self.run_interpreter_final_logits(manifest, weights, forward)?;
+            } else {
+                self.rmsnorm(
+                    1,
+                    self.topology.hidden_size,
+                    forward.hidden.ptr(),
+                    self.tensor_ptr(weights, &manifest.final_norm)?,
+                    forward.residual.ptr(),
+                    DevicePtr::NULL,
+                    forward.normed.ptr(),
+                )?;
+                self.bf16_matvec(
+                    &manifest.lm_head,
+                    forward.normed.ptr(),
+                    forward.logits.ptr(),
+                )?;
+            }
             if dump_decode {
                 if let Some(dir) = &dump_dir {
                     self.dump_buffer_to_disk(
@@ -3979,11 +4049,6 @@ impl<B: KernelBackend> Engine<B> {
                     )?;
                 }
             }
-            self.bf16_matvec(
-                &manifest.lm_head,
-                forward.normed.ptr(),
-                forward.logits.ptr(),
-            )?;
             if let Some(logits_start) = logits_start {
                 qwen36_fp4_kernels::cuda_synchronize()?;
                 prof_lm_head_ms += logits_start.elapsed().as_secs_f64() * 1000.0;
@@ -6170,6 +6235,71 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn run_interpreter_final_logits(
+        &self,
+        manifest: &ModelWeightsManifest,
+        weights: &GpuWeightStore,
+        forward: &GpuForwardBuffers,
+    ) -> Result<()> {
+        let vocab_size = *manifest.lm_head.shape.first().ok_or_else(|| {
+            CoreError::Runtime(format!("tensor {} has empty shape", manifest.lm_head.name))
+        })?;
+        let hidden = *manifest.lm_head.shape.get(1).ok_or_else(|| {
+            CoreError::Runtime(format!("tensor {} is not a matrix", manifest.lm_head.name))
+        })?;
+        if hidden != self.topology.hidden_size {
+            return Err(CoreError::Runtime(format!(
+                "interpreter logits expected lm_head in_features {} but {} has {hidden}",
+                self.topology.hidden_size, manifest.lm_head.name
+            )));
+        }
+
+        let compiled =
+            DecodeInterpreterProgram::compile_final_logits(DecodeInterpreterLogitsParams {
+                hidden,
+                vocab_size,
+                hidden_bf16: forward.hidden.ptr(),
+                residual_bf16: forward.residual.ptr(),
+                final_norm_weight_bf16: self.tensor_ptr(weights, &manifest.final_norm)?,
+                normed_bf16: forward.normed.ptr(),
+                activation_fp4: forward.activation_fp4.ptr(),
+                activation_scale_e4m3: forward.activation_scale.ptr(),
+                activation_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                lm_head_weight_bf16: self.tensor_ptr(weights, &manifest.lm_head)?,
+                logits_bf16: forward.logits.ptr(),
+            });
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_logits_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter logits program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_logits_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_logits_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter logits program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_logits_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_logits_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_logits_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_logits_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_logits_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: 0,
+            })
+    }
+
+    #[cfg(feature = "cuda")]
     fn bf16_matvec(&self, weight: &TensorInfo, input: DevicePtr, output: DevicePtr) -> Result<()> {
         let out_features = *weight
             .shape
@@ -6944,6 +7074,14 @@ impl Engine<CudaBackend> {
             item(
                 "attn_partial_denom",
                 forward.attn_partial_denom.bytes() as u64,
+            ),
+            item(
+                "interpreter_logits_instructions",
+                forward.interpreter_logits_instructions.bytes() as u64,
+            ),
+            item(
+                "interpreter_logits_counters",
+                forward.interpreter_logits_counters.bytes() as u64,
             ),
         ]);
 
