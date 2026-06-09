@@ -1791,8 +1791,8 @@ int main() {
   qwen36_device_ptr_t interp_mlp_out =
       dev_alloc<__nv_bfloat16>(interp_mlp_hidden);
   qwen36_device_ptr_t interp_mlp_instructions =
-      dev_alloc<qwen36_interpreter_instruction_t>(5);
-  qwen36_device_ptr_t interp_mlp_counters = dev_alloc<int32_t>(8);
+      dev_alloc<qwen36_interpreter_instruction_t>(4);
+  qwen36_device_ptr_t interp_mlp_counters = dev_alloc<int32_t>(6);
   copy_raw<uint8_t>(interp_mlp_input_fp4,
                     std::vector<uint8_t>(interp_mlp_hidden / 2, 0x22));
   copy_raw<uint8_t>(interp_mlp_input_scale,
@@ -1853,8 +1853,8 @@ int main() {
   must_status(qwen36_decode_nvfp4_gemv(&interp_mlp_down_ref_spec),
               "interpreter MLP down reference");
 
-  qwen36_interpreter_instruction_t interp_mlp_program_host[5]{};
-  interp_mlp_program_host[0].opcode = 3; // NVFP4_GEMV gate
+  qwen36_interpreter_instruction_t interp_mlp_program_host[4]{};
+  interp_mlp_program_host[0].opcode = 16; // NVFP4_GEMV_PAIR gate+up
   interp_mlp_program_host[0].publishes_counter = 0;
   interp_mlp_program_host[0].publish_value = 1;
   interp_mlp_program_host[0].arrival_counter = 1;
@@ -1862,65 +1862,55 @@ int main() {
   interp_mlp_program_host[0].payload[1] = interp_mlp_hidden;
   interp_mlp_program_host[0].payload[2] = interp_mlp_gate_w.ptr;
   interp_mlp_program_host[0].payload[3] = interp_mlp_gate_scale.ptr;
-  interp_mlp_program_host[0].payload[4] = interp_mlp_input_fp4.ptr;
-  interp_mlp_program_host[0].payload[5] = interp_mlp_input_scale.ptr;
-  interp_mlp_program_host[0].payload[6] = interp_mlp_gate.ptr;
-  interp_mlp_program_host[0].payload[7] = interp_gemv_alpha_bits.u;
-  interp_mlp_program_host[1].opcode = 3; // NVFP4_GEMV up
+  interp_mlp_program_host[0].payload[4] = interp_mlp_up_w.ptr;
+  interp_mlp_program_host[0].payload[5] = interp_mlp_up_scale.ptr;
+  interp_mlp_program_host[0].payload[6] = interp_mlp_input_fp4.ptr;
+  interp_mlp_program_host[0].payload[7] = interp_mlp_input_scale.ptr;
+  interp_mlp_program_host[0].payload[8] = interp_mlp_gate.ptr;
+  interp_mlp_program_host[0].payload[9] = interp_mlp_up.ptr;
+  interp_mlp_program_host[0].payload[10] = interp_gemv_alpha_bits.u;
+  interp_mlp_program_host[0].payload[11] = interp_gemv_alpha_bits.u;
+  interp_mlp_program_host[1].opcode = 4; // SWIGLU_NVFP4_QUANT
   interp_mlp_program_host[1].dep_count = 1;
   interp_mlp_program_host[1].deps[0] = qwen36_interpreter_dep_t{0, 1};
   interp_mlp_program_host[1].publishes_counter = 2;
   interp_mlp_program_host[1].publish_value = 1;
   interp_mlp_program_host[1].arrival_counter = 3;
   interp_mlp_program_host[1].payload[0] = interp_mlp_intermediate;
-  interp_mlp_program_host[1].payload[1] = interp_mlp_hidden;
-  interp_mlp_program_host[1].payload[2] = interp_mlp_up_w.ptr;
-  interp_mlp_program_host[1].payload[3] = interp_mlp_up_scale.ptr;
-  interp_mlp_program_host[1].payload[4] = interp_mlp_input_fp4.ptr;
-  interp_mlp_program_host[1].payload[5] = interp_mlp_input_scale.ptr;
-  interp_mlp_program_host[1].payload[6] = interp_mlp_up.ptr;
-  interp_mlp_program_host[1].payload[7] = interp_gemv_alpha_bits.u;
-  interp_mlp_program_host[2].opcode = 4; // SWIGLU_NVFP4_QUANT
+  interp_mlp_program_host[1].payload[1] = interp_mlp_gate.ptr;
+  interp_mlp_program_host[1].payload[2] = interp_mlp_up.ptr;
+  interp_mlp_program_host[1].payload[3] = interp_mlp_swiglu_fp4.ptr;
+  interp_mlp_program_host[1].payload[4] = interp_mlp_swiglu_scale.ptr;
+  interp_mlp_program_host[1].payload[5] = interp_mlp_swiglu_global.ptr;
+  interp_mlp_program_host[1].payload[6] = swiglu_scale_bits.u;
+  interp_mlp_program_host[2].opcode = 3; // NVFP4_GEMV down
   interp_mlp_program_host[2].dep_count = 1;
   interp_mlp_program_host[2].deps[0] = qwen36_interpreter_dep_t{2, 1};
   interp_mlp_program_host[2].publishes_counter = 4;
   interp_mlp_program_host[2].publish_value = 1;
   interp_mlp_program_host[2].arrival_counter = 5;
-  interp_mlp_program_host[2].payload[0] = interp_mlp_intermediate;
-  interp_mlp_program_host[2].payload[1] = interp_mlp_gate.ptr;
-  interp_mlp_program_host[2].payload[2] = interp_mlp_up.ptr;
-  interp_mlp_program_host[2].payload[3] = interp_mlp_swiglu_fp4.ptr;
-  interp_mlp_program_host[2].payload[4] = interp_mlp_swiglu_scale.ptr;
-  interp_mlp_program_host[2].payload[5] = interp_mlp_swiglu_global.ptr;
-  interp_mlp_program_host[2].payload[6] = swiglu_scale_bits.u;
-  interp_mlp_program_host[3].opcode = 3; // NVFP4_GEMV down
-  interp_mlp_program_host[3].dep_count = 1;
-  interp_mlp_program_host[3].deps[0] = qwen36_interpreter_dep_t{4, 1};
-  interp_mlp_program_host[3].publishes_counter = 6;
-  interp_mlp_program_host[3].publish_value = 1;
-  interp_mlp_program_host[3].arrival_counter = 7;
-  interp_mlp_program_host[3].payload[0] = interp_mlp_hidden;
-  interp_mlp_program_host[3].payload[1] = interp_mlp_intermediate;
-  interp_mlp_program_host[3].payload[2] = interp_mlp_down_w.ptr;
-  interp_mlp_program_host[3].payload[3] = interp_mlp_down_scale.ptr;
-  interp_mlp_program_host[3].payload[4] = interp_mlp_swiglu_fp4.ptr;
-  interp_mlp_program_host[3].payload[5] = interp_mlp_swiglu_scale.ptr;
-  interp_mlp_program_host[3].payload[6] = interp_mlp_out.ptr;
-  interp_mlp_program_host[3].payload[7] = interp_gemv_alpha_bits.u;
-  interp_mlp_program_host[4].opcode = 0; // EXIT
+  interp_mlp_program_host[2].payload[0] = interp_mlp_hidden;
+  interp_mlp_program_host[2].payload[1] = interp_mlp_intermediate;
+  interp_mlp_program_host[2].payload[2] = interp_mlp_down_w.ptr;
+  interp_mlp_program_host[2].payload[3] = interp_mlp_down_scale.ptr;
+  interp_mlp_program_host[2].payload[4] = interp_mlp_swiglu_fp4.ptr;
+  interp_mlp_program_host[2].payload[5] = interp_mlp_swiglu_scale.ptr;
+  interp_mlp_program_host[2].payload[6] = interp_mlp_out.ptr;
+  interp_mlp_program_host[2].payload[7] = interp_gemv_alpha_bits.u;
+  interp_mlp_program_host[3].opcode = 0; // EXIT
   copy_raw<qwen36_interpreter_instruction_t>(
       interp_mlp_instructions,
       std::vector<qwen36_interpreter_instruction_t>(
-          interp_mlp_program_host, interp_mlp_program_host + 5));
+          interp_mlp_program_host, interp_mlp_program_host + 4));
   must_cuda<int32_t>(
       cudaMemset(reinterpret_cast<void *>(interp_mlp_counters.ptr), 0,
-                 8 * sizeof(int32_t)),
+                 6 * sizeof(int32_t)),
       "cudaMemset interp MLP counters");
   qwen36_interpreter_program_t interp_mlp_spec{};
   interp_mlp_spec.instructions = interp_mlp_instructions;
-  interp_mlp_spec.instruction_count = 5;
+  interp_mlp_spec.instruction_count = 4;
   interp_mlp_spec.counters_i32 = interp_mlp_counters;
-  interp_mlp_spec.counter_count = 8;
+  interp_mlp_spec.counter_count = 6;
   interp_mlp_spec.cta_count = 2;
   must_status(qwen36_interpreter_decode_sm120(&interp_mlp_spec),
               "interpreter MLP");
