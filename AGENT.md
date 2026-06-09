@@ -903,6 +903,39 @@ the GPU; partial softmax per split + a reduction. Reuses the
 ~2.5–4×. Parity gated by a smoke cos≥0.998 (modeled on P0a) + the
 no-fork end-to-end check.
 
+### 2026-06-09 — Decode long-context fix SHIPPED: register-tiled attention, curve now flat
+
+The fix scoped in the section below is implemented and default-on.
+`kernels-cuda/attention_decode_tiled.cu`: register-tiled v2 of the
+decode split-GQA kernel — one warp per timestep (8 warps × 8-timestep
+tiles instead of a serial per-timestep loop), vectorized 8 B (FP8) /
+16 B (BF16) lane loads, 256-entry SMEM LUT FP8 decode, tile-batched
+online softmax (ONE accumulator rescale per 8 timesteps), 2 syncthreads
+per tile instead of ~24. Same grid, partials layout, shared reduce,
+device-position read and cache-append side effect as v1; TQ dtypes and
+head_dim≠256 fall back to v1. `QWEN36_DECODE_TILED_ATTENTION=0` forces
+the v1 scalar path.
+
+**Measured (MTP=0, max-new=64):**
+
+| ctx | v1 | tiled | gain |
+|---:|---:|---:|---:|
+| 128 | 49.7 | 50.7 | +2% |
+| 8192 | 43.1 | **50.3** | **+17% — flat** |
+| 16384 | 36.2 | **46.6** | +29% |
+| 24576 | 32.7 | **44.0** | **+35%** |
+
+Curve is now −13% at 24K (was −35%) — the classic-engine shape.
+full_attn at 24K: 12.7 → 5.7 ms/token (2.2×); next dominant cost is the
+context-flat MLP (11.6 ms), so further long-ctx attention work is
+diminishing returns until the MLP/weights floor moves.
+
+Gates: smoke parity 8 cases (BF16+FP8 × pos {255, 2047, 8191, 24575},
+incl. empty splits; output cos ≥ 0.998 AND cache-append byte-identical
+— the kernel owns the current token's K/V store), token identity MTP=0
+md5-equal tiled-vs-v1, MTP=4 graph capture healthy (89.7 tok/s),
+DFlash unaffected (143 tok/s, AL 8.3 at 3K).
+
 ### 2026-06-09 — Base decode (MTP=0) long-context slide: root-caused, fix scoped
 
 User flagged that base decode drops too much with context vs classic

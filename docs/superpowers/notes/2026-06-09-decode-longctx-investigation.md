@@ -4,11 +4,29 @@
 **Trigger:** user observation — base token generation (no DFlash/MTP)
 drops too much with context; a classic inference engine stays near-flat
 to 32K and never below ~50%. Investigate.
-**Verdict: confirmed, root-caused, fix scoped.** The slide is real
-(−35% at 24K, extrapolating ~−43% at 32K) and essentially 100% of it is
-the **decode full-attention kernel running ~28× off memory bandwidth**
-(latency-bound scalar inner loop). Everything else in the engine is
-already flat, as the user expects from a classic engine.
+**Verdict: confirmed, root-caused — and FIXED (same day).** The slide
+was real (−35% at 24K) and essentially 100% of it was the **decode
+full-attention kernel running ~28× off memory bandwidth** (latency-bound
+scalar inner loop). Everything else in the engine was already flat.
+
+**Fix shipped:** `kernels-cuda/attention_decode_tiled.cu` — register-
+tiled v2 of the decode split kernel (warp-per-timestep tile, vectorized
+loads, LUT FP8 decode, tile-batched online softmax). Default-on
+(`QWEN36_DECODE_TILED_ATTENTION=0` forces v1). Measured curve after:
+
+| ctx | v1 before | tiled after | gain |
+|---:|---:|---:|---:|
+| 128 | 49.7 | 50.7 | +2% |
+| 8192 | 43.1 | **50.3** | **+17% — flat** |
+| 16384 | 36.2 | **46.6** | **+29%** |
+| 24576 | 32.7 | **44.0** | **+35%** |
+
+−13% at 24K instead of −35% — the classic-engine shape. full_attn
+per token at 24K: 12.7 → 5.7 ms (2.2×). Gates: parity smoke 8 cases
+(BF16+FP8 × pos {255,2047,8191,24575}, output cos ≥ 0.998, cache append
+byte-identical), token identity MTP=0 (md5-equal) and MTP=4, graph
+capture works (tiled kernel is a graph node), DFlash unchanged
+(143 tok/s AL 8.3 at 3K). Sections below are the original analysis.
 
 ## 1. Measured curve (MTP=0, max-new=64, default config, FP8 KV)
 

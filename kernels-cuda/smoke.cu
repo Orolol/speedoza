@@ -4580,6 +4580,202 @@ int main() {
            cases);
   }
 
+  // ------------------------------------------------------------------
+  // Tiled decode attention parity gate (decode long-context fix).
+  // ------------------------------------------------------------------
+  // Compares the register-tiled decode split kernel
+  // (attention_decode_tiled.cu, QWEN36_DECODE_TILED_ATTENTION=1) against
+  // the v1 scalar split-GQA kernel (=0) through the public
+  // qwen36_attention_decode entry, at the production shape (q_heads=24,
+  // kv_heads=4, head_dim=256) across positions, dtypes and engine-like
+  // n_splits (incl. empty splits). Also asserts the cache-append side
+  // effect (the kernel stores the current token's K/V) is byte-identical.
+  {
+    const int q_heads = 24;
+    const int kv_heads = 4;
+    const int head_dim = 256;
+    const size_t positions[] = {255, 2047, 8191, 24575};
+    const int dtypes[] = {0, 1}; // bf16, fp8
+
+    qwen36_attention_shape_t shape{};
+    shape.q_heads = q_heads;
+    shape.kv_heads = kv_heads;
+    shape.head_dim = head_dim;
+    shape.rope_dims = 0;
+
+    auto cos_sim = [](const std::vector<float> &a,
+                      const std::vector<float> &b) -> double {
+      double num = 0.0, da = 0.0, db = 0.0;
+      for (size_t i = 0; i < a.size(); ++i) {
+        num += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+        da += static_cast<double>(a[i]) * static_cast<double>(a[i]);
+        db += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+      }
+      return num / sqrt(da * db);
+    };
+    auto next_pow2 = [](size_t v) {
+      size_t p = 1;
+      while (p < v) p <<= 1;
+      return p;
+    };
+
+    std::mt19937 rng(626262);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    int cases = 0;
+
+    for (int kv_dtype : dtypes) {
+      for (size_t position : positions) {
+        const size_t ctx = position + 1;
+        // Engine-like split sizing: power-of-two context bucket with a
+        // 2048 floor, 64 timesteps per block (>= 32 splits, the GQA gate).
+        const size_t bucket = next_pow2(ctx) < 2048 ? 2048 : next_pow2(ctx);
+        const int n_splits = static_cast<int>(bucket / 64);
+        const size_t kv_elems = ctx * kv_heads * head_dim;
+        const size_t row_elems = (size_t)kv_heads * head_dim;
+
+        std::vector<float> q_host((size_t)q_heads * head_dim);
+        std::vector<float> knew_host(row_elems), vnew_host(row_elems);
+        for (auto &x : q_host) x = dist(rng);
+        for (auto &x : knew_host) x = dist(rng);
+        for (auto &x : vnew_host) x = dist(rng);
+
+        qwen36_device_ptr_t q_dev = dev_alloc<__nv_bfloat16>(q_host.size());
+        qwen36_device_ptr_t knew_dev = dev_alloc<__nv_bfloat16>(row_elems);
+        qwen36_device_ptr_t vnew_dev = dev_alloc<__nv_bfloat16>(row_elems);
+        copy_bf16(q_dev, q_host);
+        copy_bf16(knew_dev, knew_host);
+        copy_bf16(vnew_dev, vnew_host);
+
+        qwen36_device_ptr_t ck_dev, cv_dev;
+        size_t row_bytes;
+        if (kv_dtype == 0) {
+          std::vector<float> ck(kv_elems), cv(kv_elems);
+          for (auto &x : ck) x = dist(rng);
+          for (auto &x : cv) x = dist(rng);
+          ck_dev = dev_alloc<__nv_bfloat16>(kv_elems);
+          cv_dev = dev_alloc<__nv_bfloat16>(kv_elems);
+          copy_bf16(ck_dev, ck);
+          copy_bf16(cv_dev, cv);
+          row_bytes = row_elems * 2;
+        } else {
+          std::uniform_int_distribution<int> ed(0, 9), md(0, 7), sd(0, 1);
+          std::vector<uint8_t> ck(kv_elems), cv(kv_elems);
+          for (auto &b : ck)
+            b = (uint8_t)((sd(rng) << 7) | (ed(rng) << 3) | md(rng));
+          for (auto &b : cv)
+            b = (uint8_t)((sd(rng) << 7) | (ed(rng) << 3) | md(rng));
+          ck_dev = dev_alloc<uint8_t>(kv_elems);
+          cv_dev = dev_alloc<uint8_t>(kv_elems);
+          copy_raw<uint8_t>(ck_dev, ck);
+          copy_raw<uint8_t>(cv_dev, cv);
+          row_bytes = row_elems;
+        }
+
+        const size_t pcount = (size_t)q_heads * n_splits;
+        qwen36_device_ptr_t pacc = dev_alloc<float>(pcount * head_dim);
+        qwen36_device_ptr_t pmax = dev_alloc<float>(pcount);
+        qwen36_device_ptr_t pden = dev_alloc<float>(pcount);
+        qwen36_device_ptr_t out_dev =
+            dev_alloc<__nv_bfloat16>((size_t)q_heads * head_dim);
+
+        qwen36_attention_decode_spec_t spec{};
+        spec.layer_index = 0;
+        spec.position = position;
+        spec.q_bf16 = q_dev;
+        spec.k_bf16 = knew_dev;
+        spec.v_bf16 = vnew_dev;
+        spec.kv_cache_k = ck_dev;
+        spec.kv_cache_v = cv_dev;
+        spec.output_bf16 = out_dev;
+        spec.shape = shape;
+        spec.kv_cache_dtype = kv_dtype;
+        spec.partial_acc_f32 = pacc;
+        spec.partial_max_f32 = pmax;
+        spec.partial_denom_f32 = pden;
+        spec.decode_n_splits = (size_t)n_splits;
+        spec.split_timesteps_per_block = 64;
+
+        const size_t append_off = position * row_bytes; // row of all kv heads
+        std::vector<uint8_t> app_k_ref(row_bytes), app_v_ref(row_bytes);
+        std::vector<uint8_t> app_k_new(row_bytes), app_v_new(row_bytes);
+
+        // v1 scalar reference.
+        setenv("QWEN36_DECODE_TILED_ATTENTION", "0", 1);
+        must_status(qwen36_attention_decode(&spec), "decode tiled parity: v1");
+        std::vector<float> ref = read_bf16(out_dev, (size_t)q_heads * head_dim);
+        must_cuda<int>(
+            cudaMemcpy(app_k_ref.data(),
+                       reinterpret_cast<const uint8_t *>(
+                           static_cast<uintptr_t>(ck_dev.ptr)) +
+                           append_off,
+                       row_bytes, cudaMemcpyDeviceToHost),
+            "append k ref");
+        must_cuda<int>(
+            cudaMemcpy(app_v_ref.data(),
+                       reinterpret_cast<const uint8_t *>(
+                           static_cast<uintptr_t>(cv_dev.ptr)) +
+                           append_off,
+                       row_bytes, cudaMemcpyDeviceToHost),
+            "append v ref");
+
+        // v2 tiled.
+        setenv("QWEN36_DECODE_TILED_ATTENTION", "1", 1);
+        must_status(qwen36_attention_decode(&spec), "decode tiled parity: v2");
+        unsetenv("QWEN36_DECODE_TILED_ATTENTION");
+        std::vector<float> got = read_bf16(out_dev, (size_t)q_heads * head_dim);
+        must_cuda<int>(
+            cudaMemcpy(app_k_new.data(),
+                       reinterpret_cast<const uint8_t *>(
+                           static_cast<uintptr_t>(ck_dev.ptr)) +
+                           append_off,
+                       row_bytes, cudaMemcpyDeviceToHost),
+            "append k new");
+        must_cuda<int>(
+            cudaMemcpy(app_v_new.data(),
+                       reinterpret_cast<const uint8_t *>(
+                           static_cast<uintptr_t>(cv_dev.ptr)) +
+                           append_off,
+                       row_bytes, cudaMemcpyDeviceToHost),
+            "append v new");
+
+        const double cos = cos_sim(got, ref);
+        if (cos < 0.998) {
+          fprintf(stderr,
+                  "decode tiled parity FAIL [dtype=%d pos=%zu n_splits=%d]: "
+                  "cos=%.6f < 0.998\n",
+                  kv_dtype, position, n_splits, cos);
+          exit(1);
+        }
+        if (app_k_ref != app_k_new || app_v_ref != app_v_new) {
+          fprintf(stderr,
+                  "decode tiled parity FAIL [dtype=%d pos=%zu]: cache append "
+                  "differs from v1\n",
+                  kv_dtype, position);
+          exit(1);
+        }
+
+        dev_free<__nv_bfloat16>(q_dev);
+        dev_free<__nv_bfloat16>(knew_dev);
+        dev_free<__nv_bfloat16>(vnew_dev);
+        if (kv_dtype == 0) {
+          dev_free<__nv_bfloat16>(ck_dev);
+          dev_free<__nv_bfloat16>(cv_dev);
+        } else {
+          dev_free<uint8_t>(ck_dev);
+          dev_free<uint8_t>(cv_dev);
+        }
+        dev_free<float>(pacc);
+        dev_free<float>(pmax);
+        dev_free<float>(pden);
+        dev_free<__nv_bfloat16>(out_dev);
+        ++cases;
+      }
+    }
+    printf("decode tiled attention parity gate passed (%d cases, BF16+FP8, "
+           "pos{255,2047,8191,24575}, append byte-identical)\n",
+           cases);
+  }
+
   printf("qwen36 CUDA smoke test passed\n");
   return 0;
 }

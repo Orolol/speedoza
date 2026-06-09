@@ -2368,6 +2368,15 @@ __global__ void attention_prefill_kernel(
 extern "C" int qwen36_attention_flash_splitk_prefill_bf16(
     const qwen36_attention_prefill_spec_t *spec, int n_splits);
 
+// Register-tiled decode split kernel (kernels-cuda/attention_decode_tiled.cu).
+// Warp-per-timestep tile + vectorized loads + LUT FP8 decode; same grid,
+// partials layout and cache-append side effect as the v1 split-GQA kernel,
+// so the shared reduce below consumes its output unchanged. Returns
+// NOT_IMPLEMENTED for shapes it does not cover (TQ, head_dim!=256).
+extern "C" int qwen36_attention_decode_split_tiled(
+    const qwen36_attention_decode_spec_t *spec, int n_splits,
+    int split_timesteps_per_block);
+
 extern "C" int
 qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
   if (spec == nullptr) {
@@ -2717,6 +2726,37 @@ qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec) {
         spec->shape.head_dim <= static_cast<size_t>(kGqaMaxHeadDim) &&
         q_per_kv <= static_cast<size_t>(kGqaMaxQPerKv) && q_per_kv > 1 &&
         n_splits >= 32;
+    // Register-tiled v2 for the hot shape (BF16/FP8, head_dim=256). The
+    // serial per-timestep v1 loop is ~28x off KV bandwidth and is the
+    // entire MTP=0 long-context slide; the tiled kernel processes 8
+    // timesteps per iteration with vectorized loads. Same partials +
+    // reduce + cache-append contract. QWEN36_DECODE_TILED_ATTENTION=0
+    // forces the v1 scalar path.
+    const bool tiled_attempted =
+        gqa_split_eligible &&
+        env_bool_or("QWEN36_DECODE_TILED_ATTENTION", true) &&
+        !is_tq_cache_dtype(spec->kv_cache_dtype) &&
+        spec->shape.head_dim == 256;
+    if (tiled_attempted) {
+      const int rc = qwen36_attention_decode_split_tiled(
+          spec, n_splits, split_timesteps_per_block);
+      if (rc == QWEN36_STATUS_SUCCESS) {
+        attention_decode_reduce_kernel<<<
+            static_cast<unsigned int>(spec->shape.q_heads), split_threads, 0,
+            qwen36_internal_active_stream()>>>(
+            ptr<const float>(spec->partial_acc_f32),
+            ptr<const float>(spec->partial_max_f32),
+            ptr<const float>(spec->partial_denom_f32),
+            ptr<__nv_bfloat16>(spec->output_bf16), spec->shape, n_splits);
+        cudaError_t err = cudaGetLastError();
+        return err == cudaSuccess ? QWEN36_STATUS_SUCCESS
+                                  : QWEN36_STATUS_CUDA_ERROR;
+      }
+      if (rc != QWEN36_STATUS_NOT_IMPLEMENTED) {
+        return rc;
+      }
+      // NOT_IMPLEMENTED -> fall through to the v1 scalar split kernel.
+    }
     if (gqa_split_eligible) {
       const dim3 split_grid(static_cast<unsigned int>(spec->shape.kv_heads),
                             static_cast<unsigned int>(n_splits));
