@@ -138,6 +138,21 @@ enum Command {
         #[arg(long)]
         drafter_dir: PathBuf,
     },
+    /// End-to-end Phase E smoke: load target + drafter, prefill the
+    /// target on a short synthetic prompt with the DFlash hidden-state
+    /// capture hook armed, then run one drafter forward consuming the
+    /// captured `target_hidden_raw`. Verifies finite output and reports
+    /// per-component VRAM.
+    DrafterHandoffSmoke {
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long)]
+        drafter_dir: PathBuf,
+        #[arg(long, default_value_t = 32)]
+        prompt_tokens: usize,
+        #[arg(long, default_value_t = 16)]
+        q_len: usize,
+    },
     /// Run one DFlash drafter forward on synthetic random inputs and
     /// report basic sanity (finite values, deterministic). With
     /// --fixture-dir, load inputs + expected output from a fixture
@@ -370,6 +385,24 @@ fn main() -> Result<()> {
                 let _ = drafter_dir;
                 anyhow::bail!(
                     "drafter-load requires the cuda feature; rebuild with --features cuda"
+                );
+            }
+        }
+        Command::DrafterHandoffSmoke {
+            model_dir,
+            drafter_dir,
+            prompt_tokens,
+            q_len,
+        } => {
+            #[cfg(feature = "cuda")]
+            {
+                drafter_handoff_smoke(model_dir, drafter_dir, prompt_tokens, q_len)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (model_dir, drafter_dir, prompt_tokens, q_len);
+                anyhow::bail!(
+                    "drafter-handoff-smoke requires the cuda feature; rebuild with --features cuda"
                 );
             }
         }
@@ -1846,6 +1879,181 @@ fn drafter_load(drafter_dir: PathBuf) -> Result<()> {
             "target_layer_ids": drafter.config.dflash_config.target_layer_ids,
         }))?,
     );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn drafter_handoff_smoke(
+    model_dir: PathBuf,
+    drafter_dir: PathBuf,
+    prompt_tokens_count: usize,
+    q_len: usize,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    use qwen36_fp4_drafter::{
+        DFlashDrafter, DFlashDrafterDevice, DrafterForward, DrafterForwardWorkspace,
+        TargetHiddenCapture,
+    };
+    use qwen36_fp4_kernels::{CudaBackend, CudaDeviceBuffer};
+
+    if prompt_tokens_count == 0 || q_len == 0 {
+        anyhow::bail!("prompt_tokens and q_len must both be > 0");
+    }
+
+    // Open drafter (host mmap only — no GPU alloc yet).
+    let drafter = DFlashDrafter::open(&drafter_dir)?;
+    if drafter.config.head_dim != 128 {
+        anyhow::bail!(
+            "drafter-handoff-smoke v1 only supports head_dim=128, got {}",
+            drafter.config.head_dim,
+        );
+    }
+
+    // --- Target side first: load the heavy 17 GB before any drafter
+    // allocations so the target gets contiguous VRAM.
+    let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+    let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
+    let target_config = EngineConfig {
+        max_context: prompt_tokens_count.max(256),
+        kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Fp8),
+        ..EngineConfig::default()
+    };
+    let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, target_config)?;
+
+    // Now stage the drafter pieces on GPU.
+    let drafter_device = DFlashDrafterDevice::upload(&drafter)?;
+    let capture = Arc::new(TargetHiddenCapture::alloc(
+        &drafter.config,
+        prompt_tokens_count,
+    )?);
+    let capture_for_hook = capture.clone();
+    let hook: qwen36_fp4_runtime::DrafterHiddenCaptureHook =
+        Arc::new(move |layer_idx, residual_ptr, tokens| {
+            capture_for_hook
+                .capture_layer(&CudaBackend, layer_idx, residual_ptr, tokens)
+                .map_err(|e| {
+                    qwen36_fp4_core::CoreError::Runtime(format!("drafter handoff: {e}"))
+                })
+        });
+    engine.set_drafter_hidden_capture(Some(hook));
+
+    // Synthetic prompt tokens. The model's vocab is large; use ids
+    // small enough to land on common bytes. We don't decode them.
+    let synthetic_tokens: Vec<u32> =
+        (0..prompt_tokens_count).map(|i| ((i % 1000) + 1) as u32).collect();
+    engine.prefill(&synthetic_tokens)?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+    engine.set_drafter_hidden_capture(None);
+
+    // --- Drafter forward on captured target_hidden_raw -----------------
+    let ctx_len = prompt_tokens_count;
+    let kv_cache_max_len = ctx_len + q_len;
+    let workspace = DrafterForwardWorkspace::alloc(
+        &drafter.config,
+        q_len,
+        ctx_len,
+        kv_cache_max_len,
+    )?;
+
+    let hidden = drafter.config.hidden_size;
+    let n_target_layers = drafter.config.dflash_config.target_layer_ids.len();
+    let _ = n_target_layers; // documented; pulled from capture's buffer sizing
+
+    // Synthetic noise embedding for the drafter (deterministic bytes).
+    let mut noise_bytes = vec![0u8; q_len * hidden * 2];
+    let mut rng: u32 = 0xCAFE_F00D;
+    for chunk in noise_bytes.chunks_exact_mut(2) {
+        rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let raw = (rng >> 16) as u16;
+        // Force BF16 exponent to 125 (≈ ±0.25) so we get tame values.
+        let bits = (raw & 0x807F) | (125u16 << 7);
+        chunk[0] = bits as u8;
+        chunk[1] = (bits >> 8) as u8;
+    }
+    let noise_buf = CudaDeviceBuffer::alloc(q_len * hidden * 2)?;
+    noise_buf.copy_from_host(&noise_bytes)?;
+
+    // Position ids: [0, ctx_len + q_len).
+    let mut pos_bytes = Vec::with_capacity(kv_cache_max_len * 4);
+    for p in 0..kv_cache_max_len {
+        pos_bytes.extend_from_slice(&(p as i32).to_le_bytes());
+    }
+    workspace.position_ids_buffer().copy_from_host(&pos_bytes)?;
+
+    let backend = CudaBackend;
+    let mut forward = DrafterForward::new(&drafter_device, &drafter.config, workspace)?;
+    forward.reset_kv_cache();
+    forward.forward(
+        &backend,
+        noise_buf.ptr(),
+        capture.output_ptr(),
+        q_len,
+        ctx_len,
+    )?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+
+    let mut out_bytes = vec![0u8; q_len * hidden * 2];
+    forward
+        .workspace()
+        .output_buffer()
+        .copy_to_host(&mut out_bytes)?;
+    let mut all_finite = true;
+    let mut sample_min = f32::INFINITY;
+    let mut sample_max = f32::NEG_INFINITY;
+    for chunk in out_bytes.chunks_exact(2).step_by(16) {
+        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let f = f32::from_bits((bits as u32) << 16);
+        if !f.is_finite() {
+            all_finite = false;
+            break;
+        }
+        if f < sample_min {
+            sample_min = f;
+        }
+        if f > sample_max {
+            sample_max = f;
+        }
+    }
+
+    // Also sanity-check a couple of capture buffer entries.
+    let mut capture_finite = true;
+    let mut cap_sample = vec![0u8; (hidden * 2).min(capture.buffer().bytes())];
+    capture.buffer().copy_to_host(&mut cap_sample)?;
+    for chunk in cap_sample.chunks_exact(2).step_by(4) {
+        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let f = f32::from_bits((bits as u32) << 16);
+        if !f.is_finite() {
+            capture_finite = false;
+            break;
+        }
+    }
+
+    let drafter_report = drafter_device.report(&drafter.manifest);
+    let workspace_report = forward.workspace().report();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "model_dir": model_dir.display().to_string(),
+            "drafter_dir": drafter_dir.display().to_string(),
+            "prompt_tokens": prompt_tokens_count,
+            "q_len": q_len,
+            "ctx_len": ctx_len,
+            "target_layer_ids": drafter.config.dflash_config.target_layer_ids,
+            "capture_buffer_bytes": capture.buffer().bytes(),
+            "capture_finite": capture_finite,
+            "drafter_vram_bytes": drafter_report.total_bytes,
+            "workspace_vram_bytes": workspace_report.total_bytes,
+            "kv_cache_vram_bytes": workspace_report.kv_caches_bytes,
+            "drafter_output_finite": all_finite,
+            "drafter_output_sample_min": sample_min,
+            "drafter_output_sample_max": sample_max,
+        }))?,
+    );
+
+    if !all_finite || !capture_finite {
+        anyhow::bail!("non-finite values in capture or drafter output");
+    }
     Ok(())
 }
 

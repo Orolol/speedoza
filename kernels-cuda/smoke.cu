@@ -1376,6 +1376,193 @@ int main() {
                  "interpreter nvfp4 gemv");
   }
 
+  const size_t interp_mlp_hidden = 1024;
+  const size_t interp_mlp_intermediate = 1024;
+  const size_t interp_mlp_act_scale_bytes = 8192;
+  const size_t interp_mlp_weight_scale_bytes = 65536;
+  const size_t interp_mlp_weight_bytes =
+      interp_mlp_hidden * interp_mlp_intermediate / 2;
+  qwen36_device_ptr_t interp_mlp_input_fp4 =
+      dev_alloc<uint8_t>(interp_mlp_hidden / 2);
+  qwen36_device_ptr_t interp_mlp_input_scale =
+      dev_alloc<uint8_t>(interp_mlp_act_scale_bytes);
+  qwen36_device_ptr_t interp_mlp_gate_w =
+      dev_alloc<uint8_t>(interp_mlp_weight_bytes);
+  qwen36_device_ptr_t interp_mlp_gate_scale =
+      dev_alloc<uint8_t>(interp_mlp_weight_scale_bytes);
+  qwen36_device_ptr_t interp_mlp_up_w =
+      dev_alloc<uint8_t>(interp_mlp_weight_bytes);
+  qwen36_device_ptr_t interp_mlp_up_scale =
+      dev_alloc<uint8_t>(interp_mlp_weight_scale_bytes);
+  qwen36_device_ptr_t interp_mlp_down_w =
+      dev_alloc<uint8_t>(interp_mlp_weight_bytes);
+  qwen36_device_ptr_t interp_mlp_down_scale =
+      dev_alloc<uint8_t>(interp_mlp_weight_scale_bytes);
+  qwen36_device_ptr_t interp_mlp_gate_ref =
+      dev_alloc<__nv_bfloat16>(interp_mlp_intermediate);
+  qwen36_device_ptr_t interp_mlp_up_ref =
+      dev_alloc<__nv_bfloat16>(interp_mlp_intermediate);
+  qwen36_device_ptr_t interp_mlp_swiglu_fp4_ref =
+      dev_alloc<uint8_t>(interp_mlp_intermediate / 2);
+  qwen36_device_ptr_t interp_mlp_swiglu_scale_ref =
+      dev_alloc<uint8_t>(interp_mlp_act_scale_bytes);
+  qwen36_device_ptr_t interp_mlp_swiglu_global_ref = dev_alloc<float>(1);
+  qwen36_device_ptr_t interp_mlp_out_ref =
+      dev_alloc<__nv_bfloat16>(interp_mlp_hidden);
+  qwen36_device_ptr_t interp_mlp_gate =
+      dev_alloc<__nv_bfloat16>(interp_mlp_intermediate);
+  qwen36_device_ptr_t interp_mlp_up =
+      dev_alloc<__nv_bfloat16>(interp_mlp_intermediate);
+  qwen36_device_ptr_t interp_mlp_swiglu_fp4 =
+      dev_alloc<uint8_t>(interp_mlp_intermediate / 2);
+  qwen36_device_ptr_t interp_mlp_swiglu_scale =
+      dev_alloc<uint8_t>(interp_mlp_act_scale_bytes);
+  qwen36_device_ptr_t interp_mlp_swiglu_global = dev_alloc<float>(1);
+  qwen36_device_ptr_t interp_mlp_out =
+      dev_alloc<__nv_bfloat16>(interp_mlp_hidden);
+  qwen36_device_ptr_t interp_mlp_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(5);
+  qwen36_device_ptr_t interp_mlp_counters = dev_alloc<int32_t>(8);
+  copy_raw<uint8_t>(interp_mlp_input_fp4,
+                    std::vector<uint8_t>(interp_mlp_hidden / 2, 0x22));
+  copy_raw<uint8_t>(interp_mlp_input_scale,
+                    std::vector<uint8_t>(interp_mlp_act_scale_bytes, 0x38));
+  copy_raw<uint8_t>(interp_mlp_gate_w,
+                    std::vector<uint8_t>(interp_mlp_weight_bytes, 0x22));
+  copy_raw<uint8_t>(interp_mlp_gate_scale,
+                    std::vector<uint8_t>(interp_mlp_weight_scale_bytes, 0x38));
+  copy_raw<uint8_t>(interp_mlp_up_w,
+                    std::vector<uint8_t>(interp_mlp_weight_bytes, 0x22));
+  copy_raw<uint8_t>(interp_mlp_up_scale,
+                    std::vector<uint8_t>(interp_mlp_weight_scale_bytes, 0x38));
+  copy_raw<uint8_t>(interp_mlp_down_w,
+                    std::vector<uint8_t>(interp_mlp_weight_bytes, 0x22));
+  copy_raw<uint8_t>(interp_mlp_down_scale,
+                    std::vector<uint8_t>(interp_mlp_weight_scale_bytes, 0x38));
+
+  qwen36_nvfp4_gemm_spec_t interp_mlp_gate_ref_spec{};
+  interp_mlp_gate_ref_spec.m = interp_mlp_intermediate;
+  interp_mlp_gate_ref_spec.n = 1;
+  interp_mlp_gate_ref_spec.k = interp_mlp_hidden;
+  interp_mlp_gate_ref_spec.a_fp4 = interp_mlp_gate_w;
+  interp_mlp_gate_ref_spec.a_scale = interp_mlp_gate_scale;
+  interp_mlp_gate_ref_spec.b_fp4 = interp_mlp_input_fp4;
+  interp_mlp_gate_ref_spec.b_scale = interp_mlp_input_scale;
+  interp_mlp_gate_ref_spec.c_bf16 = interp_mlp_gate_ref;
+  interp_mlp_gate_ref_spec.alpha = 1.0f;
+  must_status(qwen36_decode_nvfp4_gemv(&interp_mlp_gate_ref_spec),
+              "interpreter MLP gate reference");
+  qwen36_nvfp4_gemm_spec_t interp_mlp_up_ref_spec = interp_mlp_gate_ref_spec;
+  interp_mlp_up_ref_spec.a_fp4 = interp_mlp_up_w;
+  interp_mlp_up_ref_spec.a_scale = interp_mlp_up_scale;
+  interp_mlp_up_ref_spec.c_bf16 = interp_mlp_up_ref;
+  must_status(qwen36_decode_nvfp4_gemv(&interp_mlp_up_ref_spec),
+              "interpreter MLP up reference");
+  qwen36_swiglu_nvfp4_quantize_spec_t interp_mlp_swiglu_ref_spec{};
+  interp_mlp_swiglu_ref_spec.intermediate = interp_mlp_intermediate;
+  interp_mlp_swiglu_ref_spec.gate_bf16 = interp_mlp_gate_ref;
+  interp_mlp_swiglu_ref_spec.up_bf16 = interp_mlp_up_ref;
+  interp_mlp_swiglu_ref_spec.output_fp4 = interp_mlp_swiglu_fp4_ref;
+  interp_mlp_swiglu_ref_spec.output_scale_e4m3 =
+      interp_mlp_swiglu_scale_ref;
+  interp_mlp_swiglu_ref_spec.output_tensor_scale_f32 =
+      interp_mlp_swiglu_global_ref;
+  interp_mlp_swiglu_ref_spec.input_tensor_scale_f32 = 1.0f;
+  must_status(qwen36_swiglu_nvfp4_quantize(&interp_mlp_swiglu_ref_spec),
+              "interpreter MLP swiglu reference");
+  qwen36_nvfp4_gemm_spec_t interp_mlp_down_ref_spec{};
+  interp_mlp_down_ref_spec.m = interp_mlp_hidden;
+  interp_mlp_down_ref_spec.n = 1;
+  interp_mlp_down_ref_spec.k = interp_mlp_intermediate;
+  interp_mlp_down_ref_spec.a_fp4 = interp_mlp_down_w;
+  interp_mlp_down_ref_spec.a_scale = interp_mlp_down_scale;
+  interp_mlp_down_ref_spec.b_fp4 = interp_mlp_swiglu_fp4_ref;
+  interp_mlp_down_ref_spec.b_scale = interp_mlp_swiglu_scale_ref;
+  interp_mlp_down_ref_spec.c_bf16 = interp_mlp_out_ref;
+  interp_mlp_down_ref_spec.alpha = 1.0f;
+  must_status(qwen36_decode_nvfp4_gemv(&interp_mlp_down_ref_spec),
+              "interpreter MLP down reference");
+
+  qwen36_interpreter_instruction_t interp_mlp_program_host[5]{};
+  interp_mlp_program_host[0].opcode = 3; // NVFP4_GEMV gate
+  interp_mlp_program_host[0].publishes_counter = 0;
+  interp_mlp_program_host[0].publish_value = 1;
+  interp_mlp_program_host[0].arrival_counter = 1;
+  interp_mlp_program_host[0].payload[0] = interp_mlp_intermediate;
+  interp_mlp_program_host[0].payload[1] = interp_mlp_hidden;
+  interp_mlp_program_host[0].payload[2] = interp_mlp_gate_w.ptr;
+  interp_mlp_program_host[0].payload[3] = interp_mlp_gate_scale.ptr;
+  interp_mlp_program_host[0].payload[4] = interp_mlp_input_fp4.ptr;
+  interp_mlp_program_host[0].payload[5] = interp_mlp_input_scale.ptr;
+  interp_mlp_program_host[0].payload[6] = interp_mlp_gate.ptr;
+  interp_mlp_program_host[0].payload[7] = interp_gemv_alpha_bits.u;
+  interp_mlp_program_host[1].opcode = 3; // NVFP4_GEMV up
+  interp_mlp_program_host[1].dep_count = 1;
+  interp_mlp_program_host[1].deps[0] = qwen36_interpreter_dep_t{0, 1};
+  interp_mlp_program_host[1].publishes_counter = 2;
+  interp_mlp_program_host[1].publish_value = 1;
+  interp_mlp_program_host[1].arrival_counter = 3;
+  interp_mlp_program_host[1].payload[0] = interp_mlp_intermediate;
+  interp_mlp_program_host[1].payload[1] = interp_mlp_hidden;
+  interp_mlp_program_host[1].payload[2] = interp_mlp_up_w.ptr;
+  interp_mlp_program_host[1].payload[3] = interp_mlp_up_scale.ptr;
+  interp_mlp_program_host[1].payload[4] = interp_mlp_input_fp4.ptr;
+  interp_mlp_program_host[1].payload[5] = interp_mlp_input_scale.ptr;
+  interp_mlp_program_host[1].payload[6] = interp_mlp_up.ptr;
+  interp_mlp_program_host[1].payload[7] = interp_gemv_alpha_bits.u;
+  interp_mlp_program_host[2].opcode = 4; // SWIGLU_NVFP4_QUANT
+  interp_mlp_program_host[2].dep_count = 1;
+  interp_mlp_program_host[2].deps[0] = qwen36_interpreter_dep_t{2, 1};
+  interp_mlp_program_host[2].publishes_counter = 4;
+  interp_mlp_program_host[2].publish_value = 1;
+  interp_mlp_program_host[2].arrival_counter = 5;
+  interp_mlp_program_host[2].payload[0] = interp_mlp_intermediate;
+  interp_mlp_program_host[2].payload[1] = interp_mlp_gate.ptr;
+  interp_mlp_program_host[2].payload[2] = interp_mlp_up.ptr;
+  interp_mlp_program_host[2].payload[3] = interp_mlp_swiglu_fp4.ptr;
+  interp_mlp_program_host[2].payload[4] = interp_mlp_swiglu_scale.ptr;
+  interp_mlp_program_host[2].payload[5] = interp_mlp_swiglu_global.ptr;
+  interp_mlp_program_host[2].payload[6] = swiglu_scale_bits.u;
+  interp_mlp_program_host[3].opcode = 3; // NVFP4_GEMV down
+  interp_mlp_program_host[3].dep_count = 1;
+  interp_mlp_program_host[3].deps[0] = qwen36_interpreter_dep_t{4, 1};
+  interp_mlp_program_host[3].publishes_counter = 6;
+  interp_mlp_program_host[3].publish_value = 1;
+  interp_mlp_program_host[3].arrival_counter = 7;
+  interp_mlp_program_host[3].payload[0] = interp_mlp_hidden;
+  interp_mlp_program_host[3].payload[1] = interp_mlp_intermediate;
+  interp_mlp_program_host[3].payload[2] = interp_mlp_down_w.ptr;
+  interp_mlp_program_host[3].payload[3] = interp_mlp_down_scale.ptr;
+  interp_mlp_program_host[3].payload[4] = interp_mlp_swiglu_fp4.ptr;
+  interp_mlp_program_host[3].payload[5] = interp_mlp_swiglu_scale.ptr;
+  interp_mlp_program_host[3].payload[6] = interp_mlp_out.ptr;
+  interp_mlp_program_host[3].payload[7] = interp_gemv_alpha_bits.u;
+  interp_mlp_program_host[4].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_mlp_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_mlp_program_host, interp_mlp_program_host + 5));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_mlp_counters.ptr), 0,
+                 8 * sizeof(int32_t)),
+      "cudaMemset interp MLP counters");
+  qwen36_interpreter_program_t interp_mlp_spec{};
+  interp_mlp_spec.instructions = interp_mlp_instructions;
+  interp_mlp_spec.instruction_count = 5;
+  interp_mlp_spec.counters_i32 = interp_mlp_counters;
+  interp_mlp_spec.counter_count = 8;
+  interp_mlp_spec.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_mlp_spec),
+              "interpreter MLP");
+  std::vector<float> interp_mlp_ref_values =
+      read_bf16(interp_mlp_out_ref, interp_mlp_hidden);
+  std::vector<float> interp_mlp_values =
+      read_bf16(interp_mlp_out, interp_mlp_hidden);
+  for (size_t i = 0; i < interp_mlp_hidden; ++i) {
+    expect_close(interp_mlp_values[i], interp_mlp_ref_values[i], 0.0f,
+                 "interpreter MLP");
+  }
+
   qwen36_device_ptr_t conv_input = dev_alloc<__nv_bfloat16>(1);
   qwen36_device_ptr_t conv_history = dev_alloc<__nv_bfloat16>(3);
   qwen36_device_ptr_t conv_weight = dev_alloc<__nv_bfloat16>(4);
@@ -1710,6 +1897,28 @@ int main() {
   dev_free<__nv_bfloat16>(interp_gemv_out);
   dev_free<qwen36_interpreter_instruction_t>(interp_gemv_instructions);
   dev_free<int32_t>(interp_gemv_counters);
+  dev_free<uint8_t>(interp_mlp_input_fp4);
+  dev_free<uint8_t>(interp_mlp_input_scale);
+  dev_free<uint8_t>(interp_mlp_gate_w);
+  dev_free<uint8_t>(interp_mlp_gate_scale);
+  dev_free<uint8_t>(interp_mlp_up_w);
+  dev_free<uint8_t>(interp_mlp_up_scale);
+  dev_free<uint8_t>(interp_mlp_down_w);
+  dev_free<uint8_t>(interp_mlp_down_scale);
+  dev_free<__nv_bfloat16>(interp_mlp_gate_ref);
+  dev_free<__nv_bfloat16>(interp_mlp_up_ref);
+  dev_free<uint8_t>(interp_mlp_swiglu_fp4_ref);
+  dev_free<uint8_t>(interp_mlp_swiglu_scale_ref);
+  dev_free<float>(interp_mlp_swiglu_global_ref);
+  dev_free<__nv_bfloat16>(interp_mlp_out_ref);
+  dev_free<__nv_bfloat16>(interp_mlp_gate);
+  dev_free<__nv_bfloat16>(interp_mlp_up);
+  dev_free<uint8_t>(interp_mlp_swiglu_fp4);
+  dev_free<uint8_t>(interp_mlp_swiglu_scale);
+  dev_free<float>(interp_mlp_swiglu_global);
+  dev_free<__nv_bfloat16>(interp_mlp_out);
+  dev_free<qwen36_interpreter_instruction_t>(interp_mlp_instructions);
+  dev_free<int32_t>(interp_mlp_counters);
   dev_free<__nv_bfloat16>(conv_input);
   dev_free<__nv_bfloat16>(conv_history);
   dev_free<__nv_bfloat16>(conv_weight);

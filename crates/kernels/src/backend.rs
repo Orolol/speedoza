@@ -650,6 +650,40 @@ fn decode_gemv_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
+pub fn deltanet_decode_spec_abi_size() -> usize {
+    std::mem::size_of::<ffi::DeltaNetDecodeSpec>()
+}
+
+#[cfg(feature = "cuda")]
+pub fn attention_decode_spec_abi_size() -> usize {
+    std::mem::size_of::<ffi::AttentionDecodeSpec>()
+}
+
+#[cfg(feature = "cuda")]
+pub fn attention_decode_spec_abi_bytes(spec: &AttentionDecodeSpec) -> Vec<u8> {
+    let ffi_spec = ffi::AttentionDecodeSpec::from(spec);
+    unsafe {
+        std::slice::from_raw_parts(
+            (&ffi_spec as *const ffi::AttentionDecodeSpec).cast::<u8>(),
+            std::mem::size_of::<ffi::AttentionDecodeSpec>(),
+        )
+        .to_vec()
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub fn deltanet_decode_spec_abi_bytes(spec: &DeltaNetDecodeSpec) -> Vec<u8> {
+    let ffi_spec = ffi::DeltaNetDecodeSpec::from(spec);
+    unsafe {
+        std::slice::from_raw_parts(
+            (&ffi_spec as *const ffi::DeltaNetDecodeSpec).cast::<u8>(),
+            std::mem::size_of::<ffi::DeltaNetDecodeSpec>(),
+        )
+        .to_vec()
+    }
+}
+
+#[cfg(feature = "cuda")]
 mod ffi {
     use crate::attention::AttentionShape as RustAttentionShape;
     use crate::deltanet::DeltaNetShape as RustDeltaNetShape;

@@ -59,6 +59,16 @@ pub struct DecodeInterpreterMlpParams {
     pub output_bf16: DevicePtr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeInterpreterDeltaNetParams {
+    pub spec: DevicePtr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeInterpreterAttentionParams {
+    pub spec: DevicePtr,
+}
+
 impl DecodeInterpreterProgram {
     pub fn compile(topology: &ModelTopology) -> Self {
         let mut compiler = DecodeInterpreterCompiler {
@@ -205,6 +215,30 @@ impl DecodeInterpreterProgram {
             .with_dep(4, 1)
             .with_publish(6, 1)
             .with_arrival_counter(7),
+        );
+        Self {
+            program: program.finish(),
+        }
+    }
+
+    pub fn compile_deltanet_recur(params: DecodeInterpreterDeltaNetParams) -> Self {
+        let mut program = InterpreterProgram::new();
+        program.push(
+            InterpreterInstruction::deltanet_recur_spec(params.spec)
+                .with_publish(0, 1)
+                .with_arrival_counter(1),
+        );
+        Self {
+            program: program.finish(),
+        }
+    }
+
+    pub fn compile_attention_decode_full(params: DecodeInterpreterAttentionParams) -> Self {
+        let mut program = InterpreterProgram::new();
+        program.push(
+            InterpreterInstruction::attn_decode_full_spec(params.spec)
+                .with_publish(0, 1)
+                .with_arrival_counter(1),
         );
         Self {
             program: program.finish(),
@@ -402,6 +436,45 @@ mod tests {
         assert_eq!(compiled.program.instructions[3].deps[0].counter_id, 4);
         assert_eq!(
             compiled.program.instructions[4].opcode(),
+            Some(InterpreterOpcode::Exit)
+        );
+    }
+
+    #[test]
+    fn deltanet_program_uses_real_opcode_and_counter() {
+        let compiled =
+            DecodeInterpreterProgram::compile_deltanet_recur(DecodeInterpreterDeltaNetParams {
+                spec: DevicePtr(40),
+            });
+        assert_eq!(compiled.program.instructions.len(), 2);
+        assert_eq!(compiled.program.counter_count, 2);
+        assert_eq!(
+            compiled.program.instructions[0].opcode(),
+            Some(InterpreterOpcode::DeltaNetRecur)
+        );
+        assert_eq!(compiled.program.instructions[0].payload[0], 40);
+        assert_eq!(
+            compiled.program.instructions[1].opcode(),
+            Some(InterpreterOpcode::Exit)
+        );
+    }
+
+    #[test]
+    fn attention_program_uses_real_opcode_and_counter() {
+        let compiled = DecodeInterpreterProgram::compile_attention_decode_full(
+            DecodeInterpreterAttentionParams {
+                spec: DevicePtr(41),
+            },
+        );
+        assert_eq!(compiled.program.instructions.len(), 2);
+        assert_eq!(compiled.program.counter_count, 2);
+        assert_eq!(
+            compiled.program.instructions[0].opcode(),
+            Some(InterpreterOpcode::AttnDecodeFull)
+        );
+        assert_eq!(compiled.program.instructions[0].payload[0], 41);
+        assert_eq!(
+            compiled.program.instructions[1].opcode(),
             Some(InterpreterOpcode::Exit)
         );
     }

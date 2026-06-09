@@ -16,9 +16,12 @@ pub mod turboquant;
 
 pub use attention::{AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape};
 #[cfg(feature = "cuda")]
-pub use backend::nvfp4_retile_scales;
-#[cfg(feature = "cuda")]
 pub use backend::CudaBackend;
+#[cfg(feature = "cuda")]
+pub use backend::{
+    attention_decode_spec_abi_bytes, attention_decode_spec_abi_size,
+    deltanet_decode_spec_abi_bytes, deltanet_decode_spec_abi_size, nvfp4_retile_scales,
+};
 pub use backend::{DevicePtr, KernelBackend, NoCudaBackend};
 pub use deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape};
 pub use drafter_attention::DrafterAttentionBlockSpec;

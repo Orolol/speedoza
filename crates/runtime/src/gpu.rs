@@ -3,7 +3,8 @@ use std::mem::size_of;
 
 use qwen36_fp4_core::{CoreError, ModelTopology, Result, TensorDtype, TensorInfo, TensorRole};
 use qwen36_fp4_kernels::{
-    cuda_synchronize, nvfp4_retile_scales, CudaDeviceBuffer, DevicePtr, InterpreterInstruction,
+    attention_decode_spec_abi_size, cuda_synchronize, deltanet_decode_spec_abi_size,
+    nvfp4_retile_scales, CudaDeviceBuffer, DevicePtr, InterpreterInstruction,
     Nvfp4RetileScalesSpec,
 };
 use qwen36_fp4_loader::MappedModel;
@@ -584,6 +585,20 @@ pub struct GpuForwardBuffers {
     pub interpreter_mlp_instructions: CudaDeviceBuffer,
     /// Reusable counter buffer for `interpreter_mlp_instructions`.
     pub interpreter_mlp_counters: CudaDeviceBuffer,
+    /// Reusable ABI spec buffer for the opt-in decode-interpreter DeltaNet
+    /// recurrence program.
+    pub interpreter_deltanet_spec: CudaDeviceBuffer,
+    /// Reusable instruction buffer for `DELTANET_RECUR`.
+    pub interpreter_deltanet_instructions: CudaDeviceBuffer,
+    /// Reusable counter buffer for `interpreter_deltanet_instructions`.
+    pub interpreter_deltanet_counters: CudaDeviceBuffer,
+    /// Reusable ABI spec buffer for the opt-in decode-interpreter BF16 full
+    /// attention decode program.
+    pub interpreter_attention_spec: CudaDeviceBuffer,
+    /// Reusable instruction buffer for `ATTN_DECODE_FULL`.
+    pub interpreter_attention_instructions: CudaDeviceBuffer,
+    /// Reusable counter buffer for `interpreter_attention_instructions`.
+    pub interpreter_attention_counters: CudaDeviceBuffer,
 }
 
 /// Per-launch barrier-state byte count consumed by the full-attn
@@ -865,6 +880,16 @@ impl GpuForwardBuffers {
                 5 * size_of::<InterpreterInstruction>(),
             )?,
             interpreter_mlp_counters: CudaDeviceBuffer::zeroed(8 * size_of::<i32>())?,
+            interpreter_deltanet_spec: CudaDeviceBuffer::alloc(deltanet_decode_spec_abi_size())?,
+            interpreter_deltanet_instructions: CudaDeviceBuffer::alloc(
+                2 * size_of::<InterpreterInstruction>(),
+            )?,
+            interpreter_deltanet_counters: CudaDeviceBuffer::zeroed(2 * size_of::<i32>())?,
+            interpreter_attention_spec: CudaDeviceBuffer::alloc(attention_decode_spec_abi_size())?,
+            interpreter_attention_instructions: CudaDeviceBuffer::alloc(
+                2 * size_of::<InterpreterInstruction>(),
+            )?,
+            interpreter_attention_counters: CudaDeviceBuffer::zeroed(2 * size_of::<i32>())?,
         })
     }
 
@@ -899,6 +924,12 @@ impl GpuForwardBuffers {
             self.interpreter_logits_counters.bytes(),
             self.interpreter_mlp_instructions.bytes(),
             self.interpreter_mlp_counters.bytes(),
+            self.interpreter_deltanet_spec.bytes(),
+            self.interpreter_deltanet_instructions.bytes(),
+            self.interpreter_deltanet_counters.bytes(),
+            self.interpreter_attention_spec.bytes(),
+            self.interpreter_attention_instructions.bytes(),
+            self.interpreter_attention_counters.bytes(),
         ]
         .into_iter()
         .map(|bytes| bytes as u64)

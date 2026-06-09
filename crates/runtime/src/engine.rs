@@ -7,6 +7,7 @@ use qwen36_fp4_core::TensorInfo;
 use qwen36_fp4_core::{CoreError, KvCacheDtype, ModelLayout, ModelTopology, Result};
 #[cfg(feature = "cuda")]
 use qwen36_fp4_kernels::{
+    attention_decode_spec_abi_bytes, deltanet_decode_spec_abi_bytes,
     interpreter_opcodes_enabled_from_env, AttentionDecodeSpec, AttentionPrefillSpec,
     AttentionShape, Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec,
     CopyStridedRowsSpec, CublasLtFp4ScaleMode, CudaBackend, DeltaNetDecodeSpec,
@@ -29,8 +30,8 @@ use crate::gpu::{
 };
 #[cfg(feature = "cuda")]
 use crate::interpreter_compile::{
-    instructions_as_bytes, DecodeInterpreterLogitsParams, DecodeInterpreterMlpParams,
-    DecodeInterpreterProgram,
+    instructions_as_bytes, DecodeInterpreterAttentionParams, DecodeInterpreterDeltaNetParams,
+    DecodeInterpreterLogitsParams, DecodeInterpreterMlpParams, DecodeInterpreterProgram,
 };
 use crate::kv_cache::KvCachePlan;
 use crate::state::{DeltaNetStatePlan, RuntimeState};
@@ -157,6 +158,30 @@ fn decode_interpreter_mlp_enabled() -> bool {
         let opcodes = interpreter_opcodes_enabled_from_env();
         opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
             && opcodes.contains(InterpreterOpcode::SwiGluNvfp4Quant)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_deltanet_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !cuda_env_bool("QWEN36_INTERPRETER_DELTANET") {
+            return false;
+        }
+        interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::DeltaNetRecur)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_attention_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !cuda_env_bool("QWEN36_INTERPRETER_ATTN") {
+            return false;
+        }
+        interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::AttnDecodeFull)
     })
 }
 
@@ -382,6 +407,18 @@ pub struct MtpDeviceChainResult {
     pub next_draft_tokens: Vec<u32>,
 }
 
+/// Hook the prefill loop fires after each layer's `input_layernorm`,
+/// passing the engine's prefill `layer_idx` (= the transformers
+/// `hidden_states[layer_idx]` index), a device pointer to the freshly-
+/// updated residual buffer (`[tokens, hidden]` BF16), and `tokens`.
+/// Used by `crates/drafter` to scatter target hidden states into the
+/// DFlash drafter's conditioning buffer. The hook is invoked
+/// synchronously on the active CUDA stream; implementations must not
+/// block on host signals.
+#[cfg(feature = "cuda")]
+pub type DrafterHiddenCaptureHook =
+    std::sync::Arc<dyn Fn(usize, DevicePtr, usize) -> Result<()> + Send + Sync>;
+
 pub struct Engine<B: KernelBackend = NoCudaBackend> {
     pub topology: ModelTopology,
     pub config: EngineConfig,
@@ -417,6 +454,13 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
     #[cfg(feature = "cuda")]
     #[allow(dead_code)]
     decode_aux: Option<DecodeAuxStreams>,
+    /// Optional DFlash drafter hidden-state capture hook (Phase E).
+    /// Fired once per prefill layer after the input_layernorm has
+    /// produced the post-fused-residual tensor in `prefill.residual`.
+    /// `None` is the default; the speculative controller arms this
+    /// before each prefill call when DFlash is active.
+    #[cfg(feature = "cuda")]
+    drafter_hidden_capture: Option<DrafterHiddenCaptureHook>,
     backend: B,
 }
 
@@ -558,8 +602,18 @@ impl<B: KernelBackend> Engine<B> {
             decode_graph: None,
             #[cfg(feature = "cuda")]
             decode_aux: None,
+            #[cfg(feature = "cuda")]
+            drafter_hidden_capture: None,
             backend,
         }
+    }
+
+    /// Arms (or disarms) the DFlash drafter hidden-state capture hook
+    /// for subsequent prefill calls. The hook fires per layer after
+    /// each input_layernorm; see [`DrafterHiddenCaptureHook`].
+    #[cfg(feature = "cuda")]
+    pub fn set_drafter_hidden_capture(&mut self, hook: Option<DrafterHiddenCaptureHook>) {
+        self.drafter_hidden_capture = hook;
     }
 
     pub fn from_layout(layout: &ModelLayout, config: EngineConfig, backend: B) -> Result<Self> {
@@ -3310,6 +3364,14 @@ impl<B: KernelBackend> Engine<B> {
                 prefill.normed.ptr(),
             )?;
             residual_initialized = true;
+            // Phase E: DFlash drafter hidden-state capture. `prefill.residual`
+            // now equals `hidden_states[layer_idx]` (the post-fused-residual
+            // input to layer `layer_idx` in transformers' convention). The
+            // hook is a no-op when `layer_idx` is not in the configured
+            // capture set.
+            if let Some(hook) = &self.drafter_hidden_capture {
+                hook(layer_idx, prefill.residual.ptr(), tokens)?;
+            }
             if dump_all_layers {
                 if let Some(dir) = &dump_dir {
                     self.dump_buffer_to_disk(
@@ -3841,7 +3903,13 @@ impl<B: KernelBackend> Engine<B> {
             let is_linear = matches!(layer, LayerWeights::LinearAttention(_));
             match layer {
                 LayerWeights::LinearAttention(layer) => {
-                    self.run_linear_attention_layer(layer, runtime, forward, quantized_normed)?;
+                    self.run_linear_attention_layer(
+                        layer,
+                        runtime,
+                        forward,
+                        quantized_normed,
+                        position_device_i32 == DevicePtr::NULL,
+                    )?;
                 }
                 LayerWeights::FullAttention(layer) => {
                     self.run_full_attention_layer(
@@ -3943,14 +4011,14 @@ impl<B: KernelBackend> Engine<B> {
                         self.topology.hidden_size,
                         self.topology.intermediate_size,
                     );
-                if interpreter_mlp_eligible {
-                    self.run_interpreter_mlp_with_quantized_input(
-                        layer, forward, quantized,
-                    )?;
-                } else if f4_eligible {
-                    self.run_mlp_megakernel_f4(layer, forward, quantized)?;
-                } else {
-                    self.run_mlp_with_quantized_input(layer, forward, quantized)?;
+                let ran_interpreter_mlp = interpreter_mlp_eligible
+                    && self.run_interpreter_mlp_with_quantized_input(layer, forward, quantized)?;
+                if !ran_interpreter_mlp {
+                    if f4_eligible {
+                        self.run_mlp_megakernel_f4(layer, forward, quantized)?;
+                    } else {
+                        self.run_mlp_with_quantized_input(layer, forward, quantized)?;
+                    }
                 }
                 if let Some(mlp_start) = mlp_start {
                     qwen36_fp4_kernels::cuda_synchronize()?;
@@ -4093,6 +4161,7 @@ impl<B: KernelBackend> Engine<B> {
         runtime: &GpuRuntimeBuffers,
         forward: &GpuForwardBuffers,
         prequantized_normed: Option<Nvfp4ActivationQuant<'_>>,
+        interpreter_allowed: bool,
     ) -> Result<()> {
         let qkv_dim = self.topology.linear_attention_qkv_dim();
         let key_dim = self.topology.linear_num_key_heads * self.topology.linear_key_head_dim;
@@ -4175,7 +4244,7 @@ impl<B: KernelBackend> Engine<B> {
                 gate_f32: forward.gate_f32.ptr(),
                 beta_f32: forward.beta_f32.ptr(),
             })?;
-        self.backend.deltanet_decode(&DeltaNetDecodeSpec {
+        let deltanet_spec = DeltaNetDecodeSpec {
             layer_index: layer.layer_index,
             tokens_in_persistent_loop: 1,
             q_token_stride: 0,
@@ -4199,7 +4268,12 @@ impl<B: KernelBackend> Engine<B> {
             state_decay: 1.0,
             update_scale: 1.0,
             qk_l2norm: true,
-        })?;
+        };
+        if interpreter_allowed && decode_interpreter_deltanet_enabled() {
+            self.run_interpreter_deltanet_decode(&deltanet_spec, forward)?;
+        } else {
+            self.backend.deltanet_decode(&deltanet_spec)?;
+        }
         if self
             .linear_attn_in_proj_fused_layer_opt(layer.layer_index)
             .is_none()
@@ -4314,7 +4388,7 @@ impl<B: KernelBackend> Engine<B> {
         // disabled or no MLP fused store exists for this layer.
         let prefetch_join = self.fork_productive_spin(layer.layer_index)?;
         let attention_context_limit = self.decode_attention_context_limit_for_position(position);
-        self.backend.attention_decode(&AttentionDecodeSpec {
+        let attention_spec = AttentionDecodeSpec {
             layer_index: layer.layer_index,
             position,
             q_bf16: forward.aux3.ptr(),
@@ -4339,7 +4413,12 @@ impl<B: KernelBackend> Engine<B> {
                 .decode_attention_n_splits_for_context_limit(attention_context_limit),
             split_timesteps_per_block: self
                 .attention_split_timesteps_per_block_for(attention_context_limit),
-        })?;
+        };
+        if decode_interpreter_attention_enabled() {
+            self.run_interpreter_attention_decode(&attention_spec, forward)?;
+        } else {
+            self.backend.attention_decode(&attention_spec)?;
+        }
         self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
             rows: 1,
             heads: self.topology.attention_num_heads,
@@ -6235,6 +6314,265 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn run_interpreter_deltanet_decode(
+        &self,
+        spec: &DeltaNetDecodeSpec,
+        forward: &GpuForwardBuffers,
+    ) -> Result<()> {
+        if spec.tokens_in_persistent_loop != 1
+            || spec.q_token_stride != 0
+            || spec.k_token_stride != 0
+            || spec.v_token_stride != 0
+        {
+            self.backend.deltanet_decode(spec)?;
+            return Ok(());
+        }
+
+        let spec_bytes = deltanet_decode_spec_abi_bytes(spec);
+        if spec_bytes.len() > forward.interpreter_deltanet_spec.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter DeltaNet spec needs {} bytes but buffer has {}",
+                spec_bytes.len(),
+                forward.interpreter_deltanet_spec.bytes()
+            )));
+        }
+        forward
+            .interpreter_deltanet_spec
+            .copy_from_host(&spec_bytes)?;
+
+        let compiled =
+            DecodeInterpreterProgram::compile_deltanet_recur(DecodeInterpreterDeltaNetParams {
+                spec: forward.interpreter_deltanet_spec.ptr(),
+            });
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_deltanet_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter DeltaNet program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_deltanet_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_deltanet_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter DeltaNet program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_deltanet_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_deltanet_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_deltanet_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_deltanet_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_deltanet_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: 0,
+            })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_interpreter_attention_decode(
+        &self,
+        spec: &AttentionDecodeSpec,
+        forward: &GpuForwardBuffers,
+    ) -> Result<()> {
+        let bf16_kv_cache_dtype = Self::attention_kv_cache_dtype_code(KvCacheDtype::Bf16)?;
+        if spec.kv_cache_dtype != bf16_kv_cache_dtype
+            || spec.decode_n_splits > 1
+            || spec.position_device_i32 != DevicePtr::NULL
+        {
+            self.backend.attention_decode(spec)?;
+            return Ok(());
+        }
+
+        let mut interpreter_spec = spec.clone();
+        interpreter_spec.kv_cache_metadata = DevicePtr::NULL;
+        interpreter_spec.partial_acc_f32 = DevicePtr::NULL;
+        interpreter_spec.partial_max_f32 = DevicePtr::NULL;
+        interpreter_spec.partial_denom_f32 = DevicePtr::NULL;
+        interpreter_spec.decode_n_splits = interpreter_spec.decode_n_splits.min(1);
+        interpreter_spec.split_timesteps_per_block = 0;
+
+        let spec_bytes = attention_decode_spec_abi_bytes(&interpreter_spec);
+        if spec_bytes.len() > forward.interpreter_attention_spec.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter Attention spec needs {} bytes but buffer has {}",
+                spec_bytes.len(),
+                forward.interpreter_attention_spec.bytes()
+            )));
+        }
+        forward
+            .interpreter_attention_spec
+            .copy_from_host(&spec_bytes)?;
+
+        let compiled = DecodeInterpreterProgram::compile_attention_decode_full(
+            DecodeInterpreterAttentionParams {
+                spec: forward.interpreter_attention_spec.ptr(),
+            },
+        );
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_attention_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter Attention program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_attention_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_attention_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter Attention program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_attention_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_attention_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_attention_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_attention_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_attention_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: 0,
+            })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_interpreter_mlp_with_quantized_input(
+        &self,
+        layer: &LayerWeights,
+        forward: &GpuForwardBuffers,
+        quantized: Nvfp4ActivationQuant<'_>,
+    ) -> Result<bool> {
+        let common = layer_common(layer);
+        let weights = self.cuda_weights()?;
+        let intermediate = self.topology.intermediate_size;
+        let hidden = self.topology.hidden_size;
+        let LinearWeightBinding::Nvfp4 {
+            weight: gate_weight,
+            block_scale: gate_block_scale,
+            tensor_scale: gate_tensor_scale,
+            input_scale: gate_input_scale,
+        } = &common.mlp_gate_proj
+        else {
+            return Ok(false);
+        };
+        let LinearWeightBinding::Nvfp4 {
+            weight: up_weight,
+            block_scale: up_block_scale,
+            tensor_scale: up_tensor_scale,
+            input_scale: up_input_scale,
+        } = &common.mlp_up_proj
+        else {
+            return Ok(false);
+        };
+        let LinearWeightBinding::Nvfp4 {
+            weight: down_weight,
+            block_scale: down_block_scale,
+            tensor_scale: down_tensor_scale,
+            input_scale: down_input_scale,
+        } = &common.mlp_down_proj
+        else {
+            return Ok(false);
+        };
+
+        if !decode_interpreter_mlp_supports(hidden, intermediate) {
+            return Ok(false);
+        }
+        if Self::nvfp4_in_features(gate_weight)? != quantized.in_features
+            || Self::nvfp4_in_features(up_weight)? != quantized.in_features
+            || Self::nvfp4_in_features(down_weight)? != intermediate
+        {
+            return Ok(false);
+        }
+        let gate_out = *gate_weight.shape.first().ok_or_else(|| {
+            CoreError::Runtime(format!("tensor {} has empty shape", gate_weight.name))
+        })?;
+        let up_out = *up_weight.shape.first().ok_or_else(|| {
+            CoreError::Runtime(format!("tensor {} has empty shape", up_weight.name))
+        })?;
+        let down_out = *down_weight.shape.first().ok_or_else(|| {
+            CoreError::Runtime(format!("tensor {} has empty shape", down_weight.name))
+        })?;
+        if gate_out != intermediate || up_out != intermediate || down_out != hidden {
+            return Ok(false);
+        }
+
+        self.validate_nvfp4_input_scale(gate_weight, quantized.input_scale, gate_input_scale)?;
+        self.validate_nvfp4_input_scale(up_weight, quantized.input_scale, up_input_scale)?;
+
+        let gate_alpha = self.tensor_scalar_f32(weights, gate_tensor_scale)?
+            * self.tensor_scalar_f32(weights, quantized.input_scale)?;
+        let up_alpha = self.tensor_scalar_f32(weights, up_tensor_scale)?
+            * self.tensor_scalar_f32(weights, quantized.input_scale)?;
+        let down_input_tensor_scale = self.tensor_scalar_f32(weights, down_input_scale)?;
+        let down_alpha =
+            self.tensor_scalar_f32(weights, down_tensor_scale)? * down_input_tensor_scale;
+
+        let compiled = DecodeInterpreterProgram::compile_mlp(DecodeInterpreterMlpParams {
+            hidden,
+            intermediate,
+            input_fp4: forward.activation_fp4.ptr(),
+            input_scale_e4m3: forward.activation_scale.ptr(),
+            gate_weight_fp4: self.tensor_ptr(weights, gate_weight)?,
+            gate_weight_scale_e4m3: self.tensor_ptr(weights, gate_block_scale)?,
+            gate_alpha,
+            gate_out_bf16: forward.aux.ptr(),
+            up_weight_fp4: self.tensor_ptr(weights, up_weight)?,
+            up_weight_scale_e4m3: self.tensor_ptr(weights, up_block_scale)?,
+            up_alpha,
+            up_out_bf16: forward.aux2.ptr(),
+            swiglu_fp4: forward.activation_fp4.ptr(),
+            swiglu_scale_e4m3: forward.activation_scale.ptr(),
+            swiglu_tensor_scale_f32: forward.activation_scale_2.ptr(),
+            down_input_tensor_scale,
+            down_weight_fp4: self.tensor_ptr(weights, down_weight)?,
+            down_weight_scale_e4m3: self.tensor_ptr(weights, down_block_scale)?,
+            down_alpha,
+            output_bf16: forward.hidden.ptr(),
+        });
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_mlp_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter MLP program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_mlp_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_mlp_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter MLP program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_mlp_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_mlp_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_mlp_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_mlp_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_mlp_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: 0,
+            })?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "cuda")]
     fn run_interpreter_final_logits(
         &self,
         manifest: &ModelWeightsManifest,
@@ -7082,6 +7420,38 @@ impl Engine<CudaBackend> {
             item(
                 "interpreter_logits_counters",
                 forward.interpreter_logits_counters.bytes() as u64,
+            ),
+            item(
+                "interpreter_mlp_instructions",
+                forward.interpreter_mlp_instructions.bytes() as u64,
+            ),
+            item(
+                "interpreter_mlp_counters",
+                forward.interpreter_mlp_counters.bytes() as u64,
+            ),
+            item(
+                "interpreter_deltanet_spec",
+                forward.interpreter_deltanet_spec.bytes() as u64,
+            ),
+            item(
+                "interpreter_deltanet_instructions",
+                forward.interpreter_deltanet_instructions.bytes() as u64,
+            ),
+            item(
+                "interpreter_deltanet_counters",
+                forward.interpreter_deltanet_counters.bytes() as u64,
+            ),
+            item(
+                "interpreter_attention_spec",
+                forward.interpreter_attention_spec.bytes() as u64,
+            ),
+            item(
+                "interpreter_attention_instructions",
+                forward.interpreter_attention_instructions.bytes() as u64,
+            ),
+            item(
+                "interpreter_attention_counters",
+                forward.interpreter_attention_counters.bytes() as u64,
             ),
         ]);
 
