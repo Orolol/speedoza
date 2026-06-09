@@ -15,6 +15,8 @@
 //! one of the configured slots, the per-token hidden state is scattered
 //! into the right column block via `copy_strided_rows`.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use anyhow::{Result, anyhow, bail};
 use qwen36_fp4_kernels::{CopyStridedRowsSpec, CudaDeviceBuffer, DevicePtr, KernelBackend};
 
@@ -40,6 +42,11 @@ pub struct TargetHiddenCapture {
     /// `[max_tokens, hidden * n_target_layers]` BF16 row-major.
     pub buffer: CudaDeviceBuffer,
     pub slots: Vec<TargetHiddenCaptureSlot>,
+    /// Row offset for the next `capture_layer` write. Prefill leaves
+    /// this at 0 (it processes all `tokens` rows in one call). The
+    /// multi-iter controller bumps it between sequential decodes so
+    /// each per-token capture lands at a fresh row.
+    write_row_offset: AtomicUsize,
 }
 
 const BF16_BYTES: usize = 2;
@@ -77,7 +84,19 @@ impl TargetHiddenCapture {
             n_target_layers,
             buffer,
             slots,
+            write_row_offset: AtomicUsize::new(0),
         })
+    }
+
+    /// Sets the row at which the next `capture_layer` call(s) will
+    /// scatter. The controller calls this before each per-token decode
+    /// so the engine's layer-loop captures land at distinct rows.
+    pub fn set_write_row(&self, row: usize) {
+        self.write_row_offset.store(row, Ordering::Relaxed);
+    }
+
+    pub fn current_write_row(&self) -> usize {
+        self.write_row_offset.load(Ordering::Relaxed)
     }
 
     pub fn output_ptr(&self) -> DevicePtr {
@@ -114,14 +133,17 @@ impl TargetHiddenCapture {
         let Some(slot) = self.slot_for(engine_layer_idx) else {
             return Ok(());
         };
-        if tokens > self.max_tokens {
+        let write_row = self.current_write_row();
+        if write_row + tokens > self.max_tokens {
             bail!(
-                "capture_layer tokens {tokens} > max_tokens {}",
+                "capture_layer write_row={write_row} + tokens={tokens} exceeds max_tokens {}",
                 self.max_tokens,
             );
         }
         let output_stride = self.hidden_size * self.n_target_layers;
-        let column_offset_bytes = slot.target_slot * self.hidden_size * BF16_BYTES;
+        let row_bytes = output_stride * BF16_BYTES;
+        let column_offset_bytes =
+            write_row * row_bytes + slot.target_slot * self.hidden_size * BF16_BYTES;
         let dest_ptr = self
             .buffer
             .ptr_at(column_offset_bytes)

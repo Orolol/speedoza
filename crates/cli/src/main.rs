@@ -185,6 +185,22 @@ enum Command {
         #[arg(long, default_value_t = false)]
         chat_template: bool,
     },
+    /// Phase F.2: multi-iter DFlash speculative chat. Stitches the
+    /// propose+verify cycle into a loop driven by acceptance,
+    /// capturing hidden states from each verify decode for the next
+    /// iter's drafter call. Stops at `--max-new-tokens` or EOS.
+    DrafterChatSmoke {
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long)]
+        drafter_dir: PathBuf,
+        #[arg(long, default_value = "The quick brown fox jumps over the")]
+        prompt: String,
+        #[arg(long, default_value_t = false)]
+        chat_template: bool,
+        #[arg(long, default_value_t = 64)]
+        max_new_tokens: usize,
+    },
     /// Run one DFlash drafter forward on synthetic random inputs and
     /// report basic sanity (finite values, deterministic). With
     /// --fixture-dir, load inputs + expected output from a fixture
@@ -453,6 +469,37 @@ fn main() -> Result<()> {
                 let _ = (model_dir, drafter_dir, prompt, chat_template);
                 anyhow::bail!(
                     "drafter-iter-smoke requires the cuda feature; rebuild with --features cuda"
+                );
+            }
+        }
+        Command::DrafterChatSmoke {
+            model_dir,
+            drafter_dir,
+            prompt,
+            chat_template,
+            max_new_tokens,
+        } => {
+            #[cfg(feature = "cuda")]
+            {
+                drafter_chat_smoke(
+                    model_dir,
+                    drafter_dir,
+                    prompt,
+                    chat_template,
+                    max_new_tokens,
+                )?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (
+                    model_dir,
+                    drafter_dir,
+                    prompt,
+                    chat_template,
+                    max_new_tokens,
+                );
+                anyhow::bail!(
+                    "drafter-chat-smoke requires the cuda feature; rebuild with --features cuda"
                 );
             }
         }
@@ -1913,7 +1960,7 @@ fn gpu_load(_model_dir: PathBuf, _max_context: usize) -> Result<()> {
 
 #[cfg(feature = "cuda")]
 fn drafter_load(drafter_dir: PathBuf) -> Result<()> {
-    use qwen36_fp4_drafter::{DFlashDrafterDevice, DFlashDrafter};
+    use qwen36_fp4_drafter::{DFlashDrafter, DFlashDrafterDevice};
 
     let drafter = DFlashDrafter::open(&drafter_dir)?;
     let manifest = drafter.manifest.clone();
@@ -2012,9 +2059,7 @@ fn drafter_step_smoke(
         Arc::new(move |layer_idx, residual_ptr, tokens| {
             capture_for_hook
                 .capture_layer(&CudaBackend, layer_idx, residual_ptr, tokens)
-                .map_err(|e| {
-                    qwen36_fp4_core::CoreError::Runtime(format!("drafter handoff: {e}"))
-                })
+                .map_err(|e| qwen36_fp4_core::CoreError::Runtime(format!("drafter handoff: {e}")))
         });
     engine.set_drafter_hidden_capture(Some(hook));
 
@@ -2087,10 +2132,10 @@ fn drafter_step_smoke(
     // from the prior target sample. Report both.
     let seed_text = tokenizer.decode(&[seed_token], true).unwrap_or_default();
     let proposed_after_seed: Vec<u32> = proposed_tokens[1..].to_vec();
-    let proposed_text = tokenizer.decode(&proposed_after_seed, true).unwrap_or_default();
-    let full_block_text = tokenizer
-        .decode(&proposed_tokens, true)
+    let proposed_text = tokenizer
+        .decode(&proposed_after_seed, true)
         .unwrap_or_default();
+    let full_block_text = tokenizer.decode(&proposed_tokens, true).unwrap_or_default();
 
     println!(
         "{}",
@@ -2108,6 +2153,261 @@ fn drafter_step_smoke(
             "proposed_tokens_after_seed": proposed_after_seed,
             "proposed_decoded_after_seed": proposed_text,
             "full_block_decoded": full_block_text,
+        }))?,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn drafter_chat_smoke(
+    model_dir: PathBuf,
+    drafter_dir: PathBuf,
+    prompt: String,
+    chat_template: bool,
+    max_new_tokens: usize,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    use qwen36_fp4_drafter::{
+        DFlashDrafter, DFlashDrafterDevice, DFlashProposeWorkspace, DrafterForward,
+        DrafterForwardWorkspace, TargetHiddenCapture, propose_block,
+    };
+    use qwen36_fp4_kernels::CudaBackend;
+
+    if max_new_tokens == 0 {
+        anyhow::bail!("max_new_tokens must be > 0");
+    }
+
+    // --- Tokenize ----------------------------------------------------
+    let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
+    let prompt_tokens = if chat_template {
+        let messages = vec![ChatMessage {
+            role: "user".to_owned(),
+            content: prompt.clone(),
+        }];
+        tokenizer.encode_chat(&messages, true)?
+    } else {
+        tokenizer.encode(&prompt, true)?
+    };
+    if prompt_tokens.is_empty() {
+        anyhow::bail!("prompt produced 0 tokens");
+    }
+    let prompt_len = prompt_tokens.len();
+
+    // --- Open drafter -----------------------------------------------
+    let drafter = DFlashDrafter::open(&drafter_dir)?;
+    if drafter.config.head_dim != 128 {
+        anyhow::bail!(
+            "drafter-chat-smoke v1 only supports head_dim=128, got {}",
+            drafter.config.head_dim,
+        );
+    }
+    let mask_token_id = drafter.config.dflash_config.mask_token_id;
+    let block_size = drafter.config.block_size;
+    let q_len = block_size;
+    let vocab_size = drafter.config.vocab_size;
+    let eos_token_id: u32 = 248044; // Qwen3.6 standard eos (see CLI chat path)
+
+    // --- Target engine (long-context mode to fit drafter alongside) -
+    let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+    let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
+    let target_config = EngineConfig {
+        max_context: prompt_len
+            .saturating_add(max_new_tokens)
+            .saturating_add(block_size)
+            .max(256),
+        kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Fp8),
+        ..EngineConfig::default()
+    };
+    let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, target_config)?;
+
+    // --- Drafter weights + capture (sized for the largest single
+    //     capture event: prompt prefill writes `prompt_len` rows; each
+    //     verify writes up to `block_size + 1` rows). -----------------
+    let drafter_device = DFlashDrafterDevice::upload(&drafter)?;
+    let capture_max_tokens = prompt_len.max(block_size + 1);
+    let capture = Arc::new(TargetHiddenCapture::alloc(
+        &drafter.config,
+        capture_max_tokens,
+    )?);
+    let capture_for_hook = capture.clone();
+    let hook: qwen36_fp4_runtime::DrafterHiddenCaptureHook =
+        Arc::new(move |layer_idx, residual_ptr, tokens| {
+            capture_for_hook
+                .capture_layer(&CudaBackend, layer_idx, residual_ptr, tokens)
+                .map_err(|e| qwen36_fp4_core::CoreError::Runtime(format!("drafter handoff: {e}")))
+        });
+
+    // --- Prefill: captures rows [0, prompt_len) in capture buffer ----
+    capture.set_write_row(0);
+    engine.set_drafter_hidden_capture(Some(hook.clone()));
+    engine.prefill(&prompt_tokens)?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+
+    engine.queue_sample_greedy_to_current_token()?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+    let mut seed_token = engine.read_current_token()?;
+
+    // --- Drafter workspace + propose scratch ------------------------
+    let manifest = engine
+        .weights
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("engine has no weights manifest after prefill"))?;
+    let gpu_weights = engine
+        .gpu_weights
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("engine has no GPU weights after prefill"))?;
+    let target_embed_ptr = gpu_weights
+        .tensor(&manifest.embed_tokens.name)
+        .ok_or_else(|| anyhow::anyhow!("embed_tokens tensor missing"))?
+        .ptr();
+    let target_lm_head_ptr = gpu_weights
+        .tensor(&manifest.lm_head.name)
+        .ok_or_else(|| anyhow::anyhow!("lm_head tensor missing"))?
+        .ptr();
+
+    // Peak drafter KV per iter N: `prefix_len + ctx_len + q_len`
+    // where `prefix_len ≤ prompt_len + max_new_tokens`, `ctx_len ≤
+    // max(prompt_len, block_size)`, and `q_len = block_size`. Bound the
+    // budget by the sum + small headroom.
+    let ctx_len_max = prompt_len.max(block_size);
+    let kv_cache_max_len = prompt_len + max_new_tokens + ctx_len_max + block_size + 16;
+    let workspace =
+        DrafterForwardWorkspace::alloc(&drafter.config, q_len, ctx_len_max, kv_cache_max_len)?;
+    let mut pos_bytes = Vec::with_capacity(kv_cache_max_len * 4);
+    for p in 0..kv_cache_max_len {
+        pos_bytes.extend_from_slice(&(p as i32).to_le_bytes());
+    }
+    workspace.position_ids_buffer().copy_from_host(&pos_bytes)?;
+    let backend = CudaBackend;
+    let mut forward = DrafterForward::new(&drafter_device, &drafter.config, workspace)?;
+    let propose_ws = DFlashProposeWorkspace::alloc(&drafter.config, q_len)?;
+
+    // --- Outer iter loop --------------------------------------------
+    let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
+    let mut per_iter: Vec<serde_json::Value> = Vec::new();
+    let mut ctx_len = prompt_len; // capture rows from previous step
+    let mut total_committed_after_prompt = 0_usize; // tokens generated so far
+
+    while total_committed_after_prompt < max_new_tokens {
+        // Drafter KV must reflect the prefix length the drafter has
+        // already "seen". For iter 0 we start fresh; otherwise crop to
+        // the just-committed end-of-prefix position.
+        let prefix_len_for_drafter = prompt_len + total_committed_after_prompt;
+        if total_committed_after_prompt == 0 {
+            forward.reset_kv_cache();
+        } else {
+            forward.crop_kv_cache(prefix_len_for_drafter)?;
+        }
+
+        // Build noise tokens: [seed, MASK, ..., MASK].
+        let mut noise_token_ids = Vec::with_capacity(q_len);
+        noise_token_ids.push(seed_token);
+        for _ in 1..q_len {
+            noise_token_ids.push(mask_token_id);
+        }
+
+        let proposed_tokens = propose_block(
+            &backend,
+            &mut forward,
+            &propose_ws,
+            &noise_token_ids,
+            capture.output_ptr(),
+            ctx_len,
+            target_embed_ptr,
+            target_lm_head_ptr,
+            vocab_size,
+        )?;
+        qwen36_fp4_runtime::cuda_synchronize()?;
+        let drafts: Vec<u32> = proposed_tokens[1..].to_vec();
+
+        // Verify via sequential decode_one with per-decode capture
+        // write_row updates so each decode lands at a fresh row.
+        let mut accepted = 0_usize;
+        let mut prev = seed_token;
+        let mut bonus_token: u32 = 0;
+        for (i, &drafted) in drafts.iter().enumerate() {
+            capture.set_write_row(i);
+            engine.decode_one_queued(prev)?;
+            engine.queue_sample_greedy()?;
+            qwen36_fp4_runtime::cuda_synchronize()?;
+            let target_argmax = engine.read_sampled_token()?;
+            if target_argmax == drafted {
+                accepted += 1;
+                prev = drafted;
+            } else {
+                bonus_token = target_argmax;
+                break;
+            }
+        }
+        if accepted == drafts.len() {
+            capture.set_write_row(accepted);
+            engine.decode_one_queued(prev)?;
+            engine.queue_sample_greedy()?;
+            qwen36_fp4_runtime::cuda_synchronize()?;
+            bonus_token = engine.read_sampled_token()?;
+        }
+
+        // Commit accepted drafts + bonus. The seed itself was committed
+        // by the PREVIOUS iter as its bonus (or sampled from prefill
+        // for iter 0); we don't re-emit it here.
+        let mut iter_committed: Vec<u32> = Vec::with_capacity(accepted + 1);
+        if total_committed_after_prompt == 0 {
+            // Iter 0: seed is brand new, never emitted. Include it.
+            iter_committed.push(seed_token);
+        }
+        iter_committed.extend(drafts.iter().copied().take(accepted));
+        iter_committed.push(bonus_token);
+
+        let iter_text = tokenizer.decode(&iter_committed, true).unwrap_or_default();
+        per_iter.push(serde_json::json!({
+            "iter": per_iter.len(),
+            "ctx_len": ctx_len,
+            "accepted": accepted,
+            "bonus_token": bonus_token,
+            "committed_tokens": iter_committed,
+            "committed_decoded": iter_text,
+        }));
+
+        // EOS check before mutating outer state.
+        let mut hit_eos = false;
+        for &t in &iter_committed {
+            generated.push(t);
+            if t == eos_token_id {
+                hit_eos = true;
+                break;
+            }
+        }
+        if hit_eos {
+            break;
+        }
+
+        // Prep for next iter: bonus becomes seed; ctx_len = accepted+1
+        // (drafter consumes hidden states from the just-committed
+        // accepted positions, NOT the bonus). The verify decode loop
+        // wrote those rows at offsets [0, accepted+1).
+        seed_token = bonus_token;
+        ctx_len = accepted + 1;
+        total_committed_after_prompt = generated.len();
+    }
+
+    engine.set_drafter_hidden_capture(None);
+    let generated_text = tokenizer.decode(&generated, true).unwrap_or_default();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "model_dir": model_dir.display().to_string(),
+            "drafter_dir": drafter_dir.display().to_string(),
+            "prompt": prompt,
+            "chat_template": chat_template,
+            "prompt_tokens": prompt_len,
+            "max_new_tokens": max_new_tokens,
+            "block_size": block_size,
+            "iterations": per_iter.len(),
+            "generated_tokens": generated,
+            "generated_text": generated_text,
+            "per_iter": per_iter,
         }))?,
     );
     Ok(())
@@ -2160,7 +2460,10 @@ fn drafter_iter_smoke(
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
     let target_config = EngineConfig {
         // Verify advances target state by up to block_size positions.
-        max_context: ctx_len.saturating_add(block_size).saturating_add(8).max(256),
+        max_context: ctx_len
+            .saturating_add(block_size)
+            .saturating_add(8)
+            .max(256),
         kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Fp8),
         ..EngineConfig::default()
     };
@@ -2173,9 +2476,7 @@ fn drafter_iter_smoke(
         Arc::new(move |layer_idx, residual_ptr, tokens| {
             capture_for_hook
                 .capture_layer(&CudaBackend, layer_idx, residual_ptr, tokens)
-                .map_err(|e| {
-                    qwen36_fp4_core::CoreError::Runtime(format!("drafter handoff: {e}"))
-                })
+                .map_err(|e| qwen36_fp4_core::CoreError::Runtime(format!("drafter handoff: {e}")))
         });
     engine.set_drafter_hidden_capture(Some(hook));
 
@@ -2358,16 +2659,15 @@ fn drafter_handoff_smoke(
         Arc::new(move |layer_idx, residual_ptr, tokens| {
             capture_for_hook
                 .capture_layer(&CudaBackend, layer_idx, residual_ptr, tokens)
-                .map_err(|e| {
-                    qwen36_fp4_core::CoreError::Runtime(format!("drafter handoff: {e}"))
-                })
+                .map_err(|e| qwen36_fp4_core::CoreError::Runtime(format!("drafter handoff: {e}")))
         });
     engine.set_drafter_hidden_capture(Some(hook));
 
     // Synthetic prompt tokens. The model's vocab is large; use ids
     // small enough to land on common bytes. We don't decode them.
-    let synthetic_tokens: Vec<u32> =
-        (0..prompt_tokens_count).map(|i| ((i % 1000) + 1) as u32).collect();
+    let synthetic_tokens: Vec<u32> = (0..prompt_tokens_count)
+        .map(|i| ((i % 1000) + 1) as u32)
+        .collect();
     engine.prefill(&synthetic_tokens)?;
     qwen36_fp4_runtime::cuda_synchronize()?;
     engine.set_drafter_hidden_capture(None);
@@ -2375,12 +2675,8 @@ fn drafter_handoff_smoke(
     // --- Drafter forward on captured target_hidden_raw -----------------
     let ctx_len = prompt_tokens_count;
     let kv_cache_max_len = ctx_len + q_len;
-    let workspace = DrafterForwardWorkspace::alloc(
-        &drafter.config,
-        q_len,
-        ctx_len,
-        kv_cache_max_len,
-    )?;
+    let workspace =
+        DrafterForwardWorkspace::alloc(&drafter.config, q_len, ctx_len, kv_cache_max_len)?;
 
     let hidden = drafter.config.hidden_size;
     let n_target_layers = drafter.config.dflash_config.target_layer_ids.len();
@@ -2521,8 +2817,7 @@ fn drafter_forward_smoke(
             if q_len_arg == 0 {
                 anyhow::bail!("q_len must be > 0 in synthetic mode");
             }
-            let (n, t) =
-                synthesize_inputs(q_len_arg, ctx_len_arg, hidden, n_target_layers);
+            let (n, t) = synthesize_inputs(q_len_arg, ctx_len_arg, hidden, n_target_layers);
             let kv = ctx_len_arg + q_len_arg;
             let mut pos_bytes = Vec::with_capacity(kv * 4);
             for p in 0..kv {
@@ -2562,8 +2857,13 @@ fn drafter_forward_smoke(
     } else {
         None
     };
-    let target_ptr = target_buf.as_ref().map(|b| b.ptr()).unwrap_or(DevicePtr::NULL);
-    workspace.position_ids_buffer().copy_from_host(&position_bytes)?;
+    let target_ptr = target_buf
+        .as_ref()
+        .map(|b| b.ptr())
+        .unwrap_or(DevicePtr::NULL);
+    workspace
+        .position_ids_buffer()
+        .copy_from_host(&position_bytes)?;
 
     let backend = CudaBackend;
     let mut forward = DrafterForward::new(&device, &drafter.config, workspace)?;
@@ -2634,9 +2934,7 @@ fn drafter_forward_smoke(
     if let Some(cos) = cos_sim {
         const FLOOR: f64 = 0.998;
         if cos < FLOOR {
-            anyhow::bail!(
-                "drafter forward cos sim {cos:.6} < floor {FLOOR}; parity regression"
-            );
+            anyhow::bail!("drafter forward cos sim {cos:.6} < floor {FLOOR}; parity regression");
         }
     }
     Ok(())

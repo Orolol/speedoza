@@ -17,22 +17,23 @@ pub mod turboquant;
 pub use attention::{AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape};
 #[cfg(feature = "cuda")]
 pub use backend::CudaBackend;
+pub use backend::{DevicePtr, KernelBackend, NoCudaBackend};
 #[cfg(feature = "cuda")]
 pub use backend::{
     attention_decode_spec_abi_bytes, attention_decode_spec_abi_size,
     deltanet_decode_spec_abi_bytes, deltanet_decode_spec_abi_size, nvfp4_retile_scales,
 };
-pub use backend::{DevicePtr, KernelBackend, NoCudaBackend};
 pub use deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape};
 pub use drafter_attention::DrafterAttentionBlockSpec;
 pub use interpreter::{
-    interpreter_opcodes_enabled_from_env, InterpreterDep, InterpreterInstruction,
-    InterpreterOpcode, InterpreterOpcodeSet, InterpreterProgram, InterpreterProgramSpec,
+    InterpreterDep, InterpreterInstruction, InterpreterOpcode, InterpreterOpcodeSet,
+    InterpreterProgram, InterpreterProgramSpec, interpreter_opcodes_enabled_from_env,
 };
 #[cfg(feature = "cuda")]
 pub use memory::{
-    cuda_clear_l2_access_window, cuda_counters_read, cuda_counters_reset, cuda_diagnostics,
-    cuda_set_l2_access_window, cuda_synchronize, CudaCounters, CudaDeviceBuffer, CudaDiagnostics,
+    CudaCounters, CudaDeviceBuffer, CudaDiagnostics, cuda_clear_l2_access_window,
+    cuda_counters_read, cuda_counters_reset, cuda_diagnostics, cuda_set_l2_access_window,
+    cuda_synchronize,
 };
 pub use nvfp4_gemm::{CublasLtFp4ScaleMode, Nvfp4GemmPlan, Nvfp4GemmSpec};
 pub use ops::{

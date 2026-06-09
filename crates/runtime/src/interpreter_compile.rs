@@ -74,6 +74,12 @@ pub struct DecodeInterpreterRmsNormNvfp4QuantParams {
     pub output_tensor_scale_f32: DevicePtr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeInterpreterNormMlpParams {
+    pub norm: DecodeInterpreterRmsNormNvfp4QuantParams,
+    pub mlp: DecodeInterpreterMlpParams,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeInterpreterResidualAddParams {
     pub values: usize,
@@ -106,6 +112,12 @@ pub struct DecodeInterpreterDeltaNetParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeInterpreterAttentionParams {
     pub spec: DevicePtr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeInterpreterRopeAttentionParams {
+    pub rope: DecodeInterpreterRopeParams,
+    pub attention: DecodeInterpreterAttentionParams,
 }
 
 impl DecodeInterpreterProgram {
@@ -284,6 +296,89 @@ impl DecodeInterpreterProgram {
         }
     }
 
+    pub fn compile_rmsnorm_mlp(params: DecodeInterpreterNormMlpParams) -> Self {
+        let mut program = InterpreterProgram::new();
+        program.push(
+            InterpreterInstruction::rmsnorm_nvfp4_quant(
+                params.norm.hidden,
+                params.norm.eps,
+                params.norm.input_tensor_scale_f32,
+                params.norm.input_bf16,
+                params.norm.weight_bf16,
+                params.norm.residual_bf16,
+                params.norm.residual_out_bf16,
+                params.norm.output_bf16,
+                params.norm.output_fp4,
+                params.norm.output_scale_e4m3,
+                params.norm.output_tensor_scale_f32,
+            )
+            .with_publish(0, 1)
+            .with_arrival_counter(1),
+        );
+        program.push(
+            InterpreterInstruction::nvfp4_gemv(
+                params.mlp.intermediate,
+                params.mlp.hidden,
+                params.mlp.gate_alpha,
+                params.mlp.gate_weight_fp4,
+                params.mlp.gate_weight_scale_e4m3,
+                params.mlp.input_fp4,
+                params.mlp.input_scale_e4m3,
+                params.mlp.gate_out_bf16,
+            )
+            .with_dep(0, 1)
+            .with_publish(2, 1)
+            .with_arrival_counter(3),
+        );
+        program.push(
+            InterpreterInstruction::nvfp4_gemv(
+                params.mlp.intermediate,
+                params.mlp.hidden,
+                params.mlp.up_alpha,
+                params.mlp.up_weight_fp4,
+                params.mlp.up_weight_scale_e4m3,
+                params.mlp.input_fp4,
+                params.mlp.input_scale_e4m3,
+                params.mlp.up_out_bf16,
+            )
+            .with_dep(2, 1)
+            .with_publish(4, 1)
+            .with_arrival_counter(5),
+        );
+        program.push(
+            InterpreterInstruction::swiglu_nvfp4_quant(
+                params.mlp.intermediate,
+                params.mlp.down_input_tensor_scale,
+                params.mlp.gate_out_bf16,
+                params.mlp.up_out_bf16,
+                params.mlp.swiglu_fp4,
+                params.mlp.swiglu_scale_e4m3,
+                params.mlp.swiglu_tensor_scale_f32,
+            )
+            .with_dep(4, 1)
+            .with_publish(6, 1)
+            .with_arrival_counter(7),
+        );
+        program.push(
+            InterpreterInstruction::nvfp4_gemv(
+                params.mlp.hidden,
+                params.mlp.intermediate,
+                params.mlp.down_alpha,
+                params.mlp.down_weight_fp4,
+                params.mlp.down_weight_scale_e4m3,
+                params.mlp.swiglu_fp4,
+                params.mlp.swiglu_scale_e4m3,
+                params.mlp.output_bf16,
+            )
+            .with_dep(6, 1)
+            .with_publish(8, 1)
+            .with_arrival_counter(9),
+        );
+        Self {
+            program: program.finish(),
+        }
+    }
+
     pub fn compile_residual_add(params: DecodeInterpreterResidualAddParams) -> Self {
         let mut program = InterpreterProgram::new();
         program.push(
@@ -344,6 +439,37 @@ impl DecodeInterpreterProgram {
             InterpreterInstruction::attn_decode_full_spec(params.spec)
                 .with_publish(0, 1)
                 .with_arrival_counter(1),
+        );
+        Self {
+            program: program.finish(),
+        }
+    }
+
+    pub fn compile_rope_attention_decode(params: DecodeInterpreterRopeAttentionParams) -> Self {
+        let mut program = InterpreterProgram::new();
+        program.push(
+            InterpreterInstruction::rope_partial(
+                params.rope.tokens,
+                params.rope.q_heads,
+                params.rope.kv_heads,
+                params.rope.head_dim,
+                params.rope.rope_dims,
+                params.rope.base_theta,
+                params.rope.position_i32,
+                params.rope.use_scalar_position,
+                params.rope.positions_i32,
+                params.rope.q_bf16,
+                params.rope.k_bf16,
+                params.rope.scalar_position_device_i32,
+            )
+            .with_publish(0, 1)
+            .with_arrival_counter(1),
+        );
+        program.push(
+            InterpreterInstruction::attn_decode_full_spec(params.attention.spec)
+                .with_dep(0, 1)
+                .with_publish(2, 1)
+                .with_arrival_counter(3),
         );
         Self {
             program: program.finish(),
@@ -546,6 +672,78 @@ mod tests {
     }
 
     #[test]
+    fn rmsnorm_mlp_program_uses_real_opcodes_and_counters() {
+        let compiled =
+            DecodeInterpreterProgram::compile_rmsnorm_mlp(DecodeInterpreterNormMlpParams {
+                norm: DecodeInterpreterRmsNormNvfp4QuantParams {
+                    hidden: 8,
+                    eps: 1.0e-6,
+                    input_tensor_scale_f32: 0.5,
+                    input_bf16: DevicePtr(10),
+                    weight_bf16: DevicePtr(11),
+                    residual_bf16: DevicePtr(12),
+                    residual_out_bf16: DevicePtr(13),
+                    output_bf16: DevicePtr(14),
+                    output_fp4: DevicePtr(20),
+                    output_scale_e4m3: DevicePtr(21),
+                    output_tensor_scale_f32: DevicePtr(22),
+                },
+                mlp: DecodeInterpreterMlpParams {
+                    hidden: 8,
+                    intermediate: 16,
+                    input_fp4: DevicePtr(20),
+                    input_scale_e4m3: DevicePtr(21),
+                    gate_weight_fp4: DevicePtr(23),
+                    gate_weight_scale_e4m3: DevicePtr(24),
+                    gate_alpha: 0.5,
+                    gate_out_bf16: DevicePtr(25),
+                    up_weight_fp4: DevicePtr(26),
+                    up_weight_scale_e4m3: DevicePtr(27),
+                    up_alpha: 0.75,
+                    up_out_bf16: DevicePtr(28),
+                    swiglu_fp4: DevicePtr(20),
+                    swiglu_scale_e4m3: DevicePtr(21),
+                    swiglu_tensor_scale_f32: DevicePtr(22),
+                    down_input_tensor_scale: 1.25,
+                    down_weight_fp4: DevicePtr(29),
+                    down_weight_scale_e4m3: DevicePtr(30),
+                    down_alpha: 1.5,
+                    output_bf16: DevicePtr(31),
+                },
+            });
+        assert_eq!(compiled.program.instructions.len(), 6);
+        assert_eq!(compiled.program.counter_count, 10);
+        assert_eq!(
+            compiled.program.instructions[0].opcode(),
+            Some(InterpreterOpcode::RmsNormNvfp4Quant)
+        );
+        assert_eq!(
+            compiled.program.instructions[1].opcode(),
+            Some(InterpreterOpcode::Nvfp4Gemv)
+        );
+        assert_eq!(
+            compiled.program.instructions[2].opcode(),
+            Some(InterpreterOpcode::Nvfp4Gemv)
+        );
+        assert_eq!(
+            compiled.program.instructions[3].opcode(),
+            Some(InterpreterOpcode::SwiGluNvfp4Quant)
+        );
+        assert_eq!(
+            compiled.program.instructions[4].opcode(),
+            Some(InterpreterOpcode::Nvfp4Gemv)
+        );
+        assert_eq!(compiled.program.instructions[1].deps[0].counter_id, 0);
+        assert_eq!(compiled.program.instructions[2].deps[0].counter_id, 2);
+        assert_eq!(compiled.program.instructions[3].deps[0].counter_id, 4);
+        assert_eq!(compiled.program.instructions[4].deps[0].counter_id, 6);
+        assert_eq!(
+            compiled.program.instructions[5].opcode(),
+            Some(InterpreterOpcode::Exit)
+        );
+    }
+
+    #[test]
     fn rmsnorm_quant_program_uses_real_opcode_and_counter() {
         let compiled = DecodeInterpreterProgram::compile_rmsnorm_nvfp4_quant(
             DecodeInterpreterRmsNormNvfp4QuantParams {
@@ -683,6 +881,48 @@ mod tests {
         assert_eq!(compiled.program.instructions[0].payload[0], 41);
         assert_eq!(
             compiled.program.instructions[1].opcode(),
+            Some(InterpreterOpcode::Exit)
+        );
+    }
+
+    #[test]
+    fn rope_attention_program_uses_real_opcodes_and_counters() {
+        let compiled = DecodeInterpreterProgram::compile_rope_attention_decode(
+            DecodeInterpreterRopeAttentionParams {
+                rope: DecodeInterpreterRopeParams {
+                    tokens: 1,
+                    q_heads: 24,
+                    kv_heads: 4,
+                    head_dim: 256,
+                    rope_dims: 64,
+                    base_theta: 10000.0,
+                    position_i32: 7,
+                    use_scalar_position: true,
+                    positions_i32: DevicePtr::NULL,
+                    q_bf16: DevicePtr(100),
+                    k_bf16: DevicePtr(200),
+                    scalar_position_device_i32: DevicePtr::NULL,
+                },
+                attention: DecodeInterpreterAttentionParams {
+                    spec: DevicePtr(41),
+                },
+            },
+        );
+        assert_eq!(compiled.program.instructions.len(), 3);
+        assert_eq!(compiled.program.counter_count, 4);
+        assert_eq!(
+            compiled.program.instructions[0].opcode(),
+            Some(InterpreterOpcode::RopePartial)
+        );
+        assert_eq!(
+            compiled.program.instructions[1].opcode(),
+            Some(InterpreterOpcode::AttnDecodeFull)
+        );
+        assert_eq!(compiled.program.instructions[1].deps[0].counter_id, 0);
+        assert_eq!(compiled.program.instructions[1].deps[0].target, 1);
+        assert_eq!(compiled.program.instructions[1].payload[0], 41);
+        assert_eq!(
+            compiled.program.instructions[2].opcode(),
             Some(InterpreterOpcode::Exit)
         );
     }

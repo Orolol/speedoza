@@ -64,32 +64,32 @@ impl DFlashDrafterDevice {
         let mut buffers: Vec<CudaDeviceBuffer> = Vec::with_capacity(manifest.tensor_count());
         let mut total_bytes = 0_usize;
 
-        let mut upload_one =
-            |entry: &DFlashWeightRef,
-             buffers: &mut Vec<CudaDeviceBuffer>,
-             total: &mut usize|
-             -> Result<TensorOnDevice> {
-                let buffer = CudaDeviceBuffer::alloc(entry.size_bytes)
-                    .map_err(|e: CoreError| anyhow::anyhow!("alloc {}: {e}", entry.name))?;
-                host.with_tensor(&entry.name, |tensor| {
-                    buffer
-                        .copy_from_host(tensor.data())
-                        .map_err(|e: CoreError| anyhow::anyhow!("upload {}: {e}", entry.name))?;
-                    Ok(())
-                })
-                .with_context(|| format!("drafter upload {}", entry.name))?;
-                let view = TensorOnDevice {
-                    ptr: buffer.ptr(),
-                    bytes: buffer.bytes(),
-                };
-                *total += buffer.bytes();
-                buffers.push(buffer);
-                Ok(view)
+        let mut upload_one = |entry: &DFlashWeightRef,
+                              buffers: &mut Vec<CudaDeviceBuffer>,
+                              total: &mut usize|
+         -> Result<TensorOnDevice> {
+            let buffer = CudaDeviceBuffer::alloc(entry.size_bytes)
+                .map_err(|e: CoreError| anyhow::anyhow!("alloc {}: {e}", entry.name))?;
+            host.with_tensor(&entry.name, |tensor| {
+                buffer
+                    .copy_from_host(tensor.data())
+                    .map_err(|e: CoreError| anyhow::anyhow!("upload {}: {e}", entry.name))?;
+                Ok(())
+            })
+            .with_context(|| format!("drafter upload {}", entry.name))?;
+            let view = TensorOnDevice {
+                ptr: buffer.ptr(),
+                bytes: buffer.bytes(),
             };
+            *total += buffer.bytes();
+            buffers.push(buffer);
+            Ok(view)
+        };
 
         let mut layers = Vec::with_capacity(manifest.layers.len());
         for layer in &manifest.layers {
-            let device_layer = upload_layer(layer, &mut buffers, &mut total_bytes, &mut upload_one)?;
+            let device_layer =
+                upload_layer(layer, &mut buffers, &mut total_bytes, &mut upload_one)?;
             layers.push(device_layer);
         }
 
@@ -116,11 +116,7 @@ impl DFlashDrafterDevice {
     }
 
     pub fn report(&self, manifest: &DFlashManifest) -> DrafterVramReport {
-        let layer_bytes = self
-            .layers
-            .iter()
-            .map(layer_bytes)
-            .sum::<usize>();
+        let layer_bytes = self.layers.iter().map(layer_bytes).sum::<usize>();
         DrafterVramReport {
             layer_bytes,
             fc_bytes: self.fc.bytes,

@@ -127,8 +127,10 @@ impl DrafterForwardWorkspace {
 
         let carry_a = alloc(q_len_max * hidden * BF16_BYTES, "carry_a")?;
         let carry_b = alloc(q_len_max * hidden * BF16_BYTES, "carry_b")?;
-        let target_collapsed_pre_norm =
-            alloc(ctx_len_max * hidden * BF16_BYTES, "target_collapsed_pre_norm")?;
+        let target_collapsed_pre_norm = alloc(
+            ctx_len_max * hidden * BF16_BYTES,
+            "target_collapsed_pre_norm",
+        )?;
         let target_collapsed = alloc(ctx_len_max * hidden * BF16_BYTES, "target_collapsed")?;
         let normed = alloc(q_len_max * hidden * BF16_BYTES, "normed")?;
         let q = alloc(q_len_max * q_features * BF16_BYTES, "q")?;
@@ -138,10 +140,8 @@ impl DrafterForwardWorkspace {
         let up = alloc(q_len_max * intermediate * BF16_BYTES, "up")?;
         let silu = alloc(q_len_max * intermediate * BF16_BYTES, "silu")?;
         let mlp_out = alloc(q_len_max * hidden * BF16_BYTES, "mlp_out")?;
-        let rope_k_scratch =
-            alloc(new_kv_max * kv_features * BF16_BYTES, "rope_k_scratch")?;
-        let rope_q_scratch =
-            alloc(new_kv_max * q_features * BF16_BYTES, "rope_q_scratch")?;
+        let rope_k_scratch = alloc(new_kv_max * kv_features * BF16_BYTES, "rope_k_scratch")?;
+        let rope_q_scratch = alloc(new_kv_max * q_features * BF16_BYTES, "rope_q_scratch")?;
         let output = alloc(q_len_max * hidden * BF16_BYTES, "output")?;
         let gemm_workspace = alloc(GEMM_WORKSPACE_BYTES, "gemm_workspace")?;
         let position_ids = alloc(kv_cache_max_len * I32_BYTES, "position_ids")?;
@@ -225,9 +225,7 @@ impl DrafterForwardWorkspace {
             kv_cache_max_len: self.kv_cache_max_len,
             gemm_workspace_bytes: self.gemm_workspace.bytes(),
             kv_caches_bytes,
-            intermediates_bytes: self.bytes_total
-                - self.gemm_workspace.bytes()
-                - kv_caches_bytes,
+            intermediates_bytes: self.bytes_total - self.gemm_workspace.bytes() - kv_caches_bytes,
             total_bytes: self.bytes_total,
         }
     }
@@ -353,7 +351,10 @@ impl<'w> DrafterForward<'w> {
         ctx_len: usize,
     ) -> Result<DevicePtr> {
         if q_len == 0 || q_len > self.workspace.q_len_max {
-            bail!("q_len {q_len} out of range (max {})", self.workspace.q_len_max);
+            bail!(
+                "q_len {q_len} out of range (max {})",
+                self.workspace.q_len_max
+            );
         }
         if ctx_len > self.workspace.ctx_len_max {
             bail!(
@@ -407,12 +408,10 @@ impl<'w> DrafterForward<'w> {
 
         for layer_idx in 0..self.config.num_hidden_layers {
             let layer_kind = self.device.layers[layer_idx].kind;
-            let input_layernorm_ptr =
-                self.device.layers[layer_idx].input_layernorm.ptr;
+            let input_layernorm_ptr = self.device.layers[layer_idx].input_layernorm.ptr;
             let post_attn_layernorm_ptr =
                 self.device.layers[layer_idx].post_attention_layernorm.ptr;
-            let next_input_layernorm_ptr = if layer_idx + 1 < self.config.num_hidden_layers
-            {
+            let next_input_layernorm_ptr = if layer_idx + 1 < self.config.num_hidden_layers {
                 Some(self.device.layers[layer_idx + 1].input_layernorm.ptr)
             } else {
                 None
@@ -473,9 +472,7 @@ impl<'w> DrafterForward<'w> {
                         output_bf16: self.workspace.normed.ptr(),
                         direct_weight: true,
                     })
-                    .map_err(|e| {
-                        anyhow!("layer {layer_idx} mlp→next input fused rmsnorm: {e}")
-                    })?;
+                    .map_err(|e| anyhow!("layer {layer_idx} mlp→next input fused rmsnorm: {e}"))?;
                 carry = next_carry_ptr;
                 carry_buf_idx ^= 1;
             } else {

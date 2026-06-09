@@ -16,8 +16,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use qwen36_fp4_kernels::{
-    Bf16GemmSpec, CudaDeviceBuffer, DevicePtr, EmbeddingLookupSpec, KernelBackend,
-    SamplingRowsSpec,
+    Bf16GemmSpec, CudaDeviceBuffer, DevicePtr, EmbeddingLookupSpec, KernelBackend, SamplingRowsSpec,
 };
 
 use crate::dflash::DFlashConfig;
@@ -53,12 +52,11 @@ impl DFlashProposeWorkspace {
             CudaDeviceBuffer::alloc(bytes).map_err(|e| anyhow!("alloc {label}: {e}"))
         };
         let noise_token_ids = alloc(q_len_max * U32_BYTES, "noise_token_ids")?;
-        let noise_embedding =
-            alloc(q_len_max * config.hidden_size * BF16_BYTES, "noise_embedding")?;
-        let logits = alloc(
-            q_len_max * config.vocab_size * BF16_BYTES,
-            "propose_logits",
+        let noise_embedding = alloc(
+            q_len_max * config.hidden_size * BF16_BYTES,
+            "noise_embedding",
         )?;
+        let logits = alloc(q_len_max * config.vocab_size * BF16_BYTES, "propose_logits")?;
         let sampled_tokens = alloc(q_len_max * U32_BYTES, "sampled_tokens")?;
         let gemm_workspace = alloc(LM_HEAD_GEMM_WORKSPACE_BYTES, "lm_head_gemm_workspace")?;
 

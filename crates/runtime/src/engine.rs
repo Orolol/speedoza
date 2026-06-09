@@ -7,15 +7,15 @@ use qwen36_fp4_core::TensorInfo;
 use qwen36_fp4_core::{CoreError, KvCacheDtype, ModelLayout, ModelTopology, Result};
 #[cfg(feature = "cuda")]
 use qwen36_fp4_kernels::{
+    AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
+    Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode,
+    CudaBackend, DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape, DevicePtr,
+    EmbeddingLookupSpec, GdnGateSpec, InterpreterOpcode, InterpreterProgramSpec,
+    MegakernelFullAttnStageBQProjSpec, Nvfp4GemmSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
+    PartialRopeSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec,
+    RmsNormSpec, SamplingRowsSpec, SamplingSpec, SwiGluNvfp4QuantizeSpec, SwiGluSpec,
     attention_decode_spec_abi_bytes, deltanet_decode_spec_abi_bytes,
-    interpreter_opcodes_enabled_from_env, AttentionDecodeSpec, AttentionPrefillSpec,
-    AttentionShape, Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec,
-    CopyStridedRowsSpec, CublasLtFp4ScaleMode, CudaBackend, DeltaNetDecodeSpec,
-    DeltaNetPrefillSpec, DeltaNetShape, DevicePtr, EmbeddingLookupSpec, GdnGateSpec,
-    InterpreterOpcode, InterpreterProgramSpec, MegakernelFullAttnStageBQProjSpec, Nvfp4GemmSpec,
-    Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec, QProjDeinterleaveSpec,
-    QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec, SamplingRowsSpec, SamplingSpec,
-    SwiGluNvfp4QuantizeSpec, SwiGluSpec,
+    interpreter_opcodes_enabled_from_env,
 };
 use qwen36_fp4_kernels::{KernelBackend, NoCudaBackend};
 #[cfg(feature = "cuda")]
@@ -24,15 +24,16 @@ use qwen36_fp4_loader::MappedModel;
 use crate::cuda_graph::CudaGraphPlan;
 #[cfg(feature = "cuda")]
 use crate::gpu::{
-    GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers, GpuWeightStore, LinearAttnInProjFused,
-    LinearAttnInProjFusedStore, MlpFusedLayer, MlpFusedStore, MtpKvSnapshotLayout,
-    ATTN_MIN_SPLIT_TIMESTEPS_PER_BLOCK, MEGAKERNEL_BARRIER_STAGE_B_Q_PROJ_BYTES,
+    ATTN_MIN_SPLIT_TIMESTEPS_PER_BLOCK, GpuForwardBuffers, GpuPrefillBuffers, GpuRuntimeBuffers,
+    GpuWeightStore, LinearAttnInProjFused, LinearAttnInProjFusedStore,
+    MEGAKERNEL_BARRIER_STAGE_B_Q_PROJ_BYTES, MlpFusedLayer, MlpFusedStore, MtpKvSnapshotLayout,
 };
 #[cfg(feature = "cuda")]
 use crate::interpreter_compile::{
-    instructions_as_bytes, DecodeInterpreterAttentionParams, DecodeInterpreterDeltaNetParams,
-    DecodeInterpreterLogitsParams, DecodeInterpreterMlpParams, DecodeInterpreterProgram,
-    DecodeInterpreterRmsNormNvfp4QuantParams, DecodeInterpreterRopeParams,
+    DecodeInterpreterAttentionParams, DecodeInterpreterDeltaNetParams,
+    DecodeInterpreterLogitsParams, DecodeInterpreterMlpParams, DecodeInterpreterNormMlpParams,
+    DecodeInterpreterProgram, DecodeInterpreterRmsNormNvfp4QuantParams,
+    DecodeInterpreterRopeAttentionParams, DecodeInterpreterRopeParams, instructions_as_bytes,
 };
 use crate::kv_cache::KvCachePlan;
 use crate::state::{DeltaNetStatePlan, RuntimeState};
@@ -73,6 +74,13 @@ fn cuda_env_bool_value(name: &str) -> Option<bool> {
 #[cfg(feature = "cuda")]
 fn cuda_env_bool(name: &str) -> bool {
     cuda_env_bool_value(name).unwrap_or(false)
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_decode_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| cuda_env_bool("QWEN36_INTERPRETER_DECODE"))
 }
 
 #[cfg(feature = "cuda")]
@@ -153,7 +161,7 @@ fn decode_interpreter_mlp_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if !cuda_env_bool("QWEN36_INTERPRETER_MLP") {
+        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_MLP") {
             return false;
         }
         let opcodes = interpreter_opcodes_enabled_from_env();
@@ -163,11 +171,26 @@ fn decode_interpreter_mlp_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
+fn decode_interpreter_norm_mlp_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_NORM_MLP") {
+            return false;
+        }
+        let opcodes = interpreter_opcodes_enabled_from_env();
+        opcodes.contains(InterpreterOpcode::RmsNormNvfp4Quant)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
+            && opcodes.contains(InterpreterOpcode::SwiGluNvfp4Quant)
+    })
+}
+
+#[cfg(feature = "cuda")]
 fn decode_interpreter_rmsnorm_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if !cuda_env_bool("QWEN36_INTERPRETER_RMSNORM") {
+        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_RMSNORM") {
             return false;
         }
         interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::RmsNormNvfp4Quant)
@@ -179,7 +202,7 @@ fn decode_interpreter_deltanet_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if !cuda_env_bool("QWEN36_INTERPRETER_DELTANET") {
+        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_DELTANET") {
             return false;
         }
         interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::DeltaNetRecur)
@@ -191,7 +214,7 @@ fn decode_interpreter_attention_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if !cuda_env_bool("QWEN36_INTERPRETER_ATTN") {
+        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_ATTN") {
             return false;
         }
         interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::AttnDecodeFull)
@@ -203,10 +226,24 @@ fn decode_interpreter_rope_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if !cuda_env_bool("QWEN36_INTERPRETER_ROPE") {
+        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_ROPE") {
             return false;
         }
         interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::RopePartial)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_full_attention_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_FULL_ATTN") {
+            return false;
+        }
+        let opcodes = interpreter_opcodes_enabled_from_env();
+        opcodes.contains(InterpreterOpcode::RopePartial)
+            && opcodes.contains(InterpreterOpcode::AttnDecodeFull)
     })
 }
 
@@ -2749,7 +2786,7 @@ impl<B: KernelBackend> Engine<B> {
         leaf_tokens: &[u32],
         next_draft_count: usize,
     ) -> Result<qwen36_fp4_mtp::TreeVerifyResult> {
-        use qwen36_fp4_mtp::{walk_tree_acceptance, TreeDraft, MTP_TREE_MAX_LEAVES};
+        use qwen36_fp4_mtp::{MTP_TREE_MAX_LEAVES, TreeDraft, walk_tree_acceptance};
 
         if leaf_tokens.is_empty() {
             return Err(CoreError::Runtime(
@@ -3914,6 +3951,13 @@ impl<B: KernelBackend> Engine<B> {
                 )?;
             };
             residual_initialized = true;
+            // Phase F.2: DFlash drafter hidden-state capture on the
+            // decode path. Mirrors the prefill hook (Phase E); tokens=1
+            // since decode is per-token. `forward.residual` now equals
+            // `hidden_states[layer_idx]` for the single decoded token.
+            if let Some(hook) = &self.drafter_hidden_capture {
+                hook(layer_idx, forward.residual.ptr(), 1)?;
+            }
             if dump_decode {
                 if let Some(dir) = &dump_dir {
                     self.dump_buffer_to_disk(
@@ -3979,77 +4023,109 @@ impl<B: KernelBackend> Engine<B> {
                 } else {
                     DevicePtr::NULL
                 };
-                self.rmsnorm_nvfp4_quantize(
-                    self.topology.hidden_size,
-                    forward.block_out.ptr(),
-                    self.tensor_ptr(weights, &common.post_attention_layernorm)?,
-                    forward.residual.ptr(),
-                    forward.residual.ptr(),
-                    output_bf16,
-                    quantized.input_scale,
-                    position_device_i32 == DevicePtr::NULL,
-                )?;
-                if dump_decode {
-                    if let Some(dir) = &dump_dir {
-                        self.dump_buffer_to_disk(
-                            dir,
-                            &format!("{dump_prefix}_layer{layer_idx:02}_post_attn_normed.bf16"),
-                            forward.normed.ptr(),
-                            self.topology.hidden_size,
-                        )?;
-                        self.dump_bytes_to_disk(
-                            dir,
-                            &format!("{dump_prefix}_layer{layer_idx:02}_post_attn_activation.fp4"),
-                            forward.activation_fp4.ptr(),
-                            self.topology.hidden_size.div_ceil(2),
-                        )?;
-                        self.dump_bytes_to_disk(
-                            dir,
-                            &format!(
-                                "{dump_prefix}_layer{layer_idx:02}_post_attn_activation_scale.e4m3"
-                            ),
-                            forward.activation_scale.ptr(),
-                            self.topology.hidden_size.div_ceil(16).div_ceil(4) * 512,
-                        )?;
-                    }
-                }
-                let mlp_start = profile_decode.then(std::time::Instant::now);
-                // Stage F.4 fast path: when enabled AND the layer has a
-                // fused gate+up store AND alignments hold, replace the
-                // {cuBLASLt gate+up GEMM + swiglu_nvfp4_quantize + down
-                // NVFP4 GEMV} trio with a single megakernel launch.
-                // Phase 3 (residual add) is skipped so the next layer's
-                // input-norm fuse still owns the residual update.
-                let full_attn_layer = matches!(layer, LayerWeights::FullAttention(_));
-                let layer_idx = match layer {
-                    LayerWeights::LinearAttention(l) => l.layer_index,
-                    LayerWeights::FullAttention(l) => l.layer_index,
-                };
-                let f4_eligible = full_attn_layer
-                    && megakernel_full_attn_stage_f4_enabled()
-                    && megakernel_full_attn_stage_f4_supports(
-                        self.topology.hidden_size,
-                        self.topology.intermediate_size,
-                    )
-                    && self.mlp_fused_main_opt(layer_idx).is_some();
-                let interpreter_mlp_eligible = decode_interpreter_mlp_enabled()
+                let post_attention_norm_weight =
+                    self.tensor_ptr(weights, &common.post_attention_layernorm)?;
+                let mut ran_norm_mlp = false;
+                if !dump_decode
                     && position_device_i32 == DevicePtr::NULL
-                    && decode_interpreter_mlp_supports(
+                    && decode_interpreter_norm_mlp_enabled()
+                {
+                    let mlp_start = profile_decode.then(std::time::Instant::now);
+                    ran_norm_mlp = self.run_interpreter_norm_mlp(
+                        layer,
+                        forward,
+                        quantized,
                         self.topology.hidden_size,
-                        self.topology.intermediate_size,
-                    );
-                let ran_interpreter_mlp = interpreter_mlp_eligible
-                    && self.run_interpreter_mlp_with_quantized_input(layer, forward, quantized)?;
-                if !ran_interpreter_mlp {
-                    if f4_eligible {
-                        self.run_mlp_megakernel_f4(layer, forward, quantized)?;
-                    } else {
-                        self.run_mlp_with_quantized_input(layer, forward, quantized)?;
+                        forward.block_out.ptr(),
+                        post_attention_norm_weight,
+                        forward.residual.ptr(),
+                        forward.residual.ptr(),
+                        output_bf16,
+                        quantized.input_scale,
+                    )?;
+                    if ran_norm_mlp {
+                        if let Some(mlp_start) = mlp_start {
+                            qwen36_fp4_kernels::cuda_synchronize()?;
+                            prof_mlp_ms += mlp_start.elapsed().as_secs_f64() * 1000.0;
+                        }
                     }
                 }
-                if let Some(mlp_start) = mlp_start {
-                    qwen36_fp4_kernels::cuda_synchronize()?;
-                    prof_mlp_ms += mlp_start.elapsed().as_secs_f64() * 1000.0;
+                if !ran_norm_mlp {
+                    self.rmsnorm_nvfp4_quantize(
+                        self.topology.hidden_size,
+                        forward.block_out.ptr(),
+                        post_attention_norm_weight,
+                        forward.residual.ptr(),
+                        forward.residual.ptr(),
+                        output_bf16,
+                        quantized.input_scale,
+                        position_device_i32 == DevicePtr::NULL,
+                    )?;
+                    if dump_decode {
+                        if let Some(dir) = &dump_dir {
+                            self.dump_buffer_to_disk(
+                                dir,
+                                &format!("{dump_prefix}_layer{layer_idx:02}_post_attn_normed.bf16"),
+                                forward.normed.ptr(),
+                                self.topology.hidden_size,
+                            )?;
+                            self.dump_bytes_to_disk(
+                                dir,
+                                &format!(
+                                    "{dump_prefix}_layer{layer_idx:02}_post_attn_activation.fp4"
+                                ),
+                                forward.activation_fp4.ptr(),
+                                self.topology.hidden_size.div_ceil(2),
+                            )?;
+                            self.dump_bytes_to_disk(
+                                dir,
+                                &format!(
+                                    "{dump_prefix}_layer{layer_idx:02}_post_attn_activation_scale.e4m3"
+                                ),
+                                forward.activation_scale.ptr(),
+                                self.topology.hidden_size.div_ceil(16).div_ceil(4) * 512,
+                            )?;
+                        }
+                    }
+                    let mlp_start = profile_decode.then(std::time::Instant::now);
+                    // Stage F.4 fast path: when enabled AND the layer has a
+                    // fused gate+up store AND alignments hold, replace the
+                    // {cuBLASLt gate+up GEMM + swiglu_nvfp4_quantize + down
+                    // NVFP4 GEMV} trio with a single megakernel launch.
+                    // Phase 3 (residual add) is skipped so the next layer's
+                    // input-norm fuse still owns the residual update.
+                    let full_attn_layer = matches!(layer, LayerWeights::FullAttention(_));
+                    let layer_idx = match layer {
+                        LayerWeights::LinearAttention(l) => l.layer_index,
+                        LayerWeights::FullAttention(l) => l.layer_index,
+                    };
+                    let f4_eligible = full_attn_layer
+                        && megakernel_full_attn_stage_f4_enabled()
+                        && megakernel_full_attn_stage_f4_supports(
+                            self.topology.hidden_size,
+                            self.topology.intermediate_size,
+                        )
+                        && self.mlp_fused_main_opt(layer_idx).is_some();
+                    let interpreter_mlp_eligible = decode_interpreter_mlp_enabled()
+                        && position_device_i32 == DevicePtr::NULL
+                        && decode_interpreter_mlp_supports(
+                            self.topology.hidden_size,
+                            self.topology.intermediate_size,
+                        );
+                    let ran_interpreter_mlp = interpreter_mlp_eligible
+                        && self
+                            .run_interpreter_mlp_with_quantized_input(layer, forward, quantized)?;
+                    if !ran_interpreter_mlp {
+                        if f4_eligible {
+                            self.run_mlp_megakernel_f4(layer, forward, quantized)?;
+                        } else {
+                            self.run_mlp_with_quantized_input(layer, forward, quantized)?;
+                        }
+                    }
+                    if let Some(mlp_start) = mlp_start {
+                        qwen36_fp4_kernels::cuda_synchronize()?;
+                        prof_mlp_ms += mlp_start.elapsed().as_secs_f64() * 1000.0;
+                    }
                 }
             } else {
                 self.rmsnorm(
@@ -4409,16 +4485,6 @@ impl<B: KernelBackend> Engine<B> {
             k_bf16: forward.aux.ptr(),
             scalar_position_device_i32: position_device_i32,
         };
-        if decode_interpreter_rope_enabled() {
-            self.run_interpreter_partial_rope(&rope_spec, forward)?;
-        } else {
-            self.backend.partial_rope(&rope_spec)?;
-        }
-        // Productive spin: fork L2 prefetch of this layer's MLP combined
-        // weight onto the secondary stream so it overlaps the small-CTA
-        // attention kernel that follows. `None` when productive spin is
-        // disabled or no MLP fused store exists for this layer.
-        let prefetch_join = self.fork_productive_spin(layer.layer_index)?;
         let attention_context_limit = self.decode_attention_context_limit_for_position(position);
         let attention_spec = AttentionDecodeSpec {
             layer_index: layer.layer_index,
@@ -4446,11 +4512,29 @@ impl<B: KernelBackend> Engine<B> {
             split_timesteps_per_block: self
                 .attention_split_timesteps_per_block_for(attention_context_limit),
         };
-        if decode_interpreter_attention_enabled() {
-            self.run_interpreter_attention_decode(&attention_spec, forward)?;
+
+        // Productive spin: fork L2 prefetch of this layer's MLP combined
+        // weight onto the secondary stream so it overlaps the small-CTA
+        // attention work. `None` when productive spin is disabled or no MLP
+        // fused store exists for this layer.
+        let prefetch_join = if decode_interpreter_full_attention_enabled() {
+            let prefetch_join = self.fork_productive_spin(layer.layer_index)?;
+            self.run_interpreter_rope_attention_decode(&rope_spec, &attention_spec, forward)?;
+            prefetch_join
         } else {
-            self.backend.attention_decode(&attention_spec)?;
-        }
+            if decode_interpreter_rope_enabled() {
+                self.run_interpreter_partial_rope(&rope_spec, forward)?;
+            } else {
+                self.backend.partial_rope(&rope_spec)?;
+            }
+            let prefetch_join = self.fork_productive_spin(layer.layer_index)?;
+            if decode_interpreter_attention_enabled() {
+                self.run_interpreter_attention_decode(&attention_spec, forward)?;
+            } else {
+                self.backend.attention_decode(&attention_spec)?;
+            }
+            prefetch_join
+        };
         self.backend.q_proj_sigmoid_gate(&QProjSigmoidGateSpec {
             rows: 1,
             heads: self.topology.attention_num_heads,
@@ -6578,12 +6662,106 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
-    fn run_interpreter_mlp_with_quantized_input(
+    fn run_interpreter_rope_attention_decode(
+        &self,
+        rope_spec: &PartialRopeSpec,
+        attention_spec: &AttentionDecodeSpec,
+        forward: &GpuForwardBuffers,
+    ) -> Result<()> {
+        let bf16_kv_cache_dtype = Self::attention_kv_cache_dtype_code(KvCacheDtype::Bf16)?;
+        if rope_spec.tokens != 1
+            || !rope_spec.use_scalar_position
+            || rope_spec.positions_i32 != DevicePtr::NULL
+            || rope_spec.scalar_position_device_i32 != DevicePtr::NULL
+            || attention_spec.kv_cache_dtype != bf16_kv_cache_dtype
+            || attention_spec.decode_n_splits > 1
+            || attention_spec.position_device_i32 != DevicePtr::NULL
+        {
+            self.backend.partial_rope(rope_spec)?;
+            self.backend.attention_decode(attention_spec)?;
+            return Ok(());
+        }
+
+        let mut interpreter_attention_spec = attention_spec.clone();
+        interpreter_attention_spec.kv_cache_metadata = DevicePtr::NULL;
+        interpreter_attention_spec.partial_acc_f32 = DevicePtr::NULL;
+        interpreter_attention_spec.partial_max_f32 = DevicePtr::NULL;
+        interpreter_attention_spec.partial_denom_f32 = DevicePtr::NULL;
+        interpreter_attention_spec.decode_n_splits =
+            interpreter_attention_spec.decode_n_splits.min(1);
+        interpreter_attention_spec.split_timesteps_per_block = 0;
+
+        let spec_bytes = attention_decode_spec_abi_bytes(&interpreter_attention_spec);
+        if spec_bytes.len() > forward.interpreter_attention_spec.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter RoPE+Attention spec needs {} bytes but buffer has {}",
+                spec_bytes.len(),
+                forward.interpreter_attention_spec.bytes()
+            )));
+        }
+        forward
+            .interpreter_attention_spec
+            .copy_from_host(&spec_bytes)?;
+
+        let compiled = DecodeInterpreterProgram::compile_rope_attention_decode(
+            DecodeInterpreterRopeAttentionParams {
+                rope: DecodeInterpreterRopeParams {
+                    tokens: rope_spec.tokens,
+                    q_heads: rope_spec.q_heads,
+                    kv_heads: rope_spec.kv_heads,
+                    head_dim: rope_spec.head_dim,
+                    rope_dims: rope_spec.rope_dims,
+                    base_theta: rope_spec.base_theta,
+                    position_i32: rope_spec.position_i32,
+                    use_scalar_position: rope_spec.use_scalar_position,
+                    positions_i32: rope_spec.positions_i32,
+                    q_bf16: rope_spec.q_bf16,
+                    k_bf16: rope_spec.k_bf16,
+                    scalar_position_device_i32: rope_spec.scalar_position_device_i32,
+                },
+                attention: DecodeInterpreterAttentionParams {
+                    spec: forward.interpreter_attention_spec.ptr(),
+                },
+            },
+        );
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_attention_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter RoPE+Attention program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_attention_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_attention_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter RoPE+Attention program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_attention_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_attention_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_attention_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_attention_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_attention_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: 0,
+            })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn decode_interpreter_mlp_params(
         &self,
         layer: &LayerWeights,
         forward: &GpuForwardBuffers,
         quantized: Nvfp4ActivationQuant<'_>,
-    ) -> Result<bool> {
+    ) -> Result<Option<DecodeInterpreterMlpParams>> {
         let common = layer_common(layer);
         let weights = self.cuda_weights()?;
         let intermediate = self.topology.intermediate_size;
@@ -6595,7 +6773,7 @@ impl<B: KernelBackend> Engine<B> {
             input_scale: gate_input_scale,
         } = &common.mlp_gate_proj
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let LinearWeightBinding::Nvfp4 {
             weight: up_weight,
@@ -6604,7 +6782,7 @@ impl<B: KernelBackend> Engine<B> {
             input_scale: up_input_scale,
         } = &common.mlp_up_proj
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let LinearWeightBinding::Nvfp4 {
             weight: down_weight,
@@ -6613,17 +6791,17 @@ impl<B: KernelBackend> Engine<B> {
             input_scale: down_input_scale,
         } = &common.mlp_down_proj
         else {
-            return Ok(false);
+            return Ok(None);
         };
 
         if !decode_interpreter_mlp_supports(hidden, intermediate) {
-            return Ok(false);
+            return Ok(None);
         }
         if Self::nvfp4_in_features(gate_weight)? != quantized.in_features
             || Self::nvfp4_in_features(up_weight)? != quantized.in_features
             || Self::nvfp4_in_features(down_weight)? != intermediate
         {
-            return Ok(false);
+            return Ok(None);
         }
         let gate_out = *gate_weight.shape.first().ok_or_else(|| {
             CoreError::Runtime(format!("tensor {} has empty shape", gate_weight.name))
@@ -6635,7 +6813,7 @@ impl<B: KernelBackend> Engine<B> {
             CoreError::Runtime(format!("tensor {} has empty shape", down_weight.name))
         })?;
         if gate_out != intermediate || up_out != intermediate || down_out != hidden {
-            return Ok(false);
+            return Ok(None);
         }
 
         self.validate_nvfp4_input_scale(gate_weight, quantized.input_scale, gate_input_scale)?;
@@ -6649,7 +6827,7 @@ impl<B: KernelBackend> Engine<B> {
         let down_alpha =
             self.tensor_scalar_f32(weights, down_tensor_scale)? * down_input_tensor_scale;
 
-        let compiled = DecodeInterpreterProgram::compile_mlp(DecodeInterpreterMlpParams {
+        Ok(Some(DecodeInterpreterMlpParams {
             hidden,
             intermediate,
             input_fp4: forward.activation_fp4.ptr(),
@@ -6670,7 +6848,20 @@ impl<B: KernelBackend> Engine<B> {
             down_weight_scale_e4m3: self.tensor_ptr(weights, down_block_scale)?,
             down_alpha,
             output_bf16: forward.hidden.ptr(),
-        });
+        }))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_interpreter_mlp_with_quantized_input(
+        &self,
+        layer: &LayerWeights,
+        forward: &GpuForwardBuffers,
+        quantized: Nvfp4ActivationQuant<'_>,
+    ) -> Result<bool> {
+        let Some(params) = self.decode_interpreter_mlp_params(layer, forward, quantized)? else {
+            return Ok(false);
+        };
+        let compiled = DecodeInterpreterProgram::compile_mlp(params);
         let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
         if instruction_bytes.len() > forward.interpreter_mlp_instructions.bytes() {
             return Err(CoreError::Runtime(format!(
@@ -6683,6 +6874,74 @@ impl<B: KernelBackend> Engine<B> {
         if counter_bytes > forward.interpreter_mlp_counters.bytes() {
             return Err(CoreError::Runtime(format!(
                 "interpreter MLP program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_mlp_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_mlp_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_mlp_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_mlp_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_mlp_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: 0,
+            })?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_interpreter_norm_mlp(
+        &self,
+        layer: &LayerWeights,
+        forward: &GpuForwardBuffers,
+        quantized: Nvfp4ActivationQuant<'_>,
+        hidden: usize,
+        input_bf16: DevicePtr,
+        weight_bf16: DevicePtr,
+        residual_bf16: DevicePtr,
+        residual_out_bf16: DevicePtr,
+        output_bf16: DevicePtr,
+        input_scale: &TensorInfo,
+    ) -> Result<bool> {
+        let Some(mlp) = self.decode_interpreter_mlp_params(layer, forward, quantized)? else {
+            return Ok(false);
+        };
+        let input_tensor_scale_f32 = self.tensor_scalar_f32(self.cuda_weights()?, input_scale)?;
+        let compiled =
+            DecodeInterpreterProgram::compile_rmsnorm_mlp(DecodeInterpreterNormMlpParams {
+                norm: DecodeInterpreterRmsNormNvfp4QuantParams {
+                    hidden,
+                    eps: 1.0e-6,
+                    input_tensor_scale_f32,
+                    input_bf16,
+                    weight_bf16,
+                    residual_bf16,
+                    residual_out_bf16,
+                    output_bf16,
+                    output_fp4: forward.activation_fp4.ptr(),
+                    output_scale_e4m3: forward.activation_scale.ptr(),
+                    output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                },
+                mlp,
+            });
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_mlp_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter RMSNorm+MLP program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_mlp_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_mlp_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter RMSNorm+MLP program needs {counter_bytes} counter bytes but buffer has {}",
                 forward.interpreter_mlp_counters.bytes()
             )));
         }
@@ -7069,11 +7328,7 @@ impl<B: KernelBackend> Engine<B> {
         let n_splits = context_limit
             .max(1)
             .div_ceil(self.attention_split_timesteps_per_block_for(context_limit));
-        if n_splits >= 2 {
-            n_splits
-        } else {
-            0
-        }
+        if n_splits >= 2 { n_splits } else { 0 }
     }
 
     #[cfg(feature = "cuda")]
@@ -7093,11 +7348,7 @@ impl<B: KernelBackend> Engine<B> {
             return value;
         }
         let n_splits = context.div_ceil(self.attention_split_timesteps_per_block_for(context));
-        if n_splits >= 2 {
-            n_splits
-        } else {
-            0
-        }
+        if n_splits >= 2 { n_splits } else { 0 }
     }
 
     #[cfg(feature = "cuda")]

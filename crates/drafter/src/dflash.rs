@@ -199,10 +199,7 @@ impl DFlashDrafter {
 
         let shards = find_safetensors(&drafter_dir)?;
         if shards.is_empty() {
-            bail!(
-                "no .safetensors files found in {}",
-                drafter_dir.display(),
-            );
+            bail!("no .safetensors files found in {}", drafter_dir.display(),);
         }
 
         let mut files = BTreeMap::new();
@@ -329,10 +326,7 @@ fn build_manifest(
             );
         }
         if entry.dtype != "BF16" {
-            bail!(
-                "drafter tensor {name} dtype {} != BF16",
-                entry.dtype,
-            );
+            bail!("drafter tensor {name} dtype {} != BF16", entry.dtype,);
         }
         Ok(entry)
     };
@@ -352,10 +346,22 @@ fn build_manifest(
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 &[hidden],
             )?,
-            q_proj: take(&format!("{prefix}.self_attn.q_proj.weight"), &[q_out, hidden])?,
-            k_proj: take(&format!("{prefix}.self_attn.k_proj.weight"), &[kv_out, hidden])?,
-            v_proj: take(&format!("{prefix}.self_attn.v_proj.weight"), &[kv_out, hidden])?,
-            o_proj: take(&format!("{prefix}.self_attn.o_proj.weight"), &[hidden, q_out])?,
+            q_proj: take(
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                &[q_out, hidden],
+            )?,
+            k_proj: take(
+                &format!("{prefix}.self_attn.k_proj.weight"),
+                &[kv_out, hidden],
+            )?,
+            v_proj: take(
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                &[kv_out, hidden],
+            )?,
+            o_proj: take(
+                &format!("{prefix}.self_attn.o_proj.weight"),
+                &[hidden, q_out],
+            )?,
             q_norm: take(
                 &format!("{prefix}.self_attn.q_norm.weight"),
                 &[config.head_dim],
