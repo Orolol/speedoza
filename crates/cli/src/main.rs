@@ -604,12 +604,7 @@ fn main() -> Result<()> {
                 })?;
                 #[cfg(feature = "cuda")]
                 {
-                    return run_chat_dflash(
-                        model_dir,
-                        drafter_dir,
-                        prompt,
-                        max_new_tokens,
-                    );
+                    return run_chat_dflash(model_dir, drafter_dir, prompt, max_new_tokens);
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
@@ -620,9 +615,7 @@ fn main() -> Result<()> {
                 }
             }
             if drafter_dir.is_some() {
-                anyhow::bail!(
-                    "--drafter-dir is only valid with --drafter dflash"
-                );
+                anyhow::bail!("--drafter-dir is only valid with --drafter dflash");
             }
             run_chat(
                 model_dir,
@@ -1130,12 +1123,7 @@ fn run_dump_logits(
         logits.push(f32::from_bits(bits));
     }
 
-    let mut indexed: Vec<(usize, f32)> = logits
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, v)| (i, v))
-        .collect();
+    let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
     indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     println!("top-{top_k} logits after prefill:");
@@ -1237,12 +1225,7 @@ fn run_dump_decode(
         logits.push(f32::from_bits(bits));
     }
 
-    let mut indexed: Vec<(usize, f32)> = logits
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, v)| (i, v))
-        .collect();
+    let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
     indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     println!("top-{top_k} logits after one decode step:");
@@ -2241,8 +2224,7 @@ fn decode_vs_prefill_check(model_dir: PathBuf, prompt: String) -> Result<()> {
     }
 
     let make_engine = || -> Result<Engine<qwen36_fp4_kernels::CudaBackend>> {
-        let layout =
-            discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+        let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
         let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
         let config = EngineConfig {
             max_context: prompt_tokens.len().saturating_add(16).max(256),
@@ -2264,8 +2246,7 @@ fn decode_vs_prefill_check(model_dir: PathBuf, prompt: String) -> Result<()> {
         };
 
     let vocab_size = {
-        let layout =
-            discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+        let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
         layout.topology.vocab_size
     };
 
@@ -2306,7 +2287,9 @@ fn decode_vs_prefill_check(model_dir: PathBuf, prompt: String) -> Result<()> {
 
     let cos_sim = bf16_cosine_similarity(&logits_decode, &logits_prefill);
     let decode_text = tokenizer.decode(&[argmax_decode], true).unwrap_or_default();
-    let prefill_text = tokenizer.decode(&[argmax_prefill], true).unwrap_or_default();
+    let prefill_text = tokenizer
+        .decode(&[argmax_prefill], true)
+        .unwrap_or_default();
     let seed_text = tokenizer.decode(&[seed], true).unwrap_or_default();
 
     println!(
@@ -2428,12 +2411,8 @@ fn run_chat_dflash(
 
     let ctx_len_max = prompt_len.max(block_size);
     let kv_cache_max_len = prompt_len + max_new_tokens + ctx_len_max + block_size + 16;
-    let workspace = DrafterForwardWorkspace::alloc(
-        &drafter.config,
-        q_len,
-        ctx_len_max,
-        kv_cache_max_len,
-    )?;
+    let workspace =
+        DrafterForwardWorkspace::alloc(&drafter.config, q_len, ctx_len_max, kv_cache_max_len)?;
     let mut pos_bytes = Vec::with_capacity(kv_cache_max_len * 4);
     for p in 0..kv_cache_max_len {
         pos_bytes.extend_from_slice(&(p as i32).to_le_bytes());
@@ -3444,9 +3423,10 @@ fn synthesize_inputs(
 }
 
 #[cfg(feature = "cuda")]
-fn load_fixture(
-    dir: &std::path::Path,
-) -> Result<(usize, usize, Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+type DFlashFixture = (usize, usize, Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+
+#[cfg(feature = "cuda")]
+fn load_fixture(dir: &std::path::Path) -> Result<DFlashFixture> {
     let config_path = dir.join("config.json");
     let config_bytes = std::fs::read(&config_path)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", config_path.display()))?;

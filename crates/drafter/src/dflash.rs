@@ -277,16 +277,13 @@ impl DFlashDrafter {
                 }
             }
         }
-        for entry in [
+        [
             &self.manifest.fc,
             &self.manifest.hidden_norm,
             &self.manifest.norm,
-        ] {
-            if entry.name == name {
-                return Some(entry);
-            }
-        }
-        None
+        ]
+        .into_iter()
+        .find(|entry| entry.name == name)
     }
 }
 

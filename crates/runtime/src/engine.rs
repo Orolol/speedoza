@@ -9,12 +9,14 @@ use qwen36_fp4_core::{CoreError, KvCacheDtype, ModelLayout, ModelTopology, Resul
 use qwen36_fp4_kernels::{
     AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
     Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode,
-    CudaBackend, DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape, DevicePtr,
-    EmbeddingLookupSpec, GdnGateSpec, InterpreterOpcode, InterpreterProgramSpec, Nvfp4GemmSpec,
-    Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec, QProjDeinterleaveSpec,
-    QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec, SamplingRowsSpec, SamplingSpec,
-    SwiGluNvfp4QuantizeSpec, SwiGluSpec, attention_decode_spec_abi_bytes,
-    deltanet_decode_spec_abi_bytes, interpreter_opcodes_enabled_from_env,
+    CudaBackend, CudaDeviceBuffer, DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape,
+    DevicePtr, EmbeddingLookupSpec, GdnGateSpec, InterpreterOpcode, InterpreterProgramSpec,
+    Nvfp4GemmSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec,
+    QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec,
+    SamplingRowsSpec, SamplingSpec, SwiGluNvfp4QuantizeSpec, SwiGluSpec,
+    attention_decode_spec_abi_bytes, attention_decode_spec_abi_size,
+    deltanet_decode_spec_abi_bytes, deltanet_decode_spec_abi_size,
+    interpreter_opcodes_enabled_from_env,
 };
 use qwen36_fp4_kernels::{KernelBackend, NoCudaBackend};
 #[cfg(feature = "cuda")]
@@ -29,13 +31,18 @@ use crate::gpu::{
 };
 #[cfg(feature = "cuda")]
 use crate::interpreter_compile::{
-    DecodeInterpreterAttentionParams, DecodeInterpreterDeltaNetParams,
-    DecodeInterpreterFullAttentionLayerParams, DecodeInterpreterLogitsParams,
+    DecodeInterpreterAttentionParams, DecodeInterpreterConv1dGdnGateFusedParams,
+    DecodeInterpreterDeltaNetParams, DecodeInterpreterFullAttentionInputLayerParams,
+    DecodeInterpreterFullAttentionLayerParams, DecodeInterpreterFullTransformerLayerParams,
+    DecodeInterpreterLinearAttentionInputLayerParams, DecodeInterpreterLinearAttentionLayerParams,
+    DecodeInterpreterLinearAttentionPostInProjParams, DecodeInterpreterLinearAttentionTailParams,
+    DecodeInterpreterLinearTransformerLayerParams, DecodeInterpreterLogitsParams,
     DecodeInterpreterMlpParams, DecodeInterpreterNormMlpParams, DecodeInterpreterNvfp4GemvParams,
     DecodeInterpreterNvfp4QuantizeParams, DecodeInterpreterProgram,
     DecodeInterpreterQProjDeinterleaveParams, DecodeInterpreterQProjSigmoidGateParams,
     DecodeInterpreterRmsNormBf16Params, DecodeInterpreterRmsNormNvfp4QuantParams,
-    DecodeInterpreterRopeAttentionParams, DecodeInterpreterRopeParams, instructions_as_bytes,
+    DecodeInterpreterRopeAttentionParams, DecodeInterpreterRopeParams,
+    DecodeInterpreterSwiGluBf16Params, instructions_as_bytes,
 };
 use crate::kv_cache::KvCachePlan;
 use crate::state::{DeltaNetStatePlan, RuntimeState};
@@ -83,6 +90,23 @@ fn decode_interpreter_decode_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| cuda_env_bool("QWEN36_INTERPRETER_DECODE"))
+}
+
+/// Bit 0 of `InterpreterProgramSpec::flags` controls L2 weight prefetch
+/// lookahead in the dispatch loop (see
+/// `kernels-cuda/interpreter/prefetch.cuh`). Default off until the
+/// implementation reliably beats the no-prefetch baseline on MTP=0.
+#[cfg(feature = "cuda")]
+fn interpreter_launch_flags() -> u32 {
+    use std::sync::OnceLock;
+    static FLAGS: OnceLock<u32> = OnceLock::new();
+    *FLAGS.get_or_init(|| {
+        let mut bits = 0u32;
+        if cuda_env_bool("QWEN36_INTERPRETER_PREFETCH") {
+            bits |= 1;
+        }
+        bits
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -241,6 +265,167 @@ fn decode_interpreter_full_attention_layer_enabled() -> bool {
             && opcodes.contains(InterpreterOpcode::AttnDecodeFull)
             && opcodes.contains(InterpreterOpcode::QProjSigmoidGate)
             && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_full_attention_input_layer_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if cuda_env_bool("QWEN36_INTERPRETER_FULL_ATTN_INPUT_LAYER_DISABLE") {
+            return false;
+        }
+        if !decode_interpreter_decode_enabled()
+            && !cuda_env_bool("QWEN36_INTERPRETER_FULL_ATTN_INPUT_LAYER")
+        {
+            return false;
+        }
+        let opcodes = interpreter_opcodes_enabled_from_env();
+        opcodes.contains(InterpreterOpcode::RmsNormNvfp4Quant)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
+            && opcodes.contains(InterpreterOpcode::QProjDeinterleave)
+            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
+            && opcodes.contains(InterpreterOpcode::RopePartial)
+            && opcodes.contains(InterpreterOpcode::AttnDecodeFull)
+            && opcodes.contains(InterpreterOpcode::QProjSigmoidGate)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_full_transformer_layer_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if cuda_env_bool("QWEN36_INTERPRETER_FULL_TRANSFORMER_LAYER_DISABLE") {
+            return false;
+        }
+        if !decode_interpreter_decode_enabled()
+            && !cuda_env_bool("QWEN36_INTERPRETER_FULL_TRANSFORMER_LAYER")
+        {
+            return false;
+        }
+        let opcodes = interpreter_opcodes_enabled_from_env();
+        opcodes.contains(InterpreterOpcode::RmsNormNvfp4Quant)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
+            && opcodes.contains(InterpreterOpcode::QProjDeinterleave)
+            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
+            && opcodes.contains(InterpreterOpcode::RopePartial)
+            && opcodes.contains(InterpreterOpcode::AttnDecodeFull)
+            && opcodes.contains(InterpreterOpcode::QProjSigmoidGate)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
+            && opcodes.contains(InterpreterOpcode::SwiGluNvfp4Quant)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_linear_attention_tail_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !decode_interpreter_decode_enabled()
+            && !cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_TAIL")
+        {
+            return false;
+        }
+        let opcodes = interpreter_opcodes_enabled_from_env();
+        opcodes.contains(InterpreterOpcode::RmsNormBf16)
+            && opcodes.contains(InterpreterOpcode::SwiGluBf16)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_linear_attention_post_inproj_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !decode_interpreter_decode_enabled()
+            && !cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_POST_INPROJ")
+        {
+            return false;
+        }
+        let opcodes = interpreter_opcodes_enabled_from_env();
+        opcodes.contains(InterpreterOpcode::Conv1dGdnGateFused)
+            && opcodes.contains(InterpreterOpcode::DeltaNetRecur)
+            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
+            && opcodes.contains(InterpreterOpcode::SwiGluBf16)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_linear_attention_layer_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_LAYER_DISABLE") {
+            return false;
+        }
+        if !decode_interpreter_decode_enabled()
+            && !cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_LAYER")
+        {
+            return false;
+        }
+        let opcodes = interpreter_opcodes_enabled_from_env();
+        opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
+            && opcodes.contains(InterpreterOpcode::Conv1dGdnGateFused)
+            && opcodes.contains(InterpreterOpcode::DeltaNetRecur)
+            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
+            && opcodes.contains(InterpreterOpcode::SwiGluBf16)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_linear_attention_input_layer_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_INPUT_LAYER_DISABLE") {
+            return false;
+        }
+        if !decode_interpreter_decode_enabled()
+            && !cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_INPUT_LAYER")
+        {
+            return false;
+        }
+        let opcodes = interpreter_opcodes_enabled_from_env();
+        opcodes.contains(InterpreterOpcode::RmsNormNvfp4Quant)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
+            && opcodes.contains(InterpreterOpcode::Conv1dGdnGateFused)
+            && opcodes.contains(InterpreterOpcode::DeltaNetRecur)
+            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
+            && opcodes.contains(InterpreterOpcode::SwiGluBf16)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_linear_transformer_layer_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if cuda_env_bool("QWEN36_INTERPRETER_LINEAR_TRANSFORMER_LAYER_DISABLE") {
+            return false;
+        }
+        if !decode_interpreter_decode_enabled()
+            && !cuda_env_bool("QWEN36_INTERPRETER_LINEAR_TRANSFORMER_LAYER")
+        {
+            return false;
+        }
+        let opcodes = interpreter_opcodes_enabled_from_env();
+        opcodes.contains(InterpreterOpcode::RmsNormNvfp4Quant)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
+            && opcodes.contains(InterpreterOpcode::Conv1dGdnGateFused)
+            && opcodes.contains(InterpreterOpcode::DeltaNetRecur)
+            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
+            && opcodes.contains(InterpreterOpcode::SwiGluBf16)
+            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
+            && opcodes.contains(InterpreterOpcode::SwiGluNvfp4Quant)
     })
 }
 
@@ -513,6 +698,13 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
     /// instead of a host scalar so the same graph can replay across iterations.
     #[cfg(feature = "cuda")]
     decode_graph: Option<DecodeGraphState>,
+    /// Per-layer interpreter programs uploaded before CUDA graph capture.
+    /// Graph replay cannot depend on host-side instruction/spec copies into a
+    /// single scratch buffer because every graph node would then observe the
+    /// same final contents. These entries give each fused layer stable device
+    /// storage for instructions, counters, and its ABI spec.
+    #[cfg(feature = "cuda")]
+    decode_interpreter_graph_programs: Option<DecodeInterpreterGraphPrograms>,
     /// Secondary prefetch stream + reusable event pool. Lazily constructed on
     /// first use by the productive-spin / megakernel paths; `None` until then.
     #[cfg(feature = "cuda")]
@@ -535,6 +727,52 @@ struct DecodeGraphState {
     stream: qwen36_fp4_kernels::graph::OwnedCudaStream,
     exec: qwen36_fp4_kernels::graph::CudaGraphExec,
     raw_graph: qwen36_fp4_kernels::graph::CudaGraph,
+}
+
+#[cfg(feature = "cuda")]
+struct DecodeInterpreterGraphLayerProgram {
+    instructions: CudaDeviceBuffer,
+    counters_i32: CudaDeviceBuffer,
+    _spec: Option<CudaDeviceBuffer>,
+    instruction_count: usize,
+    counter_count: usize,
+}
+
+#[cfg(feature = "cuda")]
+struct DecodeInterpreterGraphPrograms {
+    attention_context_limit: usize,
+    position_device_i32: DevicePtr,
+    layers: Vec<Option<DecodeInterpreterGraphLayerProgram>>,
+}
+
+#[cfg(feature = "cuda")]
+impl DecodeInterpreterGraphLayerProgram {
+    fn upload(program: DecodeInterpreterProgram, spec: Option<CudaDeviceBuffer>) -> Result<Self> {
+        let instruction_bytes = instructions_as_bytes(&program.program.instructions);
+        let instructions = CudaDeviceBuffer::alloc(instruction_bytes.len())?;
+        instructions.copy_from_host(instruction_bytes)?;
+        let counters_i32 =
+            CudaDeviceBuffer::zeroed(program.program.counter_count * size_of::<i32>())?;
+        Ok(Self {
+            instructions,
+            counters_i32,
+            _spec: spec,
+            instruction_count: program.program.instructions.len(),
+            counter_count: program.program.counter_count,
+        })
+    }
+
+    fn run<B: KernelBackend>(&self, backend: &B) -> Result<()> {
+        self.counters_i32.memset_async(0)?;
+        backend.interpreter_decode_sm120(&InterpreterProgramSpec {
+            instructions: self.instructions.ptr(),
+            instruction_count: self.instruction_count,
+            counters_i32: self.counters_i32.ptr(),
+            counter_count: self.counter_count,
+            cta_count: 0,
+            flags: interpreter_launch_flags(),
+        })
+    }
 }
 
 /// Auxiliary CUDA stream + event pool used by the decode hot path to overlap
@@ -665,6 +903,8 @@ impl<B: KernelBackend> Engine<B> {
             #[cfg(feature = "cuda")]
             decode_graph: None,
             #[cfg(feature = "cuda")]
+            decode_interpreter_graph_programs: None,
+            #[cfg(feature = "cuda")]
             decode_aux: None,
             #[cfg(feature = "cuda")]
             drafter_hidden_capture: None,
@@ -735,18 +975,14 @@ impl<B: KernelBackend> Engine<B> {
 
         let final_norm_weight = {
             let manifest = self.weights.as_ref().ok_or_else(|| {
-                CoreError::Runtime(
-                    "verify_block_batched: missing weights manifest".to_owned(),
-                )
+                CoreError::Runtime("verify_block_batched: missing weights manifest".to_owned())
             })?;
             let weights = self.cuda_weights()?;
             self.tensor_ptr(weights, &manifest.final_norm)?
         };
         let lm_head_weight = {
             let manifest = self.weights.as_ref().ok_or_else(|| {
-                CoreError::Runtime(
-                    "verify_block_batched: missing weights manifest".to_owned(),
-                )
+                CoreError::Runtime("verify_block_batched: missing weights manifest".to_owned())
             })?;
             let weights = self.cuda_weights()?;
             self.tensor_ptr(weights, &manifest.lm_head)?
@@ -1039,6 +1275,10 @@ impl<B: KernelBackend> Engine<B> {
         // Productive-spin prefetch stream + event pool must exist before
         // capture begins so kernels can fork to it inside the graph.
         self.ensure_decode_aux_if_enabled()?;
+        self.prepare_decode_interpreter_graph_programs(
+            position_buffer_ptr,
+            attention_context_limit,
+        )?;
 
         // Capture: decode forward (using device position) + sample +
         // increment_i32. Wrapped in a closure so any error reverts the
@@ -2492,6 +2732,7 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
     fn recover_after_mtp_multi_reject(
         &mut self,
         current_token: u32,
@@ -4057,83 +4298,218 @@ impl<B: KernelBackend> Engine<B> {
                 DevicePtr::NULL
             };
             let quantized_normed = Self::layer_input_nvfp4_quant(layer)?;
-            if let Some(quantized) = quantized_normed {
-                let output_bf16 = if dump_decode {
-                    forward.normed.ptr()
-                } else {
-                    DevicePtr::NULL
-                };
-                self.rmsnorm_nvfp4_quantize(
-                    self.topology.hidden_size,
-                    forward.hidden.ptr(),
-                    self.tensor_ptr(weights, layer_common_input_norm(layer))?,
-                    input_residual,
-                    forward.residual.ptr(),
-                    output_bf16,
-                    quantized.input_scale,
-                    position_device_i32 == DevicePtr::NULL,
-                )?;
-            } else {
-                self.rmsnorm(
-                    1,
-                    self.topology.hidden_size,
-                    forward.hidden.ptr(),
-                    self.tensor_ptr(weights, layer_common_input_norm(layer))?,
-                    input_residual,
-                    forward.residual.ptr(),
-                    forward.normed.ptr(),
-                )?;
-            };
-            residual_initialized = true;
-            // Phase F.2: DFlash drafter hidden-state capture on the
-            // decode path. Mirrors the prefill hook (Phase E); tokens=1
-            // since decode is per-token. `forward.residual` now equals
-            // `hidden_states[layer_idx]` for the single decoded token.
-            if let Some(hook) = &self.drafter_hidden_capture {
-                hook(layer_idx, forward.residual.ptr(), 1)?;
-            }
-            if dump_decode {
-                if let Some(dir) = &dump_dir {
-                    self.dump_buffer_to_disk(
-                        dir,
-                        &format!("{dump_prefix}_layer{layer_idx:02}_input_normed.bf16"),
-                        forward.normed.ptr(),
-                        self.topology.hidden_size,
-                    )?;
+            let mut ran_attention = false;
+            let mut ran_transformer_layer = false;
+
+            if !dump_decode && position_device_i32 != DevicePtr::NULL {
+                if let Some(program) =
+                    self.decode_interpreter_graph_layer_program(layer_idx, position_device_i32)
+                {
+                    program.run(&self.backend)?;
+                    residual_initialized = true;
+                    ran_attention = true;
+                    ran_transformer_layer = true;
                 }
             }
 
-            let attn_start = profile_decode.then(std::time::Instant::now);
-            let is_linear = matches!(layer, LayerWeights::LinearAttention(_));
-            match layer {
-                LayerWeights::LinearAttention(layer) => {
-                    self.run_linear_attention_layer(
-                        layer,
-                        runtime,
-                        forward,
-                        quantized_normed,
-                        position_device_i32 == DevicePtr::NULL,
-                    )?;
+            if !ran_transformer_layer && !dump_decode && position_device_i32 == DevicePtr::NULL {
+                if let LayerWeights::LinearAttention(linear) = layer {
+                    if let Some(input_quantized) = quantized_normed {
+                        let common = &linear.common;
+                        let mlp_input_linears = [
+                            (&common.mlp_gate_proj, DevicePtr::NULL),
+                            (&common.mlp_up_proj, DevicePtr::NULL),
+                        ];
+                        if let Some(mlp_quantized) = Self::common_nvfp4_quant(&mlp_input_linears)? {
+                            let layer_start = profile_decode.then(std::time::Instant::now);
+                            ran_transformer_layer = self
+                                .run_interpreter_linear_transformer_layer_decode(
+                                    linear,
+                                    runtime,
+                                    forward,
+                                    input_quantized,
+                                    mlp_quantized,
+                                    input_residual,
+                                    self.tensor_ptr(weights, &common.input_layernorm)?,
+                                    self.tensor_ptr(weights, &common.post_attention_layernorm)?,
+                                )?;
+                            if ran_transformer_layer {
+                                residual_initialized = true;
+                                ran_attention = true;
+                                if let Some(layer_start) = layer_start {
+                                    qwen36_fp4_kernels::cuda_synchronize()?;
+                                    prof_linear_attn_ms +=
+                                        layer_start.elapsed().as_secs_f64() * 1000.0;
+                                }
+                            }
+                        }
+                    }
                 }
-                LayerWeights::FullAttention(layer) => {
-                    self.run_full_attention_layer(
-                        layer,
-                        runtime,
-                        forward,
-                        position,
-                        position_device_i32,
-                        quantized_normed,
-                    )?;
+                if !ran_transformer_layer {
+                    if let LayerWeights::FullAttention(full) = layer {
+                        if let Some(input_quantized) = quantized_normed {
+                            let common = &full.common;
+                            let mlp_input_linears = [
+                                (&common.mlp_gate_proj, DevicePtr::NULL),
+                                (&common.mlp_up_proj, DevicePtr::NULL),
+                            ];
+                            if let Some(mlp_quantized) =
+                                Self::common_nvfp4_quant(&mlp_input_linears)?
+                            {
+                                let layer_start = profile_decode.then(std::time::Instant::now);
+                                ran_transformer_layer = self
+                                    .run_interpreter_full_transformer_layer_decode(
+                                        full,
+                                        runtime,
+                                        forward,
+                                        position,
+                                        input_quantized,
+                                        mlp_quantized,
+                                        input_residual,
+                                        self.tensor_ptr(weights, &common.input_layernorm)?,
+                                        self.tensor_ptr(weights, &common.post_attention_layernorm)?,
+                                    )?;
+                                if ran_transformer_layer {
+                                    residual_initialized = true;
+                                    ran_attention = true;
+                                    if let Some(layer_start) = layer_start {
+                                        qwen36_fp4_kernels::cuda_synchronize()?;
+                                        prof_full_attn_ms +=
+                                            layer_start.elapsed().as_secs_f64() * 1000.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            if let Some(attn_start) = attn_start {
-                qwen36_fp4_kernels::cuda_synchronize()?;
-                let elapsed = attn_start.elapsed().as_secs_f64() * 1000.0;
-                if is_linear {
-                    prof_linear_attn_ms += elapsed;
-                } else {
-                    prof_full_attn_ms += elapsed;
+
+            if !ran_attention && !dump_decode && position_device_i32 == DevicePtr::NULL {
+                if let Some(quantized) = quantized_normed {
+                    let attn_start = profile_decode.then(std::time::Instant::now);
+                    ran_attention = match layer {
+                        LayerWeights::LinearAttention(linear) => self
+                            .run_interpreter_linear_attention_input_layer_decode(
+                                linear,
+                                runtime,
+                                forward,
+                                quantized,
+                                input_residual,
+                                self.tensor_ptr(weights, layer_common_input_norm(layer))?,
+                            )?,
+                        LayerWeights::FullAttention(full) => self
+                            .run_interpreter_full_attention_input_layer_decode(
+                                full,
+                                runtime,
+                                forward,
+                                position,
+                                quantized,
+                                input_residual,
+                                self.tensor_ptr(weights, layer_common_input_norm(layer))?,
+                            )?,
+                    };
+                    if ran_attention {
+                        residual_initialized = true;
+                        if let Some(hook) = &self.drafter_hidden_capture {
+                            hook(layer_idx, forward.residual.ptr(), 1)?;
+                        }
+                        if let Some(attn_start) = attn_start {
+                            qwen36_fp4_kernels::cuda_synchronize()?;
+                            let elapsed = attn_start.elapsed().as_secs_f64() * 1000.0;
+                            match layer {
+                                LayerWeights::LinearAttention(_) => prof_linear_attn_ms += elapsed,
+                                LayerWeights::FullAttention(_) => prof_full_attn_ms += elapsed,
+                            }
+                        }
+                    }
                 }
+            }
+
+            if !ran_attention {
+                if let Some(quantized) = quantized_normed {
+                    let output_bf16 = if dump_decode {
+                        forward.normed.ptr()
+                    } else {
+                        DevicePtr::NULL
+                    };
+                    self.rmsnorm_nvfp4_quantize(
+                        self.topology.hidden_size,
+                        forward.hidden.ptr(),
+                        self.tensor_ptr(weights, layer_common_input_norm(layer))?,
+                        input_residual,
+                        forward.residual.ptr(),
+                        output_bf16,
+                        quantized.input_scale,
+                        position_device_i32 == DevicePtr::NULL,
+                    )?;
+                } else {
+                    self.rmsnorm(
+                        1,
+                        self.topology.hidden_size,
+                        forward.hidden.ptr(),
+                        self.tensor_ptr(weights, layer_common_input_norm(layer))?,
+                        input_residual,
+                        forward.residual.ptr(),
+                        forward.normed.ptr(),
+                    )?;
+                };
+                residual_initialized = true;
+                // Phase F.2: DFlash drafter hidden-state capture on the
+                // decode path. Mirrors the prefill hook (Phase E); tokens=1
+                // since decode is per-token. `forward.residual` now equals
+                // `hidden_states[layer_idx]` for the single decoded token.
+                if let Some(hook) = &self.drafter_hidden_capture {
+                    hook(layer_idx, forward.residual.ptr(), 1)?;
+                }
+                if dump_decode {
+                    if let Some(dir) = &dump_dir {
+                        self.dump_buffer_to_disk(
+                            dir,
+                            &format!("{dump_prefix}_layer{layer_idx:02}_input_normed.bf16"),
+                            forward.normed.ptr(),
+                            self.topology.hidden_size,
+                        )?;
+                    }
+                }
+
+                let attn_start = profile_decode.then(std::time::Instant::now);
+                let attention_was_linear = matches!(layer, LayerWeights::LinearAttention(_));
+                match layer {
+                    LayerWeights::LinearAttention(layer) => {
+                        self.run_linear_attention_layer(
+                            layer,
+                            runtime,
+                            forward,
+                            quantized_normed,
+                            position_device_i32 == DevicePtr::NULL,
+                        )?;
+                    }
+                    LayerWeights::FullAttention(layer) => {
+                        self.run_full_attention_layer(
+                            layer,
+                            runtime,
+                            forward,
+                            position,
+                            position_device_i32,
+                            quantized_normed,
+                        )?;
+                    }
+                }
+                if let Some(attn_start) = attn_start {
+                    qwen36_fp4_kernels::cuda_synchronize()?;
+                    let elapsed = attn_start.elapsed().as_secs_f64() * 1000.0;
+                    if attention_was_linear {
+                        prof_linear_attn_ms += elapsed;
+                    } else {
+                        prof_full_attn_ms += elapsed;
+                    }
+                }
+            }
+            if ran_transformer_layer {
+                if let Some(hook) = &self.drafter_hidden_capture {
+                    hook(layer_idx, forward.normed.ptr(), 1)?;
+                }
+                continue;
             }
             if dump_decode {
                 if let Some(dir) = &dump_dir {
@@ -4411,6 +4787,29 @@ impl<B: KernelBackend> Engine<B> {
             .deltanet_state
             .ptr_at(layer_ordinal * self.state.deltanet.state_bytes_per_layer as usize)?;
 
+        if interpreter_allowed {
+            if let Some(fused) = self.linear_attn_in_proj_fused_layer_opt(layer.layer_index) {
+                let quantized = match prequantized_normed {
+                    Some(q) => q,
+                    None => {
+                        let q = self.linear_attn_in_proj_quant(layer)?;
+                        self.quantize_nvfp4_activation(forward.normed.ptr(), q)?;
+                        q
+                    }
+                };
+                if self.run_interpreter_linear_attention_layer_decode(
+                    layer,
+                    fused,
+                    forward,
+                    quantized,
+                    conv_history,
+                    state,
+                )? {
+                    return Ok(());
+                }
+            }
+        }
+
         let (conv_input_ptr, b_ptr, a_ptr, z_ptr) = if let Some(fused) =
             self.linear_attn_in_proj_fused_layer_opt(layer.layer_index)
         {
@@ -4465,22 +4864,6 @@ impl<B: KernelBackend> Engine<B> {
             )
         };
 
-        self.backend
-            .conv1d_gdn_gate_fused(&Conv1dGdnGateFusedSpec {
-                channels: qkv_dim,
-                kernel_size: self.topology.linear_conv_kernel_dim,
-                conv_input_bf16: conv_input_ptr,
-                conv_history_bf16: conv_history,
-                conv_weight_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.conv1d_weight)?,
-                conv_output_bf16: forward.aux.ptr(),
-                heads: self.topology.linear_num_value_heads,
-                gdn_a_bf16: a_ptr,
-                gdn_b_bf16: b_ptr,
-                gdn_a_log_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.a_log)?,
-                gdn_dt_bias_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.dt_bias)?,
-                gate_f32: forward.gate_f32.ptr(),
-                beta_f32: forward.beta_f32.ptr(),
-            })?;
         let deltanet_spec = DeltaNetDecodeSpec {
             layer_index: layer.layer_index,
             tokens_in_persistent_loop: 1,
@@ -4506,6 +4889,37 @@ impl<B: KernelBackend> Engine<B> {
             update_scale: 1.0,
             qk_l2norm: true,
         };
+        if interpreter_allowed
+            && z_ptr != conv_input_ptr
+            && self.run_interpreter_linear_attention_post_inproj_decode(
+                layer,
+                forward,
+                conv_input_ptr,
+                conv_history,
+                a_ptr,
+                b_ptr,
+                z_ptr,
+                &deltanet_spec,
+            )?
+        {
+            return Ok(());
+        }
+        self.backend
+            .conv1d_gdn_gate_fused(&Conv1dGdnGateFusedSpec {
+                channels: qkv_dim,
+                kernel_size: self.topology.linear_conv_kernel_dim,
+                conv_input_bf16: conv_input_ptr,
+                conv_history_bf16: conv_history,
+                conv_weight_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.conv1d_weight)?,
+                conv_output_bf16: forward.aux.ptr(),
+                heads: self.topology.linear_num_value_heads,
+                gdn_a_bf16: a_ptr,
+                gdn_b_bf16: b_ptr,
+                gdn_a_log_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.a_log)?,
+                gdn_dt_bias_bf16: self.tensor_ptr(self.cuda_weights()?, &layer.dt_bias)?,
+                gate_f32: forward.gate_f32.ptr(),
+                beta_f32: forward.beta_f32.ptr(),
+            })?;
         if interpreter_allowed && decode_interpreter_deltanet_enabled() {
             self.run_interpreter_deltanet_decode(&deltanet_spec, forward)?;
         } else {
@@ -4522,6 +4936,16 @@ impl<B: KernelBackend> Engine<B> {
             }
         }
         // `z_ptr` is either the fused-GEMM slice or the fallback z projection.
+        if interpreter_allowed
+            && self.run_interpreter_linear_attention_tail_decode(
+                layer,
+                forward,
+                z_ptr,
+                forward.aux3.ptr(),
+            )?
+        {
+            return Ok(());
+        }
         self.rmsnorm_direct_weight(
             self.topology.linear_num_value_heads,
             self.topology.linear_value_head_dim,
@@ -5306,6 +5730,7 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
     fn run_full_attention_layer_prefill(
         &self,
         layer: &FullAttentionLayerWeights,
@@ -6610,7 +7035,7 @@ impl<B: KernelBackend> Engine<B> {
                 counters_i32: forward.interpreter_norm_counters.ptr(),
                 counter_count: compiled.program.counter_count,
                 cta_count: 0,
-                flags: 0,
+                flags: interpreter_launch_flags(),
             })
     }
 
@@ -6672,7 +7097,7 @@ impl<B: KernelBackend> Engine<B> {
                 counters_i32: forward.interpreter_deltanet_counters.ptr(),
                 counter_count: compiled.program.counter_count,
                 cta_count: 0,
-                flags: 0,
+                flags: interpreter_launch_flags(),
             })
     }
 
@@ -6733,7 +7158,7 @@ impl<B: KernelBackend> Engine<B> {
                 counters_i32: forward.interpreter_rope_counters.ptr(),
                 counter_count: compiled.program.counter_count,
                 cta_count: 0,
-                flags: 0,
+                flags: interpreter_launch_flags(),
             })
     }
 
@@ -6804,7 +7229,7 @@ impl<B: KernelBackend> Engine<B> {
                 counters_i32: forward.interpreter_attention_counters.ptr(),
                 counter_count: compiled.program.counter_count,
                 cta_count: 0,
-                flags: 0,
+                flags: interpreter_launch_flags(),
             })
     }
 
@@ -6898,7 +7323,7 @@ impl<B: KernelBackend> Engine<B> {
                 counters_i32: forward.interpreter_attention_counters.ptr(),
                 counter_count: compiled.program.counter_count,
                 cta_count: 0,
-                flags: 0,
+                flags: interpreter_launch_flags(),
             })
     }
 
@@ -6946,6 +7371,840 @@ impl<B: KernelBackend> Engine<B> {
             b_scale_e4m3: input_scale_e4m3,
             c_bf16: output_bf16,
         }))
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_interpreter_full_attention_input_layer_decode(
+        &self,
+        layer: &FullAttentionLayerWeights,
+        runtime: &GpuRuntimeBuffers,
+        forward: &GpuForwardBuffers,
+        position: usize,
+        quantized: Nvfp4ActivationQuant<'_>,
+        input_residual_bf16: DevicePtr,
+        input_norm_weight_bf16: DevicePtr,
+    ) -> Result<bool> {
+        if !decode_interpreter_full_attention_input_layer_enabled() {
+            return Ok(false);
+        }
+
+        let bf16_kv_cache_dtype = Self::attention_kv_cache_dtype_code(KvCacheDtype::Bf16)?;
+        let configured_kv_cache_dtype =
+            Self::attention_kv_cache_dtype_code(self.config.kv_cache_dtype)?;
+        if configured_kv_cache_dtype != bf16_kv_cache_dtype {
+            return Ok(false);
+        }
+
+        let cache = runtime
+            .kv_cache
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("KV cache was not allocated".to_owned()))?;
+        let layout = self
+            .state
+            .kv_cache
+            .layers
+            .iter()
+            .find(|layout| layout.global_layer_index == layer.layer_index)
+            .ok_or_else(|| {
+                CoreError::Runtime(format!(
+                    "missing KV-cache layout for layer {}",
+                    layer.layer_index
+                ))
+            })?;
+
+        let q_values = self.topology.attention_num_heads * self.topology.attention_head_dim;
+        let kv_values = self.topology.attention_num_kv_heads * self.topology.attention_head_dim;
+        let hidden = self.topology.hidden_size;
+        let input_fp4 = forward.activation_fp4.ptr();
+        let input_scale_e4m3 = forward.activation_scale.ptr();
+
+        let Some(q_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.q_proj,
+            quantized,
+            input_fp4,
+            input_scale_e4m3,
+            forward.qkv.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        let Some(k_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.k_proj,
+            quantized,
+            input_fp4,
+            input_scale_e4m3,
+            forward.aux.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        let Some(v_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.v_proj,
+            quantized,
+            input_fp4,
+            input_scale_e4m3,
+            forward.aux2.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if q_proj.m != q_values * 2
+            || q_proj.k != hidden
+            || k_proj.m != kv_values
+            || k_proj.k != hidden
+            || v_proj.m != kv_values
+            || v_proj.k != hidden
+        {
+            return Ok(false);
+        }
+
+        let LinearWeightBinding::Nvfp4 {
+            input_scale: o_input_scale,
+            ..
+        } = &layer.o_proj
+        else {
+            return Ok(false);
+        };
+        let o_quantized = Nvfp4ActivationQuant {
+            in_features: q_values,
+            input_scale: o_input_scale,
+        };
+        let Some(o_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.o_proj,
+            o_quantized,
+            forward.activation_fp4.ptr(),
+            forward.activation_scale.ptr(),
+            forward.block_out.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if o_proj.m != hidden || o_proj.k != q_values {
+            return Ok(false);
+        }
+
+        let attention_context_limit = self.decode_attention_context_limit_for_position(position);
+        let decode_n_splits =
+            self.decode_attention_n_splits_for_context_limit(attention_context_limit);
+
+        let mut attention_spec = AttentionDecodeSpec {
+            layer_index: layer.layer_index,
+            position,
+            q_bf16: forward.aux3.ptr(),
+            k_bf16: forward.aux.ptr(),
+            v_bf16: forward.aux2.ptr(),
+            kv_cache_k: cache.ptr_at(layout.k_offset_bytes as usize)?,
+            kv_cache_v: cache.ptr_at(layout.v_offset_bytes as usize)?,
+            kv_cache_metadata: DevicePtr::NULL,
+            output_bf16: forward.aux3.ptr(),
+            shape: AttentionShape {
+                q_heads: self.topology.attention_num_heads,
+                kv_heads: self.topology.attention_num_kv_heads,
+                head_dim: self.topology.attention_head_dim,
+                rope_dims: self.topology.attention_rope_dims(),
+            },
+            kv_cache_dtype: bf16_kv_cache_dtype,
+            position_device_i32: DevicePtr::NULL,
+            partial_acc_f32: DevicePtr::NULL,
+            partial_max_f32: DevicePtr::NULL,
+            partial_denom_f32: DevicePtr::NULL,
+            decode_n_splits: decode_n_splits.min(1),
+            split_timesteps_per_block: 0,
+        };
+        attention_spec.decode_n_splits = attention_spec.decode_n_splits.min(1);
+
+        let spec_bytes = attention_decode_spec_abi_bytes(&attention_spec);
+        if spec_bytes.len() > forward.interpreter_attention_spec.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter full-attn input-layer spec needs {} bytes but buffer has {}",
+                spec_bytes.len(),
+                forward.interpreter_attention_spec.bytes()
+            )));
+        }
+        forward
+            .interpreter_attention_spec
+            .copy_from_host(&spec_bytes)?;
+
+        let weights = self.cuda_weights()?;
+        let o_input_tensor_scale_f32 = self.tensor_scalar_f32(weights, o_input_scale)?;
+        let compiled = DecodeInterpreterProgram::compile_full_attention_input_layer_decode(
+            DecodeInterpreterFullAttentionInputLayerParams {
+                input_norm: DecodeInterpreterRmsNormNvfp4QuantParams {
+                    hidden,
+                    eps: 1.0e-6,
+                    input_tensor_scale_f32: self
+                        .tensor_scalar_f32(weights, quantized.input_scale)?,
+                    input_bf16: forward.hidden.ptr(),
+                    weight_bf16: input_norm_weight_bf16,
+                    residual_bf16: input_residual_bf16,
+                    residual_out_bf16: forward.residual.ptr(),
+                    output_bf16: DevicePtr::NULL,
+                    output_fp4: forward.activation_fp4.ptr(),
+                    output_scale_e4m3: forward.activation_scale.ptr(),
+                    output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                },
+                layer: DecodeInterpreterFullAttentionLayerParams {
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    q_proj_deinterleave: DecodeInterpreterQProjDeinterleaveParams {
+                        rows: 1,
+                        heads: self.topology.attention_num_heads,
+                        head_dim: self.topology.attention_head_dim,
+                        input_bf16: forward.qkv.ptr(),
+                        output_bf16: forward.aux3.ptr(),
+                    },
+                    q_norm: DecodeInterpreterRmsNormBf16Params {
+                        rows: self.topology.attention_num_heads,
+                        hidden: self.topology.attention_head_dim,
+                        eps: 1.0e-6,
+                        direct_weight: false,
+                        input_bf16: forward.aux3.ptr(),
+                        weight_bf16: self.tensor_ptr(weights, &layer.q_norm)?,
+                        residual_bf16: DevicePtr::NULL,
+                        residual_out_bf16: DevicePtr::NULL,
+                        output_bf16: forward.aux3.ptr(),
+                    },
+                    k_norm: DecodeInterpreterRmsNormBf16Params {
+                        rows: self.topology.attention_num_kv_heads,
+                        hidden: self.topology.attention_head_dim,
+                        eps: 1.0e-6,
+                        direct_weight: false,
+                        input_bf16: forward.aux.ptr(),
+                        weight_bf16: self.tensor_ptr(weights, &layer.k_norm)?,
+                        residual_bf16: DevicePtr::NULL,
+                        residual_out_bf16: DevicePtr::NULL,
+                        output_bf16: forward.aux.ptr(),
+                    },
+                    rope: DecodeInterpreterRopeParams {
+                        tokens: 1,
+                        q_heads: self.topology.attention_num_heads,
+                        kv_heads: self.topology.attention_num_kv_heads,
+                        head_dim: self.topology.attention_head_dim,
+                        rope_dims: self.topology.attention_rope_dims(),
+                        base_theta: self.topology.rope_theta,
+                        position_i32: position as i32,
+                        use_scalar_position: true,
+                        positions_i32: DevicePtr::NULL,
+                        q_bf16: forward.aux3.ptr(),
+                        k_bf16: forward.aux.ptr(),
+                        scalar_position_device_i32: DevicePtr::NULL,
+                    },
+                    attention: DecodeInterpreterAttentionParams {
+                        spec: forward.interpreter_attention_spec.ptr(),
+                    },
+                    q_proj_gate: DecodeInterpreterQProjSigmoidGateParams {
+                        rows: 1,
+                        heads: self.topology.attention_num_heads,
+                        head_dim: self.topology.attention_head_dim,
+                        gate_bf16: forward.qkv.ptr(),
+                        input_bf16: forward.aux3.ptr(),
+                        output_bf16: forward.aux3.ptr(),
+                    },
+                    o_input_quant: DecodeInterpreterNvfp4QuantizeParams {
+                        values: q_values,
+                        input_tensor_scale_f32: o_input_tensor_scale_f32,
+                        input_bf16: forward.aux3.ptr(),
+                        output_fp4: forward.activation_fp4.ptr(),
+                        output_scale_e4m3: forward.activation_scale.ptr(),
+                        output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                    },
+                    o_proj,
+                },
+            },
+        );
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_attention_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter full-attn input-layer program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_attention_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_attention_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter full-attn input-layer program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_attention_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_attention_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_attention_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_attention_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_attention_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: interpreter_launch_flags(),
+            })?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn build_interpreter_full_transformer_layer_decode(
+        &self,
+        layer: &FullAttentionLayerWeights,
+        runtime: &GpuRuntimeBuffers,
+        forward: &GpuForwardBuffers,
+        position: usize,
+        position_device_i32: DevicePtr,
+        attention_context_limit: usize,
+        input_quantized: Nvfp4ActivationQuant<'_>,
+        mlp_quantized: Nvfp4ActivationQuant<'_>,
+        input_residual_bf16: DevicePtr,
+        input_norm_weight_bf16: DevicePtr,
+        post_attention_norm_weight_bf16: DevicePtr,
+        attention_spec_ptr: DevicePtr,
+    ) -> Result<Option<(DecodeInterpreterProgram, Vec<u8>)>> {
+        let bf16_kv_cache_dtype = Self::attention_kv_cache_dtype_code(KvCacheDtype::Bf16)?;
+        let configured_kv_cache_dtype =
+            Self::attention_kv_cache_dtype_code(self.config.kv_cache_dtype)?;
+        if configured_kv_cache_dtype != bf16_kv_cache_dtype {
+            return Ok(None);
+        }
+
+        let cache = runtime
+            .kv_cache
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("KV cache was not allocated".to_owned()))?;
+        let layout = self
+            .state
+            .kv_cache
+            .layers
+            .iter()
+            .find(|layout| layout.global_layer_index == layer.layer_index)
+            .ok_or_else(|| {
+                CoreError::Runtime(format!(
+                    "missing KV-cache layout for layer {}",
+                    layer.layer_index
+                ))
+            })?;
+
+        let q_values = self.topology.attention_num_heads * self.topology.attention_head_dim;
+        let kv_values = self.topology.attention_num_kv_heads * self.topology.attention_head_dim;
+        let hidden = self.topology.hidden_size;
+        let input_fp4 = forward.activation_fp4.ptr();
+        let input_scale_e4m3 = forward.activation_scale.ptr();
+
+        let Some(q_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.q_proj,
+            input_quantized,
+            input_fp4,
+            input_scale_e4m3,
+            forward.qkv.ptr(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(k_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.k_proj,
+            input_quantized,
+            input_fp4,
+            input_scale_e4m3,
+            forward.aux.ptr(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(v_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.v_proj,
+            input_quantized,
+            input_fp4,
+            input_scale_e4m3,
+            forward.aux2.ptr(),
+        )?
+        else {
+            return Ok(None);
+        };
+        if q_proj.m != q_values * 2
+            || q_proj.k != hidden
+            || k_proj.m != kv_values
+            || k_proj.k != hidden
+            || v_proj.m != kv_values
+            || v_proj.k != hidden
+        {
+            return Ok(None);
+        }
+
+        let LinearWeightBinding::Nvfp4 {
+            input_scale: o_input_scale,
+            ..
+        } = &layer.o_proj
+        else {
+            return Ok(None);
+        };
+        let o_quantized = Nvfp4ActivationQuant {
+            in_features: q_values,
+            input_scale: o_input_scale,
+        };
+        let Some(o_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.o_proj,
+            o_quantized,
+            forward.activation_fp4.ptr(),
+            forward.activation_scale.ptr(),
+            forward.block_out.ptr(),
+        )?
+        else {
+            return Ok(None);
+        };
+        if o_proj.m != hidden || o_proj.k != q_values {
+            return Ok(None);
+        }
+
+        let Some(mlp) =
+            self.decode_interpreter_mlp_params_from_common(&layer.common, forward, mlp_quantized)?
+        else {
+            return Ok(None);
+        };
+
+        let decode_n_splits =
+            self.decode_attention_n_splits_for_context_limit(attention_context_limit);
+
+        let mut attention_spec = AttentionDecodeSpec {
+            layer_index: layer.layer_index,
+            position,
+            q_bf16: forward.aux3.ptr(),
+            k_bf16: forward.aux.ptr(),
+            v_bf16: forward.aux2.ptr(),
+            kv_cache_k: cache.ptr_at(layout.k_offset_bytes as usize)?,
+            kv_cache_v: cache.ptr_at(layout.v_offset_bytes as usize)?,
+            kv_cache_metadata: DevicePtr::NULL,
+            output_bf16: forward.aux3.ptr(),
+            shape: AttentionShape {
+                q_heads: self.topology.attention_num_heads,
+                kv_heads: self.topology.attention_num_kv_heads,
+                head_dim: self.topology.attention_head_dim,
+                rope_dims: self.topology.attention_rope_dims(),
+            },
+            kv_cache_dtype: bf16_kv_cache_dtype,
+            position_device_i32,
+            partial_acc_f32: DevicePtr::NULL,
+            partial_max_f32: DevicePtr::NULL,
+            partial_denom_f32: DevicePtr::NULL,
+            decode_n_splits: decode_n_splits.min(1),
+            split_timesteps_per_block: 0,
+        };
+        attention_spec.decode_n_splits = attention_spec.decode_n_splits.min(1);
+        let spec_bytes = attention_decode_spec_abi_bytes(&attention_spec);
+
+        let weights = self.cuda_weights()?;
+        let program = DecodeInterpreterProgram::compile_full_transformer_layer_decode(
+            DecodeInterpreterFullTransformerLayerParams {
+                attention: DecodeInterpreterFullAttentionInputLayerParams {
+                    input_norm: DecodeInterpreterRmsNormNvfp4QuantParams {
+                        hidden,
+                        eps: 1.0e-6,
+                        input_tensor_scale_f32: self
+                            .tensor_scalar_f32(weights, input_quantized.input_scale)?,
+                        input_bf16: forward.hidden.ptr(),
+                        weight_bf16: input_norm_weight_bf16,
+                        residual_bf16: input_residual_bf16,
+                        residual_out_bf16: forward.normed.ptr(),
+                        output_bf16: DevicePtr::NULL,
+                        output_fp4: forward.activation_fp4.ptr(),
+                        output_scale_e4m3: forward.activation_scale.ptr(),
+                        output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                    },
+                    layer: DecodeInterpreterFullAttentionLayerParams {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        q_proj_deinterleave: DecodeInterpreterQProjDeinterleaveParams {
+                            rows: 1,
+                            heads: self.topology.attention_num_heads,
+                            head_dim: self.topology.attention_head_dim,
+                            input_bf16: forward.qkv.ptr(),
+                            output_bf16: forward.aux3.ptr(),
+                        },
+                        q_norm: DecodeInterpreterRmsNormBf16Params {
+                            rows: self.topology.attention_num_heads,
+                            hidden: self.topology.attention_head_dim,
+                            eps: 1.0e-6,
+                            direct_weight: false,
+                            input_bf16: forward.aux3.ptr(),
+                            weight_bf16: self.tensor_ptr(weights, &layer.q_norm)?,
+                            residual_bf16: DevicePtr::NULL,
+                            residual_out_bf16: DevicePtr::NULL,
+                            output_bf16: forward.aux3.ptr(),
+                        },
+                        k_norm: DecodeInterpreterRmsNormBf16Params {
+                            rows: self.topology.attention_num_kv_heads,
+                            hidden: self.topology.attention_head_dim,
+                            eps: 1.0e-6,
+                            direct_weight: false,
+                            input_bf16: forward.aux.ptr(),
+                            weight_bf16: self.tensor_ptr(weights, &layer.k_norm)?,
+                            residual_bf16: DevicePtr::NULL,
+                            residual_out_bf16: DevicePtr::NULL,
+                            output_bf16: forward.aux.ptr(),
+                        },
+                        rope: DecodeInterpreterRopeParams {
+                            tokens: 1,
+                            q_heads: self.topology.attention_num_heads,
+                            kv_heads: self.topology.attention_num_kv_heads,
+                            head_dim: self.topology.attention_head_dim,
+                            rope_dims: self.topology.attention_rope_dims(),
+                            base_theta: self.topology.rope_theta,
+                            position_i32: position as i32,
+                            use_scalar_position: true,
+                            positions_i32: DevicePtr::NULL,
+                            q_bf16: forward.aux3.ptr(),
+                            k_bf16: forward.aux.ptr(),
+                            scalar_position_device_i32: position_device_i32,
+                        },
+                        attention: DecodeInterpreterAttentionParams {
+                            spec: attention_spec_ptr,
+                        },
+                        q_proj_gate: DecodeInterpreterQProjSigmoidGateParams {
+                            rows: 1,
+                            heads: self.topology.attention_num_heads,
+                            head_dim: self.topology.attention_head_dim,
+                            gate_bf16: forward.qkv.ptr(),
+                            input_bf16: forward.aux3.ptr(),
+                            output_bf16: forward.aux3.ptr(),
+                        },
+                        o_input_quant: DecodeInterpreterNvfp4QuantizeParams {
+                            values: q_values,
+                            input_tensor_scale_f32: self
+                                .tensor_scalar_f32(weights, o_input_scale)?,
+                            input_bf16: forward.aux3.ptr(),
+                            output_fp4: forward.activation_fp4.ptr(),
+                            output_scale_e4m3: forward.activation_scale.ptr(),
+                            output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                        },
+                        o_proj,
+                    },
+                },
+                post: DecodeInterpreterNormMlpParams {
+                    norm: DecodeInterpreterRmsNormNvfp4QuantParams {
+                        hidden,
+                        eps: 1.0e-6,
+                        input_tensor_scale_f32: self
+                            .tensor_scalar_f32(weights, mlp_quantized.input_scale)?,
+                        input_bf16: forward.block_out.ptr(),
+                        weight_bf16: post_attention_norm_weight_bf16,
+                        residual_bf16: forward.normed.ptr(),
+                        residual_out_bf16: forward.residual.ptr(),
+                        output_bf16: DevicePtr::NULL,
+                        output_fp4: forward.activation_fp4.ptr(),
+                        output_scale_e4m3: forward.activation_scale.ptr(),
+                        output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                    },
+                    mlp,
+                },
+            },
+        );
+        Ok(Some((program, spec_bytes)))
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_interpreter_full_transformer_layer_decode(
+        &self,
+        layer: &FullAttentionLayerWeights,
+        runtime: &GpuRuntimeBuffers,
+        forward: &GpuForwardBuffers,
+        position: usize,
+        input_quantized: Nvfp4ActivationQuant<'_>,
+        mlp_quantized: Nvfp4ActivationQuant<'_>,
+        input_residual_bf16: DevicePtr,
+        input_norm_weight_bf16: DevicePtr,
+        post_attention_norm_weight_bf16: DevicePtr,
+    ) -> Result<bool> {
+        if !decode_interpreter_full_transformer_layer_enabled() {
+            return Ok(false);
+        }
+
+        let bf16_kv_cache_dtype = Self::attention_kv_cache_dtype_code(KvCacheDtype::Bf16)?;
+        let configured_kv_cache_dtype =
+            Self::attention_kv_cache_dtype_code(self.config.kv_cache_dtype)?;
+        if configured_kv_cache_dtype != bf16_kv_cache_dtype {
+            return Ok(false);
+        }
+
+        let cache = runtime
+            .kv_cache
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("KV cache was not allocated".to_owned()))?;
+        let layout = self
+            .state
+            .kv_cache
+            .layers
+            .iter()
+            .find(|layout| layout.global_layer_index == layer.layer_index)
+            .ok_or_else(|| {
+                CoreError::Runtime(format!(
+                    "missing KV-cache layout for layer {}",
+                    layer.layer_index
+                ))
+            })?;
+
+        let q_values = self.topology.attention_num_heads * self.topology.attention_head_dim;
+        let kv_values = self.topology.attention_num_kv_heads * self.topology.attention_head_dim;
+        let hidden = self.topology.hidden_size;
+        let input_fp4 = forward.activation_fp4.ptr();
+        let input_scale_e4m3 = forward.activation_scale.ptr();
+
+        let Some(q_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.q_proj,
+            input_quantized,
+            input_fp4,
+            input_scale_e4m3,
+            forward.qkv.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        let Some(k_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.k_proj,
+            input_quantized,
+            input_fp4,
+            input_scale_e4m3,
+            forward.aux.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        let Some(v_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.v_proj,
+            input_quantized,
+            input_fp4,
+            input_scale_e4m3,
+            forward.aux2.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if q_proj.m != q_values * 2
+            || q_proj.k != hidden
+            || k_proj.m != kv_values
+            || k_proj.k != hidden
+            || v_proj.m != kv_values
+            || v_proj.k != hidden
+        {
+            return Ok(false);
+        }
+
+        let LinearWeightBinding::Nvfp4 {
+            input_scale: o_input_scale,
+            ..
+        } = &layer.o_proj
+        else {
+            return Ok(false);
+        };
+        let o_quantized = Nvfp4ActivationQuant {
+            in_features: q_values,
+            input_scale: o_input_scale,
+        };
+        let Some(o_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.o_proj,
+            o_quantized,
+            forward.activation_fp4.ptr(),
+            forward.activation_scale.ptr(),
+            forward.block_out.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if o_proj.m != hidden || o_proj.k != q_values {
+            return Ok(false);
+        }
+
+        let Some(mlp) =
+            self.decode_interpreter_mlp_params_from_common(&layer.common, forward, mlp_quantized)?
+        else {
+            return Ok(false);
+        };
+
+        let attention_context_limit = self.decode_attention_context_limit_for_position(position);
+        let decode_n_splits =
+            self.decode_attention_n_splits_for_context_limit(attention_context_limit);
+        if decode_n_splits > 1 {
+            return Ok(false);
+        }
+
+        let mut attention_spec = AttentionDecodeSpec {
+            layer_index: layer.layer_index,
+            position,
+            q_bf16: forward.aux3.ptr(),
+            k_bf16: forward.aux.ptr(),
+            v_bf16: forward.aux2.ptr(),
+            kv_cache_k: cache.ptr_at(layout.k_offset_bytes as usize)?,
+            kv_cache_v: cache.ptr_at(layout.v_offset_bytes as usize)?,
+            kv_cache_metadata: DevicePtr::NULL,
+            output_bf16: forward.aux3.ptr(),
+            shape: AttentionShape {
+                q_heads: self.topology.attention_num_heads,
+                kv_heads: self.topology.attention_num_kv_heads,
+                head_dim: self.topology.attention_head_dim,
+                rope_dims: self.topology.attention_rope_dims(),
+            },
+            kv_cache_dtype: bf16_kv_cache_dtype,
+            position_device_i32: DevicePtr::NULL,
+            partial_acc_f32: DevicePtr::NULL,
+            partial_max_f32: DevicePtr::NULL,
+            partial_denom_f32: DevicePtr::NULL,
+            decode_n_splits,
+            split_timesteps_per_block: 0,
+        };
+        attention_spec.decode_n_splits = attention_spec.decode_n_splits.min(1);
+
+        let spec_bytes = attention_decode_spec_abi_bytes(&attention_spec);
+        if spec_bytes.len() > forward.interpreter_attention_spec.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter full transformer layer spec needs {} bytes but buffer has {}",
+                spec_bytes.len(),
+                forward.interpreter_attention_spec.bytes()
+            )));
+        }
+        forward
+            .interpreter_attention_spec
+            .copy_from_host(&spec_bytes)?;
+
+        let weights = self.cuda_weights()?;
+        let compiled = DecodeInterpreterProgram::compile_full_transformer_layer_decode(
+            DecodeInterpreterFullTransformerLayerParams {
+                attention: DecodeInterpreterFullAttentionInputLayerParams {
+                    input_norm: DecodeInterpreterRmsNormNvfp4QuantParams {
+                        hidden,
+                        eps: 1.0e-6,
+                        input_tensor_scale_f32: self
+                            .tensor_scalar_f32(weights, input_quantized.input_scale)?,
+                        input_bf16: forward.hidden.ptr(),
+                        weight_bf16: input_norm_weight_bf16,
+                        residual_bf16: input_residual_bf16,
+                        residual_out_bf16: forward.normed.ptr(),
+                        output_bf16: DevicePtr::NULL,
+                        output_fp4: forward.activation_fp4.ptr(),
+                        output_scale_e4m3: forward.activation_scale.ptr(),
+                        output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                    },
+                    layer: DecodeInterpreterFullAttentionLayerParams {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        q_proj_deinterleave: DecodeInterpreterQProjDeinterleaveParams {
+                            rows: 1,
+                            heads: self.topology.attention_num_heads,
+                            head_dim: self.topology.attention_head_dim,
+                            input_bf16: forward.qkv.ptr(),
+                            output_bf16: forward.aux3.ptr(),
+                        },
+                        q_norm: DecodeInterpreterRmsNormBf16Params {
+                            rows: self.topology.attention_num_heads,
+                            hidden: self.topology.attention_head_dim,
+                            eps: 1.0e-6,
+                            direct_weight: false,
+                            input_bf16: forward.aux3.ptr(),
+                            weight_bf16: self.tensor_ptr(weights, &layer.q_norm)?,
+                            residual_bf16: DevicePtr::NULL,
+                            residual_out_bf16: DevicePtr::NULL,
+                            output_bf16: forward.aux3.ptr(),
+                        },
+                        k_norm: DecodeInterpreterRmsNormBf16Params {
+                            rows: self.topology.attention_num_kv_heads,
+                            hidden: self.topology.attention_head_dim,
+                            eps: 1.0e-6,
+                            direct_weight: false,
+                            input_bf16: forward.aux.ptr(),
+                            weight_bf16: self.tensor_ptr(weights, &layer.k_norm)?,
+                            residual_bf16: DevicePtr::NULL,
+                            residual_out_bf16: DevicePtr::NULL,
+                            output_bf16: forward.aux.ptr(),
+                        },
+                        rope: DecodeInterpreterRopeParams {
+                            tokens: 1,
+                            q_heads: self.topology.attention_num_heads,
+                            kv_heads: self.topology.attention_num_kv_heads,
+                            head_dim: self.topology.attention_head_dim,
+                            rope_dims: self.topology.attention_rope_dims(),
+                            base_theta: self.topology.rope_theta,
+                            position_i32: position as i32,
+                            use_scalar_position: true,
+                            positions_i32: DevicePtr::NULL,
+                            q_bf16: forward.aux3.ptr(),
+                            k_bf16: forward.aux.ptr(),
+                            scalar_position_device_i32: DevicePtr::NULL,
+                        },
+                        attention: DecodeInterpreterAttentionParams {
+                            spec: forward.interpreter_attention_spec.ptr(),
+                        },
+                        q_proj_gate: DecodeInterpreterQProjSigmoidGateParams {
+                            rows: 1,
+                            heads: self.topology.attention_num_heads,
+                            head_dim: self.topology.attention_head_dim,
+                            gate_bf16: forward.qkv.ptr(),
+                            input_bf16: forward.aux3.ptr(),
+                            output_bf16: forward.aux3.ptr(),
+                        },
+                        o_input_quant: DecodeInterpreterNvfp4QuantizeParams {
+                            values: q_values,
+                            input_tensor_scale_f32: self
+                                .tensor_scalar_f32(weights, o_input_scale)?,
+                            input_bf16: forward.aux3.ptr(),
+                            output_fp4: forward.activation_fp4.ptr(),
+                            output_scale_e4m3: forward.activation_scale.ptr(),
+                            output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                        },
+                        o_proj,
+                    },
+                },
+                post: DecodeInterpreterNormMlpParams {
+                    norm: DecodeInterpreterRmsNormNvfp4QuantParams {
+                        hidden,
+                        eps: 1.0e-6,
+                        input_tensor_scale_f32: self
+                            .tensor_scalar_f32(weights, mlp_quantized.input_scale)?,
+                        input_bf16: forward.block_out.ptr(),
+                        weight_bf16: post_attention_norm_weight_bf16,
+                        residual_bf16: forward.normed.ptr(),
+                        residual_out_bf16: forward.residual.ptr(),
+                        output_bf16: DevicePtr::NULL,
+                        output_fp4: forward.activation_fp4.ptr(),
+                        output_scale_e4m3: forward.activation_scale.ptr(),
+                        output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                    },
+                    mlp,
+                },
+            },
+        );
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_attention_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter full transformer layer program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_attention_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_attention_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter full transformer layer program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_attention_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_attention_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_attention_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_attention_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_attention_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: interpreter_launch_flags(),
+            })?;
+        Ok(true)
     }
 
     #[cfg(feature = "cuda")]
@@ -7203,7 +8462,1198 @@ impl<B: KernelBackend> Engine<B> {
                 counters_i32: forward.interpreter_attention_counters.ptr(),
                 counter_count: compiled.program.counter_count,
                 cta_count: 0,
-                flags: 0,
+                flags: interpreter_launch_flags(),
+            })?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_interpreter_linear_attention_tail_decode(
+        &self,
+        layer: &LinearAttentionLayerWeights,
+        forward: &GpuForwardBuffers,
+        z_bf16: DevicePtr,
+        deltanet_output_bf16: DevicePtr,
+    ) -> Result<bool> {
+        if !decode_interpreter_linear_attention_tail_enabled() {
+            return Ok(false);
+        }
+        let value_dim = self.topology.linear_attention_value_dim();
+        let hidden = self.topology.hidden_size;
+        let LinearWeightBinding::Nvfp4 {
+            input_scale: out_input_scale,
+            ..
+        } = &layer.out_proj
+        else {
+            return Ok(false);
+        };
+        let out_quantized = Nvfp4ActivationQuant {
+            in_features: value_dim,
+            input_scale: out_input_scale,
+        };
+        let Some(out_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.out_proj,
+            out_quantized,
+            forward.activation_fp4.ptr(),
+            forward.activation_scale.ptr(),
+            forward.block_out.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if out_proj.m != hidden || out_proj.k != value_dim {
+            return Ok(false);
+        }
+
+        let weights = self.cuda_weights()?;
+        let compiled = DecodeInterpreterProgram::compile_linear_attention_tail_decode(
+            DecodeInterpreterLinearAttentionTailParams {
+                norm: DecodeInterpreterRmsNormBf16Params {
+                    rows: self.topology.linear_num_value_heads,
+                    hidden: self.topology.linear_value_head_dim,
+                    eps: 1.0e-6,
+                    direct_weight: true,
+                    input_bf16: deltanet_output_bf16,
+                    weight_bf16: self.tensor_ptr(weights, &layer.norm_weight)?,
+                    residual_bf16: DevicePtr::NULL,
+                    residual_out_bf16: DevicePtr::NULL,
+                    output_bf16: forward.aux2.ptr(),
+                },
+                swiglu: DecodeInterpreterSwiGluBf16Params {
+                    rows: 1,
+                    intermediate: value_dim,
+                    gate_bf16: z_bf16,
+                    up_bf16: forward.aux2.ptr(),
+                    output_bf16: forward.aux3.ptr(),
+                },
+                quant: DecodeInterpreterNvfp4QuantizeParams {
+                    values: value_dim,
+                    input_tensor_scale_f32: self.tensor_scalar_f32(weights, out_input_scale)?,
+                    input_bf16: forward.aux3.ptr(),
+                    output_fp4: forward.activation_fp4.ptr(),
+                    output_scale_e4m3: forward.activation_scale.ptr(),
+                    output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                },
+                out_proj,
+            },
+        );
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_mlp_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear-attn tail program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_mlp_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_mlp_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear-attn tail program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_mlp_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_mlp_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_mlp_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_mlp_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_mlp_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: interpreter_launch_flags(),
+            })?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_interpreter_linear_attention_layer_decode(
+        &self,
+        layer: &LinearAttentionLayerWeights,
+        fused: &LinearAttnInProjFused,
+        forward: &GpuForwardBuffers,
+        quantized: Nvfp4ActivationQuant<'_>,
+        conv_history_bf16: DevicePtr,
+        state_bf16: DevicePtr,
+    ) -> Result<bool> {
+        if !decode_interpreter_linear_attention_layer_enabled() {
+            return Ok(false);
+        }
+
+        let qkv_dim = self.topology.linear_attention_qkv_dim();
+        let key_dim = self.topology.linear_num_key_heads * self.topology.linear_key_head_dim;
+        let value_dim = self.topology.linear_attention_value_dim();
+        let hidden = self.topology.hidden_size;
+
+        let b_bf16 = forward
+            .qkv
+            .ptr()
+            .offset_bytes(fused.b_offset * 2)
+            .ok_or_else(|| CoreError::Runtime("fused DeltaNet b offset overflow".to_owned()))?;
+        let a_bf16 = forward
+            .qkv
+            .ptr()
+            .offset_bytes(fused.a_offset * 2)
+            .ok_or_else(|| CoreError::Runtime("fused DeltaNet a offset overflow".to_owned()))?;
+        let z_bf16 = forward
+            .qkv
+            .ptr()
+            .offset_bytes(fused.z_offset * 2)
+            .ok_or_else(|| CoreError::Runtime("fused DeltaNet z offset overflow".to_owned()))?;
+
+        let LinearWeightBinding::Nvfp4 {
+            weight: qkv_weight,
+            tensor_scale: qkv_tensor_scale,
+            input_scale: qkv_input_scale,
+            ..
+        } = &layer.in_proj_qkv
+        else {
+            return Ok(false);
+        };
+        let in_features = Self::nvfp4_in_features(qkv_weight)?;
+        if in_features != quantized.in_features
+            || !decode_interpreter_nvfp4_gemv_supports(fused.combined_out_features, in_features)
+        {
+            return Ok(false);
+        }
+        self.validate_nvfp4_input_scale(qkv_weight, quantized.input_scale, qkv_input_scale)?;
+
+        let LinearWeightBinding::Nvfp4 {
+            input_scale: out_input_scale,
+            ..
+        } = &layer.out_proj
+        else {
+            return Ok(false);
+        };
+        let out_quantized = Nvfp4ActivationQuant {
+            in_features: value_dim,
+            input_scale: out_input_scale,
+        };
+        let Some(out_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.out_proj,
+            out_quantized,
+            forward.activation_fp4.ptr(),
+            forward.activation_scale.ptr(),
+            forward.block_out.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if out_proj.m != hidden || out_proj.k != value_dim {
+            return Ok(false);
+        }
+
+        let weights = self.cuda_weights()?;
+        let deltanet_spec = DeltaNetDecodeSpec {
+            layer_index: layer.layer_index,
+            tokens_in_persistent_loop: 1,
+            q_token_stride: 0,
+            k_token_stride: 0,
+            v_token_stride: 0,
+            q_bf16: forward.aux.ptr(),
+            k_bf16: forward.aux.ptr_at(key_dim * 2)?,
+            v_bf16: forward.aux.ptr_at(key_dim * 4)?,
+            state_bf16,
+            conv_history_bf16,
+            output_bf16: forward.aux3.ptr(),
+            gate_f32: forward.gate_f32.ptr(),
+            beta_f32: forward.beta_f32.ptr(),
+            shape: DeltaNetShape {
+                qk_heads: self.topology.linear_num_key_heads,
+                v_heads: self.topology.linear_num_value_heads,
+                key_dim: self.topology.linear_key_head_dim,
+                value_dim: self.topology.linear_value_head_dim,
+                conv_kernel: self.topology.linear_conv_kernel_dim,
+            },
+            state_decay: 1.0,
+            update_scale: 1.0,
+            qk_l2norm: true,
+        };
+        let spec_bytes = deltanet_decode_spec_abi_bytes(&deltanet_spec);
+        if spec_bytes.len() > forward.interpreter_deltanet_spec.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear-attn layer DeltaNet spec needs {} bytes but buffer has {}",
+                spec_bytes.len(),
+                forward.interpreter_deltanet_spec.bytes()
+            )));
+        }
+        forward
+            .interpreter_deltanet_spec
+            .copy_from_host(&spec_bytes)?;
+
+        let compiled = DecodeInterpreterProgram::compile_linear_attention_layer_decode(
+            DecodeInterpreterLinearAttentionLayerParams {
+                in_proj: DecodeInterpreterNvfp4GemvParams {
+                    m: fused.combined_out_features,
+                    k: in_features,
+                    alpha: self.tensor_scalar_f32(weights, qkv_tensor_scale)?
+                        * self.tensor_scalar_f32(weights, quantized.input_scale)?,
+                    a_fp4: fused.combined_weight.ptr(),
+                    a_scale_e4m3: fused.combined_block_scale.ptr(),
+                    b_fp4: forward.activation_fp4.ptr(),
+                    b_scale_e4m3: forward.activation_scale.ptr(),
+                    c_bf16: forward.qkv.ptr(),
+                },
+                post_inproj: DecodeInterpreterLinearAttentionPostInProjParams {
+                    conv_gdn: DecodeInterpreterConv1dGdnGateFusedParams {
+                        channels: qkv_dim,
+                        kernel_size: self.topology.linear_conv_kernel_dim,
+                        conv_input_bf16: forward.qkv.ptr(),
+                        conv_history_bf16,
+                        conv_weight_bf16: self.tensor_ptr(weights, &layer.conv1d_weight)?,
+                        conv_output_bf16: forward.aux.ptr(),
+                        heads: self.topology.linear_num_value_heads,
+                        gdn_a_bf16: a_bf16,
+                        gdn_b_bf16: b_bf16,
+                        gdn_a_log_bf16: self.tensor_ptr(weights, &layer.a_log)?,
+                        gdn_dt_bias_bf16: self.tensor_ptr(weights, &layer.dt_bias)?,
+                        gate_f32: forward.gate_f32.ptr(),
+                        beta_f32: forward.beta_f32.ptr(),
+                    },
+                    deltanet: DecodeInterpreterDeltaNetParams {
+                        spec: forward.interpreter_deltanet_spec.ptr(),
+                    },
+                    tail: DecodeInterpreterLinearAttentionTailParams {
+                        norm: DecodeInterpreterRmsNormBf16Params {
+                            rows: self.topology.linear_num_value_heads,
+                            hidden: self.topology.linear_value_head_dim,
+                            eps: 1.0e-6,
+                            direct_weight: true,
+                            input_bf16: forward.aux3.ptr(),
+                            weight_bf16: self.tensor_ptr(weights, &layer.norm_weight)?,
+                            residual_bf16: DevicePtr::NULL,
+                            residual_out_bf16: DevicePtr::NULL,
+                            output_bf16: forward.aux2.ptr(),
+                        },
+                        swiglu: DecodeInterpreterSwiGluBf16Params {
+                            rows: 1,
+                            intermediate: value_dim,
+                            gate_bf16: z_bf16,
+                            up_bf16: forward.aux2.ptr(),
+                            output_bf16: forward.aux3.ptr(),
+                        },
+                        quant: DecodeInterpreterNvfp4QuantizeParams {
+                            values: value_dim,
+                            input_tensor_scale_f32: self
+                                .tensor_scalar_f32(weights, out_input_scale)?,
+                            input_bf16: forward.aux3.ptr(),
+                            output_fp4: forward.activation_fp4.ptr(),
+                            output_scale_e4m3: forward.activation_scale.ptr(),
+                            output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                        },
+                        out_proj,
+                    },
+                },
+            },
+        );
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_deltanet_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear-attn layer program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_deltanet_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_deltanet_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear-attn layer program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_deltanet_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_deltanet_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_deltanet_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_deltanet_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_deltanet_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: interpreter_launch_flags(),
+            })?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_interpreter_linear_attention_input_layer_decode(
+        &self,
+        layer: &LinearAttentionLayerWeights,
+        runtime: &GpuRuntimeBuffers,
+        forward: &GpuForwardBuffers,
+        quantized: Nvfp4ActivationQuant<'_>,
+        input_residual_bf16: DevicePtr,
+        input_norm_weight_bf16: DevicePtr,
+    ) -> Result<bool> {
+        if !decode_interpreter_linear_attention_input_layer_enabled() {
+            return Ok(false);
+        }
+        let Some(fused) = self.linear_attn_in_proj_fused_layer_opt(layer.layer_index) else {
+            return Ok(false);
+        };
+
+        let qkv_dim = self.topology.linear_attention_qkv_dim();
+        let key_dim = self.topology.linear_num_key_heads * self.topology.linear_key_head_dim;
+        let value_dim = self.topology.linear_attention_value_dim();
+        let hidden = self.topology.hidden_size;
+        let layer_ordinal = self.linear_layer_ordinal(layer.layer_index)?;
+        let conv_history_bf16 = runtime.conv_history.ptr_at(
+            layer_ordinal * qkv_dim * self.topology.linear_conv_kernel_dim.saturating_sub(1) * 2,
+        )?;
+        let state_bf16 = runtime
+            .deltanet_state
+            .ptr_at(layer_ordinal * self.state.deltanet.state_bytes_per_layer as usize)?;
+
+        let b_bf16 = forward
+            .qkv
+            .ptr()
+            .offset_bytes(fused.b_offset * 2)
+            .ok_or_else(|| CoreError::Runtime("fused DeltaNet b offset overflow".to_owned()))?;
+        let a_bf16 = forward
+            .qkv
+            .ptr()
+            .offset_bytes(fused.a_offset * 2)
+            .ok_or_else(|| CoreError::Runtime("fused DeltaNet a offset overflow".to_owned()))?;
+        let z_bf16 = forward
+            .qkv
+            .ptr()
+            .offset_bytes(fused.z_offset * 2)
+            .ok_or_else(|| CoreError::Runtime("fused DeltaNet z offset overflow".to_owned()))?;
+
+        let LinearWeightBinding::Nvfp4 {
+            weight: qkv_weight,
+            tensor_scale: qkv_tensor_scale,
+            input_scale: qkv_input_scale,
+            ..
+        } = &layer.in_proj_qkv
+        else {
+            return Ok(false);
+        };
+        let in_features = Self::nvfp4_in_features(qkv_weight)?;
+        if in_features != quantized.in_features
+            || !decode_interpreter_nvfp4_gemv_supports(fused.combined_out_features, in_features)
+        {
+            return Ok(false);
+        }
+        self.validate_nvfp4_input_scale(qkv_weight, quantized.input_scale, qkv_input_scale)?;
+
+        let LinearWeightBinding::Nvfp4 {
+            input_scale: out_input_scale,
+            ..
+        } = &layer.out_proj
+        else {
+            return Ok(false);
+        };
+        let out_quantized = Nvfp4ActivationQuant {
+            in_features: value_dim,
+            input_scale: out_input_scale,
+        };
+        let Some(out_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.out_proj,
+            out_quantized,
+            forward.activation_fp4.ptr(),
+            forward.activation_scale.ptr(),
+            forward.block_out.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if out_proj.m != hidden || out_proj.k != value_dim {
+            return Ok(false);
+        }
+
+        let weights = self.cuda_weights()?;
+        let deltanet_spec = DeltaNetDecodeSpec {
+            layer_index: layer.layer_index,
+            tokens_in_persistent_loop: 1,
+            q_token_stride: 0,
+            k_token_stride: 0,
+            v_token_stride: 0,
+            q_bf16: forward.aux.ptr(),
+            k_bf16: forward.aux.ptr_at(key_dim * 2)?,
+            v_bf16: forward.aux.ptr_at(key_dim * 4)?,
+            state_bf16,
+            conv_history_bf16,
+            output_bf16: forward.aux3.ptr(),
+            gate_f32: forward.gate_f32.ptr(),
+            beta_f32: forward.beta_f32.ptr(),
+            shape: DeltaNetShape {
+                qk_heads: self.topology.linear_num_key_heads,
+                v_heads: self.topology.linear_num_value_heads,
+                key_dim: self.topology.linear_key_head_dim,
+                value_dim: self.topology.linear_value_head_dim,
+                conv_kernel: self.topology.linear_conv_kernel_dim,
+            },
+            state_decay: 1.0,
+            update_scale: 1.0,
+            qk_l2norm: true,
+        };
+        let spec_bytes = deltanet_decode_spec_abi_bytes(&deltanet_spec);
+        if spec_bytes.len() > forward.interpreter_deltanet_spec.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear-attn input-layer DeltaNet spec needs {} bytes but buffer has {}",
+                spec_bytes.len(),
+                forward.interpreter_deltanet_spec.bytes()
+            )));
+        }
+        forward
+            .interpreter_deltanet_spec
+            .copy_from_host(&spec_bytes)?;
+
+        let compiled = DecodeInterpreterProgram::compile_linear_attention_input_layer_decode(
+            DecodeInterpreterLinearAttentionInputLayerParams {
+                input_norm: DecodeInterpreterRmsNormNvfp4QuantParams {
+                    hidden,
+                    eps: 1.0e-6,
+                    input_tensor_scale_f32: self
+                        .tensor_scalar_f32(weights, quantized.input_scale)?,
+                    input_bf16: forward.hidden.ptr(),
+                    weight_bf16: input_norm_weight_bf16,
+                    residual_bf16: input_residual_bf16,
+                    residual_out_bf16: forward.residual.ptr(),
+                    output_bf16: DevicePtr::NULL,
+                    output_fp4: forward.activation_fp4.ptr(),
+                    output_scale_e4m3: forward.activation_scale.ptr(),
+                    output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                },
+                layer: DecodeInterpreterLinearAttentionLayerParams {
+                    in_proj: DecodeInterpreterNvfp4GemvParams {
+                        m: fused.combined_out_features,
+                        k: in_features,
+                        alpha: self.tensor_scalar_f32(weights, qkv_tensor_scale)?
+                            * self.tensor_scalar_f32(weights, quantized.input_scale)?,
+                        a_fp4: fused.combined_weight.ptr(),
+                        a_scale_e4m3: fused.combined_block_scale.ptr(),
+                        b_fp4: forward.activation_fp4.ptr(),
+                        b_scale_e4m3: forward.activation_scale.ptr(),
+                        c_bf16: forward.qkv.ptr(),
+                    },
+                    post_inproj: DecodeInterpreterLinearAttentionPostInProjParams {
+                        conv_gdn: DecodeInterpreterConv1dGdnGateFusedParams {
+                            channels: qkv_dim,
+                            kernel_size: self.topology.linear_conv_kernel_dim,
+                            conv_input_bf16: forward.qkv.ptr(),
+                            conv_history_bf16,
+                            conv_weight_bf16: self.tensor_ptr(weights, &layer.conv1d_weight)?,
+                            conv_output_bf16: forward.aux.ptr(),
+                            heads: self.topology.linear_num_value_heads,
+                            gdn_a_bf16: a_bf16,
+                            gdn_b_bf16: b_bf16,
+                            gdn_a_log_bf16: self.tensor_ptr(weights, &layer.a_log)?,
+                            gdn_dt_bias_bf16: self.tensor_ptr(weights, &layer.dt_bias)?,
+                            gate_f32: forward.gate_f32.ptr(),
+                            beta_f32: forward.beta_f32.ptr(),
+                        },
+                        deltanet: DecodeInterpreterDeltaNetParams {
+                            spec: forward.interpreter_deltanet_spec.ptr(),
+                        },
+                        tail: DecodeInterpreterLinearAttentionTailParams {
+                            norm: DecodeInterpreterRmsNormBf16Params {
+                                rows: self.topology.linear_num_value_heads,
+                                hidden: self.topology.linear_value_head_dim,
+                                eps: 1.0e-6,
+                                direct_weight: true,
+                                input_bf16: forward.aux3.ptr(),
+                                weight_bf16: self.tensor_ptr(weights, &layer.norm_weight)?,
+                                residual_bf16: DevicePtr::NULL,
+                                residual_out_bf16: DevicePtr::NULL,
+                                output_bf16: forward.aux2.ptr(),
+                            },
+                            swiglu: DecodeInterpreterSwiGluBf16Params {
+                                rows: 1,
+                                intermediate: value_dim,
+                                gate_bf16: z_bf16,
+                                up_bf16: forward.aux2.ptr(),
+                                output_bf16: forward.aux3.ptr(),
+                            },
+                            quant: DecodeInterpreterNvfp4QuantizeParams {
+                                values: value_dim,
+                                input_tensor_scale_f32: self
+                                    .tensor_scalar_f32(weights, out_input_scale)?,
+                                input_bf16: forward.aux3.ptr(),
+                                output_fp4: forward.activation_fp4.ptr(),
+                                output_scale_e4m3: forward.activation_scale.ptr(),
+                                output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                            },
+                            out_proj,
+                        },
+                    },
+                },
+            },
+        );
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_deltanet_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear-attn input-layer program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_deltanet_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_deltanet_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear-attn input-layer program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_deltanet_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_deltanet_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_deltanet_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_deltanet_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_deltanet_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: interpreter_launch_flags(),
+            })?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_interpreter_linear_transformer_layer_decode(
+        &self,
+        layer: &LinearAttentionLayerWeights,
+        runtime: &GpuRuntimeBuffers,
+        forward: &GpuForwardBuffers,
+        input_quantized: Nvfp4ActivationQuant<'_>,
+        mlp_quantized: Nvfp4ActivationQuant<'_>,
+        input_residual_bf16: DevicePtr,
+        input_norm_weight_bf16: DevicePtr,
+        post_attention_norm_weight_bf16: DevicePtr,
+    ) -> Result<bool> {
+        if !decode_interpreter_linear_transformer_layer_enabled() {
+            return Ok(false);
+        }
+        let Some(fused) = self.linear_attn_in_proj_fused_layer_opt(layer.layer_index) else {
+            return Ok(false);
+        };
+
+        let qkv_dim = self.topology.linear_attention_qkv_dim();
+        let key_dim = self.topology.linear_num_key_heads * self.topology.linear_key_head_dim;
+        let value_dim = self.topology.linear_attention_value_dim();
+        let hidden = self.topology.hidden_size;
+        let layer_ordinal = self.linear_layer_ordinal(layer.layer_index)?;
+        let conv_history_bf16 = runtime.conv_history.ptr_at(
+            layer_ordinal * qkv_dim * self.topology.linear_conv_kernel_dim.saturating_sub(1) * 2,
+        )?;
+        let state_bf16 = runtime
+            .deltanet_state
+            .ptr_at(layer_ordinal * self.state.deltanet.state_bytes_per_layer as usize)?;
+
+        let b_bf16 = forward
+            .qkv
+            .ptr()
+            .offset_bytes(fused.b_offset * 2)
+            .ok_or_else(|| CoreError::Runtime("fused DeltaNet b offset overflow".to_owned()))?;
+        let a_bf16 = forward
+            .qkv
+            .ptr()
+            .offset_bytes(fused.a_offset * 2)
+            .ok_or_else(|| CoreError::Runtime("fused DeltaNet a offset overflow".to_owned()))?;
+        let z_bf16 = forward
+            .qkv
+            .ptr()
+            .offset_bytes(fused.z_offset * 2)
+            .ok_or_else(|| CoreError::Runtime("fused DeltaNet z offset overflow".to_owned()))?;
+
+        let LinearWeightBinding::Nvfp4 {
+            weight: qkv_weight,
+            tensor_scale: qkv_tensor_scale,
+            input_scale: qkv_input_scale,
+            ..
+        } = &layer.in_proj_qkv
+        else {
+            return Ok(false);
+        };
+        let in_features = Self::nvfp4_in_features(qkv_weight)?;
+        if in_features != input_quantized.in_features
+            || !decode_interpreter_nvfp4_gemv_supports(fused.combined_out_features, in_features)
+        {
+            return Ok(false);
+        }
+        self.validate_nvfp4_input_scale(qkv_weight, input_quantized.input_scale, qkv_input_scale)?;
+
+        let LinearWeightBinding::Nvfp4 {
+            input_scale: out_input_scale,
+            ..
+        } = &layer.out_proj
+        else {
+            return Ok(false);
+        };
+        let out_quantized = Nvfp4ActivationQuant {
+            in_features: value_dim,
+            input_scale: out_input_scale,
+        };
+        let Some(out_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.out_proj,
+            out_quantized,
+            forward.activation_fp4.ptr(),
+            forward.activation_scale.ptr(),
+            forward.block_out.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if out_proj.m != hidden || out_proj.k != value_dim {
+            return Ok(false);
+        }
+
+        let Some(mlp) =
+            self.decode_interpreter_mlp_params_from_common(&layer.common, forward, mlp_quantized)?
+        else {
+            return Ok(false);
+        };
+
+        let weights = self.cuda_weights()?;
+        let deltanet_spec = DeltaNetDecodeSpec {
+            layer_index: layer.layer_index,
+            tokens_in_persistent_loop: 1,
+            q_token_stride: 0,
+            k_token_stride: 0,
+            v_token_stride: 0,
+            q_bf16: forward.aux.ptr(),
+            k_bf16: forward.aux.ptr_at(key_dim * 2)?,
+            v_bf16: forward.aux.ptr_at(key_dim * 4)?,
+            state_bf16,
+            conv_history_bf16,
+            output_bf16: forward.aux3.ptr(),
+            gate_f32: forward.gate_f32.ptr(),
+            beta_f32: forward.beta_f32.ptr(),
+            shape: DeltaNetShape {
+                qk_heads: self.topology.linear_num_key_heads,
+                v_heads: self.topology.linear_num_value_heads,
+                key_dim: self.topology.linear_key_head_dim,
+                value_dim: self.topology.linear_value_head_dim,
+                conv_kernel: self.topology.linear_conv_kernel_dim,
+            },
+            state_decay: 1.0,
+            update_scale: 1.0,
+            qk_l2norm: true,
+        };
+        let spec_bytes = deltanet_decode_spec_abi_bytes(&deltanet_spec);
+        if spec_bytes.len() > forward.interpreter_deltanet_spec.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear transformer layer DeltaNet spec needs {} bytes but buffer has {}",
+                spec_bytes.len(),
+                forward.interpreter_deltanet_spec.bytes()
+            )));
+        }
+        forward
+            .interpreter_deltanet_spec
+            .copy_from_host(&spec_bytes)?;
+
+        let compiled = DecodeInterpreterProgram::compile_linear_transformer_layer_decode(
+            DecodeInterpreterLinearTransformerLayerParams {
+                attention: DecodeInterpreterLinearAttentionInputLayerParams {
+                    input_norm: DecodeInterpreterRmsNormNvfp4QuantParams {
+                        hidden,
+                        eps: 1.0e-6,
+                        input_tensor_scale_f32: self
+                            .tensor_scalar_f32(weights, input_quantized.input_scale)?,
+                        input_bf16: forward.hidden.ptr(),
+                        weight_bf16: input_norm_weight_bf16,
+                        residual_bf16: input_residual_bf16,
+                        residual_out_bf16: forward.normed.ptr(),
+                        output_bf16: DevicePtr::NULL,
+                        output_fp4: forward.activation_fp4.ptr(),
+                        output_scale_e4m3: forward.activation_scale.ptr(),
+                        output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                    },
+                    layer: DecodeInterpreterLinearAttentionLayerParams {
+                        in_proj: DecodeInterpreterNvfp4GemvParams {
+                            m: fused.combined_out_features,
+                            k: in_features,
+                            alpha: self.tensor_scalar_f32(weights, qkv_tensor_scale)?
+                                * self.tensor_scalar_f32(weights, input_quantized.input_scale)?,
+                            a_fp4: fused.combined_weight.ptr(),
+                            a_scale_e4m3: fused.combined_block_scale.ptr(),
+                            b_fp4: forward.activation_fp4.ptr(),
+                            b_scale_e4m3: forward.activation_scale.ptr(),
+                            c_bf16: forward.qkv.ptr(),
+                        },
+                        post_inproj: DecodeInterpreterLinearAttentionPostInProjParams {
+                            conv_gdn: DecodeInterpreterConv1dGdnGateFusedParams {
+                                channels: qkv_dim,
+                                kernel_size: self.topology.linear_conv_kernel_dim,
+                                conv_input_bf16: forward.qkv.ptr(),
+                                conv_history_bf16,
+                                conv_weight_bf16: self.tensor_ptr(weights, &layer.conv1d_weight)?,
+                                conv_output_bf16: forward.aux.ptr(),
+                                heads: self.topology.linear_num_value_heads,
+                                gdn_a_bf16: a_bf16,
+                                gdn_b_bf16: b_bf16,
+                                gdn_a_log_bf16: self.tensor_ptr(weights, &layer.a_log)?,
+                                gdn_dt_bias_bf16: self.tensor_ptr(weights, &layer.dt_bias)?,
+                                gate_f32: forward.gate_f32.ptr(),
+                                beta_f32: forward.beta_f32.ptr(),
+                            },
+                            deltanet: DecodeInterpreterDeltaNetParams {
+                                spec: forward.interpreter_deltanet_spec.ptr(),
+                            },
+                            tail: DecodeInterpreterLinearAttentionTailParams {
+                                norm: DecodeInterpreterRmsNormBf16Params {
+                                    rows: self.topology.linear_num_value_heads,
+                                    hidden: self.topology.linear_value_head_dim,
+                                    eps: 1.0e-6,
+                                    direct_weight: true,
+                                    input_bf16: forward.aux3.ptr(),
+                                    weight_bf16: self.tensor_ptr(weights, &layer.norm_weight)?,
+                                    residual_bf16: DevicePtr::NULL,
+                                    residual_out_bf16: DevicePtr::NULL,
+                                    output_bf16: forward.aux2.ptr(),
+                                },
+                                swiglu: DecodeInterpreterSwiGluBf16Params {
+                                    rows: 1,
+                                    intermediate: value_dim,
+                                    gate_bf16: z_bf16,
+                                    up_bf16: forward.aux2.ptr(),
+                                    output_bf16: forward.aux3.ptr(),
+                                },
+                                quant: DecodeInterpreterNvfp4QuantizeParams {
+                                    values: value_dim,
+                                    input_tensor_scale_f32: self
+                                        .tensor_scalar_f32(weights, out_input_scale)?,
+                                    input_bf16: forward.aux3.ptr(),
+                                    output_fp4: forward.activation_fp4.ptr(),
+                                    output_scale_e4m3: forward.activation_scale.ptr(),
+                                    output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                                },
+                                out_proj,
+                            },
+                        },
+                    },
+                },
+                post: DecodeInterpreterNormMlpParams {
+                    norm: DecodeInterpreterRmsNormNvfp4QuantParams {
+                        hidden,
+                        eps: 1.0e-6,
+                        input_tensor_scale_f32: self
+                            .tensor_scalar_f32(weights, mlp_quantized.input_scale)?,
+                        input_bf16: forward.block_out.ptr(),
+                        weight_bf16: post_attention_norm_weight_bf16,
+                        residual_bf16: forward.normed.ptr(),
+                        residual_out_bf16: forward.residual.ptr(),
+                        output_bf16: DevicePtr::NULL,
+                        output_fp4: forward.activation_fp4.ptr(),
+                        output_scale_e4m3: forward.activation_scale.ptr(),
+                        output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                    },
+                    mlp,
+                },
+            },
+        );
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_deltanet_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear transformer layer program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_deltanet_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_deltanet_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear transformer layer program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_deltanet_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_deltanet_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_deltanet_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_deltanet_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_deltanet_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: interpreter_launch_flags(),
+            })?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn build_interpreter_linear_transformer_layer_decode(
+        &self,
+        layer: &LinearAttentionLayerWeights,
+        runtime: &GpuRuntimeBuffers,
+        forward: &GpuForwardBuffers,
+        input_quantized: Nvfp4ActivationQuant<'_>,
+        mlp_quantized: Nvfp4ActivationQuant<'_>,
+        input_residual_bf16: DevicePtr,
+        input_norm_weight_bf16: DevicePtr,
+        post_attention_norm_weight_bf16: DevicePtr,
+        deltanet_spec_ptr: DevicePtr,
+    ) -> Result<Option<(DecodeInterpreterProgram, Vec<u8>)>> {
+        let Some(fused) = self.linear_attn_in_proj_fused_layer_opt(layer.layer_index) else {
+            return Ok(None);
+        };
+
+        let qkv_dim = self.topology.linear_attention_qkv_dim();
+        let key_dim = self.topology.linear_num_key_heads * self.topology.linear_key_head_dim;
+        let value_dim = self.topology.linear_attention_value_dim();
+        let hidden = self.topology.hidden_size;
+        let layer_ordinal = self.linear_layer_ordinal(layer.layer_index)?;
+        let conv_history_bf16 = runtime.conv_history.ptr_at(
+            layer_ordinal * qkv_dim * self.topology.linear_conv_kernel_dim.saturating_sub(1) * 2,
+        )?;
+        let state_bf16 = runtime
+            .deltanet_state
+            .ptr_at(layer_ordinal * self.state.deltanet.state_bytes_per_layer as usize)?;
+
+        let b_bf16 = forward
+            .qkv
+            .ptr()
+            .offset_bytes(fused.b_offset * 2)
+            .ok_or_else(|| CoreError::Runtime("fused DeltaNet b offset overflow".to_owned()))?;
+        let a_bf16 = forward
+            .qkv
+            .ptr()
+            .offset_bytes(fused.a_offset * 2)
+            .ok_or_else(|| CoreError::Runtime("fused DeltaNet a offset overflow".to_owned()))?;
+        let z_bf16 = forward
+            .qkv
+            .ptr()
+            .offset_bytes(fused.z_offset * 2)
+            .ok_or_else(|| CoreError::Runtime("fused DeltaNet z offset overflow".to_owned()))?;
+
+        let LinearWeightBinding::Nvfp4 {
+            weight: qkv_weight,
+            tensor_scale: qkv_tensor_scale,
+            input_scale: qkv_input_scale,
+            ..
+        } = &layer.in_proj_qkv
+        else {
+            return Ok(None);
+        };
+        let in_features = Self::nvfp4_in_features(qkv_weight)?;
+        if in_features != input_quantized.in_features
+            || !decode_interpreter_nvfp4_gemv_supports(fused.combined_out_features, in_features)
+        {
+            return Ok(None);
+        }
+        self.validate_nvfp4_input_scale(qkv_weight, input_quantized.input_scale, qkv_input_scale)?;
+
+        let LinearWeightBinding::Nvfp4 {
+            input_scale: out_input_scale,
+            ..
+        } = &layer.out_proj
+        else {
+            return Ok(None);
+        };
+        let out_quantized = Nvfp4ActivationQuant {
+            in_features: value_dim,
+            input_scale: out_input_scale,
+        };
+        let Some(out_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.out_proj,
+            out_quantized,
+            forward.activation_fp4.ptr(),
+            forward.activation_scale.ptr(),
+            forward.block_out.ptr(),
+        )?
+        else {
+            return Ok(None);
+        };
+        if out_proj.m != hidden || out_proj.k != value_dim {
+            return Ok(None);
+        }
+
+        let Some(mlp) =
+            self.decode_interpreter_mlp_params_from_common(&layer.common, forward, mlp_quantized)?
+        else {
+            return Ok(None);
+        };
+
+        let weights = self.cuda_weights()?;
+        let deltanet_spec = DeltaNetDecodeSpec {
+            layer_index: layer.layer_index,
+            tokens_in_persistent_loop: 1,
+            q_token_stride: 0,
+            k_token_stride: 0,
+            v_token_stride: 0,
+            q_bf16: forward.aux.ptr(),
+            k_bf16: forward.aux.ptr_at(key_dim * 2)?,
+            v_bf16: forward.aux.ptr_at(key_dim * 4)?,
+            state_bf16,
+            conv_history_bf16,
+            output_bf16: forward.aux3.ptr(),
+            gate_f32: forward.gate_f32.ptr(),
+            beta_f32: forward.beta_f32.ptr(),
+            shape: DeltaNetShape {
+                qk_heads: self.topology.linear_num_key_heads,
+                v_heads: self.topology.linear_num_value_heads,
+                key_dim: self.topology.linear_key_head_dim,
+                value_dim: self.topology.linear_value_head_dim,
+                conv_kernel: self.topology.linear_conv_kernel_dim,
+            },
+            state_decay: 1.0,
+            update_scale: 1.0,
+            qk_l2norm: true,
+        };
+        let spec_bytes = deltanet_decode_spec_abi_bytes(&deltanet_spec);
+
+        let program = DecodeInterpreterProgram::compile_linear_transformer_layer_decode(
+            DecodeInterpreterLinearTransformerLayerParams {
+                attention: DecodeInterpreterLinearAttentionInputLayerParams {
+                    input_norm: DecodeInterpreterRmsNormNvfp4QuantParams {
+                        hidden,
+                        eps: 1.0e-6,
+                        input_tensor_scale_f32: self
+                            .tensor_scalar_f32(weights, input_quantized.input_scale)?,
+                        input_bf16: forward.hidden.ptr(),
+                        weight_bf16: input_norm_weight_bf16,
+                        residual_bf16: input_residual_bf16,
+                        residual_out_bf16: forward.normed.ptr(),
+                        output_bf16: DevicePtr::NULL,
+                        output_fp4: forward.activation_fp4.ptr(),
+                        output_scale_e4m3: forward.activation_scale.ptr(),
+                        output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                    },
+                    layer: DecodeInterpreterLinearAttentionLayerParams {
+                        in_proj: DecodeInterpreterNvfp4GemvParams {
+                            m: fused.combined_out_features,
+                            k: in_features,
+                            alpha: self.tensor_scalar_f32(weights, qkv_tensor_scale)?
+                                * self.tensor_scalar_f32(weights, input_quantized.input_scale)?,
+                            a_fp4: fused.combined_weight.ptr(),
+                            a_scale_e4m3: fused.combined_block_scale.ptr(),
+                            b_fp4: forward.activation_fp4.ptr(),
+                            b_scale_e4m3: forward.activation_scale.ptr(),
+                            c_bf16: forward.qkv.ptr(),
+                        },
+                        post_inproj: DecodeInterpreterLinearAttentionPostInProjParams {
+                            conv_gdn: DecodeInterpreterConv1dGdnGateFusedParams {
+                                channels: qkv_dim,
+                                kernel_size: self.topology.linear_conv_kernel_dim,
+                                conv_input_bf16: forward.qkv.ptr(),
+                                conv_history_bf16,
+                                conv_weight_bf16: self.tensor_ptr(weights, &layer.conv1d_weight)?,
+                                conv_output_bf16: forward.aux.ptr(),
+                                heads: self.topology.linear_num_value_heads,
+                                gdn_a_bf16: a_bf16,
+                                gdn_b_bf16: b_bf16,
+                                gdn_a_log_bf16: self.tensor_ptr(weights, &layer.a_log)?,
+                                gdn_dt_bias_bf16: self.tensor_ptr(weights, &layer.dt_bias)?,
+                                gate_f32: forward.gate_f32.ptr(),
+                                beta_f32: forward.beta_f32.ptr(),
+                            },
+                            deltanet: DecodeInterpreterDeltaNetParams {
+                                spec: deltanet_spec_ptr,
+                            },
+                            tail: DecodeInterpreterLinearAttentionTailParams {
+                                norm: DecodeInterpreterRmsNormBf16Params {
+                                    rows: self.topology.linear_num_value_heads,
+                                    hidden: self.topology.linear_value_head_dim,
+                                    eps: 1.0e-6,
+                                    direct_weight: true,
+                                    input_bf16: forward.aux3.ptr(),
+                                    weight_bf16: self.tensor_ptr(weights, &layer.norm_weight)?,
+                                    residual_bf16: DevicePtr::NULL,
+                                    residual_out_bf16: DevicePtr::NULL,
+                                    output_bf16: forward.aux2.ptr(),
+                                },
+                                swiglu: DecodeInterpreterSwiGluBf16Params {
+                                    rows: 1,
+                                    intermediate: value_dim,
+                                    gate_bf16: z_bf16,
+                                    up_bf16: forward.aux2.ptr(),
+                                    output_bf16: forward.aux3.ptr(),
+                                },
+                                quant: DecodeInterpreterNvfp4QuantizeParams {
+                                    values: value_dim,
+                                    input_tensor_scale_f32: self
+                                        .tensor_scalar_f32(weights, out_input_scale)?,
+                                    input_bf16: forward.aux3.ptr(),
+                                    output_fp4: forward.activation_fp4.ptr(),
+                                    output_scale_e4m3: forward.activation_scale.ptr(),
+                                    output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                                },
+                                out_proj,
+                            },
+                        },
+                    },
+                },
+                post: DecodeInterpreterNormMlpParams {
+                    norm: DecodeInterpreterRmsNormNvfp4QuantParams {
+                        hidden,
+                        eps: 1.0e-6,
+                        input_tensor_scale_f32: self
+                            .tensor_scalar_f32(weights, mlp_quantized.input_scale)?,
+                        input_bf16: forward.block_out.ptr(),
+                        weight_bf16: post_attention_norm_weight_bf16,
+                        residual_bf16: forward.normed.ptr(),
+                        residual_out_bf16: forward.residual.ptr(),
+                        output_bf16: DevicePtr::NULL,
+                        output_fp4: forward.activation_fp4.ptr(),
+                        output_scale_e4m3: forward.activation_scale.ptr(),
+                        output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                    },
+                    mlp,
+                },
+            },
+        );
+        Ok(Some((program, spec_bytes)))
+    }
+
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_interpreter_linear_attention_post_inproj_decode(
+        &self,
+        layer: &LinearAttentionLayerWeights,
+        forward: &GpuForwardBuffers,
+        conv_input_bf16: DevicePtr,
+        conv_history_bf16: DevicePtr,
+        gdn_a_bf16: DevicePtr,
+        gdn_b_bf16: DevicePtr,
+        z_bf16: DevicePtr,
+        deltanet_spec: &DeltaNetDecodeSpec,
+    ) -> Result<bool> {
+        if z_bf16 == conv_input_bf16 {
+            return Ok(false);
+        }
+        if !decode_interpreter_linear_attention_post_inproj_enabled()
+            || deltanet_spec.tokens_in_persistent_loop != 1
+            || deltanet_spec.q_token_stride != 0
+            || deltanet_spec.k_token_stride != 0
+            || deltanet_spec.v_token_stride != 0
+        {
+            return Ok(false);
+        }
+
+        let value_dim = self.topology.linear_attention_value_dim();
+        let hidden = self.topology.hidden_size;
+        let LinearWeightBinding::Nvfp4 {
+            input_scale: out_input_scale,
+            ..
+        } = &layer.out_proj
+        else {
+            return Ok(false);
+        };
+        let out_quantized = Nvfp4ActivationQuant {
+            in_features: value_dim,
+            input_scale: out_input_scale,
+        };
+        let Some(out_proj) = self.decode_interpreter_nvfp4_gemv_params(
+            &layer.out_proj,
+            out_quantized,
+            forward.activation_fp4.ptr(),
+            forward.activation_scale.ptr(),
+            forward.block_out.ptr(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if out_proj.m != hidden || out_proj.k != value_dim {
+            return Ok(false);
+        }
+
+        let spec_bytes = deltanet_decode_spec_abi_bytes(deltanet_spec);
+        if spec_bytes.len() > forward.interpreter_deltanet_spec.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear-attn post-inproj DeltaNet spec needs {} bytes but buffer has {}",
+                spec_bytes.len(),
+                forward.interpreter_deltanet_spec.bytes()
+            )));
+        }
+        forward
+            .interpreter_deltanet_spec
+            .copy_from_host(&spec_bytes)?;
+
+        let weights = self.cuda_weights()?;
+        let compiled = DecodeInterpreterProgram::compile_linear_attention_post_inproj_decode(
+            DecodeInterpreterLinearAttentionPostInProjParams {
+                conv_gdn: DecodeInterpreterConv1dGdnGateFusedParams {
+                    channels: self.topology.linear_attention_qkv_dim(),
+                    kernel_size: self.topology.linear_conv_kernel_dim,
+                    conv_input_bf16,
+                    conv_history_bf16,
+                    conv_weight_bf16: self.tensor_ptr(weights, &layer.conv1d_weight)?,
+                    conv_output_bf16: forward.aux.ptr(),
+                    heads: self.topology.linear_num_value_heads,
+                    gdn_a_bf16,
+                    gdn_b_bf16,
+                    gdn_a_log_bf16: self.tensor_ptr(weights, &layer.a_log)?,
+                    gdn_dt_bias_bf16: self.tensor_ptr(weights, &layer.dt_bias)?,
+                    gate_f32: forward.gate_f32.ptr(),
+                    beta_f32: forward.beta_f32.ptr(),
+                },
+                deltanet: DecodeInterpreterDeltaNetParams {
+                    spec: forward.interpreter_deltanet_spec.ptr(),
+                },
+                tail: DecodeInterpreterLinearAttentionTailParams {
+                    norm: DecodeInterpreterRmsNormBf16Params {
+                        rows: self.topology.linear_num_value_heads,
+                        hidden: self.topology.linear_value_head_dim,
+                        eps: 1.0e-6,
+                        direct_weight: true,
+                        input_bf16: forward.aux3.ptr(),
+                        weight_bf16: self.tensor_ptr(weights, &layer.norm_weight)?,
+                        residual_bf16: DevicePtr::NULL,
+                        residual_out_bf16: DevicePtr::NULL,
+                        output_bf16: forward.aux2.ptr(),
+                    },
+                    swiglu: DecodeInterpreterSwiGluBf16Params {
+                        rows: 1,
+                        intermediate: value_dim,
+                        gate_bf16: z_bf16,
+                        up_bf16: forward.aux2.ptr(),
+                        output_bf16: forward.aux3.ptr(),
+                    },
+                    quant: DecodeInterpreterNvfp4QuantizeParams {
+                        values: value_dim,
+                        input_tensor_scale_f32: self.tensor_scalar_f32(weights, out_input_scale)?,
+                        input_bf16: forward.aux3.ptr(),
+                        output_fp4: forward.activation_fp4.ptr(),
+                        output_scale_e4m3: forward.activation_scale.ptr(),
+                        output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                    },
+                    out_proj,
+                },
+            },
+        );
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_deltanet_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear-attn post-inproj program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_deltanet_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_deltanet_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter linear-attn post-inproj program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_deltanet_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_deltanet_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_deltanet_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_deltanet_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_deltanet_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: interpreter_launch_flags(),
             })?;
         Ok(true)
     }
@@ -7215,7 +9665,16 @@ impl<B: KernelBackend> Engine<B> {
         forward: &GpuForwardBuffers,
         quantized: Nvfp4ActivationQuant<'_>,
     ) -> Result<Option<DecodeInterpreterMlpParams>> {
-        let common = layer_common(layer);
+        self.decode_interpreter_mlp_params_from_common(layer_common(layer), forward, quantized)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn decode_interpreter_mlp_params_from_common(
+        &self,
+        common: &CommonLayerWeights,
+        forward: &GpuForwardBuffers,
+        quantized: Nvfp4ActivationQuant<'_>,
+    ) -> Result<Option<DecodeInterpreterMlpParams>> {
         let weights = self.cuda_weights()?;
         let intermediate = self.topology.intermediate_size;
         let hidden = self.topology.hidden_size;
@@ -7342,7 +9801,7 @@ impl<B: KernelBackend> Engine<B> {
                 counters_i32: forward.interpreter_mlp_counters.ptr(),
                 counter_count: compiled.program.counter_count,
                 cta_count: 0,
-                flags: 0,
+                flags: interpreter_launch_flags(),
             })?;
         Ok(true)
     }
@@ -7410,7 +9869,7 @@ impl<B: KernelBackend> Engine<B> {
                 counters_i32: forward.interpreter_mlp_counters.ptr(),
                 counter_count: compiled.program.counter_count,
                 cta_count: 0,
-                flags: 0,
+                flags: interpreter_launch_flags(),
             })?;
         Ok(true)
     }
@@ -7476,7 +9935,7 @@ impl<B: KernelBackend> Engine<B> {
                 counters_i32: forward.interpreter_logits_counters.ptr(),
                 counter_count: compiled.program.counter_count,
                 cta_count: 0,
-                flags: 0,
+                flags: interpreter_launch_flags(),
             })
     }
 
@@ -7763,6 +10222,144 @@ impl<B: KernelBackend> Engine<B> {
                     self.state.position + drafts + 1,
                 ),
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn decode_interpreter_graph_layer_program(
+        &self,
+        layer_idx: usize,
+        position_device_i32: DevicePtr,
+    ) -> Option<&DecodeInterpreterGraphLayerProgram> {
+        let programs = self.decode_interpreter_graph_programs.as_ref()?;
+        if programs.position_device_i32 != position_device_i32 {
+            return None;
+        }
+        programs.layers.get(layer_idx)?.as_ref()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn prepare_decode_interpreter_graph_programs(
+        &mut self,
+        position_device_i32: DevicePtr,
+        attention_context_limit: usize,
+    ) -> Result<()> {
+        if position_device_i32 == DevicePtr::NULL || !decode_interpreter_decode_enabled() {
+            self.decode_interpreter_graph_programs = None;
+            return Ok(());
+        }
+        if self
+            .decode_interpreter_graph_programs
+            .as_ref()
+            .is_some_and(|programs| {
+                programs.position_device_i32 == position_device_i32
+                    && programs.attention_context_limit == attention_context_limit
+            })
+        {
+            return Ok(());
+        }
+
+        let layers = {
+            let manifest = self
+                .weights
+                .as_ref()
+                .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+            let weights = self.cuda_weights()?;
+            let runtime = self.cuda_runtime()?;
+            let forward = self.cuda_forward()?;
+            let mut layers = Vec::with_capacity(manifest.layers.len());
+            for (layer_idx, layer) in manifest.layers.iter().enumerate() {
+                let input_quantized = match Self::layer_input_nvfp4_quant(layer)? {
+                    Some(quantized) => quantized,
+                    None => {
+                        layers.push(None);
+                        continue;
+                    }
+                };
+                let common = layer_common(layer);
+                let mlp_input_linears = [
+                    (&common.mlp_gate_proj, DevicePtr::NULL),
+                    (&common.mlp_up_proj, DevicePtr::NULL),
+                ];
+                let mlp_quantized = match Self::common_nvfp4_quant(&mlp_input_linears)? {
+                    Some(quantized) => quantized,
+                    None => {
+                        layers.push(None);
+                        continue;
+                    }
+                };
+                let input_residual = if layer_idx == 0 {
+                    DevicePtr::NULL
+                } else {
+                    forward.residual.ptr()
+                };
+
+                let program = match layer {
+                    LayerWeights::LinearAttention(linear)
+                        if decode_interpreter_linear_transformer_layer_enabled() =>
+                    {
+                        let spec = CudaDeviceBuffer::alloc(deltanet_decode_spec_abi_size())?;
+                        match self.build_interpreter_linear_transformer_layer_decode(
+                            linear,
+                            runtime,
+                            forward,
+                            input_quantized,
+                            mlp_quantized,
+                            input_residual,
+                            self.tensor_ptr(weights, &common.input_layernorm)?,
+                            self.tensor_ptr(weights, &common.post_attention_layernorm)?,
+                            spec.ptr(),
+                        )? {
+                            Some((program, spec_bytes)) => {
+                                spec.copy_from_host(&spec_bytes)?;
+                                Some(DecodeInterpreterGraphLayerProgram::upload(
+                                    program,
+                                    Some(spec),
+                                )?)
+                            }
+                            None => None,
+                        }
+                    }
+                    LayerWeights::FullAttention(full)
+                        if decode_interpreter_full_transformer_layer_enabled() =>
+                    {
+                        let spec = CudaDeviceBuffer::alloc(attention_decode_spec_abi_size())?;
+                        match self.build_interpreter_full_transformer_layer_decode(
+                            full,
+                            runtime,
+                            forward,
+                            self.state.position,
+                            position_device_i32,
+                            attention_context_limit,
+                            input_quantized,
+                            mlp_quantized,
+                            input_residual,
+                            self.tensor_ptr(weights, &common.input_layernorm)?,
+                            self.tensor_ptr(weights, &common.post_attention_layernorm)?,
+                            spec.ptr(),
+                        )? {
+                            Some((program, spec_bytes)) => {
+                                spec.copy_from_host(&spec_bytes)?;
+                                Some(DecodeInterpreterGraphLayerProgram::upload(
+                                    program,
+                                    Some(spec),
+                                )?)
+                            }
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                };
+                layers.push(program);
+            }
+            layers
+        };
+
+        self.decode_interpreter_graph_programs = Some(DecodeInterpreterGraphPrograms {
+            attention_context_limit,
+            position_device_i32,
+            layers,
+        });
+        Ok(())
     }
 
     /// Pick the number of split-KV blocks per q-head for decode attention.

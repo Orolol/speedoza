@@ -1156,6 +1156,73 @@ int main() {
   expect_close(swiglu_values[1], 2.0f / (1.0f + expf(-1.0f)), 0.02f,
                "swiglu[1]");
 
+  qwen36_device_ptr_t interp_swiglu_bf16_gate =
+      dev_alloc<__nv_bfloat16>(17);
+  qwen36_device_ptr_t interp_swiglu_bf16_up =
+      dev_alloc<__nv_bfloat16>(17);
+  qwen36_device_ptr_t interp_swiglu_bf16_ref =
+      dev_alloc<__nv_bfloat16>(17);
+  qwen36_device_ptr_t interp_swiglu_bf16_out =
+      dev_alloc<__nv_bfloat16>(17);
+  qwen36_device_ptr_t interp_swiglu_bf16_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(2);
+  qwen36_device_ptr_t interp_swiglu_bf16_counters = dev_alloc<int32_t>(2);
+  std::vector<float> interp_swiglu_bf16_gate_values(17);
+  std::vector<float> interp_swiglu_bf16_up_values(17);
+  for (size_t i = 0; i < 17; ++i) {
+    interp_swiglu_bf16_gate_values[i] =
+        (static_cast<int>(i % 9) - 4) * 0.25f;
+    interp_swiglu_bf16_up_values[i] = 0.5f + static_cast<float>(i) * 0.03125f;
+  }
+  copy_bf16(interp_swiglu_bf16_gate, interp_swiglu_bf16_gate_values);
+  copy_bf16(interp_swiglu_bf16_up, interp_swiglu_bf16_up_values);
+  qwen36_swiglu_spec_t interp_swiglu_bf16_ref_spec{};
+  interp_swiglu_bf16_ref_spec.rows = 1;
+  interp_swiglu_bf16_ref_spec.intermediate = 17;
+  interp_swiglu_bf16_ref_spec.gate_bf16 = interp_swiglu_bf16_gate;
+  interp_swiglu_bf16_ref_spec.up_bf16 = interp_swiglu_bf16_up;
+  interp_swiglu_bf16_ref_spec.output_bf16 = interp_swiglu_bf16_ref;
+  must_status(qwen36_swiglu(&interp_swiglu_bf16_ref_spec),
+              "interpreter swiglu bf16 reference");
+  qwen36_interpreter_instruction_t interp_swiglu_bf16_program_host[2]{};
+  interp_swiglu_bf16_program_host[0].opcode = 14; // SWIGLU_BF16
+  interp_swiglu_bf16_program_host[0].publishes_counter = 0;
+  interp_swiglu_bf16_program_host[0].publish_value = 1;
+  interp_swiglu_bf16_program_host[0].arrival_counter = 1;
+  interp_swiglu_bf16_program_host[0].payload[0] = 1;
+  interp_swiglu_bf16_program_host[0].payload[1] = 17;
+  interp_swiglu_bf16_program_host[0].payload[2] =
+      interp_swiglu_bf16_gate.ptr;
+  interp_swiglu_bf16_program_host[0].payload[3] = interp_swiglu_bf16_up.ptr;
+  interp_swiglu_bf16_program_host[0].payload[4] = interp_swiglu_bf16_out.ptr;
+  interp_swiglu_bf16_program_host[1].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_swiglu_bf16_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_swiglu_bf16_program_host,
+          interp_swiglu_bf16_program_host + 2));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_swiglu_bf16_counters.ptr),
+                 0, 2 * sizeof(int32_t)),
+      "cudaMemset interp swiglu bf16 counters");
+  qwen36_interpreter_program_t interp_swiglu_bf16_spec{};
+  interp_swiglu_bf16_spec.instructions = interp_swiglu_bf16_instructions;
+  interp_swiglu_bf16_spec.instruction_count = 2;
+  interp_swiglu_bf16_spec.counters_i32 = interp_swiglu_bf16_counters;
+  interp_swiglu_bf16_spec.counter_count = 2;
+  interp_swiglu_bf16_spec.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_swiglu_bf16_spec),
+              "interpreter swiglu bf16");
+  std::vector<float> interp_swiglu_bf16_ref_values =
+      read_bf16(interp_swiglu_bf16_ref, 17);
+  std::vector<float> interp_swiglu_bf16_values =
+      read_bf16(interp_swiglu_bf16_out, 17);
+  for (size_t i = 0; i < 17; ++i) {
+    expect_close(interp_swiglu_bf16_values[i],
+                 interp_swiglu_bf16_ref_values[i], 0.0f,
+                 "interpreter swiglu bf16");
+  }
+
   const size_t interp_swiglu_values_count = 33;
   const size_t interp_swiglu_fp4_bytes = (interp_swiglu_values_count + 1) / 2;
   qwen36_device_ptr_t interp_swiglu_gate =
@@ -1895,6 +1962,135 @@ int main() {
   expect_close(read_raw<float>(gate_out, 1)[0], -logf(2.0f), 0.02f,
                "gdn gate");
   expect_close(read_raw<float>(beta_out, 1)[0], 0.5f, 0.02f, "gdn beta");
+
+  const size_t interp_conv_channels = 4;
+  const size_t interp_conv_kernel = 4;
+  const size_t interp_conv_heads = 2;
+  qwen36_device_ptr_t interp_conv_input =
+      dev_alloc<__nv_bfloat16>(interp_conv_channels);
+  qwen36_device_ptr_t interp_conv_history_ref =
+      dev_alloc<__nv_bfloat16>(interp_conv_channels * (interp_conv_kernel - 1));
+  qwen36_device_ptr_t interp_conv_history =
+      dev_alloc<__nv_bfloat16>(interp_conv_channels * (interp_conv_kernel - 1));
+  qwen36_device_ptr_t interp_conv_weight =
+      dev_alloc<__nv_bfloat16>(interp_conv_channels * interp_conv_kernel);
+  qwen36_device_ptr_t interp_conv_out_ref =
+      dev_alloc<__nv_bfloat16>(interp_conv_channels);
+  qwen36_device_ptr_t interp_conv_out =
+      dev_alloc<__nv_bfloat16>(interp_conv_channels);
+  qwen36_device_ptr_t interp_gdn_a =
+      dev_alloc<__nv_bfloat16>(interp_conv_heads);
+  qwen36_device_ptr_t interp_gdn_b =
+      dev_alloc<__nv_bfloat16>(interp_conv_heads);
+  qwen36_device_ptr_t interp_gdn_a_log =
+      dev_alloc<__nv_bfloat16>(interp_conv_heads);
+  qwen36_device_ptr_t interp_gdn_dt =
+      dev_alloc<__nv_bfloat16>(interp_conv_heads);
+  qwen36_device_ptr_t interp_gdn_gate_ref = dev_alloc<float>(interp_conv_heads);
+  qwen36_device_ptr_t interp_gdn_beta_ref = dev_alloc<float>(interp_conv_heads);
+  qwen36_device_ptr_t interp_gdn_gate = dev_alloc<float>(interp_conv_heads);
+  qwen36_device_ptr_t interp_gdn_beta = dev_alloc<float>(interp_conv_heads);
+  qwen36_device_ptr_t interp_conv_gdn_instructions =
+      dev_alloc<qwen36_interpreter_instruction_t>(2);
+  qwen36_device_ptr_t interp_conv_gdn_counters = dev_alloc<int32_t>(2);
+  copy_bf16(interp_conv_input, {0.25f, -0.5f, 1.0f, 2.0f});
+  const std::vector<float> interp_conv_history_values = {
+      0.0f, 0.25f, -0.25f, 1.0f, 0.5f, -0.5f,
+      0.75f, 0.0f, 0.125f, -0.125f, 0.375f, -0.375f};
+  copy_bf16(interp_conv_history_ref, interp_conv_history_values);
+  copy_bf16(interp_conv_history, interp_conv_history_values);
+  copy_bf16(interp_conv_weight,
+            {1.0f, 0.5f, -0.25f, 0.125f, -0.5f, 1.0f, 0.25f,
+             -0.125f, 0.25f, 0.25f, 0.25f, 0.25f, 1.0f, -1.0f,
+             0.5f, -0.5f});
+  copy_bf16(interp_gdn_a, {0.0f, 1.0f});
+  copy_bf16(interp_gdn_b, {0.0f, -1.0f});
+  copy_bf16(interp_gdn_a_log, {0.0f, 0.5f});
+  copy_bf16(interp_gdn_dt, {0.0f, -0.25f});
+  qwen36_conv1d_gdn_gate_fused_spec_t interp_conv_gdn_ref_spec{};
+  interp_conv_gdn_ref_spec.channels = interp_conv_channels;
+  interp_conv_gdn_ref_spec.kernel_size = interp_conv_kernel;
+  interp_conv_gdn_ref_spec.conv_input_bf16 = interp_conv_input;
+  interp_conv_gdn_ref_spec.conv_history_bf16 = interp_conv_history_ref;
+  interp_conv_gdn_ref_spec.conv_weight_bf16 = interp_conv_weight;
+  interp_conv_gdn_ref_spec.conv_output_bf16 = interp_conv_out_ref;
+  interp_conv_gdn_ref_spec.heads = interp_conv_heads;
+  interp_conv_gdn_ref_spec.gdn_a_bf16 = interp_gdn_a;
+  interp_conv_gdn_ref_spec.gdn_b_bf16 = interp_gdn_b;
+  interp_conv_gdn_ref_spec.gdn_a_log_bf16 = interp_gdn_a_log;
+  interp_conv_gdn_ref_spec.gdn_dt_bias_bf16 = interp_gdn_dt;
+  interp_conv_gdn_ref_spec.gate_f32 = interp_gdn_gate_ref;
+  interp_conv_gdn_ref_spec.beta_f32 = interp_gdn_beta_ref;
+  must_status(qwen36_conv1d_gdn_gate_fused(&interp_conv_gdn_ref_spec),
+              "interpreter conv1d+gdn reference");
+  qwen36_interpreter_instruction_t interp_conv_gdn_program_host[2]{};
+  interp_conv_gdn_program_host[0].opcode = 15; // CONV1D_GDN_GATE_FUSED
+  interp_conv_gdn_program_host[0].publishes_counter = 0;
+  interp_conv_gdn_program_host[0].publish_value = 1;
+  interp_conv_gdn_program_host[0].arrival_counter = 1;
+  interp_conv_gdn_program_host[0].payload[0] = interp_conv_channels;
+  interp_conv_gdn_program_host[0].payload[1] =
+      interp_conv_kernel | (static_cast<uint64_t>(interp_conv_heads) << 32);
+  interp_conv_gdn_program_host[0].payload[2] = interp_conv_input.ptr;
+  interp_conv_gdn_program_host[0].payload[3] = interp_conv_history.ptr;
+  interp_conv_gdn_program_host[0].payload[4] = interp_conv_weight.ptr;
+  interp_conv_gdn_program_host[0].payload[5] = interp_conv_out.ptr;
+  interp_conv_gdn_program_host[0].payload[6] = interp_gdn_a.ptr;
+  interp_conv_gdn_program_host[0].payload[7] = interp_gdn_b.ptr;
+  interp_conv_gdn_program_host[0].payload[8] = interp_gdn_a_log.ptr;
+  interp_conv_gdn_program_host[0].payload[9] = interp_gdn_dt.ptr;
+  interp_conv_gdn_program_host[0].payload[10] = interp_gdn_gate.ptr;
+  interp_conv_gdn_program_host[0].payload[11] = interp_gdn_beta.ptr;
+  interp_conv_gdn_program_host[1].opcode = 0; // EXIT
+  copy_raw<qwen36_interpreter_instruction_t>(
+      interp_conv_gdn_instructions,
+      std::vector<qwen36_interpreter_instruction_t>(
+          interp_conv_gdn_program_host, interp_conv_gdn_program_host + 2));
+  must_cuda<int32_t>(
+      cudaMemset(reinterpret_cast<void *>(interp_conv_gdn_counters.ptr), 0,
+                 2 * sizeof(int32_t)),
+      "cudaMemset interp conv1d+gdn counters");
+  qwen36_interpreter_program_t interp_conv_gdn_spec{};
+  interp_conv_gdn_spec.instructions = interp_conv_gdn_instructions;
+  interp_conv_gdn_spec.instruction_count = 2;
+  interp_conv_gdn_spec.counters_i32 = interp_conv_gdn_counters;
+  interp_conv_gdn_spec.counter_count = 2;
+  interp_conv_gdn_spec.cta_count = 2;
+  must_status(qwen36_interpreter_decode_sm120(&interp_conv_gdn_spec),
+              "interpreter conv1d+gdn");
+  std::vector<float> interp_conv_out_ref_values =
+      read_bf16(interp_conv_out_ref, interp_conv_channels);
+  std::vector<float> interp_conv_out_values =
+      read_bf16(interp_conv_out, interp_conv_channels);
+  std::vector<float> interp_conv_history_ref_values =
+      read_bf16(interp_conv_history_ref,
+                interp_conv_channels * (interp_conv_kernel - 1));
+  std::vector<float> interp_conv_history_out_values =
+      read_bf16(interp_conv_history,
+                interp_conv_channels * (interp_conv_kernel - 1));
+  std::vector<float> interp_gdn_gate_ref_values =
+      read_raw<float>(interp_gdn_gate_ref, interp_conv_heads);
+  std::vector<float> interp_gdn_gate_values =
+      read_raw<float>(interp_gdn_gate, interp_conv_heads);
+  std::vector<float> interp_gdn_beta_ref_values =
+      read_raw<float>(interp_gdn_beta_ref, interp_conv_heads);
+  std::vector<float> interp_gdn_beta_values =
+      read_raw<float>(interp_gdn_beta, interp_conv_heads);
+  for (size_t i = 0; i < interp_conv_channels; ++i) {
+    expect_close(interp_conv_out_values[i], interp_conv_out_ref_values[i],
+                 0.0f, "interpreter conv1d+gdn conv output");
+  }
+  for (size_t i = 0; i < interp_conv_history_ref_values.size(); ++i) {
+    expect_close(interp_conv_history_out_values[i],
+                 interp_conv_history_ref_values[i], 0.0f,
+                 "interpreter conv1d+gdn history");
+  }
+  for (size_t i = 0; i < interp_conv_heads; ++i) {
+    expect_close(interp_gdn_gate_values[i], interp_gdn_gate_ref_values[i],
+                 0.0f, "interpreter conv1d+gdn gate");
+    expect_close(interp_gdn_beta_values[i], interp_gdn_beta_ref_values[i],
+                 0.0f, "interpreter conv1d+gdn beta");
+  }
 
   qwen36_device_ptr_t sigmoid_gate = dev_alloc<__nv_bfloat16>(1);
   qwen36_device_ptr_t sigmoid_input = dev_alloc<__nv_bfloat16>(1);

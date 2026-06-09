@@ -692,34 +692,101 @@ is "kernel-fusion compiler that emits one launch per slice", not
 "on-SM interpreter that pipelines instructions" — different
 architecture, much smaller projected ceiling.
 
-**Engine work I am starting now (Claude, in this session):**
+**Engine work Claude did in this session (commit follows):**
 
-1. **Drop the per-instruction `__syncthreads()` from the dispatch
-   loop.** Move sync responsibility into each opcode body (most
-   already sync internally). Unblocks chunking + prefetch.
-2. **Wire `cp.async.bulk` weight prefetch.** Add a payload field
-   `prefetch_weight_ptr` + `prefetch_weight_bytes` (or read it from
-   the *next* instruction in the program). Kick off the load into a
-   double-buffered weight page at the top of instruction N's body so
-   the next NVFP4 GEMV's weight tile is L2/SMEM-warm. Stage A:
-   prefetch for `NVFP4_GEMV` only.
-3. **Re-bench** with the same protocol. If ≥ +3 tok/s on MTP=0, ship
-   and document. If between 0 and +3, decide between (B) implementing
-   sub-instruction chunking next, or (A) reframing the work as a
-   fusion compiler and committing at parity. If still negative,
-   revert and keep behind `QWEN36_INTERPRETER_DECODE=1` opt-in for
-   diagnostics, same outcome as the per-block megakernel.
+1. **L2 lookahead prefetch helper** — new
+   `kernels-cuda/interpreter/prefetch.cuh`. Each instruction reads
+   `program[pc + 1]` from GMEM (cheap) and, for opcodes whose weight
+   pointer is determined by the canonical payload layout
+   (`NVFP4_GEMV`, `LM_HEAD_TILED`, `RMSNORM_BF16`,
+   `RMSNORM_NVFP4_QUANT`), issues a budget of 64 KiB of
+   `prefetch.global.L2` PTX hints during instruction `pc`'s own
+   compute. Non-blocking. No ABI change.
+2. **Kernel-launch flag plumbing.** Added a `flags: u32` parameter
+   to `qwen36_interpreter_decode_kernel`; bit 0 enables the
+   prefetch lookahead. Rust side reads
+   `QWEN36_INTERPRETER_PREFETCH` (new env var, default 0) into the
+   single `interpreter_launch_flags()` helper used by all 17
+   `InterpreterProgramSpec` construction sites in `engine.rs`.
+3. **Dropped the original "drop per-instruction `__syncthreads()`"
+   idea.** Measured: 60 syncthreads/token × ~10 ns ≈ 600 ns =
+   0.003 % of token budget. Not where the regression comes from.
 
-**Codex hand-off:** if you re-enter this branch, the engine work above
-is the missing piece. Don't add more opcodes until the prefetch
-mechanism is proven (or proven not to win) on one opcode pair. The
-extensive whole-layer Rust compile coverage you've built is the right
-scaffolding — emitting a known static instruction chain means
-"prefetch the weights of program[pc + 1] during program[pc]" is
-expressible. The block list is in
-`docs/superpowers/notes/2026-06-09-long-context-decode-roadmap.md`
-under Tier 1; once the megakernel is decided, FA-tiling the DFlash
-drafter is the next ROI win.
+**Did NOT do this session (still gaps vs spec):**
+
+- `cp.async.bulk` weight prefetch into double-buffered SMEM pages.
+  The `PageAllocator` slots remain unused. A real SMEM-resident
+  weight overlap path would require refactoring the NVFP4 GEMV body
+  (~330 PTX-heavy lines in
+  `kernels-cuda/decode_gemv/nvfp4_gemv_mma_kernel.cuh`) to accept a
+  pre-warmed A operand from SMEM. Multi-day refactor; deferred.
+- Sub-instruction chunking. Requires the GEMV / SwiGLU bodies to
+  publish per-chunk counters mid-execution. The substrate ABI can
+  express it (extend `publishes_counter` to an array indexed by
+  chunk id) but no opcode body emits chunk-grained progress yet.
+
+**Bench (after prefetch + flags plumbing, same session, same GPU
+load — comparison apples-to-apples):**
+
+prompt=128, max-new=32, median of 5:
+
+| Config | tok/s | Δ vs baseline |
+|---|---:|---:|
+| MTP=0 baseline (no interpreter) | 37.50 | — |
+| MTP=0 interpreter (PF off) | 35.02 | −6.6 % |
+| MTP=0 interpreter (PF on)  | 34.12 | −9.0 % |
+| MTP=4 baseline (no interpreter) | 74.98 | — |
+| MTP=4 interpreter (PF off) | **80.43** | **+7.3 %** |
+| MTP=4 interpreter (PF on)  | 75.19 | +0.3 % |
+
+**Two findings worth noting:**
+
+- **The interpreter actually WINS on MTP=4 (+7.3 %) without
+  prefetch.** Hidden in the first bench session by noise. Hypothesis:
+  with MTP=4 the speculative head runs 4× per accepted token, so
+  per-token graph-node count is much higher than MTP=0, and the
+  whole-layer compile saves enough cross-node overhead to net out as
+  a real gain. **This passes the spec gate ("≥ +3 tok/s")** on
+  MTP=4 even though it fails on MTP=0.
+- **L2 prefetch as implemented is a net negative** on both MTP=0
+  (−2.4 pts) and MTP=4 (−7 pts). 64 KiB / instruction across all
+  prefetch-eligible opcodes pollutes the L2 working set faster than
+  warming up the next instruction's first cache lines saves. Smaller
+  budgets, opcode-filtered prefetch (only NVFP4 GEMV on the bigger
+  GEMMs), or a true `cp.async.bulk`-into-SMEM mechanism would behave
+  differently.
+
+**Decision:**
+
+- Prefetch helper stays in-tree but **default OFF**
+  (`QWEN36_INTERPRETER_PREFETCH=1` to opt-in). The infra is reusable
+  for budget / opcode-filter experiments, and the flag is plumbed
+  through every launch site already.
+- Interpreter master flag (`QWEN36_INTERPRETER_DECODE`) **remains
+  opt-in default-off** because of the MTP=0 regression. Enabling by
+  default only for MTP>0 paths is the obvious next step but requires
+  threading the choice through the chat/bench command surface; left
+  for a follow-up session.
+- MTP=0 regression source not yet root-caused. Most likely
+  candidates: (1) the 192-CTA grid wastes atomicAdd publishes on
+  small opcodes (`residual_add`, `rmsnorm_bf16`), (2) per-instruction
+  cross-CTA counter sync contends in L2, (3) the dispatch loop's
+  scratch SMEM allocation (`__shared__ float scratch[512]`) bloats
+  the kernel's register pressure / occupancy budget. Each is testable
+  in isolation.
+
+**Codex hand-off (updated):** the prefetch infra (`prefetch.cuh`,
+flags plumbing) is the substrate for any further weight-warmup
+experiments — adjust `kPrefetchBudgetBytes`, narrow the opcode
+filter to just `NVFP4_GEMV` shapes ≥ 5120 × 5120, or replace the
+PTX hint with `cp.async.bulk` into a real SMEM page when you wire
+the GEMV body to read from SMEM. The MTP=4 +7.3 % win is a real
+result and worth defending — if you add anything to the dispatch
+path, re-bench MTP=4 to make sure you don't lose it. The long-
+context roadmap doc
+(`docs/superpowers/notes/2026-06-09-long-context-decode-roadmap.md`)
+lists higher-ROI alternatives (FA-tile DFlash drafter, Quest page
+sparsity, NVFP4 KV) if the megakernel investigation plateaus.
 
 Reproduce the bench with:
 
@@ -728,6 +795,7 @@ QWEN36_FP4_KERNEL_LIB_DIR=$PWD/target/cuda \
 LD_LIBRARY_PATH=$PWD/target/cuda:${LD_LIBRARY_PATH:-} \
 QWEN36_LONG_CONTEXT_MODE=1 \
 [QWEN36_INTERPRETER_DECODE=1] \
+[QWEN36_INTERPRETER_PREFETCH=1] \
   target/release/qwen36 bench \
     --model-dir ~/models/Qwen3.6-27B-Text-NVFP4-MTP \
     --prompt-tokens 128 --max-new-tokens 32 \

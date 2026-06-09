@@ -4,7 +4,7 @@ use crate::backend::DevicePtr;
 
 pub const INTERPRETER_MAX_DEPS: usize = 4;
 pub const INTERPRETER_PAYLOAD_U64S: usize = 12;
-pub const INTERPRETER_OPCODE_COUNT: usize = 14;
+pub const INTERPRETER_OPCODE_COUNT: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InterpreterOpcode {
@@ -22,10 +22,12 @@ pub enum InterpreterOpcode {
     QProjDeinterleave,
     QProjSigmoidGate,
     Nvfp4Quantize,
+    SwiGluBf16,
+    Conv1dGdnGateFused,
 }
 
 impl InterpreterOpcode {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::Exit,
         Self::FallbackTrampoline,
         Self::RmsNormNvfp4Quant,
@@ -40,6 +42,8 @@ impl InterpreterOpcode {
         Self::QProjDeinterleave,
         Self::QProjSigmoidGate,
         Self::Nvfp4Quantize,
+        Self::SwiGluBf16,
+        Self::Conv1dGdnGateFused,
     ];
 
     pub fn code(self) -> u16 {
@@ -58,6 +62,8 @@ impl InterpreterOpcode {
             Self::QProjDeinterleave => 11,
             Self::QProjSigmoidGate => 12,
             Self::Nvfp4Quantize => 13,
+            Self::SwiGluBf16 => 14,
+            Self::Conv1dGdnGateFused => 15,
         }
     }
 
@@ -77,6 +83,8 @@ impl InterpreterOpcode {
             11 => Self::QProjDeinterleave,
             12 => Self::QProjSigmoidGate,
             13 => Self::Nvfp4Quantize,
+            14 => Self::SwiGluBf16,
+            15 => Self::Conv1dGdnGateFused,
             _ => return None,
         })
     }
@@ -97,6 +105,8 @@ impl InterpreterOpcode {
             Self::QProjDeinterleave => "Q_PROJ_DEINTERLEAVE",
             Self::QProjSigmoidGate => "Q_PROJ_SIGMOID_GATE",
             Self::Nvfp4Quantize => "NVFP4_QUANTIZE",
+            Self::SwiGluBf16 => "SWIGLU_BF16",
+            Self::Conv1dGdnGateFused => "CONV1D_GDN_GATE_FUSED",
         }
     }
 
@@ -226,6 +236,7 @@ impl InterpreterInstruction {
         instruction
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn rmsnorm_nvfp4_quant(
         hidden: usize,
         eps: f32,
@@ -274,6 +285,54 @@ impl InterpreterInstruction {
         instruction
     }
 
+    pub fn swiglu_bf16(
+        rows: usize,
+        intermediate: usize,
+        gate_bf16: DevicePtr,
+        up_bf16: DevicePtr,
+        output_bf16: DevicePtr,
+    ) -> Self {
+        let mut instruction = Self::new(InterpreterOpcode::SwiGluBf16);
+        instruction.payload[0] = rows as u64;
+        instruction.payload[1] = intermediate as u64;
+        instruction.payload[2] = gate_bf16.0;
+        instruction.payload[3] = up_bf16.0;
+        instruction.payload[4] = output_bf16.0;
+        instruction
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_gdn_gate_fused(
+        channels: usize,
+        kernel_size: usize,
+        conv_input_bf16: DevicePtr,
+        conv_history_bf16: DevicePtr,
+        conv_weight_bf16: DevicePtr,
+        conv_output_bf16: DevicePtr,
+        heads: usize,
+        gdn_a_bf16: DevicePtr,
+        gdn_b_bf16: DevicePtr,
+        gdn_a_log_bf16: DevicePtr,
+        gdn_dt_bias_bf16: DevicePtr,
+        gate_f32: DevicePtr,
+        beta_f32: DevicePtr,
+    ) -> Self {
+        let mut instruction = Self::new(InterpreterOpcode::Conv1dGdnGateFused);
+        instruction.payload[0] = channels as u64;
+        instruction.payload[1] = (kernel_size as u64) | ((heads as u64) << 32);
+        instruction.payload[2] = conv_input_bf16.0;
+        instruction.payload[3] = conv_history_bf16.0;
+        instruction.payload[4] = conv_weight_bf16.0;
+        instruction.payload[5] = conv_output_bf16.0;
+        instruction.payload[6] = gdn_a_bf16.0;
+        instruction.payload[7] = gdn_b_bf16.0;
+        instruction.payload[8] = gdn_a_log_bf16.0;
+        instruction.payload[9] = gdn_dt_bias_bf16.0;
+        instruction.payload[10] = gate_f32.0;
+        instruction.payload[11] = beta_f32.0;
+        instruction
+    }
+
     pub fn nvfp4_quantize(
         values: usize,
         input_tensor_scale_f32: f32,
@@ -292,6 +351,7 @@ impl InterpreterInstruction {
         instruction
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn nvfp4_gemv(
         m: usize,
         k: usize,
@@ -376,6 +436,7 @@ impl InterpreterInstruction {
         instruction
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn rope_partial(
         tokens: usize,
         q_heads: usize,

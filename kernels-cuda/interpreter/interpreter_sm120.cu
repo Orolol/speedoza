@@ -1,6 +1,8 @@
 #include "instruction.h"
 #include "counters.cuh"
+#include "prefetch.cuh"
 #include "opcodes/attn_decode_full.cuh"
+#include "opcodes/conv1d_gdn_gate_fused.cuh"
 #include "opcodes/deltanet_recur.cuh"
 #include "opcodes/fallback_trampoline.cuh"
 #include "opcodes/lm_head_tiled.cuh"
@@ -11,6 +13,7 @@
 #include "opcodes/rmsnorm_bf16.cuh"
 #include "opcodes/rmsnorm_nvfp4_quant.cuh"
 #include "opcodes/rope_partial.cuh"
+#include "opcodes/swiglu_bf16.cuh"
 #include "opcodes/swiglu_nvfp4_quant.cuh"
 #include "page_allocator.cuh"
 #include "../active_stream.h"
@@ -100,6 +103,12 @@ dispatch_instruction(const qwen36_interpreter_instruction_t &insn,
     qwen36_interpreter::exec_nvfp4_quantize(
         insn, pages, scratch, swiglu_decoded_scale, swiglu_staged);
     break;
+  case QWEN36_INTERPRETER_OPCODE_SWIGLU_BF16:
+    qwen36_interpreter::exec_swiglu_bf16(insn, pages);
+    break;
+  case QWEN36_INTERPRETER_OPCODE_CONV1D_GDN_GATE_FUSED:
+    qwen36_interpreter::exec_conv1d_gdn_gate_fused(insn, pages);
+    break;
   default:
     break;
   }
@@ -109,7 +118,7 @@ __global__ void __launch_bounds__(QWEN36_INTERPRETER_THREADS)
     qwen36_interpreter_decode_kernel(
         const qwen36_interpreter_instruction_t *__restrict__ instructions,
         uint32_t instruction_count, int32_t *__restrict__ counters,
-        uint32_t counter_count) {
+        uint32_t counter_count, uint32_t flags) {
   extern __shared__ __align__(16) unsigned char smem[];
   __shared__ InterpreterState state;
   __shared__ qwen36_interpreter::PageAllocator pages;
@@ -147,6 +156,16 @@ __global__ void __launch_bounds__(QWEN36_INTERPRETER_THREADS)
     for (uint32_t dep_idx = 0; dep_idx < insn.dep_count; ++dep_idx) {
       qwen36_interpreter::wait_for_counter(counters, counter_count,
                                            insn.deps[dep_idx]);
+    }
+
+    // Lookahead L2 prefetch for instruction pc+1's weights. Non-blocking
+    // PTX hint, issued in parallel with this instruction's compute so the
+    // next instruction's first cache lines land warm. Gated by the kernel
+    // launch flags so we can A/B without rebuilding (host sets bit 0).
+    const uint32_t next_pc = pc + 1u;
+    if (next_pc < instruction_count && (flags & 1u) != 0u) {
+      const qwen36_interpreter_instruction_t next = instructions[next_pc];
+      qwen36_interpreter::prefetch_next_instruction_weights(next);
     }
 
     dispatch_instruction(insn, pages, state, scratch, &swiglu_decoded_scale,
@@ -244,7 +263,7 @@ qwen36_interpreter_decode_sm120(const qwen36_interpreter_program_t *program) {
       ptr<const qwen36_interpreter_instruction_t>(program->instructions),
       static_cast<uint32_t>(program->instruction_count),
       ptr<int32_t>(program->counters_i32),
-      static_cast<uint32_t>(program->counter_count));
+      static_cast<uint32_t>(program->counter_count), program->flags);
 
   err = cudaGetLastError();
   return status(err);

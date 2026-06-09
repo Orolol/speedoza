@@ -57,6 +57,11 @@ impl CudaDeviceBuffer {
     /// Wrap an existing device allocation without taking ownership of its
     /// lifetime. Callers must `mem::forget` the returned value after using it
     /// as a temporary view, otherwise `Drop` will free the raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must reference a live CUDA device allocation of at least `bytes`
+    /// bytes for the full lifetime of the returned temporary wrapper.
     pub unsafe fn from_raw_ptr(ptr: DevicePtr, bytes: usize) -> Self {
         Self { ptr, bytes }
     }
