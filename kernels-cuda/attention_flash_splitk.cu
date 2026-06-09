@@ -399,10 +399,60 @@ __global__ void attention_flash_splitk_reduce_kernel(
 
 } // namespace
 
-// Self-contained entry: allocates its own partial buffers, runs the
-// split-K kernel + reduce. Used by the smoke parity gate. Engine
-// integration (reusing pre-allocated partials, wiring into the prefill
-// dispatch) is a separate step once parity is green.
+// Persistent grow-on-demand scratch for the split-K partials. Avoids a
+// cudaMalloc/cudaFree (each Free implicitly syncs) on every attention
+// call — there are 16 full-attn layers × many speculative iters per
+// generation, so per-call alloc dominated. The scratch is reused on the
+// stream-ordered active stream: within one entry call the split kernel
+// writes the partials and the reduce consumes them before returning, and
+// the next entry call (next layer) is ordered after on the same stream,
+// so reuse is safe. Bounded by tokens(≤32) × q_heads × n_splits(≤48) ×
+// (head_dim+2) ≈ 75 MB worst case. Freed at process exit (leaked — the
+// process owns the device for its lifetime).
+namespace {
+struct SplitKScratch {
+  float *acc = nullptr;
+  float *max = nullptr;
+  float *denom = nullptr;
+  size_t acc_floats = 0;   // capacity in floats
+  size_t scalar_floats = 0;
+};
+SplitKScratch g_splitk_scratch;
+
+// Ensure the scratch holds at least `partial_count` (scalar) and
+// `partial_count * head_dim` (acc) floats. Returns false on alloc failure.
+bool splitk_scratch_reserve(size_t partial_count, size_t head_dim) {
+  const size_t want_acc = partial_count * head_dim;
+  if (want_acc > g_splitk_scratch.acc_floats) {
+    cudaFree(g_splitk_scratch.acc);
+    g_splitk_scratch.acc = nullptr;
+    if (cudaMalloc(&g_splitk_scratch.acc, want_acc * sizeof(float)) !=
+        cudaSuccess) {
+      g_splitk_scratch.acc_floats = 0;
+      return false;
+    }
+    g_splitk_scratch.acc_floats = want_acc;
+  }
+  if (partial_count > g_splitk_scratch.scalar_floats) {
+    cudaFree(g_splitk_scratch.max);
+    cudaFree(g_splitk_scratch.denom);
+    g_splitk_scratch.max = nullptr;
+    g_splitk_scratch.denom = nullptr;
+    if (cudaMalloc(&g_splitk_scratch.max, partial_count * sizeof(float)) !=
+            cudaSuccess ||
+        cudaMalloc(&g_splitk_scratch.denom, partial_count * sizeof(float)) !=
+            cudaSuccess) {
+      g_splitk_scratch.scalar_floats = 0;
+      return false;
+    }
+    g_splitk_scratch.scalar_floats = partial_count;
+  }
+  return true;
+}
+} // namespace
+
+// Entry point: runs the split-K kernel + reduce using a persistent scratch.
+// Numerically faithful to the scalar GQA prefill (smoke parity cos>=0.998).
 extern "C" int qwen36_attention_flash_splitk_prefill_bf16(
     const qwen36_attention_prefill_spec_t *spec, int n_splits) {
   if (spec == nullptr) {
@@ -426,19 +476,12 @@ extern "C" int qwen36_attention_flash_splitk_prefill_bf16(
   const size_t partial_count =
       tokens * q_heads * static_cast<size_t>(n_splits);
 
-  float *partial_acc = nullptr;
-  float *partial_max = nullptr;
-  float *partial_denom = nullptr;
-  if (cudaMalloc(&partial_acc, partial_count * head_dim * sizeof(float)) !=
-          cudaSuccess ||
-      cudaMalloc(&partial_max, partial_count * sizeof(float)) != cudaSuccess ||
-      cudaMalloc(&partial_denom, partial_count * sizeof(float)) !=
-          cudaSuccess) {
-    cudaFree(partial_acc);
-    cudaFree(partial_max);
-    cudaFree(partial_denom);
+  if (!splitk_scratch_reserve(partial_count, head_dim)) {
     return QWEN36_STATUS_CUDA_ERROR;
   }
+  float *partial_acc = g_splitk_scratch.acc;
+  float *partial_max = g_splitk_scratch.max;
+  float *partial_denom = g_splitk_scratch.denom;
 
   const size_t smem_bytes =
       (kSkM + 2 * kSkN) * kSkD * sizeof(__nv_bfloat16) +
@@ -476,9 +519,7 @@ extern "C" int qwen36_attention_flash_splitk_prefill_bf16(
           static_cast<uintptr_t>(spec->output_bf16.ptr)),
       spec->shape, n_splits, tokens);
 
+  // Scratch is persistent — do NOT free; reused by the next call.
   cudaError_t err = cudaGetLastError();
-  cudaFree(partial_acc);
-  cudaFree(partial_max);
-  cudaFree(partial_denom);
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
