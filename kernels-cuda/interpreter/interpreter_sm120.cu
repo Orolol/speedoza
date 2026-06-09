@@ -166,7 +166,7 @@ __global__ void __launch_bounds__(QWEN36_INTERPRETER_THREADS)
     // next instruction's first cache lines land warm. Gated by the kernel
     // launch flags so we can A/B without rebuilding (host sets bit 0).
     const uint32_t next_pc = pc + 1u;
-    if (next_pc < instruction_count && (flags & 1u) != 0u) {
+    if (blockIdx.x == 0 && next_pc < instruction_count && (flags & 1u) != 0u) {
       const qwen36_interpreter_instruction_t next = instructions[next_pc];
       qwen36_interpreter::prefetch_next_instruction_weights(next);
     }

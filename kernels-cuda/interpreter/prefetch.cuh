@@ -6,8 +6,9 @@
 // inspects `program[pc + 1]` and, for opcodes whose weight matrix is known
 // from the payload, issues a small budget of `prefetch.global.L2` hints so
 // the next instruction's first cache lines land warm. The helper never
-// blocks and never writes shared memory; it is safe to call from every
-// thread of the dispatch CTA.
+// blocks and never writes shared memory. The dispatch loop calls it from CTA 0
+// only; calling it from every CTA duplicates the same 64 KiB hint stream across
+// the grid and pollutes L2.
 //
 // Mechanism:
 //   * Each call walks at most `kPrefetchBytes` bytes (64 KiB by default),

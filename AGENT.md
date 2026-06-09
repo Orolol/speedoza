@@ -809,6 +809,13 @@ prompt=128, max-new=32, median of 5:
   MTP=0 auto 49.24 tok/s; MTP=4 auto 95.85 tok/s vs interpreter
   forced-off 95.60 tok/s. Targeted chat parity for `hello` and
   `hello world`, MTP=4 auto vs forced-off, remained byte-for-byte.
+- Follow-up prefetch fix: `QWEN36_INTERPRETER_PREFETCH=1` now issues
+  lookahead hints from CTA 0 only. The old opt-in path duplicated the same
+  64 KiB prefetch stream across the whole interpreter grid. Repeated MTP=4
+  runs after the fix varied between ~89 and ~96 tok/s even for
+  interpreter-off, so this remains **default OFF**; it is only a cleaner
+  diagnostic/experiment path. Prefetch-on chat parity for `hello` and
+  `hello world` matched interpreter-off byte-for-byte.
 
 **Codex hand-off (updated):** the prefetch infra (`prefetch.cuh`,
 flags plumbing) is the substrate for any further weight-warmup
