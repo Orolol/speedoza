@@ -678,9 +678,30 @@ impl<'w> DrafterForward<'w> {
             .map_err(|e| anyhow!("rope k: {e}"))?;
 
         // Attention reads the full live KV slice [0, kv_seq_len).
-        let sliding_window = match layer.kind {
-            LayerAttentionKind::SlidingAttention => self.config.sliding_window,
-            LayerAttentionKind::FullAttention => 0,
+        //
+        // Long-context AL probes (see 2026-06-09 strategic assessment §3):
+        // QWEN36_DRAFTER_SWA_WINDOW=N overrides the checkpoint's sliding
+        // window size on the sliding layers; QWEN36_DRAFTER_SWA_ALL=1 also
+        // applies the window to the full-attention layer (testing whether
+        // its softmax dilution over long context is what degrades the
+        // drafter's conditioning, AL 9→2.8 between 3K and 7.8K ctx).
+        let sliding_window = {
+            use std::sync::OnceLock;
+            static WINDOW_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+            static FORCE_ALL: OnceLock<bool> = OnceLock::new();
+            let window_override = *WINDOW_OVERRIDE.get_or_init(|| {
+                std::env::var("QWEN36_DRAFTER_SWA_WINDOW")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+            });
+            let force_all = *FORCE_ALL
+                .get_or_init(|| std::env::var("QWEN36_DRAFTER_SWA_ALL").is_ok_and(|v| v == "1"));
+            let effective = window_override.unwrap_or(self.config.sliding_window);
+            match layer.kind {
+                LayerAttentionKind::SlidingAttention => effective,
+                LayerAttentionKind::FullAttention if force_all => effective,
+                LayerAttentionKind::FullAttention => 0,
+            }
         };
         backend
             .drafter_attention_block_bf16(&DrafterAttentionBlockSpec {

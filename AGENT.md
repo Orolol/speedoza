@@ -903,6 +903,58 @@ the GPU; partial softmax per split + a reduction. Reuses the
 ~2.5–4×. Parity gated by a smoke cos≥0.998 (modeled on P0a) + the
 no-fork end-to-end check.
 
+### 2026-06-09 — Long-context AL lane: eval battery built, window knob dead, AL variance is the real finding
+
+Follow-up to the strategic assessment (AL is the binding constraint at
+long ctx). Probed the cheapest knob first — the drafter's sliding-window
+size — and built the evaluation infrastructure the whole drafter-quality
+lane needs.
+
+**Probes added** (`crates/drafter/src/forward.rs`, env-gated, default
+off, zero effect when unset):
+- `QWEN36_DRAFTER_SWA_WINDOW=N` — override the checkpoint's sliding
+  window (2048) on the 4 sliding layers.
+- `QWEN36_DRAFTER_SWA_ALL=1` — also apply the window to the 5th
+  (full-attention) layer.
+
+**Eval battery** (`scripts/drafter_al_eval.sh`): 6 long prompts
+(7-10K tokens, real repo text, deliberate content-order variation),
+reports per-prompt tok/s + AL and the **geomean AL**. This is now the
+standard for ANY drafter-quality change — single-prompt AL deltas are
+noise (see below).
+
+**Results:**
+
+| config | geomean AL | min | max |
+|---|---:|---:|---:|
+| baseline (window 2048) | **5.10** | 2.78 | 8.10 |
+| window 4096 | 4.83 | 2.16 | 7.00 |
+
+The window knob is **dead**: an initial single-prompt probe showed a
+spectacular AL 2.78 → 6.75 at window 4096, but the battery revealed it
+as a chaotic reshuffle (2 prompts up, 4 down, swings ±2.5× both
+directions, geomean slightly negative). Same trap as the FA-drafter
+"drift" — the speculative loop amplifies any perturbation into large
+per-prompt AL swings. `SWA_ALL` also negative (geomean-level).
+
+**The real findings:**
+1. **"AL collapses at long ctx" is wrong.** The stock config sustains
+   AL 8.1 at 9.9K ctx on favorable content and drops to 2.78 at 7.8K on
+   unfavorable content — and *identical documents reordered* swing AL
+   from 2.78 to 6.79. It is content/order sensitivity, not length
+   degradation, at least up to 10K.
+2. **Single-prompt AL measurements are meaningless.** Every knob
+   evaluation must use the battery geomean.
+3. **The DFlash floor at long ctx now ≈ MTP=3.** With split-K, the
+   worst battery prompt (AL 2.78) still does 40 tok/s ≈ MTP=3's ~40 at
+   this ctx. DFlash is safe-by-default at long ctx; there is no regime
+   where it clearly loses anymore.
+4. **Knob-level interventions reshuffle; they don't lift.** The
+   credible lever to raise the geomean is a drafter long-context
+   fine-tune (the z-lab checkpoint's conditioning is what varies), or
+   smarter conditioning (capture-layer/window co-design) — both are
+   training-side projects, to be evaluated against this battery.
+
 ### 2026-06-09 — P2 SHIPPED: FA-2 wmma split-K verify kernel — 2.2–2.9×, parity-clean, opt-in
 
 Built the correct version of the q=16 full-attn win:
