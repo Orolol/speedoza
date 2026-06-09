@@ -557,11 +557,14 @@ pub struct GpuForwardBuffers {
     /// `qwen36_attention_prefill` when running the tree-MTP verify chunk.
     /// Sized for `MtpKvSnapshotLayout::VERIFY_TOKENS` rows × 8 bytes.
     pub tree_ancestor_bitmap_u64: CudaDeviceBuffer,
-    /// Per-q-head per-split scratch for split-KV decode attention. Sized
-    /// for `n_splits = ceil(max_context / kSplitTimestepsPerBlock)`.
-    /// Layout `[q_heads, n_splits, head_dim]` FP32. Keeping the partial
-    /// accumulator in FP32 avoids adding a BF16 rounding point before the final
-    /// softmax reduction.
+    /// Per-q-head per-split scratch for split-KV attention. Decode (N=1)
+    /// uses layout `[q_heads, n_splits, head_dim]` FP32; the DFlash verify
+    /// split-K path (`attention_flash_splitk.cu`, #55) reuses this same
+    /// buffer with layout `[tokens, q_heads, n_splits, head_dim]` for up to
+    /// `VERIFY_SPLIT_MAX_TOKENS` rows and `VERIFY_SPLIT_MAX_NSPLITS` splits.
+    /// It is sized to the max element count over both uses. Keeping the
+    /// partial accumulator in FP32 avoids adding a BF16 rounding point
+    /// before the final softmax reduction.
     pub attn_partial_acc: CudaDeviceBuffer,
     /// `[q_heads, n_splits]` FP32 — per-split running max from online softmax.
     pub attn_partial_max: CudaDeviceBuffer,
@@ -850,8 +853,20 @@ impl GpuForwardBuffers {
         let n_splits = attention_partial_n_splits(max_context);
         let attn_q_heads = topology.attention_num_heads;
         let attn_head_dim = topology.attention_head_dim;
-        let attn_partial_acc_bytes = attn_q_heads * n_splits * attn_head_dim * 4;
-        let attn_partial_scalar_bytes = attn_q_heads * n_splits * 4;
+        // The buffer is shared by two split-KV consumers:
+        //   decode (N=1):  [q_heads, n_splits, head_dim]
+        //   DFlash verify: [tokens<=32, q_heads, n_splits<=48, head_dim]
+        //     (attention_flash_splitk.cu — dispatch caps tokens and n_splits)
+        // Size to the max element count over both so either path fits.
+        const VERIFY_SPLIT_MAX_TOKENS: usize = 32;
+        const VERIFY_SPLIT_MAX_NSPLITS: usize = 48;
+        let decode_acc = attn_q_heads * n_splits * attn_head_dim;
+        let verify_acc =
+            VERIFY_SPLIT_MAX_TOKENS * attn_q_heads * VERIFY_SPLIT_MAX_NSPLITS * attn_head_dim;
+        let decode_scalar = attn_q_heads * n_splits;
+        let verify_scalar = VERIFY_SPLIT_MAX_TOKENS * attn_q_heads * VERIFY_SPLIT_MAX_NSPLITS;
+        let attn_partial_acc_bytes = decode_acc.max(verify_acc) * 4;
+        let attn_partial_scalar_bytes = decode_scalar.max(verify_scalar) * 4;
         Ok(Self {
             hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
             residual: CudaDeviceBuffer::alloc(hidden_bytes)?,

@@ -4396,21 +4396,46 @@ int main() {
           std::vector<float> ref = read_bf16(out_ref, q_total);
 
           for (int n_splits : split_counts) {
-            spec.output_bf16 = out_sk;
-            must_status(
-                qwen36_attention_flash_splitk_prefill_bf16(&spec, n_splits),
-                "splitk parity: flash split-K");
-            std::vector<float> got = read_bf16(out_sk, q_total);
-            const double cos = cos_sim(got, ref);
-            if (cos < 0.998) {
-              fprintf(stderr,
-                      "flash split-K parity FAIL [dtype=%d tokens=%d start=%d "
-                      "n_splits=%d]: cos=%.6f < 0.998\n",
-                      kv_dtype, tokens, start_position, n_splits, cos);
-              exit(1);
+            const size_t pcount =
+                (size_t)tokens * q_heads * (size_t)n_splits;
+            // Two paths, both must match the scalar reference:
+            //  A = fallback process-global scratch (partials NULL)
+            //  B = engine-owned partials passed via the spec (production path)
+            for (int path = 0; path < 2; ++path) {
+              qwen36_device_ptr_t pacc{}, pmax{}, pden{};
+              if (path == 1) {
+                pacc = dev_alloc<float>(pcount * head_dim);
+                pmax = dev_alloc<float>(pcount);
+                pden = dev_alloc<float>(pcount);
+              }
+              spec.partial_acc_f32 = pacc;
+              spec.partial_max_f32 = pmax;
+              spec.partial_denom_f32 = pden;
+              spec.output_bf16 = out_sk;
+              must_status(
+                  qwen36_attention_flash_splitk_prefill_bf16(&spec, n_splits),
+                  "splitk parity: flash split-K");
+              std::vector<float> got = read_bf16(out_sk, q_total);
+              const double cos = cos_sim(got, ref);
+              if (cos < 0.998) {
+                fprintf(stderr,
+                        "flash split-K parity FAIL [dtype=%d tokens=%d "
+                        "start=%d n_splits=%d path=%s]: cos=%.6f < 0.998\n",
+                        kv_dtype, tokens, start_position, n_splits,
+                        path == 0 ? "scratch" : "engine", cos);
+                exit(1);
+              }
+              if (path == 1) {
+                dev_free<float>(pacc);
+                dev_free<float>(pmax);
+                dev_free<float>(pden);
+              }
+              ++cases;
             }
-            ++cases;
           }
+          spec.partial_acc_f32 = qwen36_device_ptr_t{};
+          spec.partial_max_f32 = qwen36_device_ptr_t{};
+          spec.partial_denom_f32 = qwen36_device_ptr_t{};
 
           dev_free<__nv_bfloat16>(q_dev);
           if (kv_dtype == 0) {
@@ -4426,7 +4451,8 @@ int main() {
       }
     }
     printf("flash split-K parity gate passed (%d cases, BF16+FP8, "
-           "tokens{9,16,32} starts{0,64,2048,4096} splits{1,8,48})\n",
+           "tokens{9,16,32} starts{0,64,2048,4096} splits{1,8,48}, "
+           "scratch+engine paths)\n",
            cases);
   }
 

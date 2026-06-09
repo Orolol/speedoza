@@ -502,19 +502,37 @@ extern "C" int qwen36_attention_flash_splitk_prefill_bf16(
   const size_t partial_count =
       tokens * q_heads * static_cast<size_t>(n_splits);
 
-  const int reserve = splitk_scratch_reserve(partial_count, head_dim);
-  if (reserve == kReserveCaptureBlocked) {
-    // Would need to cudaMalloc inside a graph capture — fall back to the
-    // capture-safe scalar path (dispatch treats NOT_IMPLEMENTED as a
-    // fall-through). Unreachable once the engine pre-warms the scratch.
-    return QWEN36_STATUS_NOT_IMPLEMENTED;
+  // Prefer engine-owned partials passed via the prefill spec — pre-reserved
+  // once at engine init to the verify worst case (#55). Capture-safe: no
+  // cudaMalloc in the hot path, so a captured [9,32] chunk can use split-K.
+  // Fall back to the process-global grow-on-demand scratch only when the
+  // caller supplies none (the kernel-vs-kernel smoke uses spec{} = NULL).
+  float *partial_acc;
+  float *partial_max;
+  float *partial_denom;
+  if (spec->partial_acc_f32.ptr != 0 && spec->partial_max_f32.ptr != 0 &&
+      spec->partial_denom_f32.ptr != 0) {
+    partial_acc = reinterpret_cast<float *>(
+        static_cast<uintptr_t>(spec->partial_acc_f32.ptr));
+    partial_max = reinterpret_cast<float *>(
+        static_cast<uintptr_t>(spec->partial_max_f32.ptr));
+    partial_denom = reinterpret_cast<float *>(
+        static_cast<uintptr_t>(spec->partial_denom_f32.ptr));
+  } else {
+    const int reserve = splitk_scratch_reserve(partial_count, head_dim);
+    if (reserve == kReserveCaptureBlocked) {
+      // Would need to cudaMalloc inside a graph capture — fall back to the
+      // capture-safe scalar path (dispatch treats NOT_IMPLEMENTED as a
+      // fall-through). Unreachable once engine-owned partials are wired.
+      return QWEN36_STATUS_NOT_IMPLEMENTED;
+    }
+    if (reserve == kReserveOom) {
+      return QWEN36_STATUS_CUDA_ERROR;
+    }
+    partial_acc = g_splitk_scratch.acc;
+    partial_max = g_splitk_scratch.max;
+    partial_denom = g_splitk_scratch.denom;
   }
-  if (reserve == kReserveOom) {
-    return QWEN36_STATUS_CUDA_ERROR;
-  }
-  float *partial_acc = g_splitk_scratch.acc;
-  float *partial_max = g_splitk_scratch.max;
-  float *partial_denom = g_splitk_scratch.denom;
 
   const size_t smem_bytes =
       (kSkM + 2 * kSkN) * kSkD * sizeof(__nv_bfloat16) +
