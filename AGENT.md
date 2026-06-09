@@ -802,6 +802,65 @@ QWEN36_LONG_CONTEXT_MODE=1 \
     --mtp-speculative-tokens <0|4>
 ```
 
+### 2026-06-09 — DFlash megakernel Phase 4: kill-gate measurement → full_attn is 89% of verify
+
+Investigation workflow (`wf_2128592f-3a2`, 6 parallel agents + synthesis +
+spec) chose path C (verify megakernel) over Phase 2 (NVFP4 KV /
+BitDecoding). BitDecoding rejected: no vendorable NVFP4 Blackwell kernel
+exists (open repo ships only Int2/Int4 FP16 sm_80/sm_90), +12% only at
+7K, masked by the launch floor. Full spec:
+`docs/superpowers/specs/2026-06-09-dflash-mk-phase4-verify-megakernel.md`.
+
+**P0 done** (`18d464d`): q_len=16 drafter FA parity gate in smoke.cu —
+20 cases, cos 0.999999, proven fail-able. Closes the Phase 1 "drift
+bug" as NOT a kernel bug (cos 0.999998 everywhere; the gen forks were
+chaotic speculative sensitivity to BF16-ULP deltas).
+
+**P1 KILL-GATE fired — graph capture KILLED by measurement.**
+`QWEN36_PROFILE_PREFILL_CHUNKS=1` on the q=16 verify chunk at 7058 ctx
+(each stage `cuda_synchronize`'d, so these are true GPU times):
+
+| stage | ms/chunk | % |
+|---|---:|---:|
+| embed | 0.008 | — |
+| input_norm_quant | 1.07 | 0.5% |
+| linear_attn (48 layers) | 10.0 | 4.4% |
+| **full_attn (16 layers)** | **200.2** | **89%** |
+| post_norm_quant | 0.98 | 0.4% |
+| mlp (64 layers) | 10.95 | 4.9% |
+| logits | 1.65 | 0.7% |
+| **chunk total** | **225** | |
+
+Two decisive facts:
+1. **Launch overhead is NOT the bottleneck.** The chunk is one 200ms
+   GPU kernel stage, not 1300 small launches. Graph capture (P1) would
+   net ~0% → killed. The synthesis gate (b) (launch-idle <5% → abandon)
+   is satisfied. This is exactly the Stage-F.4/Phase-1-redux trap the
+   kill-gate existed to prevent — and it worked, saving ~1 week.
+2. **The investigation's profile ESTIMATE was wrong** (it guessed
+   full_attn=70ms, mlp=130ms). Reality: full_attn=200ms, mlp=11ms. The
+   MLP is fine (weight-bandwidth-bound, cuBLASLt-optimal at q=16). The
+   bottleneck is the **q=16 full-attn**.
+
+**Root cause (code-confirmed):** full-attn target shape is q_heads=24,
+kv_heads=4, head_dim=256, q_per_kv=6, **FP8 KV** (drafter_chat_smoke
+default, main.rs:2618 — R7 resolved, NOT TurboQuant). At q=16 the flash
+prefill kernel grids (kv_heads=4 × 1 q-tile) = 4 blocks → ~2% of 170
+SMs, so it's gated off below `kPrefillFlashMinTokens=1024`
+(attention.cu:2502) and verify falls to the scalar GQA kernel that
+re-reads the full 7K KV per token-block. 200ms / 16 layers = 12.5ms /
+layer — vs a ~0.1ms KV-bandwidth floor (230 MB FP8 @ 1.8 TB/s), i.e.
+the scalar kernel is ~100× off bandwidth.
+
+**Decision: skip P1, go straight to P2 = Flash-Decoding split-K kernel
+for q=16 / head_dim=256 / FP8 KV.** Split the 7K KV across ~48 CTAs
+(grid 4 kvh × 1 q-tile × S splits) so the FA-2 wmma tile (M=16) saturates
+the GPU; partial softmax per split + a reduction. Reuses the
+`attention_flash_prefill.cu` tile + FP8 path. Projected: full_attn
+200ms → 30–60ms (5–7×), verify 225 → ~55–85ms, end-to-end DFlash at 7K
+~2.5–4×. Parity gated by a smoke cos≥0.998 (modeled on P0a) + the
+no-fork end-to-end check.
+
 ### 2026-06-09 — DFlash megakernel roadmap Phase 1 (FA-tile drafter attn) — neutral, off by default
 
 Pivot: the user committed to "Option A" of the long-context roadmap
