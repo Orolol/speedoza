@@ -60,6 +60,29 @@ pub struct DecodeInterpreterMlpParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeInterpreterRmsNormNvfp4QuantParams {
+    pub hidden: usize,
+    pub eps: f32,
+    pub input_tensor_scale_f32: f32,
+    pub input_bf16: DevicePtr,
+    pub weight_bf16: DevicePtr,
+    pub residual_bf16: DevicePtr,
+    pub residual_out_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+    pub output_fp4: DevicePtr,
+    pub output_scale_e4m3: DevicePtr,
+    pub output_tensor_scale_f32: DevicePtr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeInterpreterResidualAddParams {
+    pub values: usize,
+    pub input_bf16: DevicePtr,
+    pub residual_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecodeInterpreterRopeParams {
     pub tokens: usize,
     pub q_heads: usize,
@@ -231,6 +254,47 @@ impl DecodeInterpreterProgram {
             .with_dep(4, 1)
             .with_publish(6, 1)
             .with_arrival_counter(7),
+        );
+        Self {
+            program: program.finish(),
+        }
+    }
+
+    pub fn compile_rmsnorm_nvfp4_quant(params: DecodeInterpreterRmsNormNvfp4QuantParams) -> Self {
+        let mut program = InterpreterProgram::new();
+        program.push(
+            InterpreterInstruction::rmsnorm_nvfp4_quant(
+                params.hidden,
+                params.eps,
+                params.input_tensor_scale_f32,
+                params.input_bf16,
+                params.weight_bf16,
+                params.residual_bf16,
+                params.residual_out_bf16,
+                params.output_bf16,
+                params.output_fp4,
+                params.output_scale_e4m3,
+                params.output_tensor_scale_f32,
+            )
+            .with_publish(0, 1)
+            .with_arrival_counter(1),
+        );
+        Self {
+            program: program.finish(),
+        }
+    }
+
+    pub fn compile_residual_add(params: DecodeInterpreterResidualAddParams) -> Self {
+        let mut program = InterpreterProgram::new();
+        program.push(
+            InterpreterInstruction::residual_add(
+                params.values,
+                params.input_bf16,
+                params.residual_bf16,
+                params.output_bf16,
+            )
+            .with_publish(0, 1)
+            .with_arrival_counter(1),
         );
         Self {
             program: program.finish(),
@@ -477,6 +541,69 @@ mod tests {
         assert_eq!(compiled.program.instructions[3].deps[0].counter_id, 4);
         assert_eq!(
             compiled.program.instructions[4].opcode(),
+            Some(InterpreterOpcode::Exit)
+        );
+    }
+
+    #[test]
+    fn rmsnorm_quant_program_uses_real_opcode_and_counter() {
+        let compiled = DecodeInterpreterProgram::compile_rmsnorm_nvfp4_quant(
+            DecodeInterpreterRmsNormNvfp4QuantParams {
+                hidden: 8,
+                eps: 1.0e-6,
+                input_tensor_scale_f32: 0.5,
+                input_bf16: DevicePtr(10),
+                weight_bf16: DevicePtr(11),
+                residual_bf16: DevicePtr(12),
+                residual_out_bf16: DevicePtr(13),
+                output_bf16: DevicePtr(14),
+                output_fp4: DevicePtr(15),
+                output_scale_e4m3: DevicePtr(16),
+                output_tensor_scale_f32: DevicePtr(17),
+            },
+        );
+        assert_eq!(compiled.program.instructions.len(), 2);
+        assert_eq!(compiled.program.counter_count, 2);
+        assert_eq!(
+            compiled.program.instructions[0].opcode(),
+            Some(InterpreterOpcode::RmsNormNvfp4Quant)
+        );
+        assert_eq!(compiled.program.instructions[0].payload[0], 8);
+        assert_eq!(compiled.program.instructions[0].payload[1], 10);
+        assert_eq!(compiled.program.instructions[0].payload[2], 11);
+        assert_eq!(compiled.program.instructions[0].payload[3], 12);
+        assert_eq!(compiled.program.instructions[0].payload[4], 13);
+        assert_eq!(compiled.program.instructions[0].payload[5], 14);
+        assert_eq!(compiled.program.instructions[0].payload[6], 15);
+        assert_eq!(compiled.program.instructions[0].payload[7], 16);
+        assert_eq!(compiled.program.instructions[0].payload[8], 17);
+        assert_eq!(
+            compiled.program.instructions[1].opcode(),
+            Some(InterpreterOpcode::Exit)
+        );
+    }
+
+    #[test]
+    fn residual_add_program_uses_real_opcode_and_counter() {
+        let compiled =
+            DecodeInterpreterProgram::compile_residual_add(DecodeInterpreterResidualAddParams {
+                values: 8,
+                input_bf16: DevicePtr(20),
+                residual_bf16: DevicePtr(21),
+                output_bf16: DevicePtr(22),
+            });
+        assert_eq!(compiled.program.instructions.len(), 2);
+        assert_eq!(compiled.program.counter_count, 2);
+        assert_eq!(
+            compiled.program.instructions[0].opcode(),
+            Some(InterpreterOpcode::ResidualAdd)
+        );
+        assert_eq!(compiled.program.instructions[0].payload[0], 8);
+        assert_eq!(compiled.program.instructions[0].payload[1], 20);
+        assert_eq!(compiled.program.instructions[0].payload[2], 21);
+        assert_eq!(compiled.program.instructions[0].payload[3], 22);
+        assert_eq!(
+            compiled.program.instructions[1].opcode(),
             Some(InterpreterOpcode::Exit)
         );
     }

@@ -32,7 +32,7 @@ use crate::gpu::{
 use crate::interpreter_compile::{
     instructions_as_bytes, DecodeInterpreterAttentionParams, DecodeInterpreterDeltaNetParams,
     DecodeInterpreterLogitsParams, DecodeInterpreterMlpParams, DecodeInterpreterProgram,
-    DecodeInterpreterRopeParams,
+    DecodeInterpreterRmsNormNvfp4QuantParams, DecodeInterpreterRopeParams,
 };
 use crate::kv_cache::KvCachePlan;
 use crate::state::{DeltaNetStatePlan, RuntimeState};
@@ -159,6 +159,18 @@ fn decode_interpreter_mlp_enabled() -> bool {
         let opcodes = interpreter_opcodes_enabled_from_env();
         opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
             && opcodes.contains(InterpreterOpcode::SwiGluNvfp4Quant)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_rmsnorm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !cuda_env_bool("QWEN36_INTERPRETER_RMSNORM") {
+            return false;
+        }
+        interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::RmsNormNvfp4Quant)
     })
 }
 
@@ -3888,6 +3900,7 @@ impl<B: KernelBackend> Engine<B> {
                     forward.residual.ptr(),
                     output_bf16,
                     quantized.input_scale,
+                    position_device_i32 == DevicePtr::NULL,
                 )?;
             } else {
                 self.rmsnorm(
@@ -3974,6 +3987,7 @@ impl<B: KernelBackend> Engine<B> {
                     forward.residual.ptr(),
                     output_bf16,
                     quantized.input_scale,
+                    position_device_i32 == DevicePtr::NULL,
                 )?;
                 if dump_decode {
                     if let Some(dir) = &dump_dir {
@@ -6332,6 +6346,44 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn run_interpreter_rmsnorm_nvfp4_quantize(
+        &self,
+        params: DecodeInterpreterRmsNormNvfp4QuantParams,
+        forward: &GpuForwardBuffers,
+    ) -> Result<()> {
+        let compiled = DecodeInterpreterProgram::compile_rmsnorm_nvfp4_quant(params);
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_norm_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter RMSNorm program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_norm_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_norm_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter RMSNorm program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_norm_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_norm_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_norm_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_norm_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_norm_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: 0,
+            })
+    }
+
+    #[cfg(feature = "cuda")]
     fn run_interpreter_deltanet_decode(
         &self,
         spec: &DeltaNetDecodeSpec,
@@ -6873,9 +6925,28 @@ impl<B: KernelBackend> Engine<B> {
         residual_out: DevicePtr,
         output_bf16: DevicePtr,
         input_scale: &TensorInfo,
+        interpreter_allowed: bool,
     ) -> Result<()> {
         let forward = self.cuda_forward()?;
         let input_tensor_scale_f32 = self.tensor_scalar_f32(self.cuda_weights()?, input_scale)?;
+        if interpreter_allowed && decode_interpreter_rmsnorm_enabled() {
+            return self.run_interpreter_rmsnorm_nvfp4_quantize(
+                DecodeInterpreterRmsNormNvfp4QuantParams {
+                    hidden,
+                    eps: 1.0e-6,
+                    input_tensor_scale_f32,
+                    input_bf16: input,
+                    weight_bf16: weight,
+                    residual_bf16: residual,
+                    residual_out_bf16: residual_out,
+                    output_bf16,
+                    output_fp4: forward.activation_fp4.ptr(),
+                    output_scale_e4m3: forward.activation_scale.ptr(),
+                    output_tensor_scale_f32: forward.activation_scale_2.ptr(),
+                },
+                forward,
+            );
+        }
         self.backend
             .rmsnorm_nvfp4_quantize(&RmsNormNvfp4QuantizeSpec {
                 hidden,
@@ -7499,6 +7570,14 @@ impl Engine<CudaBackend> {
             item(
                 "interpreter_logits_counters",
                 forward.interpreter_logits_counters.bytes() as u64,
+            ),
+            item(
+                "interpreter_norm_instructions",
+                forward.interpreter_norm_instructions.bytes() as u64,
+            ),
+            item(
+                "interpreter_norm_counters",
+                forward.interpreter_norm_counters.bytes() as u64,
             ),
             item(
                 "interpreter_mlp_instructions",
