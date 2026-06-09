@@ -58,12 +58,12 @@ dflash_cell() { # $1=prompt $2=label $3=env
     "$(echo "$out" | jnum prompt_tokens)"
 }
 
-mtp_cell() { # $1=mtp
+mtp_cell() { # $1=mtp $2=label $3=env
   local out
-  out=$("$BIN" bench --model-dir "$MODEL_DIR" --prompt-tokens 128 \
+  out=$(env ${3:-} "$BIN" bench --model-dir "$MODEL_DIR" --prompt-tokens 128 \
     --max-new-tokens 32 --mtp-speculative-tokens "$1" 2>&1) || {
-      echo "  MTP=$1: ERROR"; return; }
-  printf "  %-34s decode=%s tok/s\n" "MTP=$1" \
+      echo "  $2: ERROR"; return; }
+  printf "  %-34s decode=%s tok/s\n" "$2" \
     "$(echo "$out" | jnum decode_tokens_per_second)"
 }
 
@@ -78,7 +78,8 @@ if [ "$QUICK" = "0" ]; then
 fi
 echo
 echo "=== MTP graph path (must not regress / no capture error) ==="
-mtp_cell 0
-mtp_cell 4
+mtp_cell 0 "MTP=0 (auto interpreter off)" ""
+mtp_cell 4 "MTP=4 (auto interpreter)" ""
+mtp_cell 4 "MTP=4 (interpreter OFF)" "QWEN36_INTERPRETER_DECODE=0"
 echo
 echo "Gate done. Compare against the AGENT.md baselines before merging."

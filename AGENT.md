@@ -762,11 +762,12 @@ prompt=128, max-new=32, median of 5:
   (`QWEN36_INTERPRETER_PREFETCH=1` to opt-in). The infra is reusable
   for budget / opcode-filter experiments, and the flag is plumbed
   through every launch site already.
-- Interpreter master flag (`QWEN36_INTERPRETER_DECODE`) **remains
-  opt-in default-off** because of the MTP=0 regression. Enabling by
-  default only for MTP>0 paths is the obvious next step but requires
-  threading the choice through the chat/bench command surface; left
-  for a follow-up session.
+- Interpreter master flag (`QWEN36_INTERPRETER_DECODE`) now defaults
+  to **auto**: unset/`auto` enables whole-layer interpreter programs
+  only when `EngineConfig.mtp_speculative_tokens > 0`; MTP=0 remains on
+  the captured-graph baseline. `QWEN36_INTERPRETER_DECODE=1` forces the
+  interpreter on for every decode engine; `=0` forces it off. Fine
+  per-op env gates still override for diagnostics.
 - MTP=0 regression source not yet root-caused. Most likely
   candidates: (1) the 192-CTA grid wastes atomicAdd publishes on
   small opcodes (`residual_add`, `rmsnorm_bf16`), (2) per-instruction
@@ -774,6 +775,22 @@ prompt=128, max-new=32, median of 5:
   scratch SMEM allocation (`__shared__ float scratch[512]`) bloats
   the kernel's register pressure / occupancy budget. Each is testable
   in isolation.
+
+**Codex follow-up (2026-06-09, auto-policy landed):**
+
+- Rust gate plumbing is context-aware instead of process-global: the
+  opcode allow-list remains cached, but the master decision is made
+  from each engine's MTP depth. This avoids accidentally enabling the
+  interpreter for MTP=0 while letting MTP>0 take the measured fast path.
+- `scripts/verify_perf_gate.sh --quick` on RTX 5090,
+  `QWEN36_LONG_CONTEXT_MODE=1`: DFlash 3K split-K default 142.6 tok/s
+  vs forced-off 60.1 tok/s; MTP=0 auto 49.05 tok/s; MTP=4 auto
+  102.40 tok/s vs interpreter forced-off 102.15 tok/s. No capture
+  error, no MTP regression in this run.
+- Targeted chat parity with `QWEN36_LONG_CONTEXT_MODE=1`:
+  `hello` and `hello world`, `--mtp-speculative-tokens 4`, auto vs
+  `QWEN36_INTERPRETER_DECODE=0` produced identical 12-token text
+  prefixes.
 
 **Codex hand-off (updated):** the prefetch infra (`prefetch.cuh`,
 flags plumbing) is the substrate for any further weight-warmup
@@ -794,7 +811,7 @@ Reproduce the bench with:
 QWEN36_FP4_KERNEL_LIB_DIR=$PWD/target/cuda \
 LD_LIBRARY_PATH=$PWD/target/cuda:${LD_LIBRARY_PATH:-} \
 QWEN36_LONG_CONTEXT_MODE=1 \
-[QWEN36_INTERPRETER_DECODE=1] \
+[QWEN36_INTERPRETER_DECODE=<auto|0|1>] \
 [QWEN36_INTERPRETER_PREFETCH=1] \
   target/release/qwen36 bench \
     --model-dir ~/models/Qwen3.6-27B-Text-NVFP4-MTP \

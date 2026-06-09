@@ -10,10 +10,10 @@ use qwen36_fp4_kernels::{
     AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
     Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode,
     CudaBackend, CudaDeviceBuffer, DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape,
-    DevicePtr, EmbeddingLookupSpec, GdnGateSpec, InterpreterOpcode, InterpreterProgramSpec,
-    Nvfp4GemmSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec,
-    QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec,
-    SamplingRowsSpec, SamplingSpec, SwiGluNvfp4QuantizeSpec, SwiGluSpec,
+    DevicePtr, EmbeddingLookupSpec, GdnGateSpec, InterpreterOpcode, InterpreterOpcodeSet,
+    InterpreterProgramSpec, Nvfp4GemmSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
+    PartialRopeSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec,
+    RmsNormSpec, SamplingRowsSpec, SamplingSpec, SwiGluNvfp4QuantizeSpec, SwiGluSpec,
     attention_decode_spec_abi_bytes, attention_decode_spec_abi_size,
     deltanet_decode_spec_abi_bytes, deltanet_decode_spec_abi_size,
     interpreter_opcodes_enabled_from_env,
@@ -86,10 +86,62 @@ fn cuda_env_bool(name: &str) -> bool {
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_decode_enabled() -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeInterpreterDecodeMode {
+    Off,
+    On,
+    Auto,
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_decode_mode() -> DecodeInterpreterDecodeMode {
     use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| cuda_env_bool("QWEN36_INTERPRETER_DECODE"))
+    static MODE: OnceLock<DecodeInterpreterDecodeMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let Ok(value) = std::env::var("QWEN36_INTERPRETER_DECODE") else {
+            return DecodeInterpreterDecodeMode::Auto;
+        };
+        match value.as_str() {
+            "auto" | "AUTO" | "Auto" => DecodeInterpreterDecodeMode::Auto,
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => DecodeInterpreterDecodeMode::On,
+            "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => {
+                DecodeInterpreterDecodeMode::Off
+            }
+            other => panic!("QWEN36_INTERPRETER_DECODE must be 0, 1, or auto, got {other:?}"),
+        }
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_decode_enabled_for_mtp(mtp_speculative_tokens: usize) -> bool {
+    match decode_interpreter_decode_mode() {
+        DecodeInterpreterDecodeMode::Off => false,
+        DecodeInterpreterDecodeMode::On => true,
+        DecodeInterpreterDecodeMode::Auto => mtp_speculative_tokens > 0,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_opcodes_enabled() -> InterpreterOpcodeSet {
+    use std::sync::OnceLock;
+    static OPCODES: OnceLock<InterpreterOpcodeSet> = OnceLock::new();
+    *OPCODES.get_or_init(interpreter_opcodes_enabled_from_env)
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_gate_enabled(
+    master_enabled: bool,
+    explicit_env: &str,
+    required_opcodes: &[InterpreterOpcode],
+) -> bool {
+    if !master_enabled && !cuda_env_bool(explicit_env) {
+        return false;
+    }
+    let opcodes = decode_interpreter_opcodes_enabled();
+    required_opcodes
+        .iter()
+        .copied()
+        .all(|opcode| opcodes.contains(opcode))
 }
 
 /// Bit 0 of `InterpreterProgramSpec::flags` controls L2 weight prefetch
@@ -150,283 +202,233 @@ fn decode_interpreter_logits_enabled() -> bool {
         if !cuda_env_bool("QWEN36_INTERPRETER_LOGITS") {
             return false;
         }
-        let opcodes = interpreter_opcodes_enabled_from_env();
+        let opcodes = decode_interpreter_opcodes_enabled();
         opcodes.contains(InterpreterOpcode::RmsNormNvfp4Quant)
             && opcodes.contains(InterpreterOpcode::LmHeadTiled)
     })
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_mlp_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_MLP") {
-            return false;
-        }
-        let opcodes = interpreter_opcodes_enabled_from_env();
-        opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
-            && opcodes.contains(InterpreterOpcode::SwiGluNvfp4Quant)
-    })
+fn decode_interpreter_mlp_enabled(master_enabled: bool) -> bool {
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_MLP",
+        &[
+            InterpreterOpcode::Nvfp4Gemv,
+            InterpreterOpcode::SwiGluNvfp4Quant,
+        ],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_norm_mlp_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_NORM_MLP") {
-            return false;
-        }
-        let opcodes = interpreter_opcodes_enabled_from_env();
-        opcodes.contains(InterpreterOpcode::RmsNormNvfp4Quant)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
-            && opcodes.contains(InterpreterOpcode::SwiGluNvfp4Quant)
-    })
+fn decode_interpreter_norm_mlp_enabled(master_enabled: bool) -> bool {
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_NORM_MLP",
+        &[
+            InterpreterOpcode::RmsNormNvfp4Quant,
+            InterpreterOpcode::Nvfp4Gemv,
+            InterpreterOpcode::SwiGluNvfp4Quant,
+        ],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_rmsnorm_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_RMSNORM") {
-            return false;
-        }
-        interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::RmsNormNvfp4Quant)
-    })
+fn decode_interpreter_rmsnorm_enabled(master_enabled: bool) -> bool {
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_RMSNORM",
+        &[InterpreterOpcode::RmsNormNvfp4Quant],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_deltanet_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_DELTANET") {
-            return false;
-        }
-        interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::DeltaNetRecur)
-    })
+fn decode_interpreter_deltanet_enabled(master_enabled: bool) -> bool {
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_DELTANET",
+        &[InterpreterOpcode::DeltaNetRecur],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_attention_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_ATTN") {
-            return false;
-        }
-        interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::AttnDecodeFull)
-    })
+fn decode_interpreter_attention_enabled(master_enabled: bool) -> bool {
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_ATTN",
+        &[InterpreterOpcode::AttnDecodeFull],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_rope_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_ROPE") {
-            return false;
-        }
-        interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::RopePartial)
-    })
+fn decode_interpreter_rope_enabled(master_enabled: bool) -> bool {
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_ROPE",
+        &[InterpreterOpcode::RopePartial],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_full_attention_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !decode_interpreter_decode_enabled() && !cuda_env_bool("QWEN36_INTERPRETER_FULL_ATTN") {
-            return false;
-        }
-        let opcodes = interpreter_opcodes_enabled_from_env();
-        opcodes.contains(InterpreterOpcode::RopePartial)
-            && opcodes.contains(InterpreterOpcode::AttnDecodeFull)
-    })
+fn decode_interpreter_full_attention_enabled(master_enabled: bool) -> bool {
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_FULL_ATTN",
+        &[
+            InterpreterOpcode::RopePartial,
+            InterpreterOpcode::AttnDecodeFull,
+        ],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_full_attention_layer_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !decode_interpreter_decode_enabled()
-            && !cuda_env_bool("QWEN36_INTERPRETER_FULL_ATTN_LAYER")
-        {
-            return false;
-        }
-        let opcodes = interpreter_opcodes_enabled_from_env();
-        opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
-            && opcodes.contains(InterpreterOpcode::QProjDeinterleave)
-            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
-            && opcodes.contains(InterpreterOpcode::RopePartial)
-            && opcodes.contains(InterpreterOpcode::AttnDecodeFull)
-            && opcodes.contains(InterpreterOpcode::QProjSigmoidGate)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
-    })
+fn decode_interpreter_full_attention_layer_enabled(master_enabled: bool) -> bool {
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_FULL_ATTN_LAYER",
+        &[
+            InterpreterOpcode::Nvfp4Gemv,
+            InterpreterOpcode::QProjDeinterleave,
+            InterpreterOpcode::RmsNormBf16,
+            InterpreterOpcode::RopePartial,
+            InterpreterOpcode::AttnDecodeFull,
+            InterpreterOpcode::QProjSigmoidGate,
+            InterpreterOpcode::Nvfp4Quantize,
+        ],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_full_attention_input_layer_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if cuda_env_bool("QWEN36_INTERPRETER_FULL_ATTN_INPUT_LAYER_DISABLE") {
-            return false;
-        }
-        if !decode_interpreter_decode_enabled()
-            && !cuda_env_bool("QWEN36_INTERPRETER_FULL_ATTN_INPUT_LAYER")
-        {
-            return false;
-        }
-        let opcodes = interpreter_opcodes_enabled_from_env();
-        opcodes.contains(InterpreterOpcode::RmsNormNvfp4Quant)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
-            && opcodes.contains(InterpreterOpcode::QProjDeinterleave)
-            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
-            && opcodes.contains(InterpreterOpcode::RopePartial)
-            && opcodes.contains(InterpreterOpcode::AttnDecodeFull)
-            && opcodes.contains(InterpreterOpcode::QProjSigmoidGate)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
-    })
+fn decode_interpreter_full_attention_input_layer_enabled(master_enabled: bool) -> bool {
+    if cuda_env_bool("QWEN36_INTERPRETER_FULL_ATTN_INPUT_LAYER_DISABLE") {
+        return false;
+    }
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_FULL_ATTN_INPUT_LAYER",
+        &[
+            InterpreterOpcode::RmsNormNvfp4Quant,
+            InterpreterOpcode::Nvfp4Gemv,
+            InterpreterOpcode::QProjDeinterleave,
+            InterpreterOpcode::RmsNormBf16,
+            InterpreterOpcode::RopePartial,
+            InterpreterOpcode::AttnDecodeFull,
+            InterpreterOpcode::QProjSigmoidGate,
+            InterpreterOpcode::Nvfp4Quantize,
+        ],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_full_transformer_layer_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if cuda_env_bool("QWEN36_INTERPRETER_FULL_TRANSFORMER_LAYER_DISABLE") {
-            return false;
-        }
-        if !decode_interpreter_decode_enabled()
-            && !cuda_env_bool("QWEN36_INTERPRETER_FULL_TRANSFORMER_LAYER")
-        {
-            return false;
-        }
-        let opcodes = interpreter_opcodes_enabled_from_env();
-        opcodes.contains(InterpreterOpcode::RmsNormNvfp4Quant)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
-            && opcodes.contains(InterpreterOpcode::QProjDeinterleave)
-            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
-            && opcodes.contains(InterpreterOpcode::RopePartial)
-            && opcodes.contains(InterpreterOpcode::AttnDecodeFull)
-            && opcodes.contains(InterpreterOpcode::QProjSigmoidGate)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
-            && opcodes.contains(InterpreterOpcode::SwiGluNvfp4Quant)
-    })
+fn decode_interpreter_full_transformer_layer_enabled(master_enabled: bool) -> bool {
+    if cuda_env_bool("QWEN36_INTERPRETER_FULL_TRANSFORMER_LAYER_DISABLE") {
+        return false;
+    }
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_FULL_TRANSFORMER_LAYER",
+        &[
+            InterpreterOpcode::RmsNormNvfp4Quant,
+            InterpreterOpcode::Nvfp4Gemv,
+            InterpreterOpcode::QProjDeinterleave,
+            InterpreterOpcode::RmsNormBf16,
+            InterpreterOpcode::RopePartial,
+            InterpreterOpcode::AttnDecodeFull,
+            InterpreterOpcode::QProjSigmoidGate,
+            InterpreterOpcode::Nvfp4Quantize,
+            InterpreterOpcode::SwiGluNvfp4Quant,
+        ],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_linear_attention_tail_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !decode_interpreter_decode_enabled()
-            && !cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_TAIL")
-        {
-            return false;
-        }
-        let opcodes = interpreter_opcodes_enabled_from_env();
-        opcodes.contains(InterpreterOpcode::RmsNormBf16)
-            && opcodes.contains(InterpreterOpcode::SwiGluBf16)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
-    })
+fn decode_interpreter_linear_attention_tail_enabled(master_enabled: bool) -> bool {
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_LINEAR_ATTN_TAIL",
+        &[
+            InterpreterOpcode::RmsNormBf16,
+            InterpreterOpcode::SwiGluBf16,
+            InterpreterOpcode::Nvfp4Quantize,
+            InterpreterOpcode::Nvfp4Gemv,
+        ],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_linear_attention_post_inproj_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !decode_interpreter_decode_enabled()
-            && !cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_POST_INPROJ")
-        {
-            return false;
-        }
-        let opcodes = interpreter_opcodes_enabled_from_env();
-        opcodes.contains(InterpreterOpcode::Conv1dGdnGateFused)
-            && opcodes.contains(InterpreterOpcode::DeltaNetRecur)
-            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
-            && opcodes.contains(InterpreterOpcode::SwiGluBf16)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
-    })
+fn decode_interpreter_linear_attention_post_inproj_enabled(master_enabled: bool) -> bool {
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_LINEAR_ATTN_POST_INPROJ",
+        &[
+            InterpreterOpcode::Conv1dGdnGateFused,
+            InterpreterOpcode::DeltaNetRecur,
+            InterpreterOpcode::RmsNormBf16,
+            InterpreterOpcode::SwiGluBf16,
+            InterpreterOpcode::Nvfp4Quantize,
+            InterpreterOpcode::Nvfp4Gemv,
+        ],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_linear_attention_layer_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_LAYER_DISABLE") {
-            return false;
-        }
-        if !decode_interpreter_decode_enabled()
-            && !cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_LAYER")
-        {
-            return false;
-        }
-        let opcodes = interpreter_opcodes_enabled_from_env();
-        opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
-            && opcodes.contains(InterpreterOpcode::Conv1dGdnGateFused)
-            && opcodes.contains(InterpreterOpcode::DeltaNetRecur)
-            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
-            && opcodes.contains(InterpreterOpcode::SwiGluBf16)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
-    })
+fn decode_interpreter_linear_attention_layer_enabled(master_enabled: bool) -> bool {
+    if cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_LAYER_DISABLE") {
+        return false;
+    }
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_LINEAR_ATTN_LAYER",
+        &[
+            InterpreterOpcode::Nvfp4Gemv,
+            InterpreterOpcode::Conv1dGdnGateFused,
+            InterpreterOpcode::DeltaNetRecur,
+            InterpreterOpcode::RmsNormBf16,
+            InterpreterOpcode::SwiGluBf16,
+            InterpreterOpcode::Nvfp4Quantize,
+        ],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_linear_attention_input_layer_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_INPUT_LAYER_DISABLE") {
-            return false;
-        }
-        if !decode_interpreter_decode_enabled()
-            && !cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_INPUT_LAYER")
-        {
-            return false;
-        }
-        let opcodes = interpreter_opcodes_enabled_from_env();
-        opcodes.contains(InterpreterOpcode::RmsNormNvfp4Quant)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
-            && opcodes.contains(InterpreterOpcode::Conv1dGdnGateFused)
-            && opcodes.contains(InterpreterOpcode::DeltaNetRecur)
-            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
-            && opcodes.contains(InterpreterOpcode::SwiGluBf16)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
-    })
+fn decode_interpreter_linear_attention_input_layer_enabled(master_enabled: bool) -> bool {
+    if cuda_env_bool("QWEN36_INTERPRETER_LINEAR_ATTN_INPUT_LAYER_DISABLE") {
+        return false;
+    }
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_LINEAR_ATTN_INPUT_LAYER",
+        &[
+            InterpreterOpcode::RmsNormNvfp4Quant,
+            InterpreterOpcode::Nvfp4Gemv,
+            InterpreterOpcode::Conv1dGdnGateFused,
+            InterpreterOpcode::DeltaNetRecur,
+            InterpreterOpcode::RmsNormBf16,
+            InterpreterOpcode::SwiGluBf16,
+            InterpreterOpcode::Nvfp4Quantize,
+        ],
+    )
 }
 
 #[cfg(feature = "cuda")]
-fn decode_interpreter_linear_transformer_layer_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if cuda_env_bool("QWEN36_INTERPRETER_LINEAR_TRANSFORMER_LAYER_DISABLE") {
-            return false;
-        }
-        if !decode_interpreter_decode_enabled()
-            && !cuda_env_bool("QWEN36_INTERPRETER_LINEAR_TRANSFORMER_LAYER")
-        {
-            return false;
-        }
-        let opcodes = interpreter_opcodes_enabled_from_env();
-        opcodes.contains(InterpreterOpcode::RmsNormNvfp4Quant)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Gemv)
-            && opcodes.contains(InterpreterOpcode::Conv1dGdnGateFused)
-            && opcodes.contains(InterpreterOpcode::DeltaNetRecur)
-            && opcodes.contains(InterpreterOpcode::RmsNormBf16)
-            && opcodes.contains(InterpreterOpcode::SwiGluBf16)
-            && opcodes.contains(InterpreterOpcode::Nvfp4Quantize)
-            && opcodes.contains(InterpreterOpcode::SwiGluNvfp4Quant)
-    })
+fn decode_interpreter_linear_transformer_layer_enabled(master_enabled: bool) -> bool {
+    if cuda_env_bool("QWEN36_INTERPRETER_LINEAR_TRANSFORMER_LAYER_DISABLE") {
+        return false;
+    }
+    decode_interpreter_gate_enabled(
+        master_enabled,
+        "QWEN36_INTERPRETER_LINEAR_TRANSFORMER_LAYER",
+        &[
+            InterpreterOpcode::RmsNormNvfp4Quant,
+            InterpreterOpcode::Nvfp4Gemv,
+            InterpreterOpcode::Conv1dGdnGateFused,
+            InterpreterOpcode::DeltaNetRecur,
+            InterpreterOpcode::RmsNormBf16,
+            InterpreterOpcode::SwiGluBf16,
+            InterpreterOpcode::Nvfp4Quantize,
+            InterpreterOpcode::SwiGluNvfp4Quant,
+        ],
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -910,6 +912,11 @@ impl<B: KernelBackend> Engine<B> {
             drafter_hidden_capture: None,
             backend,
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn decode_interpreter_decode_enabled(&self) -> bool {
+        decode_interpreter_decode_enabled_for_mtp(self.config.mtp_speculative_tokens)
     }
 
     /// Arms (or disarms) the DFlash drafter hidden-state capture hook
@@ -4538,7 +4545,7 @@ impl<B: KernelBackend> Engine<B> {
                 let mut ran_norm_mlp = false;
                 if !dump_decode
                     && position_device_i32 == DevicePtr::NULL
-                    && decode_interpreter_norm_mlp_enabled()
+                    && decode_interpreter_norm_mlp_enabled(self.decode_interpreter_decode_enabled())
                 {
                     let mlp_start = profile_decode.then(std::time::Instant::now);
                     ran_norm_mlp = self.run_interpreter_norm_mlp(
@@ -4616,12 +4623,13 @@ impl<B: KernelBackend> Engine<B> {
                             self.topology.intermediate_size,
                         )
                         && self.mlp_fused_main_opt(layer_idx).is_some();
-                    let interpreter_mlp_eligible = decode_interpreter_mlp_enabled()
-                        && position_device_i32 == DevicePtr::NULL
-                        && decode_interpreter_mlp_supports(
-                            self.topology.hidden_size,
-                            self.topology.intermediate_size,
-                        );
+                    let interpreter_mlp_eligible =
+                        decode_interpreter_mlp_enabled(self.decode_interpreter_decode_enabled())
+                            && position_device_i32 == DevicePtr::NULL
+                            && decode_interpreter_mlp_supports(
+                                self.topology.hidden_size,
+                                self.topology.intermediate_size,
+                            );
                     let ran_interpreter_mlp = interpreter_mlp_eligible
                         && self
                             .run_interpreter_mlp_with_quantized_input(layer, forward, quantized)?;
@@ -4920,7 +4928,9 @@ impl<B: KernelBackend> Engine<B> {
                 gate_f32: forward.gate_f32.ptr(),
                 beta_f32: forward.beta_f32.ptr(),
             })?;
-        if interpreter_allowed && decode_interpreter_deltanet_enabled() {
+        if interpreter_allowed
+            && decode_interpreter_deltanet_enabled(self.decode_interpreter_decode_enabled())
+        {
             self.run_interpreter_deltanet_decode(&deltanet_spec, forward)?;
         } else {
             self.backend.deltanet_decode(&deltanet_spec)?;
@@ -5088,18 +5098,20 @@ impl<B: KernelBackend> Engine<B> {
         // weight onto the secondary stream so it overlaps the small-CTA
         // attention work. `None` when productive spin is disabled or no MLP
         // fused store exists for this layer.
-        let prefetch_join = if decode_interpreter_full_attention_enabled() {
+        let prefetch_join = if decode_interpreter_full_attention_enabled(
+            self.decode_interpreter_decode_enabled(),
+        ) {
             let prefetch_join = self.fork_productive_spin(layer.layer_index)?;
             self.run_interpreter_rope_attention_decode(&rope_spec, &attention_spec, forward)?;
             prefetch_join
         } else {
-            if decode_interpreter_rope_enabled() {
+            if decode_interpreter_rope_enabled(self.decode_interpreter_decode_enabled()) {
                 self.run_interpreter_partial_rope(&rope_spec, forward)?;
             } else {
                 self.backend.partial_rope(&rope_spec)?;
             }
             let prefetch_join = self.fork_productive_spin(layer.layer_index)?;
-            if decode_interpreter_attention_enabled() {
+            if decode_interpreter_attention_enabled(self.decode_interpreter_decode_enabled()) {
                 self.run_interpreter_attention_decode(&attention_spec, forward)?;
             } else {
                 self.backend.attention_decode(&attention_spec)?;
@@ -7385,7 +7397,9 @@ impl<B: KernelBackend> Engine<B> {
         input_residual_bf16: DevicePtr,
         input_norm_weight_bf16: DevicePtr,
     ) -> Result<bool> {
-        if !decode_interpreter_full_attention_input_layer_enabled() {
+        if !decode_interpreter_full_attention_input_layer_enabled(
+            self.decode_interpreter_decode_enabled(),
+        ) {
             return Ok(false);
         }
 
@@ -7918,7 +7932,9 @@ impl<B: KernelBackend> Engine<B> {
         input_norm_weight_bf16: DevicePtr,
         post_attention_norm_weight_bf16: DevicePtr,
     ) -> Result<bool> {
-        if !decode_interpreter_full_transformer_layer_enabled() {
+        if !decode_interpreter_full_transformer_layer_enabled(
+            self.decode_interpreter_decode_enabled(),
+        ) {
             return Ok(false);
         }
 
@@ -8217,8 +8233,9 @@ impl<B: KernelBackend> Engine<B> {
         position_device_i32: DevicePtr,
         quantized: Nvfp4ActivationQuant<'_>,
     ) -> Result<bool> {
-        if !decode_interpreter_full_attention_layer_enabled()
-            || position_device_i32 != DevicePtr::NULL
+        if !decode_interpreter_full_attention_layer_enabled(
+            self.decode_interpreter_decode_enabled(),
+        ) || position_device_i32 != DevicePtr::NULL
         {
             return Ok(false);
         }
@@ -8475,7 +8492,9 @@ impl<B: KernelBackend> Engine<B> {
         z_bf16: DevicePtr,
         deltanet_output_bf16: DevicePtr,
     ) -> Result<bool> {
-        if !decode_interpreter_linear_attention_tail_enabled() {
+        if !decode_interpreter_linear_attention_tail_enabled(
+            self.decode_interpreter_decode_enabled(),
+        ) {
             return Ok(false);
         }
         let value_dim = self.topology.linear_attention_value_dim();
@@ -8579,7 +8598,9 @@ impl<B: KernelBackend> Engine<B> {
         conv_history_bf16: DevicePtr,
         state_bf16: DevicePtr,
     ) -> Result<bool> {
-        if !decode_interpreter_linear_attention_layer_enabled() {
+        if !decode_interpreter_linear_attention_layer_enabled(
+            self.decode_interpreter_decode_enabled(),
+        ) {
             return Ok(false);
         }
 
@@ -8791,7 +8812,9 @@ impl<B: KernelBackend> Engine<B> {
         input_residual_bf16: DevicePtr,
         input_norm_weight_bf16: DevicePtr,
     ) -> Result<bool> {
-        if !decode_interpreter_linear_attention_input_layer_enabled() {
+        if !decode_interpreter_linear_attention_input_layer_enabled(
+            self.decode_interpreter_decode_enabled(),
+        ) {
             return Ok(false);
         }
         let Some(fused) = self.linear_attn_in_proj_fused_layer_opt(layer.layer_index) else {
@@ -9032,7 +9055,9 @@ impl<B: KernelBackend> Engine<B> {
         input_norm_weight_bf16: DevicePtr,
         post_attention_norm_weight_bf16: DevicePtr,
     ) -> Result<bool> {
-        if !decode_interpreter_linear_transformer_layer_enabled() {
+        if !decode_interpreter_linear_transformer_layer_enabled(
+            self.decode_interpreter_decode_enabled(),
+        ) {
             return Ok(false);
         }
         let Some(fused) = self.linear_attn_in_proj_fused_layer_opt(layer.layer_index) else {
@@ -9526,8 +9551,9 @@ impl<B: KernelBackend> Engine<B> {
         if z_bf16 == conv_input_bf16 {
             return Ok(false);
         }
-        if !decode_interpreter_linear_attention_post_inproj_enabled()
-            || deltanet_spec.tokens_in_persistent_loop != 1
+        if !decode_interpreter_linear_attention_post_inproj_enabled(
+            self.decode_interpreter_decode_enabled(),
+        ) || deltanet_spec.tokens_in_persistent_loop != 1
             || deltanet_spec.q_token_stride != 0
             || deltanet_spec.k_token_stride != 0
             || deltanet_spec.v_token_stride != 0
@@ -10100,7 +10126,9 @@ impl<B: KernelBackend> Engine<B> {
     ) -> Result<()> {
         let forward = self.cuda_forward()?;
         let input_tensor_scale_f32 = self.tensor_scalar_f32(self.cuda_weights()?, input_scale)?;
-        if interpreter_allowed && decode_interpreter_rmsnorm_enabled() {
+        if interpreter_allowed
+            && decode_interpreter_rmsnorm_enabled(self.decode_interpreter_decode_enabled())
+        {
             return self.run_interpreter_rmsnorm_nvfp4_quantize(
                 DecodeInterpreterRmsNormNvfp4QuantParams {
                     hidden,
@@ -10243,7 +10271,8 @@ impl<B: KernelBackend> Engine<B> {
         position_device_i32: DevicePtr,
         attention_context_limit: usize,
     ) -> Result<()> {
-        if position_device_i32 == DevicePtr::NULL || !decode_interpreter_decode_enabled() {
+        let interpreter_master_enabled = self.decode_interpreter_decode_enabled();
+        if position_device_i32 == DevicePtr::NULL || !interpreter_master_enabled {
             self.decode_interpreter_graph_programs = None;
             return Ok(());
         }
@@ -10295,7 +10324,9 @@ impl<B: KernelBackend> Engine<B> {
 
                 let program = match layer {
                     LayerWeights::LinearAttention(linear)
-                        if decode_interpreter_linear_transformer_layer_enabled() =>
+                        if decode_interpreter_linear_transformer_layer_enabled(
+                            interpreter_master_enabled,
+                        ) =>
                     {
                         let spec = CudaDeviceBuffer::alloc(deltanet_decode_spec_abi_size())?;
                         match self.build_interpreter_linear_transformer_layer_decode(
@@ -10320,7 +10351,9 @@ impl<B: KernelBackend> Engine<B> {
                         }
                     }
                     LayerWeights::FullAttention(full)
-                        if decode_interpreter_full_transformer_layer_enabled() =>
+                        if decode_interpreter_full_transformer_layer_enabled(
+                            interpreter_master_enabled,
+                        ) =>
                     {
                         let spec = CudaDeviceBuffer::alloc(attention_decode_spec_abi_size())?;
                         match self.build_interpreter_full_transformer_layer_decode(
