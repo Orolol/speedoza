@@ -600,6 +600,140 @@ LD_LIBRARY_PATH="$PWD/target/cuda:${LD_LIBRARY_PATH:-}" \
     --mtp-speculative-tokens <0|1|2|3>
 ```
 
+### 2026-06-09 — Interpreter megakernel — WIP, Stage 2 gate FAILED, engine missing
+
+Spec: `docs/superpowers/specs/2026-06-08-interpreter-megakernel-design.md`.
+Goal was one persistent kernel for the whole decode pass with on-SM
+counter sync, `cp.async.bulk` weight prefetch crossing instruction
+boundaries, and sub-instruction chunking of MLP intermediates.
+Projected gain: −1.7 ms / token realistic (+7.7 % on MTP=0, +3 tok/s).
+Stage 2 gate from the spec: ≥ +3 tok/s on MTP=0 vs baseline or revert.
+
+**What landed (Codex, in-flight working tree, not committed yet):**
+
+- CUDA substrate `kernels-cuda/interpreter/` (~460 LoC across
+  `interpreter_sm120.cu`, `instruction.h`, `counters.cuh`,
+  `page_allocator.cuh`).
+- 14 device opcode bodies in `kernels-cuda/interpreter/opcodes/`:
+  `rmsnorm_bf16`, `rmsnorm_nvfp4_quant`, `nvfp4_gemv`, `nvfp4_quantize`,
+  `swiglu_bf16`, `swiglu_nvfp4_quant`, `rope_partial`, `residual_add`,
+  `deltanet_recur`, `attn_decode_full`, `lm_head_tiled`,
+  `q_proj_deinterleave`, `q_proj_sigmoid_gate`, `conv1d_gdn_gate_fused`,
+  plus `fallback_trampoline`.
+- Rust ABI `crates/kernels/src/interpreter.rs` with typed instruction
+  constructors and `static_assert(sizeof == 152)` mirror.
+- `crates/runtime/src/interpreter_compile.rs` (~2 850 LoC):
+  whole-layer compilers — `compile_full_attention_layer_decode`,
+  `compile_full_attention_input_layer_decode`,
+  `compile_full_transformer_layer_decode`,
+  `compile_linear_attention_tail_decode`,
+  `compile_linear_attention_post_inproj_decode`,
+  `compile_linear_attention_layer_decode`,
+  `compile_linear_attention_input_layer_decode`,
+  `compile_linear_transformer_layer_decode`, plus per-op compilers.
+- `crates/runtime/src/engine.rs`: 6 call sites of
+  `interpreter_decode_sm120` (one per slice kind), feature-gated by
+  `QWEN36_INTERPRETER_DECODE` master + fine gates per opcode
+  (`_MLP`, `_NORM_MLP`, `_RMSNORM`, `_DELTANET`, `_ATTN`, `_ROPE`,
+  `_FULL_ATTN`, `_FULL_ATTN_LAYER`, `_FULL_ATTN_INPUT_LAYER`,
+  `_FULL_TRANSFORMER_LAYER`, `_LINEAR_ATTN_TAIL`,
+  `_LINEAR_ATTN_POST_INPROJ`, `_LINEAR_ATTN_LAYER`,
+  `_LINEAR_ATTN_INPUT_LAYER`, `_LINEAR_TRANSFORMER_LAYER`) and
+  per-layer-type `_DISABLE` flags for surgical opt-out.
+
+**What is NOT yet implemented (gap vs spec, drives the gate failure):**
+
+- **No `cp.async.bulk` weight prefetch crossing instruction
+  boundaries.** Spec line 70 ("Weight prefetch overlap") projected
+  −0.8 ms realistic. Not present. PageAllocator has 4 weight slots
+  reserved for double-buffering; none of them are used by any opcode
+  body.
+- **No sub-instruction chunking.** Each interpreter instruction
+  publishes ONE counter at the end (`arrive_and_publish_last_cta`
+  after a single `__syncthreads()`). Spec called for SwiGLU output
+  publishing 4 chunks (4 352-element each) so `down_proj` could start
+  consuming chunk by chunk. Not present.
+- **No SMEM activation residency** between Q/K/V and o_proj. Every
+  opcode reads/writes through `payload_ptr<...>(insn.payload[X])`
+  which are GMEM pointers; nothing stays SMEM-resident across opcode
+  boundaries.
+- **Dispatch loop has a `__syncthreads()` after every instruction**
+  (`interpreter_sm120.cu:162`). That barrier is structurally
+  incompatible with both prefetch overlap and chunking.
+- **Emitted programs are strictly serial.** Each instruction's `deps`
+  point at the previous instruction's `publishes_counter` with no
+  fan-out — the substrate could express parallel work, but the
+  compiler emits a single chain.
+- **No bench microsmoke gating the interpreter path.** `smoke.cu`
+  doesn't exercise `interpreter_decode_sm120`.
+
+**Bench (2026-06-09, in-flight, RTX 5090 native Linux, dmtp + zed +
+Megabonk taking ~1.4 GB → `QWEN36_LONG_CONTEXT_MODE=1` required to
+fit; both sides use it so comparison is fair):**
+
+prompt=128, max-new=32, median of 5:
+
+| Config | tok/s | Δ vs baseline |
+|---|---:|---:|
+| MTP=0 baseline | 36.88 | — |
+| MTP=0 interpreter | 35.07 | **−4.9 %** |
+| MTP=4 baseline | 74.96 | — |
+| MTP=4 interpreter | 76.28 | +1.8 % (noise) |
+
+Same shape as the per-block megakernel Phase 2 (`9cc92fc` /
+2026-05-23): regressive on MTP=0, noise on MTP=4. Stage 2 spec gate
+is +3 tok/s on MTP=0; we are at −1.81. **Gate failed.**
+
+The regression makes sense given the gap: the substrate adds
+dispatch overhead (opcode switch, counter spin, per-instruction
+syncthreads, GMEM round-trip between opcodes inside a slice) without
+yet collecting any of the wins the spec projected. The shipped state
+is "kernel-fusion compiler that emits one launch per slice", not
+"on-SM interpreter that pipelines instructions" — different
+architecture, much smaller projected ceiling.
+
+**Engine work I am starting now (Claude, in this session):**
+
+1. **Drop the per-instruction `__syncthreads()` from the dispatch
+   loop.** Move sync responsibility into each opcode body (most
+   already sync internally). Unblocks chunking + prefetch.
+2. **Wire `cp.async.bulk` weight prefetch.** Add a payload field
+   `prefetch_weight_ptr` + `prefetch_weight_bytes` (or read it from
+   the *next* instruction in the program). Kick off the load into a
+   double-buffered weight page at the top of instruction N's body so
+   the next NVFP4 GEMV's weight tile is L2/SMEM-warm. Stage A:
+   prefetch for `NVFP4_GEMV` only.
+3. **Re-bench** with the same protocol. If ≥ +3 tok/s on MTP=0, ship
+   and document. If between 0 and +3, decide between (B) implementing
+   sub-instruction chunking next, or (A) reframing the work as a
+   fusion compiler and committing at parity. If still negative,
+   revert and keep behind `QWEN36_INTERPRETER_DECODE=1` opt-in for
+   diagnostics, same outcome as the per-block megakernel.
+
+**Codex hand-off:** if you re-enter this branch, the engine work above
+is the missing piece. Don't add more opcodes until the prefetch
+mechanism is proven (or proven not to win) on one opcode pair. The
+extensive whole-layer Rust compile coverage you've built is the right
+scaffolding — emitting a known static instruction chain means
+"prefetch the weights of program[pc + 1] during program[pc]" is
+expressible. The block list is in
+`docs/superpowers/notes/2026-06-09-long-context-decode-roadmap.md`
+under Tier 1; once the megakernel is decided, FA-tiling the DFlash
+drafter is the next ROI win.
+
+Reproduce the bench with:
+
+```bash
+QWEN36_FP4_KERNEL_LIB_DIR=$PWD/target/cuda \
+LD_LIBRARY_PATH=$PWD/target/cuda:${LD_LIBRARY_PATH:-} \
+QWEN36_LONG_CONTEXT_MODE=1 \
+[QWEN36_INTERPRETER_DECODE=1] \
+  target/release/qwen36 bench \
+    --model-dir ~/models/Qwen3.6-27B-Text-NVFP4-MTP \
+    --prompt-tokens 128 --max-new-tokens 32 \
+    --mtp-speculative-tokens <0|4>
+```
+
 ### 2026-06-09 — DFlash speculative decoding (`chat --drafter dflash`) — opt-in fast path, 1.8× MTP=3 geo-mean
 
 Phase F.2 shipped. End-to-end speculative loop using
