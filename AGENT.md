@@ -740,6 +740,56 @@ generation lengths × 2 backends = 30 runs, driver
    based on prompt length + observed acceptance; today user picks
    via `--drafter dflash`.
 
+**Long-context follow-up (added after the standard sweep):**
+
+Probing prompt sizes from 400 to 7058 tokens shows the "long context
+hurts DFlash" framing from the standard sweep was incomplete. Full
+write-up: `docs/superpowers/notes/2026-06-09-dflash-long-context.md`.
+
+| Prompt (content) | tokens | gen | DFlash tok/s | DFlash AL | MTP=3 tok/s | speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| tech_xl_500t (post-mortem) | 400 | 128 | 69.2 | 3.45 | 55.2 | 1.25× |
+| code_xl_1500t (Rust module) | 802 | 256 | 88.6 | 5.82 | 53.6 | **1.65×** |
+| long_synth_xxl (coherent tech) | 953 | 256 | 86.1 | 6.09 | 43.9 | **1.96×** |
+| long_synth_3000t (topic-shift) | 986 | 256 | 26.1 | 1.96 | 44.4 | 0.59× |
+| AGENT.md head:150 | **3262** | 256 | 52.5 | **7.76** | 29.1 | **1.80×** |
+| AGENT.md head:300 | **7058** | 256 | 20.8 | 5.43 | 39.9 | 0.52× |
+
+Two distinct effects compose:
+
+1. **Topic / distribution diversity in the prompt.** Same ~1000-token
+   length, drastically different result: coherent tech writing
+   (`long_synth_xxl`) gets AL 6.09 and 1.96× speedup; topic-shifting
+   prose (`long_synth_3000t`, jumps between cooking, physics, game
+   design, supply chain) gets AL 1.96 and 0.59× speedup. The
+   block-diffusion drafter conditions on the concatenated target
+   hidden states; incompatible distributions across the prompt
+   destroy the denoising signal.
+
+2. **Drafter forward cost dominates above ~5K tokens.** Our drafter
+   attention kernel (`kernels-cuda/drafter_attention.cu`, Phase C
+   commit `4c2b43c`) is the naive O(q_len × kv_seq_len) version — no
+   tiling, no FlashAttention. At 3K context AL stays high (7.76) and
+   DFlash wins 1.80×; at 7K context AL is still 5.4 but per-iter
+   drafter time exceeds the gain, dropping to 0.52×. MTP's MTP head
+   is a tiny single-extra-layer pass that doesn't redo prompt
+   attention, so MTP=3 throughput stays roughly flat across context
+   lengths (~30–40 tok/s in this range).
+
+Updated routing rules:
+
+- ≤ 200t → DFlash (drafter cheap, AL high).
+- 200–1000t coherent text → DFlash gen ≥ 128.
+- 200–1000t topic-shift prose → MTP=3.
+- 1000–3000t structured technical → DFlash gen ≥ 64 (best case 1.96×).
+- 3000–5000t → benchmark per workload; mixed.
+- > 5000t → MTP=3 (drafter forward time dominates).
+
+The break-even at ~5K is set entirely by the drafter attention
+kernel. A FlashAttention-style tile rewrite would plausibly push it
+to ~20K (drafter scales bandwidth-bound rather than O(n)). Scoped as
+a follow-up; not done.
+
 **Pre-flight to run DFlash on a fresh machine:**
 
 ```bash
