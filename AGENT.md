@@ -897,8 +897,32 @@ the flash tile is the SAME kernel the prompt prefill uses (≥1024 chunks),
 so verify is now *consistent* with prefill rather than using a different
 scalar kernel.
 
-**Status: opt-in default off** (`QWEN36_VERIFY_FLASH_SPLITK=1`). Two
-follow-ups before default-on:
+**Coherent long-ctx sweep** (P2.1, persistent-scratch build, FP8 KV —
+the production default, so this exercises the FP8 path end-to-end):
+
+| ctx | prompt | baseline tok/s | split-K tok/s | speedup | base AL | split-K AL |
+|---|---|---:|---:|---:|---:|---:|
+| 3262 | coherent | 65.1 | 155.2 | 2.38× | 9.18 | 9.0 |
+| 5484 | coherent | 25.0 | **107.3** | **4.29×** | 5.16 | **7.91 ↑** |
+| 7058 | AGENT.md×2 (repetitive) | 17.5 | 53.3 | 3.04× | 4.49 | 3.64 |
+| 7815 | coherent | 9.6 | **40.4** | **4.18×** | 2.68 | 2.78 |
+
+**AL is preserved or IMPROVED on coherent prompts** — at 5484 ctx it
+jumps 5.16 → 7.91. This is the consistency dividend: the prompt is
+prefilled with the flash kernel (≥1024 chunks), so a flash split-K
+verify is *consistent* with prefill, whereas the scalar GQA verify used
+a different kernel and hurt the drafter's hidden-state conditioning. The
+only AL drift (7058) was on a pathological repetitive prompt
+(AGENT.md concatenated with itself). On real coherent text the kernel is
+a strict win on both axes.
+
+**Status: opt-in default off** (`QWEN36_VERIFY_FLASH_SPLITK=1`) pending an
+adversarial correctness review (workflow wf_a36ff789-8b8: wmma frag
+layout, partial-buffer overflow, causal-per-split, scratch stream-safety,
+default-on risk). The empty-split case (n_splits > total_k_iters → some
+splits have an empty K-range) is already validated by the smoke
+(n_splits=48 at start=2048 → 15 empty splits, cos≥0.998): empty splits
+write m=-inf/l=0 partials that the reduce skips. Remaining follow-ups:
 1. **Engine-buffer reuse** — the dispatch currently calls a self-contained
    entry that `cudaMalloc`s partials per call (per attention call, ×16
    layers × iters). Reuse pre-allocated forward buffers (sized
