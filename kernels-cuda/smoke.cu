@@ -10,6 +10,12 @@
 #include <stdint.h>
 #include <vector>
 
+// FA-tiled drafter attention entry — not in the public header (it is the
+// internal fast path the dispatcher tries first). Declared here so the
+// parity gate can call it directly. extern "C" must be at namespace scope.
+extern "C" int qwen36_drafter_attention_block_flash_bf16(
+    const qwen36_drafter_attention_block_spec_t *spec);
+
 namespace {
 
 template <typename T> void must_cuda(cudaError_t err, const char *what) {
@@ -4109,6 +4115,178 @@ int main() {
     dev_free<__nv_bfloat16>(k_dev);
     dev_free<__nv_bfloat16>(v_dev);
     dev_free<__nv_bfloat16>(out_dev);
+  }
+
+  // ------------------------------------------------------------------
+  // DFlash drafter attention — Phase 1 FA-tiled parity gate (P0).
+  // ------------------------------------------------------------------
+  // Closes Phase 1 task #49, which was never exercised because the
+  // block above uses q_len=2 — below the FA gate (q_len == kFlashM ==
+  // 16) — so the FA path always returned NOT_IMPLEMENTED and only v1
+  // was ever tested. This block runs the SPECIALISED FA shape
+  // (q_len=16, head_dim=128) and compares FA vs v1 vs an FP32 CPU
+  // reference across the kv_seq_len regime transition and both SWA
+  // configs, at the GQA ratios the DFlash drafter actually uses.
+  //
+  // The investigation harness (workflow wf_2128592f-3a2) measured cos
+  // 0.999998 here; this gate locks that in so any future drift in the
+  // FA kernel turns the smoke RED instead of silently degrading AL.
+  {
+    // The FA entry qwen36_drafter_attention_block_flash_bf16 is
+    // forward-declared at file scope (extern "C") — calling it directly
+    // avoids dispatcher ambiguity; it self-gates on
+    // QWEN36_DRAFTER_ATTENTION_FLASH so we set the env first.
+    const int q_len = 16; // == kFlashM, the FA-specialised q_len
+    const int head_dim = 128;
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    const int gqa[][2] = {{32, 8}, {40, 8}};
+    const int kv_lens[] = {16, 64, 128, 1024, 4096};
+    const int swas[] = {0, 2048};
+
+    auto bf16_round = [](float x) {
+      return __bfloat162float(__float2bfloat16(x));
+    };
+    auto cos_sim = [](const std::vector<float> &a,
+                      const std::vector<float> &b) -> double {
+      double num = 0.0, da = 0.0, db = 0.0;
+      for (size_t i = 0; i < a.size(); ++i) {
+        num += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+        da += static_cast<double>(a[i]) * static_cast<double>(a[i]);
+        db += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+      }
+      return num / sqrt(da * db);
+    };
+
+    std::mt19937 rng(909090);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+    int cases = 0;
+
+    for (const auto &g : gqa) {
+      const int q_heads = g[0];
+      const int kv_heads = g[1];
+      for (int kv_seq_len : kv_lens) {
+        for (int sliding_window : swas) {
+          std::vector<float> q_host(q_len * q_heads * head_dim);
+          std::vector<float> k_host(kv_seq_len * kv_heads * head_dim);
+          std::vector<float> v_host(kv_seq_len * kv_heads * head_dim);
+          for (auto &x : q_host) x = dist(rng);
+          for (auto &x : k_host) x = dist(rng);
+          for (auto &x : v_host) x = dist(rng);
+
+          // CPU FP32 reference: non-causal attention with the symmetric
+          // sliding-window mask matching drafter_attention.cu:91-104.
+          std::vector<float> ref(q_len * q_heads * head_dim, 0.0f);
+          for (int qp = 0; qp < q_len; ++qp) {
+            const int q_abs = kv_seq_len - q_len + qp;
+            for (int qh = 0; qh < q_heads; ++qh) {
+              const int kvh = (qh * kv_heads) / q_heads;
+              std::vector<float> scores(kv_seq_len, -INFINITY);
+              for (int j = 0; j < kv_seq_len; ++j) {
+                if (sliding_window > 0) {
+                  const int delta = q_abs - j;
+                  const int ad = delta < 0 ? -delta : delta;
+                  if (ad > sliding_window) continue;
+                }
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                  float q =
+                      bf16_round(q_host[(qp * q_heads + qh) * head_dim + d]);
+                  float kk =
+                      bf16_round(k_host[(j * kv_heads + kvh) * head_dim + d]);
+                  dot += q * kk;
+                }
+                scores[j] = dot * scale;
+              }
+              float m = -INFINITY;
+              for (float s : scores) m = fmaxf(m, s);
+              float sum = 0.0f;
+              for (float &s : scores) {
+                s = (m == -INFINITY) ? 0.0f : expf(s - m);
+                sum += s;
+              }
+              for (int d = 0; d < head_dim; ++d) {
+                float acc = 0.0f;
+                for (int j = 0; j < kv_seq_len; ++j) {
+                  float vv =
+                      bf16_round(v_host[(j * kv_heads + kvh) * head_dim + d]);
+                  acc += scores[j] * vv;
+                }
+                ref[(qp * q_heads + qh) * head_dim + d] =
+                    (sum > 0.0f) ? acc / sum : 0.0f;
+              }
+            }
+          }
+
+          qwen36_device_ptr_t q_dev = dev_alloc<__nv_bfloat16>(q_host.size());
+          qwen36_device_ptr_t k_dev = dev_alloc<__nv_bfloat16>(k_host.size());
+          qwen36_device_ptr_t v_dev = dev_alloc<__nv_bfloat16>(v_host.size());
+          qwen36_device_ptr_t out_v1 = dev_alloc<__nv_bfloat16>(ref.size());
+          qwen36_device_ptr_t out_fa = dev_alloc<__nv_bfloat16>(ref.size());
+          copy_bf16(q_dev, q_host);
+          copy_bf16(k_dev, k_host);
+          copy_bf16(v_dev, v_host);
+
+          qwen36_drafter_attention_block_spec_t spec{};
+          spec.q_bf16 = q_dev;
+          spec.k_bf16 = k_dev;
+          spec.v_bf16 = v_dev;
+          spec.q_len = q_len;
+          spec.kv_seq_len = kv_seq_len;
+          spec.q_heads = q_heads;
+          spec.kv_heads = kv_heads;
+          spec.head_dim = head_dim;
+          spec.sliding_window = sliding_window;
+
+          // v1 path: env unset -> FA self-gate returns NOT_IMPLEMENTED ->
+          // dispatcher falls through to the v1 scalar kernel.
+          unsetenv("QWEN36_DRAFTER_ATTENTION_FLASH");
+          spec.output_bf16 = out_v1;
+          must_status(qwen36_drafter_attention_block_bf16(&spec),
+                      "drafter FA parity: v1 path");
+          std::vector<float> got_v1 = read_bf16(out_v1, ref.size());
+
+          // FA path: env set, call the FA entry directly.
+          setenv("QWEN36_DRAFTER_ATTENTION_FLASH", "1", 1);
+          spec.output_bf16 = out_fa;
+          must_status(qwen36_drafter_attention_block_flash_bf16(&spec),
+                      "drafter FA parity: flash path");
+          std::vector<float> got_fa = read_bf16(out_fa, ref.size());
+          unsetenv("QWEN36_DRAFTER_ATTENTION_FLASH");
+
+#ifdef QWEN36_SMOKE_PROVE_FAIL
+          // Fail-ability proof (P0 requirement): inject a perturbation
+          // and confirm the gate turns RED. Compiled only under
+          // -DQWEN36_SMOKE_PROVE_FAIL; never in the default build.
+          for (size_t i = 0; i < got_fa.size(); ++i) {
+            got_fa[i] += (i % 3 == 0) ? 0.25f : 0.0f;
+          }
+#endif
+
+          const double cos_fa_ref = cos_sim(got_fa, ref);
+          const double cos_v1_ref = cos_sim(got_v1, ref);
+          const double cos_fa_v1 = cos_sim(got_fa, got_v1);
+
+          if (cos_fa_ref < 0.998 || cos_v1_ref < 0.998 ||
+              cos_fa_v1 < 0.998) {
+            fprintf(stderr,
+                    "drafter FA parity FAIL [q_heads=%d kv_heads=%d "
+                    "kv=%d swa=%d]: cos(fa,ref)=%.6f cos(v1,ref)=%.6f "
+                    "cos(fa,v1)=%.6f < 0.998\n",
+                    q_heads, kv_heads, kv_seq_len, sliding_window,
+                    cos_fa_ref, cos_v1_ref, cos_fa_v1);
+            exit(1);
+          }
+
+          dev_free<__nv_bfloat16>(q_dev);
+          dev_free<__nv_bfloat16>(k_dev);
+          dev_free<__nv_bfloat16>(v_dev);
+          dev_free<__nv_bfloat16>(out_v1);
+          dev_free<__nv_bfloat16>(out_fa);
+          ++cases;
+        }
+      }
+    }
+    printf("drafter FA parity gate passed (%d cases, q_len=16)\n", cases);
   }
 
   printf("qwen36 CUDA smoke test passed\n");
