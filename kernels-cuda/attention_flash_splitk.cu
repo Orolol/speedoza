@@ -419,17 +419,43 @@ struct SplitKScratch {
 };
 SplitKScratch g_splitk_scratch;
 
+// True if the active stream is currently capturing a CUDA graph. cudaMalloc/
+// cudaFree are illegal during capture and would invalidate it, so a grow
+// that would fire mid-capture must fail loudly instead of corrupting the
+// graph. After the engine pre-warms the scratch to its worst-case size
+// (eager, outside capture) the grow branch is unreachable and this guard
+// never trips; it is the belt-and-suspenders the adversarial review
+// (wf_a36ff789-8b8) required for default-on.
+bool splitk_active_stream_capturing() {
+  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(qwen36_internal_active_stream(), &status) !=
+      cudaSuccess) {
+    return false;
+  }
+  return status != cudaStreamCaptureStatusNone;
+}
+
+enum SplitKReserve { kReserveOk = 0, kReserveCaptureBlocked = 1, kReserveOom = 2 };
+
 // Ensure the scratch holds at least `partial_count` (scalar) and
-// `partial_count * head_dim` (acc) floats. Returns false on alloc failure.
-bool splitk_scratch_reserve(size_t partial_count, size_t head_dim) {
+// `partial_count * head_dim` (acc) floats. Returns kReserveCaptureBlocked
+// if a grow would be required during an active graph capture (the caller
+// then falls back to the capture-safe scalar GQA path), kReserveOom on
+// allocation failure.
+int splitk_scratch_reserve(size_t partial_count, size_t head_dim) {
   const size_t want_acc = partial_count * head_dim;
+  const bool needs_grow = want_acc > g_splitk_scratch.acc_floats ||
+                          partial_count > g_splitk_scratch.scalar_floats;
+  if (needs_grow && splitk_active_stream_capturing()) {
+    return kReserveCaptureBlocked;
+  }
   if (want_acc > g_splitk_scratch.acc_floats) {
     cudaFree(g_splitk_scratch.acc);
     g_splitk_scratch.acc = nullptr;
     if (cudaMalloc(&g_splitk_scratch.acc, want_acc * sizeof(float)) !=
         cudaSuccess) {
       g_splitk_scratch.acc_floats = 0;
-      return false;
+      return kReserveOom;
     }
     g_splitk_scratch.acc_floats = want_acc;
   }
@@ -443,11 +469,11 @@ bool splitk_scratch_reserve(size_t partial_count, size_t head_dim) {
         cudaMalloc(&g_splitk_scratch.denom, partial_count * sizeof(float)) !=
             cudaSuccess) {
       g_splitk_scratch.scalar_floats = 0;
-      return false;
+      return kReserveOom;
     }
     g_splitk_scratch.scalar_floats = partial_count;
   }
-  return true;
+  return kReserveOk;
 }
 } // namespace
 
@@ -476,7 +502,14 @@ extern "C" int qwen36_attention_flash_splitk_prefill_bf16(
   const size_t partial_count =
       tokens * q_heads * static_cast<size_t>(n_splits);
 
-  if (!splitk_scratch_reserve(partial_count, head_dim)) {
+  const int reserve = splitk_scratch_reserve(partial_count, head_dim);
+  if (reserve == kReserveCaptureBlocked) {
+    // Would need to cudaMalloc inside a graph capture — fall back to the
+    // capture-safe scalar path (dispatch treats NOT_IMPLEMENTED as a
+    // fall-through). Unreachable once the engine pre-warms the scratch.
+    return QWEN36_STATUS_NOT_IMPLEMENTED;
+  }
+  if (reserve == kReserveOom) {
     return QWEN36_STATUS_CUDA_ERROR;
   }
   float *partial_acc = g_splitk_scratch.acc;

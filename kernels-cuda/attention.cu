@@ -2603,7 +2603,7 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
   // (4 CTAs at q=16), and the scalar GQA re-reads the full KV per token.
   // This path tiles the KV across n_splits CTAs to saturate the GPU while
   // staying numerically faithful (FP32 accum, cos>=0.998 vs scalar).
-  if (!tree_mask_present && env_bool_or("QWEN36_VERIFY_FLASH_SPLITK", false) &&
+  if (!tree_mask_present && env_bool_or("QWEN36_VERIFY_FLASH_SPLITK", true) &&
       spec->tokens >= 2 && spec->tokens <= 32 && spec->shape.head_dim == 256 &&
       !is_tq_cache_dtype(spec->kv_cache_dtype) && q_per_kv > 1) {
     const size_t total_k_iters = (spec->start_position + spec->tokens + 63) / 64;

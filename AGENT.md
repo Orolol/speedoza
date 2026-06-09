@@ -916,25 +916,55 @@ only AL drift (7058) was on a pathological repetitive prompt
 (AGENT.md concatenated with itself). On real coherent text the kernel is
 a strict win on both axes.
 
-**Status: opt-in default off** (`QWEN36_VERIFY_FLASH_SPLITK=1`) pending an
-adversarial correctness review (workflow wf_a36ff789-8b8: wmma frag
-layout, partial-buffer overflow, causal-per-split, scratch stream-safety,
-default-on risk). The empty-split case (n_splits > total_k_iters → some
-splits have an empty K-range) is already validated by the smoke
-(n_splits=48 at start=2048 → 15 empty splits, cos≥0.998): empty splits
-write m=-inf/l=0 partials that the reduce skips. Remaining follow-ups:
-1. **Engine-buffer reuse** — the dispatch currently calls a self-contained
-   entry that `cudaMalloc`s partials per call (per attention call, ×16
-   layers × iters). Reuse pre-allocated forward buffers (sized
-   tokens × q_heads × n_splits × head_dim) to drop the alloc + implicit
-   sync overhead; will push the speedup higher.
-2. **Coherent long-ctx sweep** to characterize the 7K AL drift on
-   non-garbage prompts before flipping default.
+**Status: DEFAULT-ON** (`QWEN36_VERIFY_FLASH_SPLITK=1` is the default;
+set `=0` to force scalar GQA). Cleared by an adversarial correctness
+review (workflow wf_a36ff789-8b8, 5 lenses + per-finding adversarial
+verification + Opus synthesis):
+
+- **Kernel math is correct.** The QK^T / online-softmax / o_frags
+  alpha-rescale / PV stages are byte-identical to the proven
+  `attention_flash_prefill.cu` tile (geometry unchanged), the
+  log-sum-exp reduce is mathematically equivalent to the reference
+  single-pass O/l, the causal mask is split-invariant, empty/all-masked
+  splits write m=-inf/l=0 (skipped by the reduce), the partition is
+  gap-free, scratch capacity is an exact fit (no overflow), and the FP8
+  E4M3 decode is byte-identical to the scalar reference. 5 of 6 flagged
+  concerns were adversarially refuted (cross-stream race, FP8 numerics,
+  stale-partials, host/device start mismatch, error-swallowing — all NOT
+  bugs).
+- **One real HIGH finding, fixed:** the per-call grow-on-demand
+  cudaMalloc was capture-illegal. Latent (the q=16 DFlash verify path is
+  eager; captured MTP chunks (2-5 tok) are intercepted by the
+  pre-existing split path before this gate). Fixed two ways: (1) a
+  `cudaStreamIsCapturing` guard — a grow that would fire mid-capture
+  returns NOT_IMPLEMENTED so the dispatch falls through to the
+  capture-safe scalar GQA; (2) the eager q=16 calls pre-grow the
+  persistent scratch so the grow branch never fires in steady state.
+  Empirically confirmed: MTP=0/4 bench (which captures decode+MTP-verify
+  graphs) runs with no capture error and no regression (49.6 / 104.4
+  tok/s).
+- **Parity coverage extended to the production path:** smoke gate now
+  72 cases — BF16 **and FP8** KV × tokens {9,16,32} (the default-on
+  redirect band) × starts {0,64,2048,4096} × n_splits {1,8,48}, all
+  cos ≥ 0.998.
+
+DFlash default (no env) measured 143.9 tok/s at 3K (2.2× vs scalar
+baseline 65). Remaining polish (not gating; tracked #55):
+1. **Engine-owned scratch** — the entry currently uses a process-global
+   grow-on-demand scratch (capture-guarded: a mid-capture grow falls
+   through to scalar GQA; in steady state the eager q=16 calls pre-grow
+   it so no alloc happens during capture). The robustness completion is
+   to pre-reserve the partials in the engine at init (worst case from
+   `config.max_context`: n_splits≤48, tokens≤32, q_heads, head_dim+2)
+   and pass them via the spec, mirroring the decode split-KV path at
+   `attention.cu:2687-2719`. Removes even the first eager alloc and lets
+   future captured [9,32] chunks use split-K instead of falling through.
 
 Files: `kernels-cuda/attention_flash_splitk.cu` (kernel + reduce +
-self-contained entry), `attention.cu` dispatch branch (env-gated, falls
-through to scalar GQA on NOT_IMPLEMENTED), `smoke.cu` parity gate,
-`build_cuda.sh`.
+persistent-scratch entry with `cudaStreamIsCapturing` guard),
+`attention.cu` dispatch branch (default-on, falls through to scalar GQA
+on NOT_IMPLEMENTED incl. mid-capture grow), `smoke.cu` parity gate
+(72 cases BF16+FP8), `build_cuda.sh`.
 
 ### 2026-06-09 — P2 probe: existing split-K GQA at q=16 — 5× at 7K but lossy
 
