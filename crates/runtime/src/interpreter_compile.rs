@@ -59,6 +59,22 @@ pub struct DecodeInterpreterMlpParams {
     pub output_bf16: DevicePtr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeInterpreterRopeParams {
+    pub tokens: usize,
+    pub q_heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub rope_dims: usize,
+    pub base_theta: f64,
+    pub position_i32: i32,
+    pub use_scalar_position: bool,
+    pub positions_i32: DevicePtr,
+    pub q_bf16: DevicePtr,
+    pub k_bf16: DevicePtr,
+    pub scalar_position_device_i32: DevicePtr,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeInterpreterDeltaNetParams {
     pub spec: DevicePtr,
@@ -215,6 +231,31 @@ impl DecodeInterpreterProgram {
             .with_dep(4, 1)
             .with_publish(6, 1)
             .with_arrival_counter(7),
+        );
+        Self {
+            program: program.finish(),
+        }
+    }
+
+    pub fn compile_rope_partial(params: DecodeInterpreterRopeParams) -> Self {
+        let mut program = InterpreterProgram::new();
+        program.push(
+            InterpreterInstruction::rope_partial(
+                params.tokens,
+                params.q_heads,
+                params.kv_heads,
+                params.head_dim,
+                params.rope_dims,
+                params.base_theta,
+                params.position_i32,
+                params.use_scalar_position,
+                params.positions_i32,
+                params.q_bf16,
+                params.k_bf16,
+                params.scalar_position_device_i32,
+            )
+            .with_publish(0, 1)
+            .with_arrival_counter(1),
         );
         Self {
             program: program.finish(),
@@ -436,6 +477,46 @@ mod tests {
         assert_eq!(compiled.program.instructions[3].deps[0].counter_id, 4);
         assert_eq!(
             compiled.program.instructions[4].opcode(),
+            Some(InterpreterOpcode::Exit)
+        );
+    }
+
+    #[test]
+    fn rope_program_uses_real_opcode_and_counter() {
+        let compiled =
+            DecodeInterpreterProgram::compile_rope_partial(DecodeInterpreterRopeParams {
+                tokens: 1,
+                q_heads: 24,
+                kv_heads: 4,
+                head_dim: 256,
+                rope_dims: 64,
+                base_theta: 10000.0,
+                position_i32: 7,
+                use_scalar_position: true,
+                positions_i32: DevicePtr::NULL,
+                q_bf16: DevicePtr(100),
+                k_bf16: DevicePtr(200),
+                scalar_position_device_i32: DevicePtr::NULL,
+            });
+        assert_eq!(compiled.program.instructions.len(), 2);
+        assert_eq!(compiled.program.counter_count, 2);
+        assert_eq!(
+            compiled.program.instructions[0].opcode(),
+            Some(InterpreterOpcode::RopePartial)
+        );
+        assert_eq!(compiled.program.instructions[0].payload[0], 1);
+        assert_eq!(compiled.program.instructions[0].payload[1], 24);
+        assert_eq!(compiled.program.instructions[0].payload[2], 4);
+        assert_eq!(compiled.program.instructions[0].payload[3], 256);
+        assert_eq!(compiled.program.instructions[0].payload[4], 64);
+        assert_eq!(
+            compiled.program.instructions[0].payload[6],
+            7 | (1_u64 << 32)
+        );
+        assert_eq!(compiled.program.instructions[0].payload[8], 100);
+        assert_eq!(compiled.program.instructions[0].payload[9], 200);
+        assert_eq!(
+            compiled.program.instructions[1].opcode(),
             Some(InterpreterOpcode::Exit)
         );
     }

@@ -585,6 +585,11 @@ pub struct GpuForwardBuffers {
     pub interpreter_mlp_instructions: CudaDeviceBuffer,
     /// Reusable counter buffer for `interpreter_mlp_instructions`.
     pub interpreter_mlp_counters: CudaDeviceBuffer,
+    /// Reusable instruction buffer for the opt-in decode-interpreter partial
+    /// RoPE program.
+    pub interpreter_rope_instructions: CudaDeviceBuffer,
+    /// Reusable counter buffer for `interpreter_rope_instructions`.
+    pub interpreter_rope_counters: CudaDeviceBuffer,
     /// Reusable ABI spec buffer for the opt-in decode-interpreter DeltaNet
     /// recurrence program.
     pub interpreter_deltanet_spec: CudaDeviceBuffer,
@@ -880,6 +885,10 @@ impl GpuForwardBuffers {
                 5 * size_of::<InterpreterInstruction>(),
             )?,
             interpreter_mlp_counters: CudaDeviceBuffer::zeroed(8 * size_of::<i32>())?,
+            interpreter_rope_instructions: CudaDeviceBuffer::alloc(
+                2 * size_of::<InterpreterInstruction>(),
+            )?,
+            interpreter_rope_counters: CudaDeviceBuffer::zeroed(2 * size_of::<i32>())?,
             interpreter_deltanet_spec: CudaDeviceBuffer::alloc(deltanet_decode_spec_abi_size())?,
             interpreter_deltanet_instructions: CudaDeviceBuffer::alloc(
                 2 * size_of::<InterpreterInstruction>(),
@@ -924,6 +933,8 @@ impl GpuForwardBuffers {
             self.interpreter_logits_counters.bytes(),
             self.interpreter_mlp_instructions.bytes(),
             self.interpreter_mlp_counters.bytes(),
+            self.interpreter_rope_instructions.bytes(),
+            self.interpreter_rope_counters.bytes(),
             self.interpreter_deltanet_spec.bytes(),
             self.interpreter_deltanet_instructions.bytes(),
             self.interpreter_deltanet_counters.bytes(),

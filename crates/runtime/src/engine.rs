@@ -32,6 +32,7 @@ use crate::gpu::{
 use crate::interpreter_compile::{
     instructions_as_bytes, DecodeInterpreterAttentionParams, DecodeInterpreterDeltaNetParams,
     DecodeInterpreterLogitsParams, DecodeInterpreterMlpParams, DecodeInterpreterProgram,
+    DecodeInterpreterRopeParams,
 };
 use crate::kv_cache::KvCachePlan;
 use crate::state::{DeltaNetStatePlan, RuntimeState};
@@ -182,6 +183,18 @@ fn decode_interpreter_attention_enabled() -> bool {
             return false;
         }
         interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::AttnDecodeFull)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_interpreter_rope_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if !cuda_env_bool("QWEN36_INTERPRETER_ROPE") {
+            return false;
+        }
+        interpreter_opcodes_enabled_from_env().contains(InterpreterOpcode::RopePartial)
     })
 }
 
@@ -4368,7 +4381,7 @@ impl<B: KernelBackend> Engine<B> {
             DevicePtr::NULL,
             forward.aux.ptr(),
         )?;
-        self.backend.partial_rope(&PartialRopeSpec {
+        let rope_spec = PartialRopeSpec {
             tokens: 1,
             q_heads: self.topology.attention_num_heads,
             kv_heads: self.topology.attention_num_kv_heads,
@@ -4381,7 +4394,12 @@ impl<B: KernelBackend> Engine<B> {
             q_bf16: forward.aux3.ptr(),
             k_bf16: forward.aux.ptr(),
             scalar_position_device_i32: position_device_i32,
-        })?;
+        };
+        if decode_interpreter_rope_enabled() {
+            self.run_interpreter_partial_rope(&rope_spec, forward)?;
+        } else {
+            self.backend.partial_rope(&rope_spec)?;
+        }
         // Productive spin: fork L2 prefetch of this layer's MLP combined
         // weight onto the secondary stream so it overlaps the small-CTA
         // attention kernel that follows. `None` when productive spin is
@@ -6376,6 +6394,67 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn run_interpreter_partial_rope(
+        &self,
+        spec: &PartialRopeSpec,
+        forward: &GpuForwardBuffers,
+    ) -> Result<()> {
+        if spec.tokens != 1
+            || !spec.use_scalar_position
+            || spec.positions_i32 != DevicePtr::NULL
+            || spec.scalar_position_device_i32 != DevicePtr::NULL
+        {
+            self.backend.partial_rope(spec)?;
+            return Ok(());
+        }
+
+        let compiled =
+            DecodeInterpreterProgram::compile_rope_partial(DecodeInterpreterRopeParams {
+                tokens: spec.tokens,
+                q_heads: spec.q_heads,
+                kv_heads: spec.kv_heads,
+                head_dim: spec.head_dim,
+                rope_dims: spec.rope_dims,
+                base_theta: spec.base_theta,
+                position_i32: spec.position_i32,
+                use_scalar_position: spec.use_scalar_position,
+                positions_i32: spec.positions_i32,
+                q_bf16: spec.q_bf16,
+                k_bf16: spec.k_bf16,
+                scalar_position_device_i32: spec.scalar_position_device_i32,
+            });
+        let instruction_bytes = instructions_as_bytes(&compiled.program.instructions);
+        if instruction_bytes.len() > forward.interpreter_rope_instructions.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter RoPE program needs {} instruction bytes but buffer has {}",
+                instruction_bytes.len(),
+                forward.interpreter_rope_instructions.bytes()
+            )));
+        }
+        let counter_bytes = compiled.program.counter_count * size_of::<i32>();
+        if counter_bytes > forward.interpreter_rope_counters.bytes() {
+            return Err(CoreError::Runtime(format!(
+                "interpreter RoPE program needs {counter_bytes} counter bytes but buffer has {}",
+                forward.interpreter_rope_counters.bytes()
+            )));
+        }
+
+        forward
+            .interpreter_rope_instructions
+            .copy_from_host(instruction_bytes)?;
+        forward.interpreter_rope_counters.memset_async(0)?;
+        self.backend
+            .interpreter_decode_sm120(&InterpreterProgramSpec {
+                instructions: forward.interpreter_rope_instructions.ptr(),
+                instruction_count: compiled.program.instructions.len(),
+                counters_i32: forward.interpreter_rope_counters.ptr(),
+                counter_count: compiled.program.counter_count,
+                cta_count: 0,
+                flags: 0,
+            })
+    }
+
+    #[cfg(feature = "cuda")]
     fn run_interpreter_attention_decode(
         &self,
         spec: &AttentionDecodeSpec,
@@ -7428,6 +7507,14 @@ impl Engine<CudaBackend> {
             item(
                 "interpreter_mlp_counters",
                 forward.interpreter_mlp_counters.bytes() as u64,
+            ),
+            item(
+                "interpreter_rope_instructions",
+                forward.interpreter_rope_instructions.bytes() as u64,
+            ),
+            item(
+                "interpreter_rope_counters",
+                forward.interpreter_rope_counters.bytes() as u64,
             ),
             item(
                 "interpreter_deltanet_spec",

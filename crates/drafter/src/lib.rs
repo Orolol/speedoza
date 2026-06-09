@@ -5,6 +5,8 @@ pub mod forward;
 pub mod gpu;
 #[cfg(feature = "cuda")]
 pub mod handoff;
+#[cfg(feature = "cuda")]
+pub mod propose;
 
 pub use dflash::{
     DFlashConfig, DFlashDrafter, DFlashLayerWeights, DFlashManifest, DFlashWeightRef,
@@ -16,3 +18,5 @@ pub use forward::{DrafterForward, DrafterForwardWorkspace, DrafterWorkspaceRepor
 pub use gpu::{DFlashDrafterDevice, DFlashLayerDevice, DrafterVramReport};
 #[cfg(feature = "cuda")]
 pub use handoff::{TargetHiddenCapture, TargetHiddenCaptureSlot};
+#[cfg(feature = "cuda")]
+pub use propose::{DFlashProposeWorkspace, propose_block};
