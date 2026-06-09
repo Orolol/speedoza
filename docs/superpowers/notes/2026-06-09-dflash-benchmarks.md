@@ -103,17 +103,41 @@ target/release/qwen36 bench \
 in its JSON output; `bench` emits `decode_tokens_per_second` and
 `mtp_acceptance_rate`.
 
+## Chat integration
+
+`qwen36 chat` gained `--drafter {none,dflash}` and `--drafter-dir`:
+
+```bash
+target/release/qwen36 chat \
+    --model-dir   ~/models/Qwen3.6-27B-Text-NVFP4-MTP \
+    --drafter     dflash \
+    --drafter-dir ~/models/Qwen3.6-27B-DFlash \
+    --prompt "Write a Python function that returns the sum of two integers" \
+    --max-new-tokens 100
+```
+
+Streams decoded tokens to stdout as they are committed. Emits a
+trailing `[dflash] generated N tokens in K iters | AL=… | decode Xs
+(Y tok/s) | total Zs` summary line on stderr at the end. Measured on
+chat-templated prompts (release build, 100 max-new-tokens):
+
+| Prompt | tok/s | AL | iters |
+|---|---:|---:|---:|
+| "Write a Python function..." | 168.7 | 6.38 | 16 |
+| "Write a haiku about Rust..." | 115.5 | 4.26 | 19 |
+
 ## Follow-ups not done yet
 
-- CUDA-graph capture of `verify_block_batched` at fixed
-  `(k, prompt_class)` shapes. The MTP path already does this for its
-  verify graph; ~20–30% more is plausibly on the table for DFlash.
-- Per-allocation overhead: the batched logits buffer (~8 MB) is
-  allocated/freed per call. Promoting it to a pre-allocated workspace
-  on `GpuForwardBuffers` would save a few hundred microseconds per
-  iter — small but nonzero.
-- Integration behind a `chat --drafter dflash` flag on the existing
-  chat CLI.
-- Investigation of the underlying decode-kernel divergence on NVFP4
-  (this is the `chat --mtp-speculative-tokens 0` bug; orthogonal to
-  DFlash but blocks `decode_one` for any direct use).
+- **CUDA-graph capture of `verify_block_batched`** at fixed `k=16`.
+  The MTP path already does this for its verify graph; ~20–30% more
+  is plausibly on the table for DFlash. Deferred — non-trivial graph
+  coordination with the existing decode graph.
+- **Permanent logits workspace** on `GpuForwardBuffers` (replacing the
+  per-call ~8 MB alloc/free in `verify_block_batched`). Evaluated and
+  skipped: amortised cost is ~50 µs × 20 iters = 1 ms per chat over
+  ~700 ms total = 0.15 % savings. Below noise floor; not worth
+  touching `GpuForwardBuffers` (active Codex territory) for this.
+- **Investigation of the underlying decode-kernel divergence on NVFP4**
+  (this is the `chat --mtp-speculative-tokens 0` bug surfaced by
+  `decode-vs-prefill-check`). Orthogonal to DFlash but blocks
+  `decode_one` for any direct use. Out of scope for this work.
