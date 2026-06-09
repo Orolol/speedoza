@@ -600,6 +600,162 @@ LD_LIBRARY_PATH="$PWD/target/cuda:${LD_LIBRARY_PATH:-}" \
     --mtp-speculative-tokens <0|1|2|3>
 ```
 
+### 2026-06-09 — DFlash speculative decoding (`chat --drafter dflash`) — opt-in fast path, 1.8× MTP=3 geo-mean
+
+Phase F.2 shipped. End-to-end speculative loop using
+[`z-lab/Qwen3.6-27B-DFlash`](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash)
+(2 B BF16 block-diffusion drafter, paper arXiv 2602.06036) against
+our NVFP4 target. Implementation is 13 commits across two sessions;
+full details in `docs/superpowers/notes/2026-06-09-dflash-final.md`
+and the design spec
+`docs/superpowers/specs/2026-06-08-dflash-speculative-decoding-design.md`.
+
+**Activation (opt-in)** — default `chat` behaviour is unchanged:
+
+```bash
+export QWEN36_LONG_CONTEXT_MODE=1        # disable fused MLP stores to fit drafter
+target/release/qwen36 chat \
+    --model-dir   ~/models/Qwen3.6-27B-Text-NVFP4-MTP \
+    --drafter     dflash \
+    --drafter-dir ~/models/Qwen3.6-27B-DFlash \
+    --prompt "<text>" --max-new-tokens 256
+```
+
+Streams tokens as they commit; emits a trailing `[dflash] generated
+N tokens in K iters | AL=… | decode Xs (Y tok/s)` summary on stderr.
+
+**Engine-side pieces shipped:**
+
+- `Engine::verify_block_batched(tokens) -> Vec<u32>` (commit `9b7e643`):
+  runs one prefill chunk through the target then batched RMSNorm +
+  bf16_gemm lm_head (rows=k+1) + sample_rows greedy. Returns all k+1
+  argmaxes in one call. **~10× fewer target forwards per verify
+  cycle** than the sequential `engine.prefill(&[t])` chain that
+  preceded it.
+- `Engine::crop_state_position(new)` — public KV-position truncation
+  paired with `verify_block_batched` to drop the rejected speculative
+  tail (data past the cut is left in place, overwritten by the next
+  forward write).
+- `DrafterHiddenCaptureHook` (commit `97993c0` + Phase F.2 update):
+  `Arc<dyn Fn(layer_idx, residual_ptr, tokens) -> Result<()> + Send +
+  Sync>`. Engine fires it once per layer after each `input_layernorm`
+  in **both** prefill and decode paths. `crates/drafter/handoff.rs`
+  provides `TargetHiddenCapture` which uses `copy_strided_rows` to
+  scatter per-layer residuals into a `[max_tokens, hidden *
+  n_target_layers]` BF16 buffer matching the drafter's
+  `target_hidden_raw` input layout. Supports a per-decode
+  `set_write_row(row)` so multi-iter chats accumulate per-decode
+  captures into distinct rows.
+
+**Drafter-side pieces** (new `crates/drafter` crate, no impact on
+default engine surface):
+
+- `DFlashDrafter`: mmap'd safetensors loader + 58-tensor manifest.
+- `DFlashDrafterDevice`: GPU upload (~3.46 GB BF16).
+- `DrafterForward`: 5-layer drafter forward with per-layer KV cache,
+  reset/crop API, internal `fc + hidden_norm` collapse.
+  Parity-validated against transformers reference at cos sim
+  **0.99987** (Python harness `scripts/dflash_parity.py`).
+- New CUDA kernel `kernels-cuda/drafter_attention.cu`:
+  `qwen36_drafter_attention_block_bf16` — non-causal BF16 attention
+  with `K = [k_ctx; k_noise]` (target_hidden + noise embeddings),
+  GQA broadcast, optional SWA. Smoke cos sim 0.999999 vs host fp32.
+- `propose_block`: embed → drafter forward → lm_head GEMM →
+  greedy argmax. Returns k candidate tokens.
+
+**Bench sweep** (RTX 5090 release build, 5 prompt types × 3
+generation lengths × 2 backends = 30 runs, driver
+`scripts/dflash_bench_sweep.py`, raw CSV at
+`docs/superpowers/notes/2026-06-09-dflash-sweep.csv`):
+
+| Prompt | prompt tok | gen | DFlash tok/s | DFlash AL | MTP=3 tok/s | MTP=3 AL_eff | speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| completion_short | 7 | 32  | 102.4 | 3.67  | 67.7  | 3.52 | 1.51× |
+| completion_short | 7 | 128 | 128.0 | 4.68  | 56.4  | 3.33 | **2.27×** |
+| completion_short | 7 | 256 | 102.5 | 3.97  | 68.0  | 3.56 | 1.51× |
+| code_short       | 4 | 32  | 121.7 | 4.38  | 108.0 | 4.00 | 1.13× |
+| code_short       | 4 | 128 | 257.0 | 9.36  | 69.3  | 3.54 | **3.71×** |
+| code_short       | 4 | 256 | **313.6** | **11.77** | 81.9 | 3.73 | **3.83×** |
+| prose_medium     | 51 | 32  | 32.3  | 1.19  | 40.8 | 2.97 | 0.79× |
+| prose_medium     | 51 | 128 | 87.9  | 3.25  | 53.0 | 3.28 | 1.66× |
+| prose_medium     | 51 | 256 | 105.9 | 4.10  | 58.7 | 3.43 | **1.80×** |
+| qa_medium        | 59 | 32  | 79.7  | 3.00  | 44.6 | 3.04 | 1.79× |
+| qa_medium        | 59 | 128 | 130.4 | 4.96  | 48.8 | 3.20 | **2.67×** |
+| qa_medium        | 59 | 256 | 153.8 | 6.07  | 51.7 | 3.30 | **2.98×** |
+| code_long        | 229 | 32  | 46.6  | 2.00  | 85.9 | 3.88 | 0.54× |
+| code_long        | 229 | 128 | 53.9  | 2.37  | 74.1 | 3.73 | 0.73× |
+| code_long        | 229 | 256 | 79.8  | 3.55  | 69.1 | 3.70 | 1.15× |
+
+- **Geo-mean over 15 cells:** DFlash 117.5 tok/s vs MTP=3 65.2 tok/s
+  → **1.80× speedup**.
+- **Peak:** 313.6 tok/s on code_short@256, AL **11.77** (block_size
+  upper bound is 16 — near-full block acceptance every iter).
+- **Worst case:** 0.54× on code_long@32. Long prompts dilute the
+  drafter's `fc + hidden_norm` conditioning; short generations don't
+  give the drafter time to warm up.
+
+**Patterns:**
+
+- DFlash AL **rises with generation length**: code 4.38 → 9.36 → 11.77
+  across gen=32/128/256. MTP=3 AL_eff is flat at 3.3–4.0.
+- DFlash AL **falls with prompt length**: same code task,
+  3.83× speedup at 4 prompt tokens → 1.15× at 229 prompt tokens.
+- Three cells favour MTP=3 (long-context + short-gen); common factor
+  is AL ≤ 2.5.
+
+**Routing heuristics** (manual today, not adaptive):
+
+- `prompt_tokens > 150` AND `max_new_tokens < 64` → MTP=3.
+- Code/QA short context → DFlash.
+- Long prose continuations → DFlash if `max_new_tokens ≥ 128`.
+
+**Workflow during DFlash bring-up (write-ups in
+`docs/superpowers/notes/`):**
+
+- `2026-06-08-dflash-kernel-reuse-audit.md` — Phase B catalog of which
+  existing kernels the drafter forward can reuse and which needed
+  new CUDA (only the `drafter_attention` kernel; everything else
+  reuses `Bf16GemmSpec`, `RmsNormSpec`, `PartialRopeSpec` with
+  `rope_dims=128`, `SwiGluSpec`, `EmbeddingLookupSpec`).
+- `2026-06-09-dflash-final.md` — full results doc (this section's
+  long form, plus implementation history and known issues).
+
+**Known issues / out of scope (documented; not addressed):**
+
+1. **NVFP4 decode-kernel divergence**: `chat
+   --mtp-speculative-tokens 0` produces degenerate output ("Here
+   question or looks sentence address") because the engine's
+   per-token decode path produces logits with cos sim ~0.76
+   (sometimes negative) vs the prefill kernel path on the same
+   input. New diagnostic CLI `qwen36 decode-vs-prefill-check`
+   reproduces it in 2 sequential engine loads. DFlash routes around
+   it by verifying through prefill chunks (commit `6571f37`).
+2. **CUDA-graph capture of `verify_block_batched`** — deferred.
+   Plausible 20–30% more tok/s but requires coordination with the
+   existing decode-graph machinery.
+3. **Permanent logits workspace** on `GpuForwardBuffers` — evaluated
+   and skipped. Per-call alloc cost ≈ 0.15 % of decode time; not
+   worth touching `GpuForwardBuffers` for that margin.
+4. **Adaptive drafter routing** — controller could swap dynamically
+   based on prompt length + observed acceptance; today user picks
+   via `--drafter dflash`.
+
+**Pre-flight to run DFlash on a fresh machine:**
+
+```bash
+hf download z-lab/Qwen3.6-27B-DFlash --local-dir ~/models/Qwen3.6-27B-DFlash
+curl -sL https://raw.githubusercontent.com/z-lab/dflash/main/dflash/model.py \
+     -o ~/models/Qwen3.6-27B-DFlash/dflash.py   # for the Python parity harness
+cargo build --release -p qwen36-fp4 --features cuda
+./scripts/build_cuda.sh                          # CUDA lib (.so) build
+QWEN36_LONG_CONTEXT_MODE=1 \
+QWEN36_FP4_KERNEL_LIB_DIR=$PWD/target/cuda \
+LD_LIBRARY_PATH=$PWD/target/cuda:$LD_LIBRARY_PATH \
+  target/release/qwen36 validate-drafter --drafter-dir ~/models/Qwen3.6-27B-DFlash
+```
+
+Then any of the chat / sweep / smoke commands above.
+
 ### Validated against PyTorch reference (matching to within FP4 quantization noise)
 
 Cosine similarity floor is `0.998` unless noted.
