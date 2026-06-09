@@ -2290,12 +2290,15 @@ fn drafter_chat_smoke(
     max_new_tokens: usize,
 ) -> Result<()> {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use qwen36_fp4_drafter::{
         DFlashDrafter, DFlashDrafterDevice, DFlashProposeWorkspace, DrafterForward,
         DrafterForwardWorkspace, TargetHiddenCapture, propose_block,
     };
     use qwen36_fp4_kernels::CudaBackend;
+
+    let bench_start = Instant::now();
 
     if max_new_tokens == 0 {
         anyhow::bail!("max_new_tokens must be > 0");
@@ -2342,11 +2345,14 @@ fn drafter_chat_smoke(
         kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Fp8),
         ..EngineConfig::default()
     };
+    let target_load_start = Instant::now();
     let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, target_config)?;
+    let target_load_seconds = target_load_start.elapsed().as_secs_f64();
 
     // --- Drafter weights + capture (sized for the largest single
     //     capture event: prompt prefill writes `prompt_len` rows; each
     //     verify writes up to `block_size + 1` rows). -----------------
+    let drafter_load_start = Instant::now();
     let drafter_device = DFlashDrafterDevice::upload(&drafter)?;
     let capture_max_tokens = prompt_len.max(block_size + 1);
     let capture = Arc::new(TargetHiddenCapture::alloc(
@@ -2360,12 +2366,15 @@ fn drafter_chat_smoke(
                 .capture_layer(&CudaBackend, layer_idx, residual_ptr, tokens)
                 .map_err(|e| qwen36_fp4_core::CoreError::Runtime(format!("drafter handoff: {e}")))
         });
+    let drafter_load_seconds = drafter_load_start.elapsed().as_secs_f64();
 
     // --- Prefill: captures rows [0, prompt_len) in capture buffer ----
+    let prefill_start = Instant::now();
     capture.set_write_row(0);
     engine.set_drafter_hidden_capture(Some(hook.clone()));
     engine.prefill(&prompt_tokens)?;
     qwen36_fp4_runtime::cuda_synchronize()?;
+    let prefill_seconds = prefill_start.elapsed().as_secs_f64();
 
     engine.queue_sample_greedy_to_current_token()?;
     qwen36_fp4_runtime::cuda_synchronize()?;
@@ -2412,6 +2421,7 @@ fn drafter_chat_smoke(
     let mut ctx_len = prompt_len; // capture rows from previous step
     let mut total_committed_after_prompt = 0_usize; // tokens generated so far
 
+    let decode_start = Instant::now();
     while total_committed_after_prompt < max_new_tokens {
         // Drafter KV must reflect the prefix length the drafter has
         // already "seen". For iter 0 we start fresh; otherwise crop to
@@ -2521,9 +2531,21 @@ fn drafter_chat_smoke(
         ctx_len = accepted + 1;
         total_committed_after_prompt = generated.len();
     }
+    let decode_seconds = decode_start.elapsed().as_secs_f64();
+    let total_seconds = bench_start.elapsed().as_secs_f64();
 
     engine.set_drafter_hidden_capture(None);
     let generated_text = tokenizer.decode(&generated, true).unwrap_or_default();
+    let tokens_per_second = if decode_seconds > 0.0 {
+        generated.len() as f64 / decode_seconds
+    } else {
+        0.0
+    };
+    let acceptance_length = if per_iter.is_empty() {
+        0.0
+    } else {
+        generated.len() as f64 / per_iter.len() as f64
+    };
 
     println!(
         "{}",
@@ -2536,8 +2558,17 @@ fn drafter_chat_smoke(
             "max_new_tokens": max_new_tokens,
             "block_size": block_size,
             "iterations": per_iter.len(),
-            "generated_tokens": generated,
+            "generated_token_count": generated.len(),
             "generated_text": generated_text,
+            "timings_seconds": {
+                "target_load": target_load_seconds,
+                "drafter_load": drafter_load_seconds,
+                "prefill": prefill_seconds,
+                "decode": decode_seconds,
+                "total": total_seconds,
+            },
+            "acceptance_length": acceptance_length,
+            "tokens_per_second": tokens_per_second,
             "per_iter": per_iter,
         }))?,
     );
