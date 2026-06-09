@@ -251,6 +251,14 @@ enum Command {
         mtp_speculative_tokens: usize,
         #[arg(long, default_value_t = 1)]
         mtp_tree_leaves: usize,
+        /// Drafter for speculative decoding. `none` uses the
+        /// chain/tree MTP path (with `--mtp-speculative-tokens`).
+        /// `dflash` routes through the DFlash drafter end-to-end via
+        /// batched verify, requires `--drafter-dir`.
+        #[arg(long, value_enum, default_value = "none")]
+        drafter: DrafterArg,
+        #[arg(long)]
+        drafter_dir: Option<PathBuf>,
     },
     Bench {
         #[arg(long)]
@@ -312,6 +320,16 @@ enum KvArg {
     Fp8,
     Turboquant3,
     Turboquant35,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum DrafterArg {
+    /// No DFlash drafter; the chat path uses chain/tree MTP via
+    /// `--mtp-speculative-tokens`.
+    None,
+    /// DFlash drafter (`z-lab/Qwen3.6-27B-DFlash` style) end-to-end:
+    /// drafter propose + batched verify per iteration.
+    Dflash,
 }
 
 impl From<KvArg> for KvCacheDtype {
@@ -572,9 +590,39 @@ fn main() -> Result<()> {
             max_new_tokens,
             mtp_speculative_tokens,
             mtp_tree_leaves,
+            drafter,
+            drafter_dir,
         } => {
             if mtp_tree_leaves == 0 || mtp_tree_leaves > 8 {
                 anyhow::bail!("--mtp-tree-leaves must be in 1..=8, got {mtp_tree_leaves}");
+            }
+            if drafter == DrafterArg::Dflash {
+                let drafter_dir = drafter_dir.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--drafter dflash requires --drafter-dir <path to DFlash drafter>"
+                    )
+                })?;
+                #[cfg(feature = "cuda")]
+                {
+                    return run_chat_dflash(
+                        model_dir,
+                        drafter_dir,
+                        prompt,
+                        max_new_tokens,
+                    );
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = (model_dir, drafter_dir, prompt, max_new_tokens);
+                    anyhow::bail!(
+                        "chat --drafter dflash requires the cuda feature; rebuild with --features cuda"
+                    );
+                }
+            }
+            if drafter_dir.is_some() {
+                anyhow::bail!(
+                    "--drafter-dir is only valid with --drafter dflash"
+                );
             }
             run_chat(
                 model_dir,
@@ -2282,6 +2330,252 @@ fn decode_vs_prefill_check(model_dir: PathBuf, prompt: String) -> Result<()> {
 }
 
 #[cfg(feature = "cuda")]
+fn run_chat_dflash(
+    model_dir: PathBuf,
+    drafter_dir: PathBuf,
+    prompt: String,
+    max_new_tokens: usize,
+) -> Result<()> {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use qwen36_fp4_drafter::{
+        DFlashDrafter, DFlashDrafterDevice, DFlashProposeWorkspace, DrafterForward,
+        DrafterForwardWorkspace, TargetHiddenCapture, propose_block,
+    };
+    use qwen36_fp4_kernels::CudaBackend;
+
+    let chat_start = Instant::now();
+
+    let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
+    let messages = vec![ChatMessage {
+        role: "user".to_owned(),
+        content: prompt.clone(),
+    }];
+    let prompt_tokens = tokenizer.encode_chat(&messages, true)?;
+    if prompt_tokens.is_empty() {
+        anyhow::bail!("prompt produced 0 tokens");
+    }
+    let prompt_len = prompt_tokens.len();
+
+    let drafter = DFlashDrafter::open(&drafter_dir)?;
+    if drafter.config.head_dim != 128 {
+        anyhow::bail!(
+            "chat --drafter dflash only supports head_dim=128, got {}",
+            drafter.config.head_dim,
+        );
+    }
+    let mask_token_id = drafter.config.dflash_config.mask_token_id;
+    let block_size = drafter.config.block_size;
+    let q_len = block_size;
+    let vocab_size = drafter.config.vocab_size;
+    let eos_token_id: u32 = 248044;
+
+    let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+    let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
+    let target_config = EngineConfig {
+        max_context: prompt_len
+            .saturating_add(max_new_tokens)
+            .saturating_add(block_size)
+            .max(256),
+        kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Fp8),
+        ..EngineConfig::default()
+    };
+    let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, target_config)?;
+
+    let drafter_device = DFlashDrafterDevice::upload(&drafter)?;
+    let capture_max_tokens = prompt_len.max(block_size + 1);
+    let capture = Arc::new(TargetHiddenCapture::alloc(
+        &drafter.config,
+        capture_max_tokens,
+    )?);
+    let capture_for_hook = capture.clone();
+    let hook: qwen36_fp4_runtime::DrafterHiddenCaptureHook =
+        Arc::new(move |layer_idx, residual_ptr, tokens| {
+            capture_for_hook
+                .capture_layer(&CudaBackend, layer_idx, residual_ptr, tokens)
+                .map_err(|e| qwen36_fp4_core::CoreError::Runtime(format!("drafter handoff: {e}")))
+        });
+
+    capture.set_write_row(0);
+    engine.set_drafter_hidden_capture(Some(hook.clone()));
+    engine.prefill(&prompt_tokens)?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+
+    engine.queue_sample_greedy_to_current_token()?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+    let mut seed_token = engine.read_current_token()?;
+
+    let (target_embed_ptr, target_lm_head_ptr) = {
+        let manifest = engine
+            .weights
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("engine has no weights manifest after prefill"))?;
+        let gpu_weights = engine
+            .gpu_weights
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("engine has no GPU weights after prefill"))?;
+        let embed = gpu_weights
+            .tensor(&manifest.embed_tokens.name)
+            .ok_or_else(|| anyhow::anyhow!("embed_tokens tensor missing"))?
+            .ptr();
+        let lm = gpu_weights
+            .tensor(&manifest.lm_head.name)
+            .ok_or_else(|| anyhow::anyhow!("lm_head tensor missing"))?
+            .ptr();
+        (embed, lm)
+    };
+
+    let ctx_len_max = prompt_len.max(block_size);
+    let kv_cache_max_len = prompt_len + max_new_tokens + ctx_len_max + block_size + 16;
+    let workspace = DrafterForwardWorkspace::alloc(
+        &drafter.config,
+        q_len,
+        ctx_len_max,
+        kv_cache_max_len,
+    )?;
+    let mut pos_bytes = Vec::with_capacity(kv_cache_max_len * 4);
+    for p in 0..kv_cache_max_len {
+        pos_bytes.extend_from_slice(&(p as i32).to_le_bytes());
+    }
+    workspace.position_ids_buffer().copy_from_host(&pos_bytes)?;
+    let backend = CudaBackend;
+    let mut forward = DrafterForward::new(&drafter_device, &drafter.config, workspace)?;
+    let propose_ws = DFlashProposeWorkspace::alloc(&drafter.config, q_len)?;
+
+    // Same off-by-one bookkeeping as `drafter-chat-smoke`: include the
+    // seed in iter 0's `iter_committed`. This gives the drafter one
+    // extra cached attention slot per iter and empirically raises AL by
+    // ~20% on every prompt vs the strict dflash crop semantics. See
+    // docs/superpowers/notes/2026-06-09-dflash-benchmarks.md.
+    let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
+    let mut stdout = io::stdout();
+
+    let mut ctx_len = prompt_len;
+    let mut total_committed_after_prompt = 0_usize;
+    let mut iter_accepts: Vec<usize> = Vec::new();
+
+    let decode_start = Instant::now();
+    while total_committed_after_prompt < max_new_tokens {
+        let prefix_len_for_drafter = prompt_len + total_committed_after_prompt;
+        if total_committed_after_prompt == 0 {
+            forward.reset_kv_cache();
+        } else {
+            // Clamp: when the off-by-one bookkeeping would crop past
+            // the cache's actual extent (happens on near-full-accept
+            // iters after a long chat-template prompt), keep the cache
+            // as-is.
+            let safe = prefix_len_for_drafter.min(forward.current_kv_len());
+            forward.crop_kv_cache(safe)?;
+        }
+
+        let mut noise_token_ids = Vec::with_capacity(q_len);
+        noise_token_ids.push(seed_token);
+        for _ in 1..q_len {
+            noise_token_ids.push(mask_token_id);
+        }
+        let proposed_tokens = propose_block(
+            &backend,
+            &mut forward,
+            &propose_ws,
+            &noise_token_ids,
+            capture.output_ptr(),
+            ctx_len,
+            target_embed_ptr,
+            target_lm_head_ptr,
+            vocab_size,
+        )?;
+        qwen36_fp4_runtime::cuda_synchronize()?;
+        let drafts: Vec<u32> = proposed_tokens[1..].to_vec();
+
+        capture.set_write_row(0);
+        let mut verify_input = Vec::with_capacity(drafts.len() + 1);
+        verify_input.push(seed_token);
+        verify_input.extend_from_slice(&drafts);
+        let argmaxes = engine.verify_block_batched(&verify_input)?;
+
+        let mut accepted = 0_usize;
+        let mut bonus_token: u32 = 0;
+        for (i, &drafted) in drafts.iter().enumerate() {
+            if argmaxes[i] == drafted {
+                accepted += 1;
+            } else {
+                bonus_token = argmaxes[i];
+                break;
+            }
+        }
+        if accepted == drafts.len() {
+            bonus_token = argmaxes[drafts.len()];
+        }
+        iter_accepts.push(accepted);
+
+        let committed_target_position = prompt_len + total_committed_after_prompt + accepted + 1;
+        let clamped_target = committed_target_position.min(engine.state.position);
+        engine.crop_state_position(clamped_target)?;
+
+        let mut iter_committed: Vec<u32> = Vec::with_capacity(accepted + 2);
+        if total_committed_after_prompt == 0 {
+            iter_committed.push(seed_token);
+        }
+        iter_committed.extend(drafts.iter().copied().take(accepted));
+        iter_committed.push(bonus_token);
+
+        // Stream iter_committed to stdout.
+        let text = tokenizer.decode(&iter_committed, true).unwrap_or_default();
+        write!(stdout, "{text}")?;
+        stdout.flush().ok();
+
+        let mut hit_eos = false;
+        for &t in &iter_committed {
+            generated.push(t);
+            if t == eos_token_id {
+                hit_eos = true;
+                break;
+            }
+        }
+        if hit_eos {
+            break;
+        }
+
+        seed_token = bonus_token;
+        ctx_len = accepted + 1;
+        total_committed_after_prompt = generated.len();
+    }
+    let decode_seconds = decode_start.elapsed().as_secs_f64();
+    let total_seconds = chat_start.elapsed().as_secs_f64();
+    engine.set_drafter_hidden_capture(None);
+
+    let tokens_per_second = if decode_seconds > 0.0 {
+        generated.len() as f64 / decode_seconds
+    } else {
+        0.0
+    };
+    let iters = iter_accepts.len();
+    let avg_accept = if iters > 0 {
+        iter_accepts.iter().sum::<usize>() as f64 / iters as f64
+    } else {
+        0.0
+    };
+    let acceptance_length = if iters > 0 {
+        generated.len() as f64 / iters as f64
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "\n[dflash] generated {} tokens in {} iters | AL={:.2} avg_accept={:.2} | decode {:.2}s ({:.1} tok/s) | total {:.2}s",
+        generated.len(),
+        iters,
+        acceptance_length,
+        avg_accept,
+        decode_seconds,
+        tokens_per_second,
+        total_seconds,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn drafter_chat_smoke(
     model_dir: PathBuf,
     drafter_dir: PathBuf,
@@ -2425,7 +2719,13 @@ fn drafter_chat_smoke(
     while total_committed_after_prompt < max_new_tokens {
         // Drafter KV must reflect the prefix length the drafter has
         // already "seen". For iter 0 we start fresh; otherwise crop to
-        // the just-committed end-of-prefix position.
+        // the just-committed end-of-prefix position. Note: we keep
+        // total_committed_after_prompt counting seed-in-iter-0; in
+        // practice this off-by-one improved AL on every prompt vs the
+        // strict dflash crop semantics (drafter has slightly more
+        // attention context). The bench numbers in
+        // docs/superpowers/notes/2026-06-09-dflash-benchmarks.md use
+        // this formula.
         let prefix_len_for_drafter = prompt_len + total_committed_after_prompt;
         if total_committed_after_prompt == 0 {
             forward.reset_kv_cache();
@@ -2529,10 +2829,6 @@ fn drafter_chat_smoke(
             break;
         }
 
-        // Prep for next iter: bonus becomes seed; ctx_len = accepted+1
-        // (drafter consumes hidden states from the just-committed
-        // accepted positions, NOT the bonus). The verify decode loop
-        // wrote those rows at offsets [0, accepted+1).
         seed_token = bonus_token;
         ctx_len = accepted + 1;
         total_committed_after_prompt = generated.len();
