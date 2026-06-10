@@ -104,6 +104,8 @@ Full details in `DAILY.md` (dated sections):
 - **Lossy env-tuned split-K verify** (`QWEN36_PREFILL_SPLIT_MAX_TOKENS=16`) — 5× at 7K but AL-destroying at 3K; superseded by the faithful `attention_flash_splitk.cu`.
 - **KVarN (huawei-csl) KV-cache quantization** — evaluated 2026-06-10, NOT integrated: it is a vLLM fork (Python/Triton), KV is not the bottleneck at ≤24K (already FP8 + in-house TQ3/TQ35), and sub-4-bit V risks the known speculative-loop AL amplification. If the B1 lane (aggressive KV quant for 64K–262K) is reopened, its recipe (asymmetric K4/V2 RTN + Hadamard rotation, 128-token tiles, calibration-free) is the reference to port — see `DAILY.md` § 2026-06-10.
 - **Synthetic-prompt MTP acceptance dips** (acc 0.84 at 4K) — artefact of single-token-repeat bench prompts; falsified as a kernel bug. Use `--prompt-file` or `chat`+`QWEN36_MTP_STATS=1`.
+- **lm_head NVFP4** — falsified 2026-06-10 by an offline numpy probe before any kernel work: 1 top-1 flip / 27 real `final_normed` positions (3.7%); low-margin (p10 0.25) positions sit under FP4 noise (max Δlogit 1.24). Retry only via FP8 lm_head or FP4-topk+BF16-rescore (see DAILY).
+- **Interpreter whole-decode single-launch + MLP chunking** — closed 2026-06-10: substrate probe measured 4.71 µs/grid-barrier (512-barrier program = 2.4 ms/token vs the <0.5 ms gate) and MLP-chunking benched +0.0% at MTP=4 on real text. The historical "+7.3% MTP=4 interpreter" gain is a synthetic-prompt artefact (ON vs OFF = 39.5 vs 39.5 tok/s on the dashboard corpus). Lane frozen; deletion candidate under the complexity budget.
 
 ### 2.6 Known open issues
 

@@ -97,6 +97,48 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-10 — P5 plancher système : clock-lock impossible en conteneur, le reste < 1% — DECISION (différé)
+
+`nvidia-smi -lgc` est refusé (conteneur Vast non privilégié) — le lock
+de clocks pour la stabilité des benches n'est pas disponible sur cette
+instance ; la variance restera celle de l'hôte. Lecture du code de la
+boucle chat MTP=0 : ~2 syncs + une D2H pageable de 4 octets par token
+= dizaines de µs sur 19.6 ms (<0.5%) ; l'audit nsys montre
+sample_argmax à 0.17 ms/token. Aucun item P5 ne dépasse ~1% — différés
+en bloc, à reprendre seulement en accompagnement d'un gros gain (genre
+lm_head FP8 + batch du stop-check dans la même passe).
+
+### 2026-06-10 — lm_head NVFP4 : 1 flip argmax / 27 positions → item tué par la probe offline — FALSIFIED
+
+Probe de falsification AVANT tout travail kernel (règle « measure
+before building ») : quantization NVFP4 simulée du lm_head (e2m1 +
+scales e4m3 par bloc de 16 + scale tenseur amax/(448·6)) en numpy,
+logits comparés au BF16 de référence sur **27 vecteurs `final_normed`
+réels** (dumps moteur : 20 prompts variés code/FR/EN/JSON/SQL/math +
+6 tailles de corpus 500→45K chars + hello). Script :
+`/tmp/lmhead_probe/quant_probe.py` (recopier depuis cette entrée si
+besoin : la logique tient en ~100 lignes).
+
+Résultat : **1 flip top-1 sur 27 (3.7%)**, top-5 overlap 4.63/5,
+|Δlogit| moyen 0.144 / max 1.24, marge top-1 de référence médiane 1.43
+mais **p10 = 0.25** — les positions à faible marge sont structurellement
+sous le bruit FP4. Le gate roadmap (« top-1 flips = fail, it feeds
+sampling directly ») est violé ⇒ **item clos**. ~4% de tokens greedy
+divergents casseraient aussi la parité MTP/DFlash (classe de risque
+verify-perturbation, la même que KV quant).
+
+Voies de repêchage enregistrées (ne PAS rebuilder sans l'une d'elles) :
+1. **lm_head FP8 e4m3** (2× compression au lieu de 4×, erreur ~16× plus
+   faible — probablement argmax-clean) : gain ~0.43 ms ≈ +2.5% MTP=0,
+   sous la barre des 15% seul — à coupler avec d'autres petits gains.
+2. FP4 top-k + rescore BF16 des 64 meilleurs candidats (coût rescore
+   négligeable, garantit l'argmax si le vrai top-1 est dans le top-64
+   FP4 — vérifier ce taux d'abord avec la même probe).
+
+Économie de la probe : ~1 h vs plusieurs jours de quantizer-at-load +
+plumbing gemv + gate de parité. Files: aucun (probe /tmp).
+Inventory: §2.5.
+
 ### 2026-06-10 — Gate (a) interpreter : MLP-chunking +0.0%, et le +7.3% MTP=4 est un artefact synthétique — NEGATIVE, lane gelée
 
 Bench (corpus dashboard, ctx 3072, MTP=4, max-new 128, 2 reps/config) :

@@ -168,10 +168,12 @@ TODO, strictly gated:
       with a fundamentally cheaper sync design (cluster-local mbarriers +
       true parallel emission, i.e. the full Hazy design — not the current
       counter substrate).
-- [ ] **lm_head NVFP4** (small, independent): 1.55 GB BF16 read = 0.87 ms
-      floor of its measured 1.65 ms; FP4 → ~0.4 ms. ~+1 ms/token ≈ +5%
-      MTP=0. Needs argmax-parity gate on the bench corpus (top-1 flips =
-      fail, it feeds sampling directly).
+- [x] ~~lm_head NVFP4~~ — **FALSIFIED 2026-06-10** by an offline probe
+      before any kernel work: 1 top-1 flip / 27 real normed positions
+      (3.7%); low-margin positions (p10 = 0.25) sit under the FP4 noise
+      (max Δlogit 1.24). Recorded rescue paths (DAILY): FP8 lm_head
+      (~+2.5%, likely clean) or FP4-topk + BF16 rescore. Do not rebuild
+      without one of them.
 
 Explicit non-goals for this lane (already falsified here): naive op fusion
 without prefetch, L2-pinning tricks against graph replay, persistent grids
