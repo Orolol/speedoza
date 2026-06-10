@@ -1,4 +1,7 @@
 #include "qwen36_fp4.h"
+#include "interpreter/instruction.h"
+
+#include <string.h>
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -3264,6 +3267,122 @@ int main() {
   }
 
   // ------------------------------------------------------------------
+  // Sage prefill cp.async pipeline gate (P1 prefill long-context).
+  // ------------------------------------------------------------------
+  // The pipelined variants (QWEN36_SAGE_PIPELINE; FP8: staged raw tiles,
+  // BF16: V cp.async'd directly into sm_V) move the same bytes with the
+  // same decode logic in the same arithmetic order as the legacy path, so
+  // their output must be BIT-IDENTICAL, not just cos-close. Shapes cover
+  // full + partial M-tiles, K-tile boundaries (kSageN=64) and a nonzero
+  // start_position so the masked-tail zero-fill path is exercised.
+  {
+    const int q_heads = 8;
+    const int kv_heads = 2;
+    const int head_dim = 256;
+    struct Case {
+      int tokens;
+      int start;
+    };
+    const Case sage_cases[] = {{32, 0}, {80, 70}, {64, 129}, {33, 2048}};
+
+    qwen36_attention_shape_t shape{};
+    shape.q_heads = q_heads;
+    shape.kv_heads = kv_heads;
+    shape.head_dim = head_dim;
+    shape.rope_dims = 0;
+
+    std::mt19937 rng(626262);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> ed(0, 9), md(0, 7), sd(0, 1);
+    int cases = 0;
+
+    for (int kv_dtype : {1, 0}) { // 1=fp8 (staged pipeline), 0=bf16 (V direct)
+      for (const Case &c : sage_cases) {
+        const int ctx = c.start + c.tokens;
+        const size_t q_total = (size_t)c.tokens * q_heads * head_dim;
+        const size_t kv_elems = (size_t)ctx * kv_heads * head_dim;
+
+        std::vector<float> q_host(q_total);
+        for (auto &x : q_host) x = dist(rng);
+        qwen36_device_ptr_t q_dev = dev_alloc<__nv_bfloat16>(q_total);
+        copy_bf16(q_dev, q_host);
+
+        qwen36_device_ptr_t ck_dev, cv_dev;
+        if (kv_dtype == 1) {
+          std::vector<uint8_t> ck(kv_elems), cv(kv_elems);
+          for (auto &b : ck)
+            b = (uint8_t)((sd(rng) << 7) | (ed(rng) << 3) | md(rng));
+          for (auto &b : cv)
+            b = (uint8_t)((sd(rng) << 7) | (ed(rng) << 3) | md(rng));
+          ck_dev = dev_alloc<uint8_t>(kv_elems);
+          cv_dev = dev_alloc<uint8_t>(kv_elems);
+          copy_raw<uint8_t>(ck_dev, ck);
+          copy_raw<uint8_t>(cv_dev, cv);
+        } else {
+          std::vector<float> ck(kv_elems), cv(kv_elems);
+          for (auto &x : ck) x = dist(rng);
+          for (auto &x : cv) x = dist(rng);
+          ck_dev = dev_alloc<__nv_bfloat16>(kv_elems);
+          cv_dev = dev_alloc<__nv_bfloat16>(kv_elems);
+          copy_bf16(ck_dev, ck);
+          copy_bf16(cv_dev, cv);
+        }
+
+        qwen36_device_ptr_t out_legacy = dev_alloc<__nv_bfloat16>(q_total);
+        qwen36_device_ptr_t out_pipe = dev_alloc<__nv_bfloat16>(q_total);
+
+        qwen36_attention_prefill_spec_t spec{};
+        spec.start_position = c.start;
+        spec.tokens = c.tokens;
+        spec.q_bf16 = q_dev;
+        spec.k_bf16 = q_dev; // unused: sage reads K/V from the cache
+        spec.v_bf16 = q_dev;
+        spec.kv_cache_k = ck_dev;
+        spec.kv_cache_v = cv_dev;
+        spec.shape = shape;
+        spec.kv_cache_dtype = kv_dtype;
+
+        setenv("QWEN36_SAGE_PIPELINE", "0", 1);
+        spec.output_bf16 = out_legacy;
+        must_status(qwen36_attention_sage_prefill(&spec),
+                    "sage pipeline gate: legacy");
+        setenv("QWEN36_SAGE_PIPELINE", "1", 1);
+        spec.output_bf16 = out_pipe;
+        must_status(qwen36_attention_sage_prefill(&spec),
+                    "sage pipeline gate: pipelined");
+        unsetenv("QWEN36_SAGE_PIPELINE");
+
+        std::vector<float> a = read_bf16(out_legacy, q_total);
+        std::vector<float> b = read_bf16(out_pipe, q_total);
+        for (size_t i = 0; i < q_total; ++i) {
+          if (a[i] != b[i]) {
+            fprintf(stderr,
+                    "sage pipeline gate FAIL [dtype=%d tokens=%d start=%d]: "
+                    "mismatch at %zu (legacy=%f pipelined=%f)\n",
+                    kv_dtype, c.tokens, c.start, i, a[i], b[i]);
+            exit(1);
+          }
+        }
+        ++cases;
+
+        dev_free<__nv_bfloat16>(q_dev);
+        if (kv_dtype == 1) {
+          dev_free<uint8_t>(ck_dev);
+          dev_free<uint8_t>(cv_dev);
+        } else {
+          dev_free<__nv_bfloat16>(ck_dev);
+          dev_free<__nv_bfloat16>(cv_dev);
+        }
+        dev_free<__nv_bfloat16>(out_legacy);
+        dev_free<__nv_bfloat16>(out_pipe);
+      }
+    }
+    printf("sage cp.async pipeline gate passed (%d cases, FP8 staged + BF16 "
+           "V-direct, bit-identical vs legacy)\n",
+           cases);
+  }
+
+  // ------------------------------------------------------------------
   // Tiled decode attention parity gate (decode long-context fix).
   // ------------------------------------------------------------------
   // Compares the register-tiled decode split kernel
@@ -3457,6 +3576,83 @@ int main() {
     printf("decode tiled attention parity gate passed (%d cases, BF16+FP8, "
            "pos{255,2047,8191,24575}, append byte-identical)\n",
            cases);
+  }
+
+  // ------------------------------------------------------------------
+  // Interpreter substrate cost probe (perf-roadmap P3 gate (b)).
+  // ------------------------------------------------------------------
+  // A 512-instruction chain of FALLBACK_TRAMPOLINE no-ops, each gated on the
+  // previous instruction's published counter — i.e. 512 grid-wide
+  // counter barriers, the per-token synchronization budget of a
+  // whole-decode single-launch program. Informational print; the P3
+  // kill-gate reads this number (must be < 0.5 ms per program or the
+  // single-launch lane is dead on SM120).
+  {
+    constexpr uint32_t kProbeInsns = 512;
+    // Counter ids: [0, kProbeInsns) arrival slots, [kProbeInsns, 2*kProbeInsns)
+    // publish slots (instruction i publishes kProbeInsns+i; i+1 deps on it).
+    const uint32_t counter_count = 2 * kProbeInsns;
+    std::vector<qwen36_interpreter_instruction_t> insns(kProbeInsns + 1);
+    for (uint32_t i = 0; i < kProbeInsns; ++i) {
+      qwen36_interpreter_instruction_t &insn = insns[i];
+      memset(&insn, 0, sizeof(insn));
+      insn.opcode = QWEN36_INTERPRETER_OPCODE_FALLBACK_TRAMPOLINE;
+      insn.arrival_counter = i;
+      insn.publishes_counter = kProbeInsns + i;
+      insn.publish_value = 1;
+      if (i > 0) {
+        insn.dep_count = 1;
+        insn.deps[0].counter_id = kProbeInsns + i - 1;
+        insn.deps[0].target = 1;
+      }
+    }
+    memset(&insns[kProbeInsns], 0, sizeof(insns[kProbeInsns]));
+    insns[kProbeInsns].opcode = QWEN36_INTERPRETER_OPCODE_EXIT;
+
+    const size_t insn_bytes = insns.size() * sizeof(insns[0]);
+    qwen36_device_ptr_t insn_dev = dev_alloc<uint8_t>(insn_bytes);
+    must_status(qwen36_cuda_memcpy_h2d(insn_dev, insns.data(), insn_bytes),
+                "substrate probe: h2d instructions");
+    qwen36_device_ptr_t counters_dev = dev_alloc<int32_t>(counter_count);
+
+    qwen36_interpreter_program_t program{};
+    program.instructions = insn_dev;
+    program.instruction_count = insns.size();
+    program.counters_i32 = counters_dev;
+    program.counter_count = counter_count;
+    program.cta_count = 0; // occupancy-derived, the realistic grid
+    program.flags = 0;
+
+    cudaEvent_t ev_start, ev_stop;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+    float total_ms = 0.0f;
+    const int kWarmup = 3, kTimed = 20;
+    for (int rep = 0; rep < kWarmup + kTimed; ++rep) {
+      must_status(qwen36_cuda_memset(counters_dev, 0,
+                                     counter_count * sizeof(int32_t)),
+                  "substrate probe: counter reset");
+      cudaEventRecord(ev_start);
+      must_status(qwen36_interpreter_decode_sm120(&program),
+                  "substrate probe: launch");
+      cudaEventRecord(ev_stop);
+      cudaEventSynchronize(ev_stop);
+      if (rep >= kWarmup) {
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        total_ms += ms;
+      }
+    }
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
+    const float ms_per_program = total_ms / kTimed;
+    printf("interpreter substrate probe: %.3f ms / %u-barrier program "
+           "(%.2f us/barrier) [P3 kill-gate: < 0.5 ms]\n",
+           ms_per_program, kProbeInsns,
+           1000.0f * ms_per_program / kProbeInsns);
+
+    dev_free<uint8_t>(insn_dev);
+    dev_free<int32_t>(counters_dev);
   }
 
   printf("qwen36 CUDA smoke test passed\n");
