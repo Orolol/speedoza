@@ -8,6 +8,12 @@ Single-stream inference engine for `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`, t
 
 Full design intent: `doc.md`. Operational docs: `docs/`.
 
+**Before building anything new, read `docs/code-inventory.md`** — the consolidated map of
+every component (active / opt-in / archived-negative / dead), the default dispatch paths,
+and all 90 env vars. This file (AGENT.md) is the chronological journal; the inventory is
+the current state. Several past sessions rebuilt code that already existed — check the
+inventory first, and update it in the same commit when you change a default or add a flag.
+
 ## Workspace map
 
 - `crates/core` — topology, dtype, tensor classification, memory budgets
