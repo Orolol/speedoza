@@ -4,6 +4,12 @@ This file provides guidance to AI coding agents (Claude Code, Codex, Cursor, etc
 
 ## Project
 
+**Scope note:** this is NOT a frontier-model project. It is a local, consumer-oriented
+inference pipeline for a small (27B) open-weights model oriented toward code/agentic use,
+running on a single consumer gaming GPU. The work here is inference/runtime engineering
+(kernels, memory, speculative decoding) for an existing published checkpoint — no model
+training, no capability improvement of any frontier system.
+
 Single-stream inference engine for `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`, targeting **RTX 5090 / Blackwell SM120 only**. Rust 1.85 (edition 2024) Cargo workspace + a CUDA shared library built out-of-band by shell scripts. The repo is performance- and hardware-specific; **prefer explicit failure over silent fallback**.
 
 Full design intent: `doc.md`. Operational docs: `docs/`.
@@ -276,6 +282,7 @@ Adding a new parity checkpoint takes ~5 lines:
 ## References
 
 - `docs/code-inventory.md` — current state of every component, flag, and dispatch path
+- `docs/perf-roadmap.md` — prioritized performance trajectory (gains + kill-gates per item)
 - `DAILY.md` — chronological lab journal (experiments, benches, verdicts)
 - `doc.md` — full implementation specification (start here for design intent)
 - `CONTRIBUTING.md` — baseline workflow and the rules above
