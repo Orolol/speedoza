@@ -70,7 +70,10 @@ deltanet_prefill_kernel(
     const __nv_bfloat16 *__restrict__ v,         // [T, v_heads,  V]
     const float *__restrict__ gate,              // [T, v_heads]   log-decay g
     const float *__restrict__ beta,              // [T, v_heads]
-    __nv_bfloat16 *__restrict__ state,           // [v_heads, K, V] in/out
+    __nv_bfloat16 *__restrict__ state,           // [v_heads, V, K] in/out
+                                                 // (canonical layout shared with
+                                                 // qwen36_deltanet_decode; SMEM
+                                                 // copy is [K, V])
     __nv_bfloat16 *__restrict__ output,          // [T, v_heads, V]
     qwen36_deltanet_shape_t shape,
     size_t tokens,
@@ -130,11 +133,17 @@ deltanet_prefill_kernel(
   cursor += C * C * sizeof(__nv_bfloat16);
 
   // --- Load initial state for this v_head from global to SMEM (BF16) ---
+  // Global layout is [V, K] (the canonical layout written and read by the
+  // sequential qwen36_deltanet_decode kernel); the SMEM working copy is
+  // [K, V] (what the wmma phases consume). Transpose on the way in. Global
+  // reads stay coalesced; the strided SMEM writes are a one-off per call.
   {
     const __nv_bfloat16 *state_in = state + (size_t)vh * K * V;
     const int total = K * V;
     for (int idx = tid; idx < total; idx += blockDim.x) {
-      sm_S[idx] = state_in[idx];
+      const int vd = idx / K;
+      const int kd = idx % K;
+      sm_S[kd * V + vd] = state_in[idx];
     }
   }
   __syncthreads();
@@ -641,11 +650,19 @@ deltanet_prefill_kernel(
   }
 
   // --- Write final state for this v_head back to global ---
+  // Transpose SMEM [K, V] back to the canonical global [V, K] layout so the
+  // decode-time qwen36_deltanet_decode kernel (and the interpreter
+  // DELTANET_RECUR opcode) read the state they expect. Writing the SMEM
+  // copy out untransposed silently corrupts every decode step after a
+  // chunked prefill — see the deltanet prefill/decode state parity case in
+  // smoke.cu, which gates exactly this.
   {
     __nv_bfloat16 *state_out = state + (size_t)vh * K * V;
     const int total = K * V;
     for (int idx = tid; idx < total; idx += blockDim.x) {
-      state_out[idx] = sm_S[idx];
+      const int vd = idx / K;
+      const int kd = idx % K;
+      state_out[idx] = sm_S[kd * V + vd];
     }
   }
 }

@@ -1371,14 +1371,14 @@ generation lengths × 2 backends = 30 runs, driver
 
 **Known issues / out of scope (documented; not addressed):**
 
-1. **NVFP4 decode-kernel divergence**: `chat
-   --mtp-speculative-tokens 0` produces degenerate output ("Here
-   question or looks sentence address") because the engine's
-   per-token decode path produces logits with cos sim ~0.76
-   (sometimes negative) vs the prefill kernel path on the same
-   input. New diagnostic CLI `qwen36 decode-vs-prefill-check`
-   reproduces it in 2 sequential engine loads. DFlash routes around
-   it by verifying through prefill chunks (commit `6571f37`).
+1. **NVFP4 decode-kernel divergence** — **FIXED 2026-06-10** (see the
+   dated entry below): the chunked DeltaNet prefill kernel wrote its
+   final recurrent state transposed ([K,V] instead of the canonical
+   [V,K]), corrupting every per-token decode step after a chunked
+   prefill. `qwen36 decode-vs-prefill-check` now reports
+   `argmax_match: true`, cos ≥ 0.997. DFlash's verify-through-prefill
+   detour (commit `6571f37`) is no longer load-bearing for
+   correctness.
 2. **CUDA-graph capture of `verify_block_batched`** — deferred.
    Plausible 20–30% more tok/s but requires coordination with the
    existing decode-graph machinery.
@@ -1454,6 +1454,56 @@ LD_LIBRARY_PATH=$PWD/target/cuda:$LD_LIBRARY_PATH \
 ```
 
 Then any of the chat / sweep / smoke commands above.
+
+### 2026-06-10 — decode-vs-prefill divergence FIXED: chunked DeltaNet prefill wrote its final state transposed
+
+The "NVFP4 decode-kernel divergence" known issue (decode logits cos
+~0.76–0.93 vs prefill on the same input, degenerate MTP=0 chat in some
+configs) is root-caused and fixed. It was **not** an NVFP4/GEMM issue.
+
+**Root cause:** `kernels-cuda/deltanet_prefill.cu` (the chunked WY-form
+DeltaNet prefill, `QWEN36_DELTANET_CHUNKED_PREFILL` default ON) kept its
+SMEM working state as [K, V] and wrote it back to global memory
+**untransposed**, while the sequential `deltanet_decode` kernel (and the
+interpreter `DELTANET_RECUR` opcode) define the canonical global layout
+as `state[(vh·V + vd)·K + kd]` = [v_heads, V, K]. Per-token *outputs*
+were correct (cos 1.0 vs sequential), and chunk→chunk prefill was
+self-consistent (each kernel call re-read its own transposed layout
+consistently enough to keep logits sane), so every output-level parity
+gate passed. But the first per-token decode step after a chunked prefill
+read the state transposed → layer-0 DeltaNet `attn_out` cos −0.46,
+logits cos ~0.85, wrong argmax. Measured signature: final state cos
+0.0099 as-is vs sequential, 0.999989 after transposing K↔V.
+
+**Fix (correctness-first, no throughput cost):** transpose at the
+global↔SMEM boundary in `deltanet_prefill.cu` (load + final store, both
+coalesced on the global side). The chunked kernel's internal [K,V] wmma
+layout is unchanged; the global layout is now canonical [V,K].
+
+**Gates:**
+- New smoke case (proven fail-able: cos 0.37 without the fix): chunked
+  `qwen36_deltanet_prefill` vs sequential `qwen36_deltanet_decode` at
+  the real shape (16/48/128/128, T=40 = full chunk + partial chunk,
+  random inputs, NONZERO initial state) — output AND final-state cos ≥
+  0.998. The nonzero initial state is what catches the layout; do not
+  weaken it to a zero state.
+- `decode-vs-prefill-check`: argmax_match=true, logits cos 0.9971
+  (fox prompt) / 0.9985 (hello). The residual vs 1.0 is the known
+  per-token-vs-chunk path noise, same class as the MTP chunked-verify
+  non-bit-equality.
+- Chat parity: `hello` / `hello world` × MTP {0..4} → 10/10 identical
+  outputs.
+- `cargo test` (CPU + cuda features), clippy clean; bench sanity at
+  prompt=2000: prefill 3126 tok/s, decode MTP=0 54.5 tok/s (no
+  regression; the boundary transpose is ~3 MB/layer-chunk of traffic).
+- Engine now dumps `layer0_deltanet_state.bf16` under
+  `QWEN36_DEBUG_DUMP_DIR` for future state-layout parity work.
+
+**Lesson:** output-only parity gates cannot see state-layout bugs
+between alternative kernels for the same recurrence. Any kernel pair
+that hands a carried state across implementations (prefill↔decode,
+graph↔eager, interpreter↔host) needs an explicit carried-state parity
+gate with a nonzero initial state.
 
 ### Validated against PyTorch reference (matching to within FP4 quantization noise)
 

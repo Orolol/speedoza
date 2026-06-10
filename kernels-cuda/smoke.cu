@@ -634,6 +634,129 @@ int main() {
   expect_status(qwen36_deltanet_decode(&invalid_delta_spec),
                 QWEN36_STATUS_INVALID_ARGUMENT, "deltanet key_dim guard");
 
+  // --- Chunked DeltaNet prefill vs sequential decode: output AND final-state
+  // parity at the real Qwen3.6 shape. The two kernels are alternative
+  // implementations of the same recurrence and must be interchangeable: the
+  // engine prefills with the chunked kernel and then decodes with the
+  // sequential kernel against the state the chunked kernel left behind. A
+  // state-layout mismatch between them (e.g. [K,V] vs the canonical [V,K])
+  // passes every output-only check and corrupts every decode step after a
+  // chunked prefill, so the final state is gated here explicitly.
+  // T=40 covers one full 32-token chunk plus a partial 8-token chunk.
+  {
+    constexpr size_t kQkHeads = 16, kVHeads = 48, kKeyDim = 128, kValDim = 128;
+    constexpr size_t kTokens = 40;
+    const qwen36_deltanet_shape_t real_shape{kQkHeads, kVHeads, kKeyDim,
+                                             kValDim, 4};
+    const size_t qk_values = kTokens * kQkHeads * kKeyDim;
+    const size_t v_values = kTokens * kVHeads * kValDim;
+    const size_t state_values = kVHeads * kValDim * kKeyDim;
+    const size_t gate_values = kTokens * kVHeads;
+
+    // Deterministic LCG inputs; gates are mild log-decays, betas in (0, 1).
+    uint32_t lcg = 0x2dfc9e1bu;
+    auto next_unit = [&lcg]() {
+      lcg = lcg * 1664525u + 1013904223u;
+      return static_cast<float>(lcg >> 8) /
+             static_cast<float>(1u << 24); // [0, 1)
+    };
+    std::vector<float> h_q(qk_values), h_k(qk_values), h_v(v_values),
+        h_state(state_values), h_gate(gate_values), h_beta(gate_values);
+    for (auto &x : h_q) x = next_unit() * 2.0f - 1.0f;
+    for (auto &x : h_k) x = next_unit() * 2.0f - 1.0f;
+    for (auto &x : h_v) x = next_unit() * 2.0f - 1.0f;
+    for (auto &x : h_state) x = (next_unit() * 2.0f - 1.0f) * 0.5f;
+    for (auto &x : h_gate) x = -0.5f * next_unit() - 0.01f;
+    for (auto &x : h_beta) x = 0.1f + 0.8f * next_unit();
+
+    qwen36_device_ptr_t pq = dev_alloc<__nv_bfloat16>(qk_values);
+    qwen36_device_ptr_t pk = dev_alloc<__nv_bfloat16>(qk_values);
+    qwen36_device_ptr_t pv = dev_alloc<__nv_bfloat16>(v_values);
+    qwen36_device_ptr_t pgate = dev_alloc<float>(gate_values);
+    qwen36_device_ptr_t pbeta = dev_alloc<float>(gate_values);
+    qwen36_device_ptr_t state_seq = dev_alloc<__nv_bfloat16>(state_values);
+    qwen36_device_ptr_t state_chunk = dev_alloc<__nv_bfloat16>(state_values);
+    qwen36_device_ptr_t out_seq = dev_alloc<__nv_bfloat16>(v_values);
+    qwen36_device_ptr_t out_chunk = dev_alloc<__nv_bfloat16>(v_values);
+    copy_bf16(pq, h_q);
+    copy_bf16(pk, h_k);
+    copy_bf16(pv, h_v);
+    copy_raw<float>(pgate, h_gate);
+    copy_raw<float>(pbeta, h_beta);
+    copy_bf16(state_seq, h_state);
+    copy_bf16(state_chunk, h_state);
+
+    qwen36_deltanet_decode_spec_t seq_spec{};
+    seq_spec.tokens_in_persistent_loop = kTokens;
+    seq_spec.q_token_stride = kQkHeads * kKeyDim;
+    seq_spec.k_token_stride = kQkHeads * kKeyDim;
+    seq_spec.v_token_stride = kVHeads * kValDim;
+    seq_spec.q_bf16 = pq;
+    seq_spec.k_bf16 = pk;
+    seq_spec.v_bf16 = pv;
+    seq_spec.gate_f32 = pgate;
+    seq_spec.beta_f32 = pbeta;
+    seq_spec.state_bf16 = state_seq;
+    seq_spec.output_bf16 = out_seq;
+    seq_spec.shape = real_shape;
+    seq_spec.state_decay = 1.0f;
+    seq_spec.update_scale = 1.0f;
+    seq_spec.qk_l2norm = 1;
+    must_status(qwen36_deltanet_decode(&seq_spec),
+                "deltanet sequential (prefill parity ref)");
+
+    qwen36_deltanet_prefill_spec_t chunk_spec{};
+    chunk_spec.tokens = kTokens;
+    chunk_spec.chunk_size = 32;
+    chunk_spec.q_token_stride = kQkHeads * kKeyDim;
+    chunk_spec.k_token_stride = kQkHeads * kKeyDim;
+    chunk_spec.v_token_stride = kVHeads * kValDim;
+    chunk_spec.q_bf16 = pq;
+    chunk_spec.k_bf16 = pk;
+    chunk_spec.v_bf16 = pv;
+    chunk_spec.gate_f32 = pgate;
+    chunk_spec.beta_f32 = pbeta;
+    chunk_spec.state_bf16 = state_chunk;
+    chunk_spec.output_bf16 = out_chunk;
+    chunk_spec.shape = real_shape;
+    chunk_spec.state_decay = 1.0f;
+    chunk_spec.update_scale = 1.0f;
+    chunk_spec.qk_l2norm = 1;
+    must_status(qwen36_deltanet_prefill(&chunk_spec),
+                "deltanet chunked prefill");
+
+    auto gate_cos = [](const std::vector<float> &a, const std::vector<float> &b,
+                       const char *what) {
+      double dot = 0.0, na = 0.0, nb = 0.0;
+      for (size_t i = 0; i < a.size(); ++i) {
+        dot += static_cast<double>(a[i]) * b[i];
+        na += static_cast<double>(a[i]) * a[i];
+        nb += static_cast<double>(b[i]) * b[i];
+      }
+      const double cos_sim = dot / sqrt(na * nb);
+      if (cos_sim < 0.998) {
+        fprintf(stderr, "%s cos_sim %.6f below 0.998 floor — failing smoke\n",
+                what, cos_sim);
+        exit(1);
+      }
+    };
+    gate_cos(read_bf16(out_seq, v_values), read_bf16(out_chunk, v_values),
+             "deltanet chunked-vs-sequential output");
+    gate_cos(read_bf16(state_seq, state_values),
+             read_bf16(state_chunk, state_values),
+             "deltanet chunked-vs-sequential final state");
+
+    dev_free<__nv_bfloat16>(pq);
+    dev_free<__nv_bfloat16>(pk);
+    dev_free<__nv_bfloat16>(pv);
+    dev_free<float>(pgate);
+    dev_free<float>(pbeta);
+    dev_free<__nv_bfloat16>(state_seq);
+    dev_free<__nv_bfloat16>(state_chunk);
+    dev_free<__nv_bfloat16>(out_seq);
+    dev_free<__nv_bfloat16>(out_chunk);
+  }
+
   qwen36_device_ptr_t norm_in = dev_alloc<__nv_bfloat16>(4);
   qwen36_device_ptr_t norm_weight = dev_alloc<__nv_bfloat16>(4);
   qwen36_device_ptr_t norm_residual = dev_alloc<__nv_bfloat16>(4);

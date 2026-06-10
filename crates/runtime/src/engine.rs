@@ -5693,6 +5693,14 @@ impl<B: KernelBackend> Engine<B> {
                     prefill.aux3.ptr(),
                     tokens * value_dim,
                 )?;
+                self.dump_buffer_to_disk(
+                    &dir,
+                    "layer0_deltanet_state.bf16",
+                    state,
+                    self.topology.linear_num_value_heads
+                        * self.topology.linear_key_head_dim
+                        * self.topology.linear_value_head_dim,
+                )?;
             }
         }
 
