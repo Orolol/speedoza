@@ -57,8 +57,8 @@ enum {
   QWEN36_STATUS_INVALID_ARGUMENT = 2,
   QWEN36_STATUS_CUDA_ERROR = 3,
   QWEN36_STATUS_CUBLAS_ERROR = 4,
-  // Returned by entry points whose kernel implementation has not yet
-  // landed (e.g. the Mirage megakernel path while it is being built up).
+  // Returned by entry points for shapes their kernel does not support
+  // (e.g. the decode NVFP4 gemv outside its specialised shape set).
   // The Rust runtime treats this as a soft fallback signal so it can route
   // back to the existing cuBLASLt path without breaking parity.
   QWEN36_STATUS_NOT_IMPLEMENTED = 5
@@ -545,171 +545,6 @@ int qwen36_cuda_clear_l2_access_window(void);
 int qwen36_l2_prefetch(qwen36_device_ptr_t base, size_t bytes,
                        int target_cta_count);
 
-// Per-block megakernel for full-attn decode — Stage A (skeleton).
-// Identity copy of `hidden_in` to `hidden_out` through a single phase
-// barrier. Exercises the persistent-grid + atomic-barrier infrastructure
-// that Stages B-F will plug computation into. Caller must zero
-// `barrier_state` (≥ `phases * 4` bytes; Stage A uses 4 bytes) before
-// every launch. Runs on the active stream.
-int qwen36_full_attn_block_stage_a(qwen36_device_ptr_t hidden_in,
-                                   qwen36_device_ptr_t hidden_out,
-                                   qwen36_device_ptr_t barrier_state,
-                                   size_t hidden_size);
-
-// Per-block megakernel — Stage B.1: RMSNorm phase only. CTA 0 cooperates
-// on one row of length `hidden_size` (decode is N=1) using the (1+weight)
-// parameterization (matches Qwen base layer norms). Other CTAs idle at
-// the barrier; later stages fill them. Designed to be byte-exact with
-// `qwen36_rmsnorm` invoked with the same input, no residual, and
-// `direct_weight = 0`. `barrier_state` ≥ 4 bytes, zeroed by caller.
-int qwen36_full_attn_block_stage_b_rmsnorm(
-    qwen36_device_ptr_t hidden_in, qwen36_device_ptr_t input_norm_weight,
-    qwen36_device_ptr_t hidden_normed_out, qwen36_device_ptr_t barrier_state,
-    size_t hidden_size, float eps);
-
-// Per-block megakernel — Stage B.2: fused RMSNorm + NVFP4 quantize phase.
-// Produces FP4-packed bytes + e4m3 per-block scales (in the vec16_scale
-// tile layout the Q proj GEMV expects) so downstream stages can chain
-// directly. Optional bf16 normed copy and f32 tensor scale propagation
-// match `qwen36_rmsnorm_nvfp4_quantize`. Caller pre-zeroes `barrier_state`.
-// Pass `input_tensor_scale = 0.0` to use 1.0 as the global scale.
-int qwen36_full_attn_block_stage_b_rmsnorm_quantize(
-    qwen36_device_ptr_t hidden_in, qwen36_device_ptr_t input_norm_weight,
-    qwen36_device_ptr_t hidden_normed_out_bf16,
-    qwen36_device_ptr_t output_fp4, qwen36_device_ptr_t output_scale_e4m3,
-    qwen36_device_ptr_t output_tensor_scale_f32,
-    qwen36_device_ptr_t barrier_state, size_t hidden_size, float eps,
-    float input_tensor_scale);
-
-// Per-block megakernel — Stage B.3: Stage B.2 + Q projection NVFP4 GEMV
-// fused into one launch. Phase layout: CTA 0 RMSNorm+quantize → barrier →
-// all CTAs run the 8-warp GEMV body for Q (each CTA owns one m16 row tile)
-// → barrier. Grid = ceil(q_features / 16); block = 256 threads = 8 warps;
-// caller pre-zeroes `barrier_state` (≥ 2 × 4 bytes). `hidden_size` must be
-// a multiple of 512 (the 8-warp GEMV K-shard alignment) and `q_features`
-// must be a multiple of 16. `q_alpha` is the pre-folded product of the
-// per-tensor scales (`q_weight_tensor_scale * input_tensor_scale`).
-int qwen36_full_attn_block_stage_b_q_proj(
-    qwen36_device_ptr_t hidden_in, qwen36_device_ptr_t input_norm_weight,
-    qwen36_device_ptr_t q_weight_fp4, qwen36_device_ptr_t q_weight_scale,
-    float q_alpha, qwen36_device_ptr_t hidden_normed_out_bf16,
-    qwen36_device_ptr_t quantized_fp4,
-    qwen36_device_ptr_t quantized_scale_e4m3, qwen36_device_ptr_t q_out,
-    qwen36_device_ptr_t barrier_state, size_t hidden_size, size_t q_features,
-    float eps, float input_tensor_scale);
-
-// Per-block megakernel — Stage E: attention output → NVFP4 quantize →
-// o_proj GEMV → residual add → post-attn RMSNorm + NVFP4 quantize, all
-// fused into one launch. Picks up where Stage D (attention) leaves off
-// in the full-attn layer pipeline. Caller pre-zeroes `barrier_state`
-// (≥ 4 × 4 bytes). `q_features` % 512 == 0 (GEMV K-shard alignment);
-// `hidden_size` % 16 == 0 (GEMV m-tile alignment). `o_alpha` is the
-// pre-folded product of the o_proj per-tensor scales. Pass tensor
-// scales (≤ 0 selects 1.0 internally).
-int qwen36_full_attn_block_stage_e_o_proj_residual_norm(
-    qwen36_device_ptr_t attention_out, qwen36_device_ptr_t residual_in,
-    qwen36_device_ptr_t o_proj_fp4, qwen36_device_ptr_t o_proj_scale,
-    float o_alpha, qwen36_device_ptr_t post_norm_weight,
-    qwen36_device_ptr_t attention_quantized_fp4,
-    qwen36_device_ptr_t attention_quantized_scale,
-    qwen36_device_ptr_t o_proj_out, qwen36_device_ptr_t residual_out,
-    qwen36_device_ptr_t post_normed_out,
-    qwen36_device_ptr_t post_quantized_fp4,
-    qwen36_device_ptr_t post_quantized_scale,
-    qwen36_device_ptr_t barrier_state, size_t q_features, size_t hidden_size,
-    float eps, float post_input_tensor_scale,
-    float attention_output_tensor_scale);
-
-// Per-block megakernel — Stage C: Stage B.3 + K projection + V projection
-// + partial RoPE on Q/K, fused into one launch. Grid sized to the widest
-// phase (Q proj: ceil(q_features/16) CTAs); smaller K/V phases share the
-// same grid and skip tail CTAs via the GEMV body's bounds checks.
-// Caller pre-zeroes `barrier_state` (≥ 5 × 4 bytes for 5 phase barriers).
-// `hidden_size` % 512 == 0, `q_features` % 16 == 0, `kv_features` % 16 == 0.
-// `position` is the scalar token position (decode is N=1); `base_theta`
-// matches the model's RoPE theta. Partial RoPE is split-half (Qwen3.6
-// convention), applied in place to `q_out` and `k_out`.
-int qwen36_full_attn_block_stage_c_qkv_rope(
-    qwen36_device_ptr_t hidden_in, qwen36_device_ptr_t input_norm_weight,
-    qwen36_device_ptr_t q_weight_fp4, qwen36_device_ptr_t q_weight_scale,
-    float q_alpha, qwen36_device_ptr_t k_weight_fp4,
-    qwen36_device_ptr_t k_weight_scale, float k_alpha,
-    qwen36_device_ptr_t v_weight_fp4, qwen36_device_ptr_t v_weight_scale,
-    float v_alpha, qwen36_device_ptr_t hidden_normed_out_bf16,
-    qwen36_device_ptr_t quantized_fp4,
-    qwen36_device_ptr_t quantized_scale_e4m3, qwen36_device_ptr_t q_out,
-    qwen36_device_ptr_t k_out, qwen36_device_ptr_t v_out,
-    qwen36_device_ptr_t barrier_state, size_t hidden_size, size_t q_features,
-    size_t kv_features, size_t q_heads, size_t kv_heads, size_t head_dim,
-    size_t rope_dims, int32_t position, float base_theta, float eps,
-    float input_tensor_scale);
-
-// Per-block megakernel — Stage F.1: MLP gate+up NVFP4 GEMV. First
-// sub-phase of the MLP fusion. Output is BF16 [2 * intermediate]
-// arranged as gate||up (matching the engine's combined gate+up store).
-//
-// Uses a persistent grid + atomic work counter: m-tiles (2*intermediate
-// / 16 of them, e.g. 2176 for Qwen3.6) are distributed across a fixed
-// CTA pool sized to the SM's true concurrent capacity. The caller
-// pre-zeroes `barrier_state` (the first 4 bytes are the work counter;
-// no inter-CTA spinlock is used in F.1 because it is the only phase
-// today). Alignment: 2*intermediate % 16 == 0, hidden_size % 512 == 0.
-// `gate_up_alpha = gate_up_weight_tensor_scale * input_tensor_scale`
-// is folded host-side. Activation is the post-attn-quantized FP4
-// produced by Stage E (so this kernel is the natural successor in
-// the full-attn pipeline). F.2/F.3/F.4 will append SwiGLU + down GEMV
-// + residual_add phases on the same launch and use the remaining
-// barrier slots (still safe because the persistent grid stays ≤
-// concurrent CTA capacity).
-int qwen36_full_attn_block_stage_f1_gate_up(
-    qwen36_device_ptr_t hidden_quantized_fp4,
-    qwen36_device_ptr_t hidden_quantized_scale,
-    qwen36_device_ptr_t mlp_gate_up_fp4,
-    qwen36_device_ptr_t mlp_gate_up_scale, float gate_up_alpha,
-    qwen36_device_ptr_t gate_up_out, qwen36_device_ptr_t barrier_state,
-    size_t intermediate, size_t hidden_size);
-
-// Per-block megakernel — Stage F.2: Stage F.1 + fused SwiGLU + NVFP4
-// quantize of the down-projection input. Outputs in addition to
-// `gate_up_out` (BF16, [2 * intermediate], gate||up): `swiglu_fp4`
-// (packed, [intermediate / 2]) and `swiglu_scale` (e4m3 per 16-element
-// group, vec16 tile layout matching `qwen36_swiglu_nvfp4_quantize`).
-// `barrier_state` must hold ≥ 4 zeroed u32 slots (two work counters +
-// two phase spinlocks). `down_input_tensor_scale` is the pre-folded
-// per-tensor scale for the down GEMV's NVFP4 input — equivalent to
-// the standalone path's `input_tensor_scale_f32`.
-int qwen36_full_attn_block_stage_f2_gate_up_swiglu(
-    qwen36_device_ptr_t hidden_quantized_fp4,
-    qwen36_device_ptr_t hidden_quantized_scale,
-    qwen36_device_ptr_t mlp_gate_up_fp4,
-    qwen36_device_ptr_t mlp_gate_up_scale, float gate_up_alpha,
-    qwen36_device_ptr_t gate_up_out, qwen36_device_ptr_t swiglu_fp4,
-    qwen36_device_ptr_t swiglu_scale, qwen36_device_ptr_t barrier_state,
-    size_t intermediate, size_t hidden_size,
-    float down_input_tensor_scale);
-
-// Per-block megakernel — Stage F.4: complete MLP block fused.
-// Subsumes F.1 (gate+up GEMV) and F.2 (+ SwiGLU + quantize) and adds:
-//   - phase 2: down NVFP4 GEMV (M=hidden_size, K=intermediate)
-//   - phase 3: residual add in-place (residual += down_out, BF16)
-// `residual` is updated in place — matches the standalone path's
-// `residual_add` semantics. `down_alpha` is the pre-folded per-tensor
-// product for the down GEMV. `barrier_state` must hold ≥ 8 zeroed u32
-// slots (4 work counters interleaved with 4 phase spinlocks).
-// Alignment: hidden_size % 512 == 0 (gate+up K) AND % 16 (down M);
-// intermediate % 512 == 0 (down K) AND 2*intermediate % 16 (gate+up M).
-int qwen36_full_attn_block_stage_f4_mlp_block(
-    qwen36_device_ptr_t hidden_quantized_fp4,
-    qwen36_device_ptr_t hidden_quantized_scale,
-    qwen36_device_ptr_t mlp_gate_up_fp4,
-    qwen36_device_ptr_t mlp_gate_up_scale, float gate_up_alpha,
-    qwen36_device_ptr_t mlp_down_fp4, qwen36_device_ptr_t mlp_down_scale,
-    float down_alpha, qwen36_device_ptr_t gate_up_out,
-    qwen36_device_ptr_t swiglu_fp4, qwen36_device_ptr_t swiglu_scale,
-    qwen36_device_ptr_t down_out, qwen36_device_ptr_t residual,
-    qwen36_device_ptr_t barrier_state, size_t intermediate,
-    size_t hidden_size, float down_input_tensor_scale);
-
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 
 // Stage-0 interpreter shell for decode. It executes a static instruction
@@ -718,19 +553,11 @@ int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 // Real opcode bodies are added behind the same ABI in later stages.
 int qwen36_interpreter_decode_sm120(const qwen36_interpreter_program_t *program);
 
-// Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot
-// decode shapes (M » N=1, K=hidden) on Blackwell SM120. Uses the same
-// Nvfp4GemmSpec contract as `qwen36_nvfp4_gemm` so callers can A/B route
-// via env var. Returns QWEN36_STATUS_NOT_IMPLEMENTED for shapes the
-// kernel does not yet specialise; the Rust dispatcher then falls back
-// to the cuBLASLt path. See `docs/mirage-megakernel.md`.
-int qwen36_megakernel_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 // Direction B decode-time NVFP4 gemv: hand-written kernel optimised for the
 // (M, N=1, K) shapes that dominate decode. Reuses `qwen36_nvfp4_gemm_spec_t`.
 // Returns QWEN36_STATUS_NOT_IMPLEMENTED (5) for shapes outside the supported
 // set (M%128==0, K%128==0, N==1); the Rust dispatcher falls back to the
-// existing megakernel/cuBLASLt path on that code, mirroring the Mirage
-// pattern. Gated by `QWEN36_DECODE_GEMV=1`. See
+// existing cuBLASLt path on that code. Gated by `QWEN36_DECODE_GEMV=1`. See
 // `docs/superpowers/specs/2026-05-04-direction-b-nvfp4-gemv-design.md`.
 int qwen36_decode_nvfp4_gemv(const qwen36_nvfp4_gemm_spec_t *spec);
 int qwen36_bf16_gemm(const qwen36_bf16_gemm_spec_t *spec);
@@ -823,8 +650,8 @@ int qwen36_cuda_stream_destroy(qwen36_cuda_stream_t stream);
 int qwen36_cuda_stream_synchronize(qwen36_cuda_stream_t stream);
 
 // Secondary "prefetch" stream used by the decode path to overlap idle-SM L2
-// prefetch (productive spin during full-attn) and any future megakernel-side
-// concurrent work with the main stream. Lifetime is owned by the engine: the
+// prefetch (productive spin during full-attn) and any future concurrent
+// work with the main stream. Lifetime is owned by the engine: the
 // engine creates it at boot via `qwen36_cuda_stream_create` (cudaStreamNon-
 // Blocking) and registers it here with `qwen36_set_prefetch_stream`. Kernels
 // that want to dispatch onto it use `qwen36_internal_prefetch_stream` from
@@ -833,7 +660,7 @@ qwen36_cuda_stream_t qwen36_get_prefetch_stream(void);
 void qwen36_set_prefetch_stream(qwen36_cuda_stream_t stream);
 
 // Generic CUDA event handle for cross-stream synchronization. Used by the
-// productive-spin and megakernel paths to record an event on one stream and
+// productive-spin path to record an event on one stream and
 // have another stream wait on it; the pattern is graph-captureable so the
 // decode CUDA graph can include cross-stream waits without re-recording.
 // Events are created with `cudaEventDisableTiming` to avoid the timer cost.

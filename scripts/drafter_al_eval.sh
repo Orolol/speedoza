@@ -34,9 +34,12 @@ cat doc.md docs/development.md docs/research.md docs/roadmap.md \
     docs/kernel-validation.md docs/troubleshooting.md > "$TMPD/p1_docs_a.txt"
 cat docs/troubleshooting.md docs/kernel-validation.md docs/roadmap.md \
     docs/research.md docs/development.md doc.md > "$TMPD/p2_docs_b.txt"
-head -300 AGENT.md > "$TMPD/p3_agent7k.txt"
-{ head -250 AGENT.md; cat doc.md; } > "$TMPD/p4_agent_doc.txt"
-{ cat doc.md; head -250 AGENT.md; } > "$TMPD/p5_doc_agent.txt"
+# Frozen snapshot (NOT the live AGENT.md): the AL geomean baseline (5.10)
+# was measured on the 2026-06-09 text; AGENT.md was split on 2026-06-10.
+SNAPSHOT=benches/data/agent_md_snapshot_2026-06-09.txt
+head -300 "$SNAPSHOT" > "$TMPD/p3_agent7k.txt"
+{ head -250 "$SNAPSHOT"; cat doc.md; } > "$TMPD/p4_agent_doc.txt"
+{ cat doc.md; head -250 "$SNAPSHOT"; } > "$TMPD/p5_doc_agent.txt"
 cat docs/research.md docs/roadmap.md doc.md docs/development.md \
     docs/troubleshooting.md docs/kernel-validation.md > "$TMPD/p6_docs_c.txt"
 

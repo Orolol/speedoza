@@ -24,7 +24,7 @@ int status(cudaError_t value) {
 std::atomic<cudaStream_t> g_active_stream{nullptr};
 
 // Secondary "prefetch" stream registered by the engine. Used by productive
-// spin (Phase 1) and the per-block megakernel (Phase 2) to overlap idle-SM
+// spin (Phase 1) to overlap idle-SM
 // L2 prefetch with the main stream. Defaults to nullptr (= unused).
 std::atomic<cudaStream_t> g_prefetch_stream{nullptr};
 
@@ -382,9 +382,8 @@ extern "C" int qwen36_cuda_memset(qwen36_device_ptr_t dst, int value,
 }
 
 // Async variant that targets the active stream so the call can be captured
-// inside a CUDA graph (mirrors the d2d_async pattern). Used by the
-// megakernel integration path (Stage B.3 / Stage C / Stage E) to zero the
-// per-launch barrier-state words before each launch without breaking graph
+// inside a CUDA graph (mirrors the d2d_async pattern). Lets callers zero
+// per-launch scratch words before each launch without breaking graph
 // capture. Falls back to synchronous `cudaMemset` when no stream has been
 // registered (matches the d2d_async fallback).
 extern "C" int qwen36_cuda_memset_async(qwen36_device_ptr_t dst, int value,

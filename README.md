@@ -84,6 +84,10 @@ cargo run -p qwen36-fp4 --features cuda -- gpu-load --model-dir /path/to/model -
 
 ## CUDA Runtime Knobs
 
+The list below is a partial selection. The complete reference (88 env vars, defaults
+verified in code, plus the component status map) is in
+[docs/code-inventory.md](docs/code-inventory.md).
+
 - `QWEN36_KV_CACHE_DTYPE=tq35` selects the TurboQuant 3.5-bit KV cache.
 - `QWEN36_LONG_CONTEXT_MODE` overrides the automatic long-context policy. When unset, contexts at or above 8192 tokens disable the large fused weight stores to save VRAM; set `QWEN36_LONG_CONTEXT_MODE=0` to force the fused stores back on, or `=1` to force long-context mode on smaller runs.
 - `QWEN36_LONG_CONTEXT_AUTO_MIN_CONTEXT=<tokens>` changes the automatic threshold.

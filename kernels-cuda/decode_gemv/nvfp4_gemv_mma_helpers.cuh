@@ -1,6 +1,6 @@
 // Shared device-side helpers for the Direction B NVFP4 GEMV kernel
-// (nvfp4_gemv_sm120.cu) — extracted into a header so the per-block
-// megakernel (kernels-cuda/megakernel/full_attn_block_sm120.cu) can call
+// (nvfp4_gemv_sm120.cu) — extracted into a header so other fused callers
+// (e.g. the decode interpreter's GEMV opcode) can call
 // the same MMA atom and SF helpers without duplicating the inline PTX.
 //
 // All definitions live in the `qwen36_gemv` namespace; including TUs can

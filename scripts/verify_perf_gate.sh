@@ -39,11 +39,16 @@ fi
 echo
 
 # --- prompt fixtures ---
+# Prompts come from a frozen snapshot (benches/data/), NOT the live AGENT.md:
+# the recorded gate baselines were measured on the 2026-06-09 text, and
+# AGENT.md was split into instructions + DAILY.md on 2026-06-10. Editing docs
+# must never silently change the gate prompts.
+SNAPSHOT=benches/data/agent_md_snapshot_2026-06-09.txt
 PROMPT_3K=$(mktemp); PROMPT_5K=$(mktemp); PROMPT_7K=$(mktemp)
 trap 'rm -f "$PROMPT_3K" "$PROMPT_5K" "$PROMPT_7K"' EXIT
-head -150 AGENT.md > "$PROMPT_3K"
+head -150 "$SNAPSHOT" > "$PROMPT_3K"
 cat doc.md docs/development.md docs/research.md > "$PROMPT_5K" 2>/dev/null || cp "$PROMPT_3K" "$PROMPT_5K"
-head -300 AGENT.md > "$PROMPT_7K"
+head -300 "$SNAPSHOT" > "$PROMPT_7K"
 
 jnum() { grep -oE "\"$1\": [0-9.]+" | grep -oE '[0-9.]+' | head -1; }
 
@@ -82,4 +87,4 @@ mtp_cell 0 "MTP=0 (auto interpreter off)" ""
 mtp_cell 4 "MTP=4 (auto interpreter)" ""
 mtp_cell 4 "MTP=4 (interpreter OFF)" "QWEN36_INTERPRETER_DECODE=0"
 echo
-echo "Gate done. Compare against the AGENT.md baselines before merging."
+echo "Gate done. Compare against the DAILY.md baselines before merging."
