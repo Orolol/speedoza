@@ -184,6 +184,7 @@ Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
 | `QWEN36_MTP_STATS` | off | print `mtp.stats accepted=… acceptance_rate=…` (the reference way to measure acceptance) |
 | `QWEN36_MTP_TRACE` | off | verbose verify-window trace |
 | `QWEN36_MTP_MULTI_GRAPH_DISABLE` | off | force host-launch path for MTP=2/3 (bisection aid) |
+| `QWEN36_MTP_RECOVER_GRAPH` | **1** | `0` falls back to the host-launched reject-recovery path (re-prefill + next-draft chain). Graph cache `MtpRecover{committed,drafts}`, one capture per shape; cycle-time neutral @depth 4 (recovery is serial GPU work, not launch-bound — DAILY 2026-06-10), kept ON for depth 6/8 |
 | `QWEN36_MTP_TREE_DISABLE` | off | kill tree-MTP dispatch (force chain) |
 | `QWEN36_MTP_BATCH_LM_HEAD_DISABLE` | off | kill batched lm_head in verify |
 | `QWEN36_MTP_SNAPSHOT_RECURRENT` | **on** | `=0` skips recurrent-state snapshots (unsafe unless full-accept) |

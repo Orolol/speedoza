@@ -487,6 +487,14 @@ fn mtp_tree_disable_enabled() -> bool {
     cuda_env_bool("QWEN36_MTP_TREE_DISABLE")
 }
 
+/// Reject-recovery graph (re-prefill + next-draft chain in one capture).
+/// Default ON; `QWEN36_MTP_RECOVER_GRAPH=0` falls back to the host-launched
+/// recovery path (bisect/kill switch).
+#[cfg(feature = "cuda")]
+fn mtp_recover_graph_enabled() -> bool {
+    cuda_env_bool_default_true("QWEN36_MTP_RECOVER_GRAPH")
+}
+
 #[cfg(feature = "cuda")]
 fn cuda_env_workspace_bytes() -> usize {
     cuda_env_usize("QWEN36_CUDA_WORKSPACE_BYTES")
@@ -749,6 +757,12 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
     /// instead of a host scalar so the same graph can replay across iterations.
     #[cfg(feature = "cuda")]
     decode_graph: Option<DecodeGraphState>,
+    /// Captured MTP reject-recovery graphs, keyed by their `MtpRecover`
+    /// kind. Kept in a separate cache from `decode_graph` so a rejection
+    /// (which alternates verify-graph / recover-graph launches within one
+    /// cycle) never forces a re-capture of either side.
+    #[cfg(feature = "cuda")]
+    mtp_recover_graphs: Vec<DecodeGraphState>,
     /// Per-layer interpreter programs uploaded before CUDA graph capture.
     /// Graph replay cannot depend on host-side instruction/spec copies into a
     /// single scratch buffer because every graph node would then observe the
@@ -909,6 +923,13 @@ enum DecodeGraphKind {
         device_chain: bool,
         device_chain_batch: usize,
     },
+    /// Reject-recovery: re-prefill of the committed tokens + the full
+    /// next-draft MTP chain, all in one graph (one shape per
+    /// (committed, drafts) pair, cached in `mtp_recover_graphs`).
+    MtpRecover {
+        committed: usize,
+        drafts: usize,
+    },
 }
 
 #[cfg(feature = "cuda")]
@@ -967,6 +988,8 @@ impl<B: KernelBackend> Engine<B> {
             linear_attn_in_proj_fused: None,
             #[cfg(feature = "cuda")]
             decode_graph: None,
+            #[cfg(feature = "cuda")]
+            mtp_recover_graphs: Vec::new(),
             #[cfg(feature = "cuda")]
             decode_interpreter_graph_programs: None,
             #[cfg(feature = "cuda")]
@@ -1836,6 +1859,188 @@ impl<B: KernelBackend> Engine<B> {
         Ok(())
     }
 
+    /// Capture (or re-capture on context-bucket growth) the reject-recovery
+    /// graph for one `(committed, drafts)` shape: re-prefill of the committed
+    /// tokens + the full next-draft MTP chain. Per-launch inputs are staged
+    /// by the caller: committed tokens + consecutive positions in the prefill
+    /// token/position buffers, shifted MTP input tokens in
+    /// `mtp_verify_token_u32[0..committed]`. Outputs land in the
+    /// `MTP_GRAPH_NEXT_DRAFT_BASE` bundle slots.
+    #[cfg(feature = "cuda")]
+    fn ensure_mtp_recover_graph(
+        &mut self,
+        committed: usize,
+        drafts: usize,
+        start_position: usize,
+    ) -> Result<()> {
+        use qwen36_fp4_kernels::graph::{self, CudaStream};
+
+        if committed == 0 || committed > MTP_GRAPH_NEXT_DRAFT_BASE {
+            return Err(CoreError::Runtime(format!(
+                "MTP recover graph expects 1..={MTP_GRAPH_NEXT_DRAFT_BASE} committed tokens, got {committed}"
+            )));
+        }
+        if drafts == 0 || MTP_GRAPH_NEXT_DRAFT_BASE + drafts > MTP_GRAPH_BUNDLE_U32S {
+            return Err(CoreError::Runtime(format!(
+                "MTP recover graph draft count {drafts} exceeds bundle capacity"
+            )));
+        }
+        let kind = DecodeGraphKind::MtpRecover { committed, drafts };
+        let active_context = start_position + committed + drafts;
+        let attention_context_limit =
+            self.decode_attention_context_limit_for_active_context(active_context);
+        if let Some(idx) = self
+            .mtp_recover_graphs
+            .iter()
+            .position(|graph| graph.kind == kind)
+        {
+            if self.mtp_recover_graphs[idx].attention_context_limit == attention_context_limit {
+                return Ok(());
+            }
+            // Context bucket grew: drain and drop the stale capture.
+            let stale = self.mtp_recover_graphs.swap_remove(idx);
+            let synchronize_result = stale.stream.handle().synchronize();
+            graph::set_active_stream(CudaStream::NULL);
+            synchronize_result?;
+            drop(stale);
+        }
+        Self::ensure_graph_capture_allowed()?;
+        if self.config.mtp_speculative_tokens == 0 {
+            return Err(CoreError::Runtime(
+                "MTP recover graph requested with MTP disabled".to_owned(),
+            ));
+        }
+        if self.backend.name() == "no-cuda" {
+            return Err(CoreError::UnsupportedNoCuda("ensure_mtp_recover_graph"));
+        }
+
+        let stream = CudaStream::create()?;
+        let stream_handle = stream.handle();
+        let position_device_i32 = self.cuda_prefill()?.position_i32.ptr();
+        graph::set_active_stream(stream_handle);
+        self.ensure_decode_aux_if_enabled()?;
+
+        let capture_result = (|| -> Result<(graph::CudaGraph, graph::CudaGraphExec)> {
+            graph::begin_capture(stream_handle)?;
+
+            self.prefill_cuda_chunk(committed, start_position, position_device_i32, false)?;
+            self.final_norm_prefill_rows(committed)?;
+
+            // Next-draft chain — mirrors generate_mtp_drafts_from_committed_prefill
+            // with device-side positions and pre-staged shifted tokens.
+            self.run_mtp_prefill_chunk_with_tokens(
+                committed,
+                start_position,
+                position_device_i32,
+                self.cuda_prefill()?.normed.ptr(),
+                self.cuda_forward()?.mtp_verify_token_u32.ptr(),
+                true,
+            )?;
+            let first_out = self
+                .cuda_forward()?
+                .mtp_verify_token_u32
+                .ptr_at(MTP_GRAPH_NEXT_DRAFT_BASE * 4)?;
+            self.queue_sample_greedy_into(first_out)?;
+
+            if drafts > 1 {
+                let hidden = self.topology.hidden_size;
+                let last_hidden = Self::ptr_offset(
+                    self.cuda_prefill()?.normed.ptr(),
+                    (committed - 1) * hidden * 2,
+                )?;
+                for draft_idx in 1..drafts {
+                    let position = start_position
+                        .checked_add(committed)
+                        .and_then(|value| value.checked_add(draft_idx - 1))
+                        .ok_or_else(|| {
+                            CoreError::Runtime("MTP recover draft position overflow".to_owned())
+                        })?;
+                    let position_ptr = Self::ptr_offset(
+                        position_device_i32,
+                        (committed + draft_idx - 1) * 4,
+                    )?;
+                    let input_token = self
+                        .cuda_forward()?
+                        .mtp_verify_token_u32
+                        .ptr_at((MTP_GRAPH_NEXT_DRAFT_BASE + draft_idx - 1) * 4)?;
+                    let target_hidden = if draft_idx == 1 {
+                        last_hidden
+                    } else {
+                        self.cuda_prefill()?.normed.ptr()
+                    };
+                    self.run_mtp_prefill_chunk_with_tokens(
+                        1,
+                        position,
+                        position_ptr,
+                        target_hidden,
+                        input_token,
+                        true,
+                    )?;
+                    let output_token = self
+                        .cuda_forward()?
+                        .mtp_verify_token_u32
+                        .ptr_at((MTP_GRAPH_NEXT_DRAFT_BASE + draft_idx) * 4)?;
+                    self.queue_sample_greedy_into(output_token)?;
+                }
+            }
+
+            let raw_graph = graph::end_capture(stream_handle)?;
+            let exec = graph::instantiate(raw_graph)?;
+            Ok((raw_graph, exec))
+        })();
+
+        let (raw_graph, exec) = match capture_result {
+            Ok(value) => value,
+            Err(err) => {
+                graph::set_active_stream(CudaStream::NULL);
+                return Err(err);
+            }
+        };
+
+        if std::env::var("QWEN36_MTP_TRACE").is_ok() {
+            eprintln!(
+                "mtp.trace recover_graph captured committed={committed} drafts={drafts} limit={attention_context_limit}"
+            );
+        }
+        self.mtp_recover_graphs.push(DecodeGraphState {
+            kind,
+            attention_context_limit,
+            stream,
+            exec,
+            raw_graph,
+        });
+        Ok(())
+    }
+
+    /// Route subsequent buffer writes onto the recover graph's stream so they
+    /// are ordered before its launch (same pattern as
+    /// `activate_existing_graph_stream` for the single-slot graphs).
+    #[cfg(feature = "cuda")]
+    fn activate_mtp_recover_graph_stream(&self, committed: usize, drafts: usize) {
+        let kind = DecodeGraphKind::MtpRecover { committed, drafts };
+        if let Some(graph_state) = self
+            .mtp_recover_graphs
+            .iter()
+            .find(|graph| graph.kind == kind)
+        {
+            qwen36_fp4_kernels::graph::set_active_stream(graph_state.stream.handle());
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn launch_mtp_recover_graph(&self, committed: usize, drafts: usize) -> Result<()> {
+        let kind = DecodeGraphKind::MtpRecover { committed, drafts };
+        let graph_state = self
+            .mtp_recover_graphs
+            .iter()
+            .find(|graph| graph.kind == kind)
+            .ok_or_else(|| {
+                CoreError::Runtime("MTP recover graph launch requested before capture".to_owned())
+            })?;
+        qwen36_fp4_kernels::graph::launch(graph_state.exec, graph_state.stream.handle())?;
+        Ok(())
+    }
+
     #[cfg(feature = "cuda")]
     pub fn run_mtp_assume_accept_device_chain(
         &mut self,
@@ -2036,6 +2241,14 @@ impl<B: KernelBackend> Engine<B> {
             );
             synchronize_result?;
             // Drop runs the destructors below.
+            drop(graph_state);
+        }
+        for graph_state in self.mtp_recover_graphs.drain(..) {
+            let synchronize_result = graph_state.stream.handle().synchronize();
+            qwen36_fp4_kernels::graph::set_active_stream(
+                qwen36_fp4_kernels::graph::CudaStream::NULL,
+            );
+            synchronize_result?;
             drop(graph_state);
         }
         Ok(())
@@ -2817,11 +3030,54 @@ impl<B: KernelBackend> Engine<B> {
         next_draft_count: usize,
     ) -> Result<MtpMultiVerifyResult> {
         let committed_tokens = rejected_draft_idx + 1;
-        self.mtp_restore_state(start_position, verify_tokens)?;
 
         let mut committed_input = Vec::with_capacity(committed_tokens);
         committed_input.push(current_token);
         committed_input.extend_from_slice(&draft_tokens[..rejected_draft_idx]);
+
+        // Graph path: the recovery re-prefill + the entire next-draft chain
+        // replay as one capture (the host-launched chain was the dominant
+        // per-cycle cost at acceptance < 1). State restore and input staging
+        // stay host-side; they are ordered before the launch by activating
+        // the recover graph's stream first.
+        let use_recover_graph = next_draft_count > 0
+            && committed_tokens <= MTP_GRAPH_NEXT_DRAFT_BASE
+            && MTP_GRAPH_NEXT_DRAFT_BASE + next_draft_count <= MTP_GRAPH_BUNDLE_U32S
+            && mtp_recover_graph_enabled()
+            && std::env::var("QWEN36_MTP_MULTI_GRAPH_DISABLE").is_err()
+            && Self::ensure_graph_capture_allowed().is_ok()
+            && self.backend.name() != "no-cuda";
+        if use_recover_graph {
+            self.ensure_mtp_recover_graph(committed_tokens, next_draft_count, start_position)?;
+            self.activate_mtp_recover_graph_stream(committed_tokens, next_draft_count);
+            self.mtp_restore_state(start_position, verify_tokens)?;
+            self.write_prefill_tokens_and_position_count(
+                &committed_input,
+                start_position,
+                committed_tokens + next_draft_count,
+            )?;
+            let mut shifted_bytes = Vec::with_capacity(committed_tokens * 4);
+            for token in draft_tokens[..rejected_draft_idx].iter().copied() {
+                shifted_bytes.extend_from_slice(&token.to_ne_bytes());
+            }
+            shifted_bytes.extend_from_slice(&verified_token.to_ne_bytes());
+            self.cuda_forward()?
+                .mtp_verify_token_u32
+                .copy_from_host(&shifted_bytes)?;
+            self.launch_mtp_recover_graph(committed_tokens, next_draft_count)?;
+            let next_draft_tokens =
+                self.read_mtp_token_bundle(MTP_GRAPH_NEXT_DRAFT_BASE, next_draft_count)?;
+
+            self.state.advance(committed_tokens);
+            return Ok(MtpMultiVerifyResult {
+                accepted_drafts: rejected_draft_idx,
+                rejected: true,
+                next_token: Some(verified_token),
+                next_draft_tokens,
+            });
+        }
+
+        self.mtp_restore_state(start_position, verify_tokens)?;
         self.write_prefill_tokens_and_positions(&committed_input, start_position)?;
         self.prefill_cuda_chunk(committed_tokens, start_position, DevicePtr::NULL, false)?;
         self.final_norm_prefill_rows(committed_tokens)?;
@@ -10242,6 +10498,10 @@ impl<B: KernelBackend> Engine<B> {
             DecodeGraphKind::MtpVerifyMulti { drafts, .. } => self
                 .decode_attention_context_limit_for_active_context(
                     self.state.position + drafts + 1,
+                ),
+            DecodeGraphKind::MtpRecover { committed, drafts } => self
+                .decode_attention_context_limit_for_active_context(
+                    self.state.position + committed + drafts,
                 ),
         }
     }

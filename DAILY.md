@@ -97,6 +97,52 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-10 — MTP : graph-capture du chemin de rejet (MtpRecover) — SHIPPED, mais l'hypothèse « launch overhead » est FALSIFIÉE
+
+Contexte : le sweep @1K (cycle 17→35→50→61→76 ms pour MTP 0→4) pointait
+un coût marginal ~13-15 ms/draft. Lecture du code : le multi-graph
+couvrait déjà le cycle full-accept (verify + next-drafts dans UNE
+capture) ; le seul chemin host-launched restant était le **rejet**
+(`recover_after_mtp_multi_reject` : restore + re-prefill des tokens
+commités (48 couches) + chaîne MTP complète), pris ~72-79 % des cycles
+(33 rejets / 42 cycles mesurés au trace, acc 0.71). Kill-gate : parity
+floor exact + A/B ON/OFF identique, sinon revert.
+
+Fait : cache `mtp_recover_graphs` (coexiste avec le slot `decode_graph`,
+sinon l'alternance verify/recover re-capturerait chaque cycle) + kind
+`MtpRecover{committed,drafts}` (une capture par forme, re-capture sur
+changement de bucket contexte, 8 captures observées @1K/MTP4). Capturé :
+re-prefill (positions device) + final_norm + chaîne next-drafts (tokens
+shiftés stagés par l'hôte dans `mtp_verify_token_u32[0..committed]` —
+committed ≤ 8 < NEXT_DRAFT_BASE=9, pas de collision). Restore et staging
+restent host-side, ordonnés par activation du stream du graph. Kill
+switch `QWEN36_MTP_RECOVER_GRAPH=0` (et respecte
+`QWEN36_MTP_MULTI_GRAPH_DISABLE`).
+
+Mesures (corpus 91k, @1K, MTP=4, 512 tokens pour amortir les captures) :
+ON 44.5 tok/s / cycle 72.0 ms ; OFF 43.2 / 71.4. **Cycle inchangé** — le
++3 % tok/s vient d'une divergence de flux (bruit chunked-verify connu,
+steps 160 vs 166), pas du coût de cycle. Verdict : le chemin de rejet
+host-launched n'était PAS launch-bound ; les ~13-15 ms/draft marginaux
+sont du travail GPU **sériel** (re-prefill 48 couches ~17 ms sur rejet +
+forwards MTP dépendants en chaîne). Graphing ne comprime pas une chaîne
+sérielle. Gardé default ON : correctness prouvée, coût nul, et le
+recovery re-prefille `committed` tokens — la part graphée croît avec
+depth 6/8 (chantier suivant).
+
+Piège de session (2× faux verdicts) : `scripts/build_cuda.sh` ne
+reconstruit QUE le `.so` kernels — le binaire Rust exige
+`cargo build --release -p qwen36-fp4 --features cuda`. Les premiers
+« gates verts » et le premier bench plat tournaient sur un binaire
+périmé ; tout a été re-validé sur le vrai binaire.
+
+Gates (binaire reconstruit) : parity floor hello/hello world × MTP 0-4
+identiques ; A/B ON/OFF 64 tokens × MTP 2-4 identiques ; smoke passed.
+Leçon : avant tout verdict, vérifier que le binaire contient bien le
+code (trace d'engagement > absence d'erreur).
+
+Files: `crates/runtime/src/engine.rs`. Inventory updated: yes (§ flags).
+
 ### 2026-06-10 — MTP : LUT split-K neutre (3e micro-fix neutre) ; depth 6/8 débloqué côté buffers mais depth 6 CASSE le parity floor — WIP gated off
 
 **LUT FP8 dans `attention_flash_splitk.cu`** (levier 1 du diagnostic
