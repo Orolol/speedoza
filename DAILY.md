@@ -97,6 +97,36 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-10 — Gate (a) interpreter : MLP-chunking +0.0%, et le +7.3% MTP=4 est un artefact synthétique — NEGATIVE, lane gelée
+
+Bench (corpus dashboard, ctx 3072, MTP=4, max-new 128, 2 reps/config) :
+
+| config | decode tok/s |
+|---|---:|
+| interpreter auto (BASE) | 39.46 / 39.49 |
+| + `QWEN36_INTERPRETER_MLP_CHUNKED=1` | 39.49 / 39.50 |
+| interpreter OFF | 39.47 / 39.47 |
+
+1. **Gate (a) raté net** : chunking MLP +0.0% (seuil : ≥ +2-3 tok/s).
+   La thèse pipelining-via-interpreter est morte sur ce substrat —
+   cohérent avec la probe 4.71 µs/barrière de la même session.
+2. **Découverte** : l'interpreter complet est NEUTRE sur texte réel à
+   MTP=4 (39.5 = 39.5). Le « +7.3% MTP=4 » historique a été mesuré sur
+   le prompt synthétique répété (full-accept, verify-dominated) — même
+   artefact que le 95 tok/s du perf gate. L'auto-policy (ON iff MTP>0)
+   est sans effet mesurable en production réelle ; on la laisse telle
+   quelle aujourd'hui, mais le budget complexité (AGENT.md règle 6)
+   plaide pour purger le lane interpreter entièrement si une session
+   future cherche de la simplification — il ne reste AUCUN gain mesuré
+   qui le justifie.
+
+Verdict lane P3 : single-launch clos (probe), chunking clos (ce gate),
+interpreter sans gain réel. Survivent : prototype GEMV SMEM-paging
+(kernel-level pur, gate +20% BW) et lm_head NVFP4 (indépendant).
+
+Files: aucun (bench only). Inventory: §2.1 ligne interpreter à nuancer
+au prochain commit de code.
+
 ### 2026-06-10 — Audit bande passante du décode (P0) : GEMV 62% peak, lm_head 86%, rmsnorm 7% du token — SHIPPED
 
 `ncu` est bloqué sur cette instance (ERR_NVGPUCTRPERM, conteneur non

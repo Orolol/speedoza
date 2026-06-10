@@ -77,10 +77,11 @@ explains precisely (see P3).
 - [ ] **CUDA-graph the DFlash verify** (`verify_block_batched`): documented
       estimate +20–30% DFlash tok/s. #55 made the split-K path capture-safe
       already. Gate: byte-identical DFlash output on the AL battery prompts.
-- [ ] **Interpreter MLP-chunking bench** (Codex lane gate (a)): ≥+2–3 tok/s
-      on a counting path → the pipelining thesis lives and feeds P3;
-      ~0% → freeze the interpreter as MTP>0 auto-only (the +7.3% is banked)
-      and P3 proceeds on the Hazy design instead.
+- [x] **Interpreter MLP-chunking bench** — DONE 2026-06-10, **gate FAILED
+      (+0.0%)**: interpreter frozen. Worse: interpreter ON vs OFF at MTP=4
+      on real text is 39.5 vs 39.5 — the historical "+7.3%" was a
+      synthetic-prompt artefact. No measured gain justifies the lane;
+      candidate for deletion under the complexity budget.
 
 ## P2 — Tokens per forward: speculation quality (MiMo's main lever)
 
