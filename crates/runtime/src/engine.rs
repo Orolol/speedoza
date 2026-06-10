@@ -586,8 +586,59 @@ fn cuda_deltanet_chunked_prefill_enabled() -> bool {
     cuda_env_bool_value("QWEN36_DELTANET_CHUNKED_PREFILL").unwrap_or(true)
 }
 
+/// Default `max_context` for engines built from `EngineConfig::default()`.
+///
+/// Deliberately far below the checkpoint's 262_144 `max_position_embeddings`:
+/// a full-length KV cache is a multi-GB allocation (~17 GB at BF16) that
+/// silently eats the 32 GB 5090 before weights and fused stores land. Long
+/// contexts are an explicit opt-in — set `EngineConfig.max_context` directly
+/// or export `QWEN36_MAX_CONTEXT` (validated against the model ceiling at
+/// engine construction).
+pub const DEFAULT_MAX_CONTEXT: usize = 16_384;
+
+/// The shipped checkpoint's `max_position_embeddings`. Engine construction
+/// rejects any `max_context` above this; the per-model ceiling from the
+/// loaded topology is the authoritative bound.
+pub const MODEL_MAX_CONTEXT: usize = 262_144;
+
+fn validate_max_context(config: &EngineConfig, topology: &ModelTopology) -> Result<()> {
+    if config.max_context == 0 {
+        return Err(CoreError::Runtime(
+            "max_context must be at least 1".to_owned(),
+        ));
+    }
+    let ceiling = topology.max_position_embeddings;
+    if config.max_context > ceiling {
+        return Err(CoreError::Runtime(format!(
+            "max_context {} exceeds the model's max_position_embeddings {ceiling}; long \
+             contexts are an explicit opt-in up to that ceiling (set \
+             EngineConfig.max_context or QWEN36_MAX_CONTEXT)",
+            config.max_context
+        )));
+    }
+    Ok(())
+}
+
+fn default_max_context() -> usize {
+    let Ok(raw) = std::env::var("QWEN36_MAX_CONTEXT") else {
+        return DEFAULT_MAX_CONTEXT;
+    };
+    let parsed: usize = raw
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("QWEN36_MAX_CONTEXT must be a positive integer, got {raw:?}"));
+    assert!(
+        (1..=MODEL_MAX_CONTEXT).contains(&parsed),
+        "QWEN36_MAX_CONTEXT must be in 1..={MODEL_MAX_CONTEXT}, got {parsed}"
+    );
+    parsed
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
+    /// KV-cache / position capacity for this engine. Defaults to
+    /// [`DEFAULT_MAX_CONTEXT`] (overridable via `QWEN36_MAX_CONTEXT`);
+    /// the model ceiling of [`MODEL_MAX_CONTEXT`] is explicit opt-in.
     pub max_context: usize,
     pub kv_cache_dtype: KvCacheDtype,
     pub turboquant: bool,
@@ -598,7 +649,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            max_context: 262144,
+            max_context: default_max_context(),
             kv_cache_dtype: KvCacheDtype::Fp8,
             turboquant: true,
             mtp_speculative_tokens: 0,
@@ -945,6 +996,7 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     pub fn from_layout(layout: &ModelLayout, config: EngineConfig, backend: B) -> Result<Self> {
+        validate_max_context(&config, &layout.topology)?;
         let weights = ModelWeightsManifest::from_layout(layout)?;
         let mut engine = Self::new(layout.topology.clone(), config, backend);
         engine.weights = Some(weights);
@@ -10732,6 +10784,7 @@ fn layer_common_input_norm(layer: &LayerWeights) -> &TensorInfo {
 #[cfg(feature = "cuda")]
 impl Engine<CudaBackend> {
     pub fn cuda_with_mapped_weights(model: &MappedModel, config: EngineConfig) -> Result<Self> {
+        validate_max_context(&config, &model.layout.topology)?;
         if config.mtp_speculative_tokens > MTP_MAX_DRAFT_TOKENS {
             return Err(CoreError::Runtime(format!(
                 "MTP runtime currently supports up to {MTP_MAX_DRAFT_TOKENS} speculative tokens"
@@ -11068,5 +11121,35 @@ impl Engine<CudaBackend> {
             linear_attn_fused_enabled: cuda_linear_attn_fused_enabled(max_context),
             prefill_fused_linear_attn_enabled: cuda_prefill_fused_linear_attn_enabled(max_context),
         })
+    }
+}
+
+#[cfg(test)]
+mod max_context_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_sane_and_below_model_ceiling() {
+        let default = DEFAULT_MAX_CONTEXT;
+        assert!((8_192..=32_768).contains(&default));
+        assert!(default <= MODEL_MAX_CONTEXT);
+    }
+
+    #[test]
+    fn validate_rejects_zero_and_above_model_ceiling() {
+        let topology = ModelTopology::expected_qwen36_text_mtp();
+        assert_eq!(topology.max_position_embeddings, MODEL_MAX_CONTEXT);
+        let mut config = EngineConfig {
+            max_context: 0,
+            ..EngineConfig::default()
+        };
+        assert!(validate_max_context(&config, &topology).is_err());
+        config.max_context = 1;
+        assert!(validate_max_context(&config, &topology).is_ok());
+        // The model ceiling itself is reachable — but only by explicit opt-in.
+        config.max_context = topology.max_position_embeddings;
+        assert!(validate_max_context(&config, &topology).is_ok());
+        config.max_context = topology.max_position_embeddings + 1;
+        assert!(validate_max_context(&config, &topology).is_err());
     }
 }

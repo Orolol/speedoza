@@ -1505,6 +1505,34 @@ that hands a carried state across implementations (prefill↔decode,
 graph↔eager, interpreter↔host) needs an explicit carried-state parity
 gate with a nonzero initial state.
 
+### 2026-06-10 — `EngineConfig` max_context default 262144 → 16384; 262K is explicit opt-in
+
+`EngineConfig::default().max_context` was the checkpoint's full
+262_144, which plans a multi-GB KV cache (~8.6 GB FP8, ~17 GB BF16)
+before weights land — the silent-OOM usability trap flagged in the
+2026-06-09 long-context investigation. New behaviour
+(`crates/runtime/src/engine.rs`):
+
+- **`DEFAULT_MAX_CONTEXT = 16_384`** is the `EngineConfig::default()`
+  value. Override with `QWEN36_MAX_CONTEXT=<n>` (strictly parsed —
+  garbage panics with a clear message; explicit failure over silent
+  fallback).
+- **`MODEL_MAX_CONTEXT = 262_144`** stays fully reachable, but only by
+  explicit opt-in: set `EngineConfig.max_context` directly, pass the
+  CLI's `--max-context`, or export `QWEN36_MAX_CONTEXT`. Verified:
+  `gpu-load --max-context 262144` loads on the 32 GB 5090 with FP8 KV.
+- Engine construction (`from_layout`, `cuda_with_mapped_weights`) now
+  validates `1 <= max_context <= topology.max_position_embeddings` and
+  returns a descriptive error instead of attempting the allocation
+  (e.g. `--max-context 300000` → clean "exceeds the model's
+  max_position_embeddings 262144" error).
+- CLI commands that derive `max_context` from the prompt
+  (`chat`, `bench`, `dump-*`, DFlash paths) are unaffected — they
+  always overrode the default. The change protects library consumers
+  and any future surface that leans on `EngineConfig::default()`.
+- Unit tests: `engine::max_context_tests` gate the default's 8K–32K
+  band and the constructor validation.
+
 ### Validated against PyTorch reference (matching to within FP4 quantization noise)
 
 Cosine similarity floor is `0.998` unless noted.
