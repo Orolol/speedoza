@@ -70,16 +70,26 @@ __global__ void fp8_quantize_rows_kernel(const __nv_bfloat16 *__restrict__ w,
 constexpr int kMvRowsPerCta = 8; // one warp per row
 constexpr int kMvThreads = kMvRowsPerCta * 32;
 
+// Up to this many input rows are staged together and share ONE pass over
+// the weight bytes (grid.y batching would re-read the 1.27 GB matrix per
+// row — measured 4x slower on the 5-row MTP verify). Matches the MTP
+// verify maximum (4 drafts + 1).
+constexpr int kMvMaxRows = 8;
+
 __global__ void __launch_bounds__(kMvThreads)
     fp8_matvec_kernel(const uint8_t *__restrict__ w,
                       const float *__restrict__ row_scale,
                       const __nv_bfloat16 *__restrict__ input,
                       __nv_bfloat16 *__restrict__ output, size_t M, size_t K,
-                      size_t input_stride) {
-  extern __shared__ float sm_b[]; // [K]
-  const __nv_bfloat16 *b = input + blockIdx.y * input_stride;
-  for (size_t k = threadIdx.x; k < K; k += blockDim.x) {
-    sm_b[k] = __bfloat162float(b[k]);
+                      size_t input_stride, int rows) {
+  // BF16 staging: rows x K x 4B of f32 would blow the 99 KB SMEM cap at
+  // rows=5 (K=5120); BF16 keeps rows=8 at 80 KB, cvt happens at the FMA.
+  extern __shared__ __nv_bfloat16 sm_b[]; // [rows, K]
+  for (int r = 0; r < rows; ++r) {
+    const __nv_bfloat16 *b = input + static_cast<size_t>(r) * input_stride;
+    for (size_t k = threadIdx.x; k < K; k += blockDim.x) {
+      sm_b[r * K + k] = b[k];
+    }
   }
   __syncthreads();
 
@@ -91,11 +101,15 @@ __global__ void __launch_bounds__(kMvThreads)
   }
   const uint4 *row16 = reinterpret_cast<const uint4 *>(w + m * K);
   const size_t vecs = K / 16;
-  float acc = 0.0f;
+  float acc[kMvMaxRows];
+#pragma unroll
+  for (int r = 0; r < kMvMaxRows; ++r) {
+    acc[r] = 0.0f;
+  }
   for (size_t i = lane; i < vecs; i += 32) {
     const uint4 v = row16[i];
-    const float *bk = sm_b + i * 16;
     const uint32_t words[4] = {v.x, v.y, v.z, v.w};
+    float wdec[16];
 #pragma unroll
     for (int wi = 0; wi < 4; ++wi) {
 #pragma unroll
@@ -104,18 +118,30 @@ __global__ void __launch_bounds__(kMvThreads)
             static_cast<__nv_fp8x2_storage_t>(
                 (words[wi] >> (16 * p)) & 0xffffu),
             __NV_E4M3);
-        const float2 f2 = __half22float2(*reinterpret_cast<const __half2 *>(&h2));
-        acc = fmaf(f2.x, bk[wi * 4 + p * 2], acc);
-        acc = fmaf(f2.y, bk[wi * 4 + p * 2 + 1], acc);
+        const float2 f2 =
+            __half22float2(*reinterpret_cast<const __half2 *>(&h2));
+        wdec[wi * 4 + p * 2] = f2.x;
+        wdec[wi * 4 + p * 2 + 1] = f2.y;
+      }
+    }
+    for (int r = 0; r < rows; ++r) {
+      const __nv_bfloat16 *bk = sm_b + r * K + i * 16;
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        acc[r] = fmaf(wdec[j], __bfloat162float(bk[j]), acc[r]);
       }
     }
   }
+  const float scale = row_scale[m];
+  for (int r = 0; r < rows; ++r) {
+    float a = acc[r];
 #pragma unroll
-  for (int off = 16; off > 0; off >>= 1) {
-    acc += __shfl_xor_sync(0xffffffff, acc, off);
-  }
-  if (lane == 0) {
-    output[blockIdx.y * M + m] = __float2bfloat16(acc * row_scale[m]);
+    for (int off = 16; off > 0; off >>= 1) {
+      a += __shfl_xor_sync(0xffffffff, a, off);
+    }
+    if (lane == 0) {
+      output[static_cast<size_t>(r) * M + m] = __float2bfloat16(a * scale);
+    }
   }
 }
 
@@ -150,19 +176,19 @@ extern "C" int qwen36_fp8_matvec(const qwen36_fp8_matvec_spec_t *spec) {
     return QWEN36_STATUS_NULL_POINTER;
   }
   if (spec->out_features == 0 || spec->in_features == 0 || spec->rows == 0 ||
+      spec->rows > static_cast<size_t>(kMvMaxRows) ||
       spec->weight_e4m3.ptr == 0 || spec->row_scale_f32.ptr == 0 ||
       spec->input_bf16.ptr == 0 || spec->output_bf16.ptr == 0 ||
       (spec->in_features % 16) != 0) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }
-  const size_t smem_bytes = spec->in_features * sizeof(float);
+  const size_t smem_bytes =
+      spec->rows * spec->in_features * sizeof(__nv_bfloat16);
   cudaFuncSetAttribute(fp8_matvec_kernel,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(smem_bytes));
-  const dim3 grid(
-      static_cast<unsigned>((spec->out_features + kMvRowsPerCta - 1) /
-                            kMvRowsPerCta),
-      static_cast<unsigned>(spec->rows));
+  const dim3 grid(static_cast<unsigned>(
+      (spec->out_features + kMvRowsPerCta - 1) / kMvRowsPerCta));
   fp8_matvec_kernel<<<grid, kMvThreads, smem_bytes,
                       qwen36_internal_active_stream()>>>(
       reinterpret_cast<const uint8_t *>(
@@ -173,7 +199,8 @@ extern "C" int qwen36_fp8_matvec(const qwen36_fp8_matvec_spec_t *spec) {
           static_cast<uintptr_t>(spec->input_bf16.ptr)),
       reinterpret_cast<__nv_bfloat16 *>(
           static_cast<uintptr_t>(spec->output_bf16.ptr)),
-      spec->out_features, spec->in_features, spec->input_stride);
+      spec->out_features, spec->in_features, spec->input_stride,
+      static_cast<int>(spec->rows));
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }

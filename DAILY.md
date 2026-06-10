@@ -97,6 +97,63 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-10 — MTP recovery steps 0-1 : la prémisse « acceptance collapse » est FAUSSE ; le coupable est le coût du cycle (75 ms), profilé kernel par kernel — DECISION
+
+Exécution de `docs/mtp-recovery-plan.md` (steps 0-1) avec un twist : le
+step 0 était déjà instrumenté (`run_bench_mtp_multi` émet acceptance
+depuis toujours) — les JSONL du dashboard du matin contenaient déjà la
+réponse.
+
+**Step 0 (lecture des JSONL existants)** : acceptance MTP=4 sur le corpus
+= **0.71-0.77, ~3 tokens/cycle sur 5 max** à TOUS les ctx (128→24K).
+PAS d'effondrement. Le gate du plan s'applique : « si acceptance haute,
+re-profiler le coût du cycle ». Le coût : 128 tokens / 43 cycles à
+39.3 tok/s = **75-83 ms/cycle**, verify = 98% du temps décode. Même à
+acceptance parfaite (5 tok/cycle), 75 ms/cycle ⇒ 66 tok/s = MTP=0.
+
+**Step 1 (A/B, ctx 3072, MTP=4)** :
+
+| config | tok/s | tok/cyc | acc | ms/cycle |
+|---|---:|---:|---:|---:|
+| DEFAULT | 39.4 | 3.05 | 0.735 | 77.4 |
+| `QWEN36_MTP_MULTI_GRAPH_DISABLE=1` | 42.6 | 3.05 | 0.735 | 71.5 |
+| `QWEN36_ATTENTION_SPLIT_DISABLE=1` | 23.3 | 2.61 | 0.653 | 112.1 |
+| `QWEN36_DELTANET_CHUNKED_PREFILL=0` | 37.1 | 2.67 | 0.687 | 71.8 |
+
+Les deux suspects du plan sont **falsifiés** : le DeltaNet séquentiel
+BAISSE l'acceptance (0.687 — le chunked WY n'est pas le problème), et le
+multi-graph ne coûte que ~8%. Le split path est meilleur que son
+fallback scalaire.
+
+**Profil nsys node-trace du cycle (bench MTP=4 @3K, 14 cycles)** — les
+~50 ms/cycle au-dessus du plancher GEMM (~18 ms) sont QUATRE pathologies
+empilées :
+
+| poste | ms/cycle | détail |
+|---|---:|---|
+| `attention_flash_splitk` | ~16 | **784 µs/launch** (×~20/cycle, 16 layers + MTP head) — énorme pour q=5 ; dimensionnement n_splits sous capture à investiguer |
+| `nvfp4_quantize_rows` | ~14.5 | **35.7 µs/launch** × ~406/cycle — quantizer 5 lignes devrait coûter ~5 µs ; grille minuscule latency-bound |
+| `fp8_matvec` (régression du jour !) | ~8.7 | grid.y=rows relisait les **1.27 GB de poids 5×** pour le verify batché (le cuBLASLt BF16 les lisait 1×) — fix immédiat ci-dessous |
+| `sample_argmax` + gemvx + rmsnorm | ~6 | secondaire |
+
+**Fix #1 (cette session)** : `fp8_matvec` multi-rows — toutes les rows
+stagées en SMEM BF16 (f32 dépassait le cap 99 KB à rows=5), UNE passe de
+poids, accumulateurs par row en registres. `kMvMaxRows=8` (couvre depth
+7 du step 3 ; depth 8 demandera 9 rows). **Mesuré : e2e NEUTRE**
+(38.7 vs 39.4 tok/s — bruit ; MTP=0 stable 64.8 ; smoke gate identique
+au bit près). Lecture honnête : l'appel batché rows=5 n'est qu'1×/cycle,
+les ~6 appels rows=1 (drafts) dominent le poste fp8 — le fix divise bien
+par ~4 les octets de l'appel batché mais ce n'était que ~3 ms/cycle.
+Gardé (correct par construction, nécessaire pour depth 6+ où rows
+monte). Les 30 ms/cycle des deux vrais coupables (quantize_rows 14.5 +
+split-K 16) restent le travail à faire.
+
+**Reste à faire (priorisé)** : (a) `nvfp4_quantize_rows` à rows≤5 —
+élargir la grille/fusionner (14.5 ms/cycle en jeu) ; (b) le split-K à
+784 µs/launch sur q=5 — lire le n_splits effectif sous capture
+(`attention.cu` + engine bucket) ; (c) puis steps 3-4 du plan (depth 6,
+routing). Le plan est mis à jour en tête de fichier.
+
 ### 2026-06-10 — lm_head FP8 e4m3 (voie de repêchage de la probe FP4) — SHIPPED
 
 La probe offline FP8 (même harness que la probe FP4 tueuse, mêmes 27
