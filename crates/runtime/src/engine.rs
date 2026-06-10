@@ -168,30 +168,6 @@ fn productive_spin_enabled() -> bool {
     cuda_env_bool("QWEN36_PRODUCTIVE_SPIN")
 }
 
-/// Gate for the per-block megakernel Stage F.4 (full MLP block) in the
-/// MLP hot path. When ON and the layer has a fused gate+up store, the
-/// runtime replaces `run_mlp_with_quantized_input`'s
-/// {gate+up cuBLASLt GEMM, swiglu_nvfp4_quantize, down NVFP4 GEMV} trio
-/// with a single Stage F.4 launch. Phase 3 (residual add) is skipped by
-/// passing `residual = NULL` so the next layer's input-norm fuse still
-/// owns the residual update — matches the standalone pipeline so no
-/// double-add. Cached once per process so the dispatch hot path does
-/// not re-parse the environment per layer.
-#[cfg(feature = "cuda")]
-fn megakernel_full_attn_stage_f4_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| cuda_env_bool("QWEN36_MEGAKERNEL_FULL_ATTN_STAGE_F4"))
-}
-
-/// Stage F.4 requires `hidden_size % 512 == 0` AND `intermediate % 512
-/// == 0` (both GEMV K-shard alignments). Qwen3.6 satisfies both
-/// (hidden=5120, intermediate=17408 — divisible by 512).
-#[cfg(feature = "cuda")]
-fn megakernel_full_attn_stage_f4_supports(hidden_size: usize, intermediate: usize) -> bool {
-    hidden_size > 0 && intermediate > 0 && hidden_size & 511 == 0 && intermediate & 511 == 0
-}
-
 /// Gate for the first runtime-backed decode-interpreter slice. This replaces
 /// only the final RMSNorm + lm_head logits pair, stays outside CUDA Graph
 /// capture for now, and also respects the opcode allow-list used by op-level
@@ -725,7 +701,7 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
     #[cfg(feature = "cuda")]
     decode_interpreter_graph_programs: Option<DecodeInterpreterGraphPrograms>,
     /// Secondary prefetch stream + reusable event pool. Lazily constructed on
-    /// first use by the productive-spin / megakernel paths; `None` until then.
+    /// first use by the productive-spin path; `None` until then.
     #[cfg(feature = "cuda")]
     #[allow(dead_code)]
     decode_aux: Option<DecodeAuxStreams>,
@@ -795,8 +771,8 @@ impl DecodeInterpreterGraphLayerProgram {
 }
 
 /// Auxiliary CUDA stream + event pool used by the decode hot path to overlap
-/// productive-spin L2 prefetch (Phase 1) and per-block megakernel side work
-/// (Phase 2) with the main stream. Lifetime spans the engine's CUDA-active
+/// productive-spin L2 prefetch with the main stream — reusable cross-stream
+/// fork/join infrastructure. Lifetime spans the engine's CUDA-active
 /// session: the prefetch stream is registered with the kernel library on
 /// construction and unregistered on Drop so dispatches can't chase a dangling
 /// `cudaStream_t`.
@@ -4622,24 +4598,6 @@ impl<B: KernelBackend> Engine<B> {
                         }
                     }
                     let mlp_start = profile_decode.then(std::time::Instant::now);
-                    // Stage F.4 fast path: when enabled AND the layer has a
-                    // fused gate+up store AND alignments hold, replace the
-                    // {cuBLASLt gate+up GEMM + swiglu_nvfp4_quantize + down
-                    // NVFP4 GEMV} trio with a single megakernel launch.
-                    // Phase 3 (residual add) is skipped so the next layer's
-                    // input-norm fuse still owns the residual update.
-                    let full_attn_layer = matches!(layer, LayerWeights::FullAttention(_));
-                    let layer_idx = match layer {
-                        LayerWeights::LinearAttention(l) => l.layer_index,
-                        LayerWeights::FullAttention(l) => l.layer_index,
-                    };
-                    let f4_eligible = full_attn_layer
-                        && megakernel_full_attn_stage_f4_enabled()
-                        && megakernel_full_attn_stage_f4_supports(
-                            self.topology.hidden_size,
-                            self.topology.intermediate_size,
-                        )
-                        && self.mlp_fused_main_opt(layer_idx).is_some();
                     let interpreter_mlp_eligible =
                         decode_interpreter_mlp_enabled(self.decode_interpreter_decode_enabled())
                             && position_device_i32 == DevicePtr::NULL
@@ -4651,11 +4609,7 @@ impl<B: KernelBackend> Engine<B> {
                         && self
                             .run_interpreter_mlp_with_quantized_input(layer, forward, quantized)?;
                     if !ran_interpreter_mlp {
-                        if f4_eligible {
-                            self.run_mlp_megakernel_f4(layer, forward, quantized)?;
-                        } else {
-                            self.run_mlp_with_quantized_input(layer, forward, quantized)?;
-                        }
+                        self.run_mlp_with_quantized_input(layer, forward, quantized)?;
                     }
                     if let Some(mlp_start) = mlp_start {
                         qwen36_fp4_kernels::cuda_synchronize()?;
@@ -6055,102 +6009,6 @@ impl<B: KernelBackend> Engine<B> {
     #[cfg(feature = "cuda")]
     fn mlp_fused_main_opt(&self, layer_idx: usize) -> Option<&MlpFusedLayer> {
         self.mlp_fused.as_ref()?.layers.get(layer_idx)
-    }
-
-    /// Per-block megakernel Stage F.4 dispatch for the MLP block. Reads
-    /// the post-attn-quantized FP4 input from `forward.activation_fp4 /
-    /// _scale` (filled by the outer rmsnorm_nvfp4_quantize) and writes
-    /// the down-projection output to `forward.hidden`. Phase 3 (residual
-    /// add) is skipped (`residual = NULL`) so the next layer's input
-    /// norm still owns the residual update — matches the standalone
-    /// pipeline so no double-add.
-    ///
-    /// The caller (`forward_device_token_cuda_inner`) zeroes the
-    /// barrier-state scratch on the active stream before each launch
-    /// via `megakernel_barrier_state.memset_async`, keeping the launch
-    /// graph-captureable.
-    #[cfg(feature = "cuda")]
-    fn run_mlp_megakernel_f4(
-        &self,
-        layer: &LayerWeights,
-        forward: &GpuForwardBuffers,
-        _quantized: Nvfp4ActivationQuant<'_>,
-    ) -> Result<()> {
-        use qwen36_fp4_kernels::MegakernelFullAttnStageF4Spec;
-        let common = layer_common(layer);
-        let layer_idx = match layer {
-            LayerWeights::LinearAttention(l) => l.layer_index,
-            LayerWeights::FullAttention(l) => l.layer_index,
-        };
-        let fused = self.mlp_fused_main_opt(layer_idx).ok_or_else(|| {
-            CoreError::Runtime(format!(
-                "Stage F.4 dispatched for layer {layer_idx} but no MLP fused store"
-            ))
-        })?;
-        let weights = self.cuda_weights()?;
-        let intermediate = self.topology.intermediate_size;
-        let hidden_size = self.topology.hidden_size;
-
-        let LinearWeightBinding::Nvfp4 {
-            tensor_scale: gate_tensor_scale,
-            input_scale: gate_input_scale,
-            ..
-        } = &common.mlp_gate_proj
-        else {
-            return Err(CoreError::Runtime(
-                "Stage F.4 fast path requires NVFP4 gate_proj".to_owned(),
-            ));
-        };
-        let LinearWeightBinding::Nvfp4 {
-            weight: down_weight,
-            block_scale: down_block_scale,
-            tensor_scale: down_tensor_scale,
-            input_scale: down_input_scale,
-        } = &common.mlp_down_proj
-        else {
-            return Err(CoreError::Runtime(
-                "Stage F.4 fast path requires NVFP4 down_proj".to_owned(),
-            ));
-        };
-
-        let gate_up_alpha = self.tensor_scalar_f32(weights, gate_tensor_scale)?
-            * self.tensor_scalar_f32(weights, gate_input_scale)?;
-        let down_alpha = self.tensor_scalar_f32(weights, down_tensor_scale)?
-            * self.tensor_scalar_f32(weights, down_input_scale)?;
-        let down_input_scale_f32 = self.tensor_scalar_f32(weights, down_input_scale)?;
-
-        // Zero the barrier scratch on the active stream before launch.
-        // Stage F.4 reads 8 u32 slots (4 work counters interleaved with 4
-        // phase spinlocks); the buffer is sized to 64 B which is more
-        // than enough.
-        forward.megakernel_barrier_state.memset_async(0)?;
-
-        self.backend
-            .megakernel_full_attn_stage_f4_mlp_block(&MegakernelFullAttnStageF4Spec {
-                intermediate,
-                hidden_size,
-                gate_up_alpha,
-                down_alpha,
-                down_input_tensor_scale: down_input_scale_f32,
-                hidden_quantized_fp4: forward.activation_fp4.ptr(),
-                hidden_quantized_scale: forward.activation_scale.ptr(),
-                mlp_gate_up_fp4: fused.combined_weight.ptr(),
-                mlp_gate_up_scale: fused.combined_block_scale.ptr(),
-                mlp_down_fp4: self.tensor_ptr(weights, down_weight)?,
-                mlp_down_scale: self.tensor_ptr(weights, down_block_scale)?,
-                gate_up_out: forward.aux.ptr(),
-                // Reuses activation_fp4/_scale: Stage F.4 reads the
-                // post-attn-quantized input during phase 0, then phase 1
-                // overwrites the buffer with the SwiGLU output for phase
-                // 2 to consume as the down GEMV's quantized activation.
-                // Safe because the inter-phase barriers serialize the
-                // reads and writes.
-                swiglu_fp4: forward.activation_fp4.ptr(),
-                swiglu_scale: forward.activation_scale.ptr(),
-                down_out: forward.hidden.ptr(),
-                residual: DevicePtr::NULL,
-                barrier_state: forward.megakernel_barrier_state.ptr(),
-            })
     }
 
     #[cfg(feature = "cuda")]

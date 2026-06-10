@@ -75,7 +75,7 @@ pub fn get_active_stream() -> CudaStream {
 }
 
 /// Register a secondary "prefetch" stream the kernel library can use for
-/// productive-spin / megakernel-side concurrent work. Passing NULL clears it.
+/// productive-spin concurrent work. Passing NULL clears it.
 /// The engine owns the stream's lifetime — see [`OwnedCudaStream`].
 pub fn set_prefetch_stream(stream: CudaStream) {
     unsafe { ffi::qwen36_set_prefetch_stream(stream.0) }

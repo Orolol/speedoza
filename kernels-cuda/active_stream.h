@@ -9,7 +9,7 @@
 extern "C" cudaStream_t qwen36_internal_active_stream();
 
 // Returns the secondary "prefetch" stream the engine has registered (or
-// nullptr if none). Used by productive-spin and megakernel paths to dispatch
+// nullptr if none). Used by the productive-spin path to dispatch
 // concurrent prefetch / helper kernels alongside the main stream. The two
 // streams synchronize via qwen36_cuda_event_record / _stream_wait_event so
 // the whole sequence remains graph-captureable.

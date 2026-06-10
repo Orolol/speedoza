@@ -75,8 +75,8 @@
 //
 // The cp.async / MMA / SF helpers + constants (kRowsPerBlock, kKPerMma,
 // kATilePerWarpBytes, etc.) and the QWEN36_DECODE_GEMV_* macros all live
-// in that header so the per-block megakernel
-// (kernels-cuda/megakernel/full_attn_block_sm120.cu) can reuse them
+// in that header so other fused callers (e.g. the decode interpreter's
+// GEMV opcode) can reuse them
 // without duplicating the inline PTX. Bring them into the unqualified
 // namespace below for the existing kernel body's call sites.
 
@@ -93,8 +93,8 @@ using namespace qwen36_gemv;
 // square the tensor-scale factor and produce silent gibberish on real
 // model weights.
 //
-// The body itself lives in nvfp4_gemv_mma_kernel.cuh so the per-block
-// megakernel can call the same __device__ template without duplicating
+// The body itself lives in nvfp4_gemv_mma_kernel.cuh so other fused
+// callers can call the same __device__ template without duplicating
 // the inline PTX. The __global__ wrapper here is a thin shim that picks
 // up __launch_bounds__ for the standalone-dispatcher launch path.
 template <int kWarpsPerBlockTpl>

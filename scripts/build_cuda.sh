@@ -8,26 +8,9 @@ SM="${QWEN36_FP4_SM:-120a}"
 
 mkdir -p "${OUT_DIR}"
 
-CUTLASS_DIR="${CUTLASS_DIR:-kernels-cuda/cutlass}"
-
-CUTLASS_FLAGS=()
-if [ -d "${CUTLASS_DIR}/include" ]; then
-  CUTLASS_FLAGS+=(
-    -I "${CUTLASS_DIR}/include"
-    -I "${CUTLASS_DIR}/tools/util/include"
-    --expt-relaxed-constexpr
-    --extended-lambda
-  )
-  EXTRA_SRC=(kernels-cuda/megakernel/nvfp4_matvec_sm120.cu)
-else
-  echo "warn: ${CUTLASS_DIR} not found; building without Mirage megakernel" >&2
-  EXTRA_SRC=(kernels-cuda/megakernel/nvfp4_matvec_stub.cu)
-fi
-# decode_gemv is pure CUDA (no CUTLASS dep), always compile the real one.
-EXTRA_SRC+=(kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu)
+# decode_gemv is pure CUDA, always compile the real one.
+EXTRA_SRC=(kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu)
 EXTRA_SRC+=(kernels-cuda/decode_gemv/l2_prefetch.cu)
-# Phase-2 per-block megakernel — pure CUDA, no CUTLASS dep.
-EXTRA_SRC+=(kernels-cuda/megakernel/full_attn_block_sm120.cu)
 # Stage-0 decode interpreter substrate — pure CUDA, no CUTLASS dep.
 EXTRA_SRC+=(kernels-cuda/interpreter/interpreter_sm120.cu)
 # DFlash drafter attention (Phase C v1 + Phase 1 FA-tiled) — pure CUDA.
@@ -42,7 +25,6 @@ EXTRA_SRC+=(kernels-cuda/drafter_attention_flash.cu)
   -arch="sm_${SM}" \
   -I kernels-cuda/include \
   -I kernels-cuda \
-  "${CUTLASS_FLAGS[@]}" \
   kernels-cuda/nvfp4_gemm.cu \
   kernels-cuda/deltanet.cu \
   kernels-cuda/deltanet_prefill.cu \
