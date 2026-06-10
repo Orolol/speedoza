@@ -4,7 +4,7 @@
 > agents, and the same code has been rediscovered or rebuilt more than once. This file is
 > the authoritative map of (1) everything that has been developed, (2) what the default
 > hot path actually executes, (3) what is opt-in, archived-negative, or dead, and (4) every
-> option/env var that toggles a mode. `AGENT.md` is the chronological lab journal; this
+> option/env var that toggles a mode. `DAILY.md` is the chronological lab journal (`AGENT.md` holds instructions only); this
 > file is the consolidated state. If you change a default, a dispatch condition, or add an
 > env var, **update this file in the same commit.**
 >
@@ -83,7 +83,7 @@ activated by flag/env. **NEG** = built, benchmarked negative/neutral, kept in tr
 **Removed 2026-06-10** (branch `chore/rationalization` — recover from git history if ever needed):
 
 - **Mirage CUTLASS megakernel GEMM** (`kernels-cuda/megakernel/nvfp4_matvec_sm120.cu` + stub, `QWEN36_USE_MEGAKERNEL_GEMM`): never executed — the SM120 body was guarded by `CUTLASS_ARCH_MMA_SM120_SUPPORTED` without including the header defining it, so every call silently fell back to cuBLASLt. Its "validated parity" claims tested cuBLASLt against itself. Superseded by the Direction B gemv. Analysis kept in `docs/mirage-megakernel.md`.
-- **Per-block megakernel, all stages** (`kernels-cuda/megakernel/full_attn_block_sm120.cu`, `QWEN36_MEGAKERNEL_FULL_ATTN_STAGE_F4`): only Stage F.4 was wired and it benched **−4.0% MTP=0**; the other stages had no engine call site. The persistent-grid + work-stealing + spinlock-barrier pattern (and its two bring-up bugs) is documented in `AGENT.md` § 2026-05-23.
+- **Per-block megakernel, all stages** (`kernels-cuda/megakernel/full_attn_block_sm120.cu`, `QWEN36_MEGAKERNEL_FULL_ATTN_STAGE_F4`): only Stage F.4 was wired and it benched **−4.0% MTP=0**; the other stages had no engine call site. The persistent-grid + work-stealing + spinlock-barrier pattern (and its two bring-up bugs) is documented in `DAILY.md` § 2026-05-23.
 - **Triton AOT placeholder** (`scripts/triton_aot.py`): never implemented.
 
 Still in tree:
@@ -94,7 +94,7 @@ Still in tree:
 
 ### 2.5 Tried and reverted / falsified — do NOT rebuild without addressing the recorded blocker
 
-Full details in `AGENT.md` (dated sections):
+Full details in `DAILY.md` (dated sections):
 
 - **Full-attn Q/K/V fusion** — parity OK but VRAM pressure destabilized cuBLASLt plan caching (−10–20% MTP=2/3). Needs dropping originals post-fuse first.
 - **Single-block GQA decode kernel** (non-split path) — −5%; the split-GQA kernel already covers the win regime.
@@ -108,7 +108,7 @@ Full details in `AGENT.md` (dated sections):
 
 - **Per-token decode vs prefill logits divergence** (cos ~0.76 on some inputs) — diagnostic: `qwen36 decode-vs-prefill-check`. DFlash routes around it by verifying through prefill chunks.
 - **MTP≥1 chunked verify is not bit-equal to MTP=0** — 1–2 token flips on borderline-argmax prompts. Parity floor = `hello` / `hello world` gates.
-- **Long-context prefill is latency-stalled** (274 tok/s at 64K, 170 W) — flash/sage prefill kernels have no cp.async pipelining. This is the current top optimization target (`AGENT.md` § Next steps).
+- **Long-context prefill is latency-stalled** (274 tok/s at 64K, 170 W) — flash/sage prefill kernels have no cp.async pipelining. This is the current top optimization target (`DAILY.md` § Next steps).
 - **Default config OOM trap**: `EngineConfig::default()` reserves 262K context; fused stores don't fit at intermediate `max_context` (2–4K) on a busy GPU → use `QWEN36_LONG_CONTEXT_MODE=1`.
 
 ## 3. Attention dispatch reference
@@ -294,7 +294,8 @@ GPU-gated Rust without linking), and the workspace tests. The GPU gates
 (`build_cuda.sh`, `smoke_cuda.sh`, `verify_perf_gate.sh`) remain local and
 mandatory before merging anything that touches kernels or the engine hot path.
 
-Docs: `doc.md` = design spec (start here for intent). `AGENT.md` = agent rules + dated
-experiment journal (the source of the verdicts summarized in §2). `docs/*.md` = operational
+Docs: `doc.md` = design spec (start here for intent). `AGENT.md` = agent instructions,
+contracts and guardrails. `DAILY.md` = dated experiment journal (the source of the
+verdicts summarized in §2). `docs/*.md` = operational
 guides. `docs/superpowers/{specs,notes,plans}` = per-experiment design docs and write-ups;
 `plans/archive/` is historical. `benches/data/` holds the real-text bench prompts.
