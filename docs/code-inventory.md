@@ -295,7 +295,7 @@ GPU-gated Rust without linking), and the workspace tests. The GPU gates
 (`build_cuda.sh`, `smoke_cuda.sh`, `verify_perf_gate.sh`) remain local and
 mandatory before merging anything that touches kernels or the engine hot path.
 
-Docs: `doc.md` = design spec (start here for intent). `AGENT.md` = agent instructions,
+Docs: `docs/perf-roadmap.md` = prioritized perf trajectory. `doc.md` = design spec (start here for intent). `AGENT.md` = agent instructions,
 contracts and guardrails. `DAILY.md` = dated experiment journal (the source of the
 verdicts summarized in §2). `docs/*.md` = operational
 guides. `docs/superpowers/{specs,notes,plans}` = per-experiment design docs and write-ups;
