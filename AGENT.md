@@ -276,6 +276,7 @@ Adding a new parity checkpoint takes ~5 lines:
 ## References
 
 - `docs/code-inventory.md` — current state of every component, flag, and dispatch path
+- `docs/perf-roadmap.md` — prioritized performance trajectory (gains + kill-gates per item)
 - `DAILY.md` — chronological lab journal (experiments, benches, verdicts)
 - `doc.md` — full implementation specification (start here for design intent)
 - `CONTRIBUTING.md` — baseline workflow and the rules above

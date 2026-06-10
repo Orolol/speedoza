@@ -31,6 +31,9 @@ Files: <paths>. Inventory updated: yes/no.
 
 ## Next steps (état au 2026-06-09, fin de session)
 
+> 2026-06-10: superseded/absorbed by `docs/perf-roadmap.md` (P1) — keep for the
+> per-item context below.
+
 Ordonnés par ROI attendu. Chaque item porte son gate de validation.
 
 1. **Valider le reduce parallèle décode (DANS L'ARBRE, bench en attente).**
@@ -93,6 +96,28 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 ---
 
 ## Journal
+
+### 2026-06-10 — Performance trajectory researched and written — DECISION
+
+Researched current SOTA for single-stream low-latency inference (Xiaomi
+MiMo/TileRT 1T @ 1000+ tok/s, Hazy Research "no bubbles" megakernel,
+EAGLE-3.1) and wrote the prioritized roadmap: `docs/perf-roadmap.md`.
+
+Key findings:
+- MiMo's recipe = FP4 + DFlash (block=8, AL 6.3 code) + persistent-pipeline
+  runtime — maps 1:1 onto this repo's three lanes; we already ship two.
+- The Hazy megakernel names the exact mechanisms our three failed fusion
+  attempts lacked: SMEM paging with cross-instruction weight prefetch,
+  counter-based fine-grained chunking, parallel instruction emission. Their
+  result: 78% DRAM BW vs our measured ~40% (19.6 ms/token vs ~7.7 ms
+  weight-read floor ⇒ ~129 tok/s MTP=0 ceiling).
+- Roadmap: P0 correctness+Nsight audit → P1 banked wins (prefill cp.async,
+  graphed DFlash verify, split-reduce bench) → P2 speculation quality (ONE
+  training bet: drafter fine-tune vs EAGLE-3.1 head; adaptive routing) →
+  P3 persistent-pipeline lane with strict kill-gates → P4 long-ctx →
+  P5 system floor. Targets: MTP=0 ≥80, DFlash typical ≥250, prefill@64K ≥1000.
+
+Files: docs/perf-roadmap.md (new). Inventory updated: pointer added.
 
 ### 2026-06-10 — KVarN (huawei-csl) evaluated for KV-cache quantization — DECISION: not integrated
 
