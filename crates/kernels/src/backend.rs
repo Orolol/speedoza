@@ -196,7 +196,14 @@ impl KernelBackend for CudaBackend {
         // QWEN36_STATUS_NOT_IMPLEMENTED we fall through to the cuBLASLt
         // routing. See the Direction B spec under
         // `docs/superpowers/specs/2026-05-04-direction-b-nvfp4-gemv-design.md`.
-        if decode_gemv_enabled() && spec.n == 1 {
+        // Exception measured 2026-06-10 (kernels-cuda/tools/gemv_shape_bench,
+        // cold-data per-shape A/B): the mlp.down decode shape (M=5120,
+        // K=17408) is the one production shape where cuBLASLt beats the
+        // hand-rolled gemv (55.4 vs 68.0 µs — the 320-CTA grid cannot hide
+        // DRAM latency over the long K). Route it straight to cuBLASLt;
+        // every other decode shape keeps the gemv (it wins 1.3-2.9x there).
+        let cublaslt_preferred = spec.m == 5120 && spec.k == 17408;
+        if decode_gemv_enabled() && spec.n == 1 && !cublaslt_preferred {
             let code = unsafe { ffi::qwen36_decode_nvfp4_gemv(&ffi_spec) };
             if code != 5 {
                 return check("qwen36_decode_nvfp4_gemv", code);

@@ -97,6 +97,49 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-10 — GEMV par shape : mlp.down routé vers cuBLASLt (+4.1% MTP=0) ; profondeur de pipeline falsifiée — SHIPPED + NEGATIVE
+
+Nouvel instrument : `kernels-cuda/tools/gemv_shape_bench.cu` — microbench
+apparié par shape de production du gemv Direction B, **données froides**
+(rotation sur N copies de A, footprint > L2 96 MB ; la v1 mono-buffer
+mesurait le L2 à 2.4 TB/s, piège classique). Total isolé 12.01 ms/token
+= l'in-situ nsys (12.10) : méthodologie validée.
+
+| shape | M | K | CTAs | %peak gemv | cuBLASLt µs (vs gemv µs) |
+|---|---:|---:|---:|---:|---:|
+| mlp.gate_up | 34816 | 5120 | 2176 | **81%** | 96.9 vs 69.5 |
+| mlp.down | 5120 | 17408 | 320 | **41%** | **55.4 vs 68.0 ← cuBLASLt gagne** |
+| deltanet.in_proj | 16640 | 5120 | 1040 | 73% | 47.1 vs 36.9 |
+| deltanet.out_proj | 5120 | 3584 | 320 | 56% | 18.4 vs 10.4 |
+| attn.q_proj | 12288 | 5120 | 768 | 69% | 36.9 vs 28.8 |
+| attn.kv_proj | 1024 | 5120 | 64 | 26% | 18.3 vs 6.3 |
+| attn.o_proj | 5120 | 6144 | 320 | 60% | 22.5 vs 16.5 |
+
+**SHIPPED — routing par shape** : mlp.down (M=5120, K=17408) part
+désormais directement sur cuBLASLt (`backend.rs`, condition de shape
+exacte, commentaire avec la mesure) ; toutes les autres shapes gardent
+le gemv (1.3-2.9× plus rapide). E2e MTP=0 @3K : **59.4 → 61.8 tok/s
+(+4.1%)**, 3 reps stables. Gates : smoke vert, parité inchangée
+(cuBLASLt = le chemin historiquement validé).
+
+**NEGATIVE — profondeur de pipeline A 2→4** (l'expérience kernel-level
+du prototype SMEM-paging) : ring de 4 buffers de 512 B/warp, 3 chunks
+en vol au lieu d'1. Résultat : **+0% partout** (81→81, 73→71, 69→66,
+56→56, 60→56) et K=17408 dépasse les 48 KB SMEM (rejeté). Reverté.
+Lecture : tripler les octets en vol par warp ne change RIEN → le gemv
+n'est PAS limité par la profondeur de prefetch par warp ; le
+pré-chauffage SMEM du design Hazy (même mécanisme, plus de complexité)
+est donc très improbablement gagnant ici. La corrélation dominante du
+tableau est le **nombre de CTAs** (64→23%, 320→56-60%, 768→66%,
+1040→73%, 2176→81%). Piste survivante pour la famille 320-CTAs
+(out_proj, o_proj ; down est routé) : **split-K au niveau CTA** avec
+reduce déterministe (PAS d'atomics FP32), à prototyper sur o_proj.
+Gain résiduel accessible ≈ 0.3-0.5 ms/token (~+2-3%) — sous la barre
+des 15%, à coupler avec lm_head FP8.
+
+Files: crates/kernels/src/backend.rs (routing), kernels-cuda/tools/
+gemv_shape_bench.cu (nouveau, instrument permanent). Inventory: oui.
+
 ### 2026-06-10 — P5 plancher système : clock-lock impossible en conteneur, le reste < 1% — DECISION (différé)
 
 `nvidia-smi -lgc` est refusé (conteneur Vast non privilégié) — le lock
