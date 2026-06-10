@@ -41,34 +41,47 @@ explains precisely (see P3).
       `DAILY.md` § 2026-06-10. MTP=0 numbers are trustworthy again. The
       possible DFlash AL dividend (verify/decode consistency) is still
       unmeasured — re-run the AL battery when touching that lane.
-- [ ] **Merge `chore/rationalization`** after on-target GPU validation
-      (`build_cuda.sh && smoke_cuda.sh`, perf gate, parity floor).
-- [ ] **One bench dashboard**: a single script (fixed corpus from
-      `benches/data/`, fixed configs: MTP {0,4} × ctx {128, 3K, 8K, 24K} +
-      DFlash 2 cells) that emits one table to paste into DAILY.md. Every
-      perf item below cites before/after from this script, nothing else.
-- [ ] **Nsight bandwidth audit of the decode hot path** (cheap, sizes P3):
-      % peak DRAM BW per kernel (gemv shapes M={5120,16640,34816},
-      deltanet, tiled attention, lm_head). Output: a table in DAILY.md
-      naming the worst offenders. This decides where P3 starts.
+- [x] **Merge `chore/rationalization`** — DONE 2026-06-10: the branch content
+      was already merged into main (d25daca); on-target validation re-run green
+      the same day (smoke suite, MTP parity floor 10/10, decode-vs-prefill
+      argmax_match cos 0.9977, perf gate MTP=0 52.3 / MTP=4 95.3 tok/s).
+- [x] **One bench dashboard** — DONE 2026-06-10: `scripts/bench_dashboard.sh`
+      (corpus `benches/data/bench_corpus_91k.txt`, MTP {0,4} × ctx {128, 3K,
+      8K, 24K} + DFlash 2 cells). Baseline table in DAILY.md § 2026-06-10.
+      Found: MTP=4 on real text is ~40 tok/s (synthetic 95 is full-accept
+      artefact) and LOSES to MTP=0 at 24K — routing (P2) must be
+      best-of-three {MTP=0, MTP=4, DFlash}.
+- [x] **Nsight bandwidth audit of the decode hot path** — DONE 2026-06-10
+      (ncu blocked by host counter perms; equivalent via nsys
+      `--cuda-graph-trace=node` + analytic weight bytes — table in DAILY).
+      GEMV 62% peak (12.1 ms/tok, 72% of the token) → SMEM-paging
+      prototype's +20% gate is plausible (62→78% = +26%); lm_head cuBLAS
+      already 86% (NVFP4 saves ~1 ms); NEW: 128 rmsnorm+quantize launches
+      = 1.21 ms/tok (7%), pure node-latency — fusion candidate. Realistic
+      MTP=0 ceiling ≈ 87 tok/s at Hazy-level 78% everywhere.
 
 ## P1 — Bank the pending wins (days, already scoped or in-tree)
 
-- [ ] **Bench the parallel split-reduce** (in tree, gate pending).
-      Expected: full_attn flat ≈5–6 ms at 64K → decode ~43–46 tok/s @64K
-      (vs 32.7). Gate: `verify_perf_gate.sh` + 24K/64K cells.
-- [ ] **Prefill cp.async pipeline** (top scoped item; DAILY § Next steps 2).
-      flash/sage prefill have zero cp.async/double-buffering — 170 W
-      latency-stalled at 64K. 2–3 stage pipelined K/V tile loads.
-      Expected: 3–5× prefill at 64K (274 → ≥1000 tok/s). Gate: wattmeter
-      400–500 W + parity (cos ≥ 0.998) + no short-ctx regression.
+- [x] **Bench the parallel split-reduce** — DONE 2026-06-10: decode @64K
+      32.7 → 35.6 tok/s (+8.9%), @24K 47.2. Below the 43–46 prediction —
+      the residual 64K cost is NOT in the reduce anymore; suspect the tiled
+      kernel's own loads (Nsight 64K cell to confirm). Perf gate green.
+- [x] **Prefill cp.async pipeline** — SHIPPED 2026-06-10 (sage kernel, both
+      KV dtypes; `QWEN36_SAGE_PIPELINE=0` kill switch). BF16 (default path):
+      64K prefill 306 → **884 tok/s (×2.89)**, 24K +71%, 8K +35%. FP8: 64K
+      ×2.09. Bit-identical to legacy (8-case smoke gate). Power @64K
+      180 → 238 W — latency remains; scoped next notch: stage K(i+1) in two
+      16 KB half-tiles, and/or q_head → grid.z (the q_head outer loop
+      re-reads the KV stripe 6× per CTA). The ≥1000 target is within one
+      iteration's reach.
 - [ ] **CUDA-graph the DFlash verify** (`verify_block_batched`): documented
       estimate +20–30% DFlash tok/s. #55 made the split-K path capture-safe
       already. Gate: byte-identical DFlash output on the AL battery prompts.
-- [ ] **Interpreter MLP-chunking bench** (Codex lane gate (a)): ≥+2–3 tok/s
-      on a counting path → the pipelining thesis lives and feeds P3;
-      ~0% → freeze the interpreter as MTP>0 auto-only (the +7.3% is banked)
-      and P3 proceeds on the Hazy design instead.
+- [x] **Interpreter MLP-chunking bench** — DONE 2026-06-10, **gate FAILED
+      (+0.0%)**: interpreter frozen. Worse: interpreter ON vs OFF at MTP=4
+      on real text is 39.5 vs 39.5 — the historical "+7.3%" was a
+      synthetic-prompt artefact. No measured gain justifies the lane;
+      candidate for deletion under the complexity budget.
 
 ## P2 — Tokens per forward: speculation quality (MiMo's main lever)
 
@@ -98,11 +111,14 @@ the whole project: every +1 AL ≈ +15–20% end-to-end.
       4×/cycle at MTP=4. Needs a parity harness vs BF16 head first
       (MTP parity floor is the gate). Expected: +5–10% on MTP modes
       (which remain the long-prompt fallback even with DFlash routing).
-- [ ] **Evaluate EAGLE-3.1-style head** (vLLM blog 2026-05: up to 2× AL at
-      long ctx vs EAGLE-3; ~4.5–5 AL typical): would directly attack our
-      weak regime (long-ctx low-AL). Heavy: requires training a head on
-      Qwen3.6 hidden states. Decision item only — score vs drafter
-      fine-tune on (cost, expected AL, risk); pick ONE training-side bet.
+- [x] **Evaluate EAGLE-3.1-style head** — DECIDED 2026-06-10 (see DAILY):
+      the training bet is the **drafter long-context fine-tune**, not EAGLE.
+      The DFlash paper (2602.06036v2 §5.4) already validates the exact
+      fine-tune (AL 3.61→6.05 @16K, 1.6K samples, no short-ctx regression);
+      EAGLE-3.1 has no published absolute long-ctx AL, no hybrid-target
+      training support, and a chain-mode ceiling below our current DFlash.
+      Launch awaits user sign-off (<$200 compute + 1–2 weeks pipeline
+      reimplementation, training code unreleased).
 - [ ] ~~Tree/multi-leaf speculation~~ — blocked until a batched-leaf
       forward exists (inventory §2.5); re-open only if the routing +
       fine-tune lane plateaus.
@@ -131,9 +147,12 @@ that's the part we never built:
 
 TODO, strictly gated:
 
-- [ ] **Substrate cost probe** (gate (b), ~1 day): a 64-layer trampoline
-      program; the ~512 grid-wide counter barriers must cost <0.5 ms/token
-      or the single-launch path is dead on SM120 and we stop here.
+- [x] **Substrate cost probe** — MEASURED 2026-06-10, **gate FAILED**:
+      2.411 ms / 512-barrier program (4.71 µs/barrier) vs the <0.5 ms gate.
+      **The whole-decode single-launch path is dead on SM120.** The probe
+      lives in smoke.cu. Only the GEMV SMEM-paging prototype (own
+      kernel-level gate) and lm_head NVFP4 survive in this lane; full-layer
+      single-launch items below are closed.
 - [ ] **GEMV SMEM-paging prototype on ONE shape** (M=5120 decode gemv):
       refactor the NVFP4 GEMV body to read its A-operand from a pre-warmed
       SMEM page (the scoped multi-day refactor of
@@ -143,14 +162,18 @@ TODO, strictly gated:
 - [ ] **MLP chunked pipeline** (gate+up → SwiGLU → down in 4 chunks with
       counters, K-sliced FP32 accum for down). Expected from Hazy's
       numbers: MLP bucket 10.7 → ~7 ms.
-- [ ] **Full-layer program with prefetch overlap**, then whole-decode
-      single launch. End gate: **MTP=0 ≥ +15%** vs captured-graph baseline
-      (i.e. ≥ 58 tok/s) at the first milestone, ≥ 75 tok/s at lane end,
-      MTP parity floor intact, MTP=4 not regressed (defend the +7.3%).
-- [ ] **lm_head NVFP4** (small, independent): 1.55 GB BF16 read = 0.87 ms
-      floor of its measured 1.65 ms; FP4 → ~0.4 ms. ~+1 ms/token ≈ +5%
-      MTP=0. Needs argmax-parity gate on the bench corpus (top-1 flips =
-      fail, it feeds sampling directly).
+- [~] ~~Full-layer program with prefetch overlap, whole-decode single
+      launch~~ — CLOSED 2026-06-10 by the substrate probe (4.71 µs/barrier;
+      512 barriers/token alone exceed the per-token budget). Re-open only
+      with a fundamentally cheaper sync design (cluster-local mbarriers +
+      true parallel emission, i.e. the full Hazy design — not the current
+      counter substrate).
+- [x] ~~lm_head NVFP4~~ — **FALSIFIED 2026-06-10** by an offline probe
+      before any kernel work: 1 top-1 flip / 27 real normed positions
+      (3.7%); low-margin positions (p10 = 0.25) sit under the FP4 noise
+      (max Δlogit 1.24). Recorded rescue paths (DAILY): FP8 lm_head
+      (~+2.5%, likely clean) or FP4-topk + BF16 rescore. Do not rebuild
+      without one of them.
 
 Explicit non-goals for this lane (already falsified here): naive op fusion
 without prefetch, L2-pinning tricks against graph replay, persistent grids

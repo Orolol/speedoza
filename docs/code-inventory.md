@@ -54,7 +54,7 @@ activated by flag/env. **NEG** = built, benchmarked negative/neutral, kept in tr
 | DeltaNet decode + chunked prefill | `kernels-cuda/deltanet.cu`, `deltanet_prefill.cu` | 48 linear-attention layers; chunked prefill default ON |
 | Elementwise/fused ops | `kernels-cuda/ops.cu` | rmsnorm (+nvfp4-quantize), swiglu (+nvfp4-quantize), conv1d (+gdn-gate fused), sampling, embedding, q_proj deinterleave/gate |
 | Partial RoPE | in `ops.cu` / `crates/kernels/src/rope.rs` | 64 of 256 dims |
-| FP8 KV cache | engine + attention kernels | default KV dtype (`EngineConfig::default`, `engine.rs:602`) |
+| KV cache dtype | engine + attention kernels | `EngineConfig::default` is FP8 (`engine.rs:602`) **but the CLI overrides per command**: `chat`/`bench` default **BF16**, DFlash paths default **FP8** (`cli/main.rs cuda_kv_cache_dtype` call sites); `QWEN36_KV_CACHE_DTYPE` overrides all. Discovered 2026-06-10 — perf numbers from bench/chat are BF16-KV numbers |
 | MTP chain controller + verify graphs | `crates/mtp/src/lib.rs`, engine | opt-in by CLI flag but fully on the supported path; MTP=1 two-token graph, MTP=2/3/4 chunked verify + multi-graph |
 | Decode interpreter (whole-layer fused launches) | `kernels-cuda/interpreter/`, `crates/kernels/src/interpreter.rs`, `crates/runtime/src/interpreter_compile.rs` | **AUTO**: enabled iff `mtp_speculative_tokens > 0` (+7.3% MTP=4), disabled at MTP=0 (would regress −5%). `QWEN36_INTERPRETER_DECODE=0|1|auto` |
 
@@ -104,6 +104,8 @@ Full details in `DAILY.md` (dated sections):
 - **Lossy env-tuned split-K verify** (`QWEN36_PREFILL_SPLIT_MAX_TOKENS=16`) — 5× at 7K but AL-destroying at 3K; superseded by the faithful `attention_flash_splitk.cu`.
 - **KVarN (huawei-csl) KV-cache quantization** — evaluated 2026-06-10, NOT integrated: it is a vLLM fork (Python/Triton), KV is not the bottleneck at ≤24K (already FP8 + in-house TQ3/TQ35), and sub-4-bit V risks the known speculative-loop AL amplification. If the B1 lane (aggressive KV quant for 64K–262K) is reopened, its recipe (asymmetric K4/V2 RTN + Hadamard rotation, 128-token tiles, calibration-free) is the reference to port — see `DAILY.md` § 2026-06-10.
 - **Synthetic-prompt MTP acceptance dips** (acc 0.84 at 4K) — artefact of single-token-repeat bench prompts; falsified as a kernel bug. Use `--prompt-file` or `chat`+`QWEN36_MTP_STATS=1`.
+- **lm_head NVFP4** — falsified 2026-06-10 by an offline numpy probe before any kernel work: 1 top-1 flip / 27 real `final_normed` positions (3.7%); low-margin (p10 0.25) positions sit under FP4 noise (max Δlogit 1.24). Retry only via FP8 lm_head or FP4-topk+BF16-rescore (see DAILY).
+- **Interpreter whole-decode single-launch + MLP chunking** — closed 2026-06-10: substrate probe measured 4.71 µs/grid-barrier (512-barrier program = 2.4 ms/token vs the <0.5 ms gate) and MLP-chunking benched +0.0% at MTP=4 on real text. The historical "+7.3% MTP=4 interpreter" gain is a synthetic-prompt artefact (ON vs OFF = 39.5 vs 39.5 tok/s on the dashboard corpus). Lane frozen; deletion candidate under the complexity budget.
 
 ### 2.6 Known open issues
 
@@ -146,6 +148,7 @@ Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
 | Var | Default | Effect |
 |---|---|---|
 | `QWEN36_ATTENTION_SAGE_PREFILL` | **1** | `0` falls back to flash BF16 prefill (`attention.cu:2565`) |
+| `QWEN36_SAGE_PIPELINE` | **1** | `0` disables the sage prefill cp.async pipeline (FP8: staged raw KV tiles; BF16: V copied async directly into SMEM). Bit-identical to legacy (smoke-gated); kill switch only (`attention_sage_prefill.cu`) |
 | `QWEN36_ATTENTION_FLASH_PREFILL` | **1** | `0` falls back to scalar GQA prefill (`attention.cu:2578`) |
 | `QWEN36_VERIFY_FLASH_SPLITK` | **1** | `0` forces scalar GQA for 2–32-token verify chunks (`attention.cu:2655`) |
 | `QWEN36_DECODE_TILED_ATTENTION` | **1** | `0` forces v1 scalar split decode kernel (`attention.cu:2777`) |
@@ -284,6 +287,8 @@ in `crates/kernels/src/backend.rs` + the typed spec module + `smoke.cu`** (see A
 |---|---|
 | `build_cuda.sh` / `smoke_cuda.sh` | build `.so` (sm_120a) / run kernel smoke suite |
 | `verify_perf_gate.sh` | **run before/after any perf change** — DFlash split-K + MTP interpreter gates vs baselines |
+| `bench_dashboard.sh` | **THE perf dashboard** (roadmap P0): fixed grid MTP {0,4} × ctx {128,3K,8K,24K} on the frozen `benches/data/bench_corpus_91k.txt` + 2 DFlash cells; every roadmap perf item cites before/after from this script |
+| `nsight_audit.sh` | ncu DRAM-bandwidth audit of the decode hot path (sizes the P3 lane) |
 | `bench_matrix.sh`, `bench_tq35_contexts.sh`, `bench_attention_ab.sh`, `profile_bench.sh` | bench sweeps / A-B / nsys profiling |
 | `quality_tq35.sh` | TQ35 vs BF16 KV logits quality |
 | `decode_parity.py`, `dflash_parity.py` | PyTorch parity (64-layer decode boundaries / drafter fixtures) |

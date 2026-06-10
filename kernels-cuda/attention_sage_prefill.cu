@@ -26,8 +26,11 @@
 #include "active_stream.h"
 
 #include <cuda_bf16.h>
+#include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 #include <mma.h>
+
+#include <cstdlib>
 
 namespace wmma = nvcuda::wmma;
 
@@ -97,6 +100,38 @@ mma_m16n8k32_s8(int32_t (&d)[4], const uint32_t (&a)[4],
         "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
 }
 
+// cp.async stage of one raw FP8 KV tile (kSageN rows × kSageD bytes) into
+// SMEM.  Rows past kv_total are zero-filled with plain stores (e4m3 code 0
+// decodes to +0.0f, matching the legacy out-of-range load behaviour).  The
+// caller owns the barriers: the stage buffer must not have pending readers
+// when this is called, and consumers must __pipeline_wait_prior(0) +
+// __syncthreads() before reading.
+__device__ __forceinline__ void
+sage_stage_fp8_tile_async(uint8_t *stage, const uint8_t *cache, size_t k_base,
+                          size_t kv_total, size_t kv_heads, size_t kvh) {
+  constexpr int kChunksPerRow = kSageD / 16;
+  const size_t rows_valid =
+      (k_base < kv_total)
+          ? min(static_cast<size_t>(kSageN), kv_total - k_base)
+          : 0;
+  const size_t tail_chunks = (kSageN - rows_valid) * kChunksPerRow;
+  for (size_t i = threadIdx.x; i < tail_chunks; i += blockDim.x) {
+    const size_t row = rows_valid + i / kChunksPerRow;
+    const size_t off = (i % kChunksPerRow) * 16;
+    *reinterpret_cast<uint4 *>(stage + row * kSageD + off) =
+        make_uint4(0, 0, 0, 0);
+  }
+  for (size_t i = threadIdx.x; i < rows_valid * kChunksPerRow;
+       i += blockDim.x) {
+    const size_t row = i / kChunksPerRow;
+    const size_t off = (i % kChunksPerRow) * 16;
+    __pipeline_memcpy_async(
+        stage + row * kSageD + off,
+        cache + ((k_base + row) * kv_heads + kvh) * kSageD + off, 16);
+  }
+  __pipeline_commit();
+}
+
 // Per-row INT8 quantisation: each warp owns `rows_per_warp` rows.  For each
 // row, the 32 lanes scan D=256 cols (8 elements per lane), compute the row
 // abs-max via shfl_xor reduction, write the scale to `sm_scale[row]`, then
@@ -136,6 +171,54 @@ sage_per_row_quantize(int8_t *dst, float *sm_scale, SrcLoad src_load) {
   }
 }
 
+// Pipeline modes (same arithmetic order as legacy in every mode, so outputs
+// are bit-identical — gated in smoke.cu; kill: QWEN36_SAGE_PIPELINE=0):
+//  kPipeNone  — legacy synchronous loads.
+//  kPipeFp8   — cp.async ping-pong of the raw FP8 KV tiles through a 16 KB
+//               SMEM stage: V(i)'s transfer overlaps the INT8 S=QK^T mma,
+//               K(i+1)'s transfer overlaps softmax+PV.  FP8 cache only (a
+//               BF16 stage would not fit the 99 KB sm_120a SMEM cap).
+//  kPipeBf16V — BF16 cache: V(i) is cp.async'd DIRECTLY into sm_V (no
+//               decode needed, no extra SMEM), overlapping K-quantize +
+//               S mma; K loads stay synchronous (no room to stage 32 KB).
+constexpr int kPipeNone = 0;
+constexpr int kPipeFp8 = 1;
+constexpr int kPipeBf16V = 2;
+
+// cp.async of one BF16 V tile straight into sm_V; rows past kv_total are
+// zero-filled with plain stores.  Caller owns the barriers (sm_V must have
+// no pending readers; consumers wait_prior(0) + __syncthreads()).
+__device__ __forceinline__ void
+sage_stage_bf16_v_async(__nv_bfloat16 *sm_V, const __nv_bfloat16 *cache,
+                        size_t k_base, size_t kv_total, size_t kv_heads,
+                        size_t kvh) {
+  constexpr int kRowBytes = kSageD * sizeof(__nv_bfloat16); // 512
+  constexpr int kChunksPerRow = kRowBytes / 16;             // 32
+  const size_t rows_valid =
+      (k_base < kv_total)
+          ? min(static_cast<size_t>(kSageN), kv_total - k_base)
+          : 0;
+  const size_t tail_chunks = (kSageN - rows_valid) * kChunksPerRow;
+  uint8_t *dst = reinterpret_cast<uint8_t *>(sm_V);
+  const uint8_t *src = reinterpret_cast<const uint8_t *>(cache);
+  for (size_t i = threadIdx.x; i < tail_chunks; i += blockDim.x) {
+    const size_t row = rows_valid + i / kChunksPerRow;
+    const size_t off = (i % kChunksPerRow) * 16;
+    *reinterpret_cast<uint4 *>(dst + row * kRowBytes + off) =
+        make_uint4(0, 0, 0, 0);
+  }
+  for (size_t i = threadIdx.x; i < rows_valid * kChunksPerRow;
+       i += blockDim.x) {
+    const size_t row = i / kChunksPerRow;
+    const size_t off = (i % kChunksPerRow) * 16;
+    __pipeline_memcpy_async(
+        dst + row * kRowBytes + off,
+        src + ((k_base + row) * kv_heads + kvh) * kRowBytes + off, 16);
+  }
+  __pipeline_commit();
+}
+
+template <int kPipeMode>
 __global__ void
 attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
                               const void *cache_v, int kv_cache_dtype,
@@ -187,6 +270,8 @@ attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
   float *sm_l = sm_m + kSageM;
   float *sm_alpha = sm_l + kSageM;
   float *sm_k_mean = sm_alpha + kSageM; // [kSageD] per-channel K mean (smooth-K)
+  // Raw FP8 stage for the cp.async pipeline (16 KB, pipelined variant only).
+  uint8_t *sm_stage = reinterpret_cast<uint8_t *>(sm_k_mean + kSageD);
   // After the K-iter loop we reuse the sm_V region (32 KB) as f32 O scratch.
 
   for (size_t qh_local = 0; qh_local < q_per_kv; ++qh_local) {
@@ -216,6 +301,12 @@ attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
     __syncthreads();
 
     const size_t k_iters = (max_kv_visible + kSageN) / kSageN;
+    if constexpr (kPipeMode == kPipeFp8) {
+      // Prologue: K(0) in flight while the row state above settles.
+      sage_stage_fp8_tile_async(sm_stage,
+                                reinterpret_cast<const uint8_t *>(cache_k),
+                                /*k_base=*/0, kv_total, shape.kv_heads, kvh);
+    }
     for (size_t k_iter = 0; k_iter < k_iters; ++k_iter) {
       const size_t k_base = k_iter * kSageN;
       if (k_base > max_kv_visible) {
@@ -227,7 +318,28 @@ attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
       // we skip the staging entirely and read K from the cache directly into
       // the int8 buffer, matching the B.0 layout that won +23% at T=1024.
       constexpr bool kSmoothKEnabled = false;
-      if constexpr (kSmoothKEnabled) {
+      if constexpr (kPipeMode == kPipeBf16V) {
+        // V(i) straight into sm_V; its transfer overlaps the K quantize
+        // below and the INT8 S = Q @ K^T mma.  sm_V has no pending readers
+        // here (PV(i-1) retired at the loop-end __syncthreads()).
+        sage_stage_bf16_v_async(sm_V,
+                                reinterpret_cast<const __nv_bfloat16 *>(
+                                    cache_v),
+                                k_base, kv_total, shape.kv_heads, kvh);
+      }
+      if constexpr (kPipeMode == kPipeFp8) {
+        __pipeline_wait_prior(0);
+        __syncthreads(); // stage holds raw K(i)
+        sage_per_row_quantize<kSageKRowsPerWarp>(
+            sm_K_int8, sm_kscale, [&](int row, int d) -> float {
+              return sage_decode_e4m3(sm_stage[row * kSageD + d]);
+            });
+        __syncthreads(); // sm_K_int8 ready; stage has no readers left
+        // V(i)'s transfer overlaps the INT8 S = Q @ K^T mma below.
+        sage_stage_fp8_tile_async(sm_stage,
+                                  reinterpret_cast<const uint8_t *>(cache_v),
+                                  k_base, kv_total, shape.kv_heads, kvh);
+      } else if constexpr (kSmoothKEnabled) {
         for (size_t i = threadIdx.x; i < kSageN * kSageD; i += blockDim.x) {
           const size_t n = i / kSageD;
           const size_t d = i % kSageD;
@@ -270,20 +382,25 @@ attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
       __syncthreads();
 
       // Now load V bf16 over sm_V (BF16 PV path; switches to FP8 in B.2).
-      for (size_t i = threadIdx.x; i < kSageN * kSageD; i += blockDim.x) {
-        const size_t n = i / kSageD;
-        const size_t d = i % kSageD;
-        const size_t kv_idx = k_base + n;
-        if (kv_idx >= kv_total) {
-          sm_V[i] = __float2bfloat16(0.0f);
-        } else {
-          const size_t cache_index =
-              (kv_idx * shape.kv_heads + kvh) * head_dim + d;
-          sm_V[i] = __float2bfloat16(
-              sage_load_kv_f32(cache_v, kv_cache_dtype, cache_index));
+      // Pipelined variants: V(i) is still in flight — it lands in sm_V
+      // (kPipeBf16V: directly; kPipeFp8: decoded from the stage) after the
+      // S = Q @ K^T mma below, so the transfer overlaps it.
+      if constexpr (kPipeMode == kPipeNone) {
+        for (size_t i = threadIdx.x; i < kSageN * kSageD; i += blockDim.x) {
+          const size_t n = i / kSageD;
+          const size_t d = i % kSageD;
+          const size_t kv_idx = k_base + n;
+          if (kv_idx >= kv_total) {
+            sm_V[i] = __float2bfloat16(0.0f);
+          } else {
+            const size_t cache_index =
+                (kv_idx * shape.kv_heads + kvh) * head_dim + d;
+            sm_V[i] = __float2bfloat16(
+                sage_load_kv_f32(cache_v, kv_cache_dtype, cache_index));
+          }
         }
+        __syncthreads();
       }
-      __syncthreads();
 
       // -------------------- S = Q @ K^T (inline PTX m16n8k32 INT8) --------------------
       // Each warp owns 4 N-atoms of 8 cols each, covering its 32-col N-half.
@@ -353,6 +470,23 @@ attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
       }
       __syncthreads();
 
+      if constexpr (kPipeMode == kPipeFp8) {
+        // V(i) finished its overlap window with the S mma; decode it to BF16
+        // and immediately put K(i+1) in flight to overlap softmax + PV.
+        __pipeline_wait_prior(0);
+        __syncthreads(); // stage holds raw V(i)
+        for (size_t i = threadIdx.x; i < kSageN * kSageD; i += blockDim.x) {
+          sm_V[i] = __float2bfloat16(sage_decode_e4m3(sm_stage[i]));
+        }
+        __syncthreads(); // sm_V ready; stage has no readers left
+        if (k_iter + 1 < k_iters) {
+          sage_stage_fp8_tile_async(sm_stage,
+                                    reinterpret_cast<const uint8_t *>(cache_k),
+                                    k_base + kSageN, kv_total, shape.kv_heads,
+                                    kvh);
+        }
+      }
+
       // -------------------- dequant + causal mask + qk_scale --------------------
       for (size_t i = threadIdx.x; i < kSageM * kSageN; i += blockDim.x) {
         const size_t r = i / kSageN;
@@ -419,6 +553,14 @@ attention_sage_prefill_kernel(const __nv_bfloat16 *q, const void *cache_k,
         o_frags[i].x[5] *= alpha_lo;
         o_frags[i].x[6] *= alpha_hi;
         o_frags[i].x[7] *= alpha_hi;
+      }
+
+      if constexpr (kPipeMode == kPipeBf16V) {
+        // V(i)'s direct transfer into sm_V retires here, just before its
+        // first reader (PV) — the overlap window covers K-quantize, the S
+        // mma, dequant and softmax.
+        __pipeline_wait_prior(0);
+        __syncthreads();
       }
 
       // -------------------- O += P @ V (BF16, unchanged from Phase A) --------------------
@@ -493,22 +635,43 @@ qwen36_attention_sage_prefill(const qwen36_attention_prefill_spec_t *spec) {
   // sm_V (32 KB) + sm_Q_int8 (8 KB) + sm_K_int8 (16 KB) + sm_S (8 KB)
   // + sm_P (4 KB) + sm_qscale (128 B) + sm_kscale (256 B) + 3·M f32 row state
   // + sm_k_mean (D f32 = 1 KB) ≈ 70 KB.  Below the 100 KB sm_120a cap.
-  const size_t smem_bytes =
+  // The cp.async pipeline (FP8 cache only; kill: QWEN36_SAGE_PIPELINE=0)
+  // appends a 16 KB raw-FP8 stage → ≈ 86 KB, still under the cap.
+  // Read per call (not cached): smoke.cu A/Bs the variants via setenv, and
+  // the call rate is one per prefill chunk — getenv cost is noise.
+  const char *pipeline_raw = getenv("QWEN36_SAGE_PIPELINE");
+  const bool pipeline_enabled = pipeline_raw == nullptr ||
+                                pipeline_raw[0] == '\0' ||
+                                pipeline_raw[0] != '0';
+  int pipe_mode = kPipeNone;
+  if (pipeline_enabled && spec->kv_cache_dtype == kKvCacheFp8) {
+    pipe_mode = kPipeFp8;
+  } else if (pipeline_enabled && spec->kv_cache_dtype == kKvCacheBf16) {
+    pipe_mode = kPipeBf16V;
+  }
+
+  const size_t smem_base =
       kSageN * kSageD * sizeof(__nv_bfloat16) +
       kSageM * kSageD * sizeof(int8_t) + kSageN * kSageD * sizeof(int8_t) +
       kSageM * kSageN * sizeof(float) +
       kSageM * kSageN * sizeof(__nv_bfloat16) +
       kSageM * sizeof(float) + kSageN * sizeof(float) +
       3 * kSageM * sizeof(float) + kSageD * sizeof(float);
-  cudaFuncSetAttribute(attention_sage_prefill_kernel,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+  const size_t smem_bytes =
+      smem_base +
+      (pipe_mode == kPipeFp8 ? kSageN * kSageD * sizeof(uint8_t) : 0);
+  const auto kernel = pipe_mode == kPipeFp8
+                          ? attention_sage_prefill_kernel<kPipeFp8>
+                          : (pipe_mode == kPipeBf16V
+                                 ? attention_sage_prefill_kernel<kPipeBf16V>
+                                 : attention_sage_prefill_kernel<kPipeNone>);
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(smem_bytes));
 
   const dim3 grid(
       static_cast<unsigned int>(spec->shape.kv_heads),
       static_cast<unsigned int>((spec->tokens + kSageM - 1) / kSageM));
-  attention_sage_prefill_kernel<<<grid, kSageThreads, smem_bytes,
-                                  qwen36_internal_active_stream()>>>(
+  kernel<<<grid, kSageThreads, smem_bytes, qwen36_internal_active_stream()>>>(
       reinterpret_cast<const __nv_bfloat16 *>(
           static_cast<uintptr_t>(spec->q_bf16.ptr)),
       reinterpret_cast<const void *>(
