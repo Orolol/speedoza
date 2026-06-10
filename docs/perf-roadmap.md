@@ -51,10 +51,14 @@ explains precisely (see P3).
       Found: MTP=4 on real text is ~40 tok/s (synthetic 95 is full-accept
       artefact) and LOSES to MTP=0 at 24K — routing (P2) must be
       best-of-three {MTP=0, MTP=4, DFlash}.
-- [ ] **Nsight bandwidth audit of the decode hot path** (cheap, sizes P3):
-      % peak DRAM BW per kernel (gemv shapes M={5120,16640,34816},
-      deltanet, tiled attention, lm_head). Output: a table in DAILY.md
-      naming the worst offenders. This decides where P3 starts.
+- [x] **Nsight bandwidth audit of the decode hot path** — DONE 2026-06-10
+      (ncu blocked by host counter perms; equivalent via nsys
+      `--cuda-graph-trace=node` + analytic weight bytes — table in DAILY).
+      GEMV 62% peak (12.1 ms/tok, 72% of the token) → SMEM-paging
+      prototype's +20% gate is plausible (62→78% = +26%); lm_head cuBLAS
+      already 86% (NVFP4 saves ~1 ms); NEW: 128 rmsnorm+quantize launches
+      = 1.21 ms/tok (7%), pure node-latency — fusion candidate. Realistic
+      MTP=0 ceiling ≈ 87 tok/s at Hazy-level 78% everywhere.
 
 ## P1 — Bank the pending wins (days, already scoped or in-tree)
 

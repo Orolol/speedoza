@@ -97,6 +97,44 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-10 — Audit bande passante du décode (P0) : GEMV 62% peak, lm_head 86%, rmsnorm 7% du token — SHIPPED
+
+`ncu` est bloqué sur cette instance (ERR_NVGPUCTRPERM, conteneur non
+privilégié — compteurs perf GPU interdits par l'hôte ; rien à faire
+in-container). Fallback équivalent : **nsys `--cuda-graph-trace=node`**
+(durées par kernel, y compris dans le graph capturé) + octets de poids
+analytiques exacts (dims du config.json). Bench : MTP=0, ctx 3072,
+64 tokens, 59.1 tok/s = 16.9 ms/token (cohérent dashboard).
+
+| bucket décode | inst/tok | ms/tok | GB/tok | GB/s | %peak (1.79 TB/s) |
+|---|---:|---:|---:|---:|---:|
+| nvfp4_gemv_mma (tous shapes) | 288 | 12.10 | 13.37 | 1105 | **62%** |
+| lm_head BF16 (cuBLAS gemvx) | 1 | 1.65 | 2.54 | 1536 | **86%** |
+| rmsnorm_nvfp4_quantize | 128 | 1.21 | ~0.01 | — | latence pure (~9.5 µs/kernel de 10 KB) |
+| attention tiled + reduce @3K | 16+16 | 0.73 | — | — | — |
+| deltanet_decode (état) | 48 | 0.47 | 0.075 | 159 | 9% |
+| swiglu + quantize + conv1d + rope + divers | — | ~0.9 | — | — | — |
+
+(`/tmp/decode3k_node_cuda_gpu_kern_sum.csv` ; attention : sans
+`--cuda-graph-trace=node`, nsys ne voit AUCUN kernel du décode.)
+
+Décisions que l'audit prend :
+1. **Le prototype GEMV SMEM-paging (P3) survit à son pré-gate** : 62→78%
+   (la réf. Hazy) = +26% kernel-level, au-dessus du kill-gate +20%. C'est
+   LA plus grosse part du token (72% du temps décode).
+2. **lm_head NVFP4** : ~1 ms/token récupérable (+6% MTP=0) — confirmé.
+3. **Découverte : 128 rmsnorm(+quantize) = 1.21 ms/token (7%)** — kernels
+   minuscules bound par la latence d'exécution des nodes, pas la BW.
+   Candidat fusion (norm→gemv adjacent) ou élargissement de blocs. Pas
+   au-dessus de la barre des 15% seul, mais cumulable avec lm_head.
+4. Plafond réaliste : GEMV+lm_head = 81% du token ; tout à ~78% peak ⇒
+   ~11.4 ms/token ⇒ **~87 tok/s MTP=0** — cohérent avec la cible ≥80.
+5. deltanet_decode lit son état à 9% du peak (75 MB en 0.47 ms) — petit
+   en absolu, à revoir seulement si le reste se compresse.
+
+Files: scripts/nsight_audit.sh (ncu, inutilisable ici — gardé pour les
+hôtes qui exposent les compteurs). Inventory: n/a.
+
 ### 2026-06-10 — Probe coût substrat (P3 gate b) : 4.71 µs/barrière → single-launch MORT sur SM120 — FALSIFIED
 
 La probe scoped par la roadmap (programme de 512 trampolines no-op
