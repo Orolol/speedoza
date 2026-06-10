@@ -56,9 +56,9 @@ use crate::weights::{
 };
 
 #[cfg(feature = "cuda")]
-const MTP_MAX_DRAFT_TOKENS: usize = 4;
+const MTP_MAX_DRAFT_TOKENS: usize = 8;
 #[cfg(feature = "cuda")]
-const MTP_GRAPH_BUNDLE_U32S: usize = 16;
+const MTP_GRAPH_BUNDLE_U32S: usize = 24;
 #[cfg(feature = "cuda")]
 const MTP_GRAPH_VERIFIED_BASE: usize = 5;
 #[cfg(feature = "cuda")]

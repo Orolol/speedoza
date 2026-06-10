@@ -97,6 +97,41 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-10 — MTP : LUT split-K neutre (3e micro-fix neutre) ; depth 6/8 débloqué côté buffers mais depth 6 CASSE le parity floor — WIP gated off
+
+**LUT FP8 dans `attention_flash_splitk.cu`** (levier 1 du diagnostic
+utilisateur) : 256 entrées SMEM, byte-identique (gate 144 cas vert).
+**E2e : neutre** (38.2 tok/s, cycle 79.8) — 3e fix kernel neutre
+d'affilée. Confirmation définitive : le cycle verify n'est pas borné par
+les µs des kernels individuels mais par la longueur de la chaîne série
+(nœuds graph + 4 forwards de draft séquentiels). Gardé (sain). Le levier
+occupancy (N=64→32) reste à tester mais avec une attente désormais
+faible — mesurer le wall d'UNE couche verify isolée d'abord.
+
+**Depth 6/8 (step 3 du plan)** : constantes débloquées
+(MTP_MAX_DRAFT_TOKENS=8, VERIFY_TOKENS=17, BUNDLE_U32S=24, mtp_logits
+×9, mtp_verify_token_u32 96 B, kMvMaxRows=10,
+kPrefillSplitLongChunkMaxTokens=16). Sweep @3K :
+
+| depth | tok/s | tok/cyc | acc | verdict |
+|---|---:|---:|---:|---|
+| 4 | 38.3 | 3.05 | 0.735 | inchangé ✓ |
+| 6 | 19.1 | 1.75 | **0.433** | **parity floor MISMATCH (hello)** — bug de correctness |
+| 8 | — | — | — | bench crash (stderr avalé) ; chat « parity OK » à confirmer, suspect |
+
+**La CLI re-verrouille >4** (correctness d'abord) ; les buffers restent
+dimensionnés. Piste pour la suite : un littéral 4/5 résiduel dans le
+chemin verify/draft-régen (multi-graph MTP=2/3 ? fenêtre de
+draft-régen ?) — `grep -n "\b4\b\|\b5\b" engine.rs` autour de
+verify_mtp_draft_tokens / prepare_mtp_drafts, et re-tester depth 5
+(au-dessus de l'ancien max d'un seul cran) pour bisecter. L'acceptance
+0.433 à depth 6 sent le draft mal régénéré (état MTP recyclé au mauvais
+offset), pas le verify.
+
+Files: attention_flash_splitk.cu (LUT), engine.rs/gpu.rs/fp8_matvec.cu/
+attention.cu (constantes), main.rs (cap re-posé). Inventory: n/a (pas de
+flag nouveau).
+
 ### 2026-06-10 — MTP recovery steps 0-1 : la prémisse « acceptance collapse » est FAUSSE ; le coupable est le coût du cycle (75 ms), profilé kernel par kernel — DECISION
 
 Exécution de `docs/mtp-recovery-plan.md` (steps 0-1) avec un twist : le

@@ -73,8 +73,8 @@ constexpr int kMvThreads = kMvRowsPerCta * 32;
 // Up to this many input rows are staged together and share ONE pass over
 // the weight bytes (grid.y batching would re-read the 1.27 GB matrix per
 // row — measured 4x slower on the 5-row MTP verify). Matches the MTP
-// verify maximum (4 drafts + 1).
-constexpr int kMvMaxRows = 8;
+// verify maximum (8 drafts + 1, depth-8 unlock).
+constexpr int kMvMaxRows = 10;
 
 __global__ void __launch_bounds__(kMvThreads)
     fp8_matvec_kernel(const uint8_t *__restrict__ w,

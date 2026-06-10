@@ -1278,8 +1278,14 @@ fn run_bench(
     mtp_speculative_tokens: usize,
     mtp_tree_leaves: usize,
 ) -> Result<()> {
+    // Depth 5-8 buffers are sized (VERIFY_TOKENS=17, bundle 24, fp8 rows 10)
+    // but depth 6 FAILS the parity floor and depth 8 crashes bench — see
+    // DAILY § 2026-06-10 depth unlock. Re-raise this cap only after the
+    // verify path is fixed and the floor passes at every depth.
     if mtp_speculative_tokens > 4 {
-        anyhow::bail!("bench currently supports --mtp-speculative-tokens 0..=4");
+        anyhow::bail!(
+            "bench currently supports --mtp-speculative-tokens 0..=4 (5-8 unlocked in buffers but parity-gated off)"
+        );
     }
     let total_start = Instant::now();
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;

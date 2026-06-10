@@ -1033,7 +1033,7 @@ constexpr int kGqaMaxWarps = 8;
 constexpr int kDefaultSplitTimestepsPerBlock = 512;
 constexpr int kMinSplitTimestepsPerBlock = 64;
 constexpr size_t kPrefillSplitShortChunkMaxTokens = 2;
-constexpr size_t kPrefillSplitLongChunkMaxTokens = 8;
+constexpr size_t kPrefillSplitLongChunkMaxTokens = 16; // depth-8 verify = 9 tokens (2026-06-10)
 constexpr size_t kPrefillSplitLongChunkMinSplits = 64;
 
 __global__ void attention_decode_split_kernel(

@@ -736,7 +736,7 @@ impl GpuRuntimeBuffers {
 }
 
 impl MtpKvSnapshotLayout {
-    pub const VERIFY_TOKENS: usize = 13; // bumped from 5: chain=4 + K=8 + 1 (current) = 13
+    pub const VERIFY_TOKENS: usize = 17; // chain=8 + K=8 + 1 (current); depth 6/8 unlock 2026-06-10
 
     fn new(topology: &ModelTopology, kv_cache: &crate::kv_cache::KvCachePlan) -> Result<Self> {
         if kv_cache.max_context == 0 {
@@ -866,9 +866,9 @@ impl GpuForwardBuffers {
             token_u32: CudaDeviceBuffer::alloc(4)?,
             position_i32: CudaDeviceBuffer::alloc(4)?,
             logits: CudaDeviceBuffer::alloc(topology.vocab_size * 2)?,
-            mtp_logits: CudaDeviceBuffer::alloc(topology.vocab_size * 5 * 2)?,
+            mtp_logits: CudaDeviceBuffer::alloc(topology.vocab_size * 9 * 2)?,
             sampled_token_u32: CudaDeviceBuffer::alloc(4)?,
-            mtp_verify_token_u32: CudaDeviceBuffer::alloc(64)?,
+            mtp_verify_token_u32: CudaDeviceBuffer::alloc(96)?,
             leaf_tokens_u32: CudaDeviceBuffer::alloc(MTP_TREE_MAX_LEAVES * 4)?,
             tree_ancestor_bitmap_u64: CudaDeviceBuffer::alloc(
                 MtpKvSnapshotLayout::VERIFY_TOKENS * 8,
