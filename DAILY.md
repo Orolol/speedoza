@@ -97,6 +97,186 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-10 — Probe coût substrat (P3 gate b) : 4.71 µs/barrière → single-launch MORT sur SM120 — FALSIFIED
+
+La probe scoped par la roadmap (programme de 512 trampolines no-op
+chaînés par compteurs grid-wide, grille occupancy-derived, 20 launches
+timés, smoke.cu) mesure **2.411 ms / programme = 4.71 µs/barrière** —
+le kill-gate pré-déclaré était < 0.5 ms/token. Raté d'un facteur ~5.
+
+Verdict (conforme au gate écrit AVANT la mesure) : **le chemin
+whole-decode single-launch du lane interpreter est mort sur SM120.**
+~512 barrières grid-wide par token coûteraient à elles seules plus que
+le budget total visé (~7.7 ms/token au plancher BW). Le spin
+`ld.acquire.gpu` + `__nanosleep` + atomics sur L2 ne tient pas la
+cadence sur 192 SMs — cohérent avec les 3 échecs de fusion précédents.
+Ce qui reste vivant dans P3 : (1) le prototype GEMV SMEM-paging a son
+propre kill-gate kernel-level (l'audit Nsight dit si le GEMV a du
+headroom BW — s'il est déjà ~peak, ce prototype meurt aussi) ;
+(2) lm_head NVFP4 (indépendant du substrat). Pour re-tenter du
+single-launch un jour : il faudrait des barrières par-cluster/mbarrier
+(pas globales) et une émission parallèle réelle — c.-à-d. le design
+Hazy complet, pas le substrat actuel.
+
+Files: kernels-cuda/smoke.cu (probe, conservée comme instrument).
+Inventory: §2.5 à compléter au prochain passage si le lane est fermé.
+
+### 2026-06-10 — Dashboard bench unique (P0) + baseline, et bench du split-reduce parallèle (P1) — SHIPPED
+
+**Dashboard** : `scripts/bench_dashboard.sh` — grille fixe MTP {0,4} ×
+ctx {128, 3072, 8192, 24576} sur corpus réel gelé
+(`benches/data/bench_corpus_91k.txt`, 91 265 tokens, concat docs du repo)
++ 2 cellules DFlash (3K/7K snapshot ; skippées tant que le drafter HF
+gated n'est pas téléchargeable). Tout item perf de la roadmap cite ses
+before/after depuis CE script. JSONL brut sous `target/dashboard-*.jsonl`.
+
+**Baseline 2026-06-10** (RTX 5090, commit d25daca, GPU non contendu) :
+
+| cell | prefill tok/s | decode tok/s |
+|---|---:|---:|
+| MTP=0 ctx=128   | 697 | 52.3 |
+| MTP=4 ctx=128   | 633 | 39.8 |
+| MTP=0 ctx=3072  | 2761 | 59.4 |
+| MTP=4 ctx=3072  | 2717 | 39.3 |
+| MTP=0 ctx=8192  | 2137 | 53.7 |
+| MTP=4 ctx=8192  | 2136 | 42.1 |
+| MTP=0 ctx=24576 | 1147 | 47.2 |
+| MTP=4 ctx=24576 | 1118 | 25.6 |
+| MTP=0 ctx=65536 | 306 | 35.6 |
+
+Deux observations qui comptent :
+1. **MTP=4 sur texte réel est ~40 tok/s, pas 95** — le 95.3 du perf gate
+   est l'artefact full-accept du prompt synthétique répété. Et MTP=4 @24K
+   (25.6) est PLUS LENT que MTP=0 (47.2) : l'acceptance du MTP head
+   s'effondre sur ce corpus à long ctx. Le routing adaptatif (P2) doit
+   inclure une cellule MTP=0 dans son best-of-both, pas seulement
+   MTP↔DFlash.
+2. **Split-reduce parallèle (item P1, déjà in-tree)** : décode @64K
+   **32.7 → 35.6 tok/s (+8.9%)**, @24K 47.2. L'attendu (43-46 @64K,
+   full_attn ~plat) n'est PAS atteint : la courbe décode reste descendante
+   (59.4 @3K → 35.6 @64K). Verdict : gain banké mais le résiduel @64K
+   n'est plus dans le reduce — le prochain coupable probable est la
+   lecture des partials/loads du kernel tiled lui-même (à confirmer par
+   l'audit Nsight, cellule 64K). Gates : perf gate vert (52.3/95.3),
+   smoke 100%.
+
+Files: scripts/bench_dashboard.sh (new), benches/data/bench_corpus_91k.txt
+(new, fixture gelée). Inventory: à mettre à jour avec le script.
+
+### 2026-06-10 — Pari training-side tranché : fine-tune DFlash long-ctx, PAS EAGLE-3.1 — DECISION
+
+Scoping de l'item roadmap P2 « pick ONE training-side bet » (recherche web,
+sources vérifiées). Verdict sans ambiguïté : **fine-tune long-contexte du
+drafter z-lab** (option A).
+
+Faits décisifs (vérifiés à la source) :
+- **L'expérience exacte est déjà publiée** : arXiv 2602.06036 **v2 §5.4**
+  fine-tune le drafter DFlash Qwen3.5-27B (entraîné à 4K) sur **1 600
+  échantillons LongAlign-10K, 3 epochs** → AL hotpotqa@16K **3.61 → 6.05**,
+  **sans régression short-ctx** (Table 4). Notre peur principale
+  (déstabiliser l'AL short-ctx) est falsifiée par le papier.
+- Recette DFlash : ~800K échantillons self-distillés (réponses générées par
+  la cible), hidden states de 5 couches uniformes [2, n-3], 512 anchors par
+  séquence. **Code d'entraînement non publié** (« soon », repo au 2026-05-10);
+  à réimplémenter du papier (~1-2 semaines) ou attendre
+  SpecForge#486. Le checkpoint Qwen3.6-27B-DFlash est « still under
+  training » côté z-lab — re-vérifier le repo avant de lancer.
+- MiMo : drafter **SWA partout** (coût constant en ctx), block **8**,
+  AL code 6.30 ; entraîné nativement long (anchors multi-positions par
+  séquence). Confirme le design SWA-all-layers comme cible du fine-tune.
+- EAGLE-3.1 : « up to 2× AL long-ctx » **sans aucun chiffre absolu publié** ;
+  aucun framework d'entraînement ne supporte les cibles hybrides DeltaNet ;
+  seul précédent hybride (Together Aurora, Qwen3-Coder-Next) : **AL 3.06** ;
+  ses headline-AL exigent le tree-verify que nous n'avons pas. Chain-mode
+  réaliste ~4-5.5 — sous notre DFlash actuel.
+- NVFP4 : neutre pour l'AL (arXiv 2505.22179 : W4 ≈ aucune dégradation
+  d'acceptance) ; distiller depuis NOTRE cible NVFP4 est même un bonus
+  d'alignement.
+
+Coûts : option A < ~200 $ de compute loué (10-40 H100-h fine-tune 2B à
+8-16K seq + 10-30 H100-h de génération de données ; faisable lentement sur
+la 5090 locale) vs 1,5-4 k$ + 3-5 semaines d'intégration pour EAGLE.
+
+**Kill-gate du fine-tune (avant lancement)** : geomean batterie
+(`drafter_al_eval.sh`, baseline 5.10) **< 6.3 après le premier round**
+(≥1.6K échantillons LongAlign+domaine, 3 epochs) → abandon ; AL code
+short-ctx **< 10.5** (vs 11.8) → abandon (catastrophic forgetting).
+Pré-gate : réimplémentation pipeline > 2 semaines sans release z-lab →
+attendre/contribuer SpecForge#486, ne PAS basculer sur EAGLE.
+
+**Lancement = décision utilisateur** (coût GPU réel + 1-2 semaines d'effort).
+Données : LongAlign-10K + prompts synthétiques topic-shift (notre slice
+faible spécifique, absente de LongBench).
+
+Files: docs only. Inventory: pas de changement de code.
+
+### 2026-06-10 — Sage prefill cp.async pipeline (P1) : +29/+49/+109% (FP8), kill-gate passé — SHIPPED (BF16 V-direct mesuré dans la foulée)
+
+Hypothèse (DAILY § Next steps 2, roadmap P1) : le prefill long-ctx est
+latency-stalled (170 W @64K) car la boucle K-iter de
+`attention_sage_prefill.cu` expose la latence HBM (load K → sync →
+quantize → load V → sync → compute, zéro cp.async).
+**Kill-gate (écrit avant le travail)** : prefill @64K < +30% → revert.
+
+**Design.** Trois modes template dans le kernel sage
+(`QWEN36_SAGE_PIPELINE=0` = kill-switch, legacy conservé) :
+- **FP8 (kPipeFp8)** : staging brut 16 KB ping-pong en SMEM — un seul
+  buffer : cp.async V(i) recouvre le MMA INT8 S=QK^T, cp.async K(i+1)
+  recouvre softmax+PV ; quantize/decode lisent le staging au lieu du
+  global. SMEM 70→86 KB (< 99 KB cap sm_120a).
+- **BF16 (kPipeBf16V)** : V(i) cp.async **directement dans sm_V** (pas de
+  décodage, zéro SMEM en plus), wait juste avant PV → recouvre
+  quantize-K + MMA + dequant + softmax. K reste synchrone (un tile K BF16
+  = 32 KB, pas de place pour le stager).
+Bit-exact par construction dans les deux modes (mêmes octets, même ordre
+arithmétique) — gate smoke : 8 cas (FP8+BF16, tiles pleins/partiels,
+start_position ≠ 0) **bit-identiques** vs legacy.
+
+**Mesures FP8 KV** (`QWEN36_KV_CACHE_DTYPE=fp8`, corpus dashboard,
+max-new=4, RTX 5090 non contendu) :
+
+| ctx | legacy | pipeliné | gain |
+|---|---:|---:|---:|
+| 8K  | 1865 | 2406 | +29% |
+| 24K | 940  | 1400 | +49% |
+| 64K | 293  | **613** | **×2.09** |
+
+Puissance @64K : 180 W (legacy, la signature stall documentée) → 238 W
+médian / 273 max. Toujours sous les 400-500 W d'un prefill sain → il
+reste de la latence exposée ; prochains crans si besoin : K(i+1) en
+2 demi-tiles pour le mode BF16, et/ou q_head en grid.z (la boucle q_head
+externe relit la stripe KV 6× par CTA — découverte de cette session).
+
+**Découverte annexe importante** : le `bench`/`chat` CLI force le KV en
+**BF16** (`cuda_kv_cache_dtype(KvCacheDtype::Bf16)`) — EngineConfig::default
+(fp8) ne s'applique qu'aux chemins DFlash. Les chiffres « prefill 274 @64K »
+du journal étaient donc des chiffres BF16-KV. Et le FP8 KV est ~18% plus
+LENT que BF16 en prefill legacy (940 vs 1147 @24K) : le décode e4m3
+scalaire (branches + ldexpf) coûte cher — candidat LUT-decode noté.
+Inventaire corrigé (§2.1).
+
+**Mesures BF16 KV (le chemin par défaut de bench/chat — mode V-direct)** :
+
+| ctx | legacy | pipeliné | gain |
+|---|---:|---:|---:|
+| 8K  | 2140 | 2896 | +35% |
+| 24K | 1148 | 1969 | **+71%** |
+| 64K | 306  | **884** | **×2.89** |
+
+Le mode V-direct (zéro SMEM supplémentaire, un seul wait par K-iter)
+fait mieux que le mode FP8 staged en relatif — cohérent : en BF16 le
+tile V pèse 32 KB (le double du FP8) donc son recouvrement rapporte
+plus, et il n'y a pas de boucle de décodage SMEM→SMEM. 884 @64K vs la
+cible roadmap ≥1000 : le reliquat est la latence K (toujours synchrone
+en BF16) + la redondance q_head ×6. Prochain cran scoped : K(i+1) staged
+en 2 demi-tiles de 16 KB (ping-pong dans le buffer V déjà consommé).
+
+Gates : smoke 8/8 bit-identique ; perf gate MTP + parity floor re-runs
+après merge des deux modes (le sage ne touche ni le décode ni les chunks
+verify < 1024 tokens — la bit-identité smoke est le gate décisif).
+Files: `kernels-cuda/attention_sage_prefill.cu`, `kernels-cuda/smoke.cu`.
+Inventory: oui (flag + note KV dtype).
+
 ### 2026-06-10 — Decode-vs-prefill divergence FIXED: chunked DeltaNet prefill wrote its final state transposed — SHIPPED
 
 The P0 correctness bug (decode logits cos ~0.76–0.93 vs prefill on the
