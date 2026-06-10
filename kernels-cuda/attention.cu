@@ -1476,25 +1476,65 @@ __global__ void attention_decode_reduce_kernel(
     qwen36_attention_shape_t shape, int n_splits) {
   __shared__ float gmax;
   __shared__ float gdenom;
+  // Per-warp staging for the block-wide max/sum reductions below.
+  __shared__ float reduce_warp[8];
 
   const size_t qh = blockIdx.x;
   const size_t head_dim = shape.head_dim;
   const size_t d = threadIdx.x;
+  const unsigned lane = threadIdx.x & 31u;
+  const unsigned warp = threadIdx.x >> 5;
+  const unsigned n_warps = (blockDim.x + 31u) >> 5;
 
+  // Block-parallel max/denom scans. The previous thread-0 serial loops
+  // became the decode full-attn bottleneck at large n_splits (2048 splits
+  // at a 128K context bucket ≈ 0.8 ms/layer of single-thread dependent
+  // loads — the residual long-context slide after the tiled split kernel).
+  float local_max = -INFINITY;
+  for (int s = static_cast<int>(threadIdx.x); s < n_splits;
+       s += static_cast<int>(blockDim.x)) {
+    local_max = fmaxf(local_max, partial_max[qh * n_splits + s]);
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max,
+                                                 offset));
+  }
+  if (lane == 0) {
+    reduce_warp[warp] = local_max;
+  }
+  __syncthreads();
   if (threadIdx.x == 0) {
     float m = -INFINITY;
-    for (int s = 0; s < n_splits; ++s) {
-      m = fmaxf(m, partial_max[qh * n_splits + s]);
-    }
-    float dn = 0.0f;
-    for (int s = 0; s < n_splits; ++s) {
-      const float pm = partial_max[qh * n_splits + s];
-      const float pd = partial_denom[qh * n_splits + s];
-      const float scale =
-          isinf(pm) && pm < 0.0f ? 0.0f : expf(pm - m);
-      dn += pd * scale;
+    for (unsigned w = 0; w < n_warps; ++w) {
+      m = fmaxf(m, reduce_warp[w]);
     }
     gmax = m;
+  }
+  __syncthreads();
+
+  const float m_global = gmax;
+  float local_denom = 0.0f;
+  for (int s = static_cast<int>(threadIdx.x); s < n_splits;
+       s += static_cast<int>(blockDim.x)) {
+    const float pm = partial_max[qh * n_splits + s];
+    const float pd = partial_denom[qh * n_splits + s];
+    const float scale = isinf(pm) && pm < 0.0f ? 0.0f : expf(pm - m_global);
+    local_denom += pd * scale;
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_denom += __shfl_xor_sync(0xffffffffu, local_denom, offset);
+  }
+  if (lane == 0) {
+    reduce_warp[warp] = local_denom;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float dn = 0.0f;
+    for (unsigned w = 0; w < n_warps; ++w) {
+      dn += reduce_warp[w];
+    }
     gdenom = dn;
   }
   __syncthreads();

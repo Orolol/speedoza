@@ -1554,3 +1554,64 @@ Adding a new parity checkpoint takes ~5 lines:
 - `docs/development.md` — kernel dev loop and PR checklist
 - `docs/repo-layout.md` — crate responsibilities and the ABI rule
 - `docs/kernel-validation.md`, `docs/troubleshooting.md`, `docs/roadmap.md`
+
+## Next steps (état au 2026-06-09, fin de session)
+
+Ordonnés par ROI attendu. Chaque item porte son gate de validation.
+
+1. **Valider le reduce parallèle décode (DANS L'ARBRE, bench en attente).**
+   Les scans max/denom sériels thread-0 de `attention_decode_reduce_kernel`
+   sont parallélisés (réductions warp block-wide) — c'est le coût résiduel
+   du décode long-ctx après le kernel tiled (full_attn 5.7 → 13 ms entre
+   24K et 64K quand n_splits passe 512 → 2048 ≈ 0.8 ms/layer de loads
+   sériels mono-thread). Parité smoke verte (gate decode-tiled 8 cas, gate
+   split-K 144 cas). RESTE À FAIRE : bench 24K + 64K (attendu : full_attn
+   ~plat ≈ 5-6 ms à 64K → décode ~43-46 tok/s vs 32.7 avant), puis
+   `scripts/verify_perf_gate.sh --quick`. Optionnel : une cellule 128K
+   (le prefill seul y prend ~8-10 min au rythme actuel — voir item 2).
+
+2. **Prefill long-context (LA prochaine target).** Mesuré : 2006 (8K) →
+   1053 (16K) → 728 (24K) → **274 tok/s (64K)**. Signature puissance
+   pendant le prefill 64K+ : **170 W / 575 W à "util" 100% et clocks SM
+   à plein boost (2842 MHz)** = latency-stalled, PAS compute-bound (un
+   prefill sain tirerait 450-550 W). Root cause identifiée : les kernels
+   `attention_flash_prefill.cu` et `attention_sage_prefill.cu` ont **zéro
+   cp.async / double-buffering** (grep = 0) — boucle K-tile sérielle à
+   latence HBM exposée (load tile → sync → compute → sync), grille 256
+   CTAs × 128 threads (~10% d'occupation thread, 1 CTA/SM à cause des
+   ~90 KB SMEM). Fix : pipeline cp.async 2-3 étages sur les loads de
+   tiles K/V. Le gate de succès se lit au wattmètre : la puissance doit
+   monter vers 400-500 W ; cible prefill ≥ 1000 tok/s à 64K (3-5×).
+   Est. 2-4 jours, parity-gated comme les autres kernels.
+
+3. **Lane interpreter (Codex) : deux gates avant `compile_decode_stack`.**
+   (a) Bencher le chunking MLP landé (~30 min) : ≥ +2-3 tok/s sur un
+   chemin qui compte → la thèse pipelining vit ; ~0% → archiver
+   l'interpreter en opt-in MTP>0 (le +7.3% MTP=4 est déjà banké via
+   l'auto-policy). (b) Si (a) passe : probe de coût substrat — programme
+   64-layers de trampolines timé (le coût des ~512 barrières grid-wide
+   doit rester < 0.5 ms/token) AVANT de construire l'assemblage
+   single-launch. Vigilance aliasing : `attn_partial_acc` a maintenant
+   TROIS consommateurs (decode split, verify split-K #55, programmes
+   MLP chunked) — cartographier avant tout programme full-stack.
+
+4. **AL long-ctx DFlash : décision fine-tune drafter.** La batterie
+   d'éval est prête (`scripts/drafter_al_eval.sh`, geomean sur 6 prompts
+   7-10K ; baseline 5.10). Les knobs cheap sont falsifiés (sweep window
+   = reshuffle chaotique). Le levier crédible pour lever le geomean est
+   un fine-tune long-contexte du drafter z-lab — à scoper (données,
+   pipeline, coût GPU) et à valider avec l'utilisateur avant lancement.
+
+5. **Leviers en réserve (non planifiés).** Verify split-K : décode FP8
+   par LUT + >1 CTA/SM via tile KV réduit + équilibrage des splits vides
+   (~10-20% chacun sur le verify). NVFP4 KV cache : différé (aucun
+   kernel sm_120 vendorable ; classe de bugs divergence FP4). Tile M=16
+   verify + scan DeltaNet : mesurés sous la barre des 15%, skip.
+
+Garde-fous process qui ont fait leurs preuves (à garder) :
+- `scripts/verify_perf_gate.sh` avant/après tout changement perf.
+- Mesure d'abord : microbench apparié / kill-gate avant de construire
+  (5 hypothèses model-based falsifiées par des probes cheap ce sprint).
+- Les deltas AL mono-prompt sont du bruit — geomean batterie uniquement.
+- La puissance + clocks SM comme signal de profiling de premier rang
+  (170 W à "util 100%" a exposé le stall prefill en un coup d'œil).
