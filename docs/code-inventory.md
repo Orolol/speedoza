@@ -102,6 +102,7 @@ Full details in `DAILY.md` (dated sections):
 - **TMA multicast, persistent grid for gemv, sub-byte LDSM** — investigated, blocked or <2% (see `docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md`).
 - **M=16 verify tile, DeltaNet scan optimization, BitDecoding/NVFP4-KV port** — measured/assessed below the 15% bar (2026-06-09).
 - **Lossy env-tuned split-K verify** (`QWEN36_PREFILL_SPLIT_MAX_TOKENS=16`) — 5× at 7K but AL-destroying at 3K; superseded by the faithful `attention_flash_splitk.cu`.
+- **KVarN (huawei-csl) KV-cache quantization** — evaluated 2026-06-10, NOT integrated: it is a vLLM fork (Python/Triton), KV is not the bottleneck at ≤24K (already FP8 + in-house TQ3/TQ35), and sub-4-bit V risks the known speculative-loop AL amplification. If the B1 lane (aggressive KV quant for 64K–262K) is reopened, its recipe (asymmetric K4/V2 RTN + Hadamard rotation, 128-token tiles, calibration-free) is the reference to port — see `DAILY.md` § 2026-06-10.
 - **Synthetic-prompt MTP acceptance dips** (acc 0.84 at 4K) — artefact of single-token-repeat bench prompts; falsified as a kernel bug. Use `--prompt-file` or `chat`+`QWEN36_MTP_STATS=1`.
 
 ### 2.6 Known open issues

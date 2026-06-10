@@ -94,6 +94,34 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-10 — KVarN (huawei-csl) evaluated for KV-cache quantization — DECISION: not integrated
+
+Context: user asked whether to include KVarN (https://github.com/huawei-csl/KVarN,
+Apache-2.0) — a vLLM-fork KV-cache quantization backend (asymmetric RTN, K=4-bit /
+V=2-bit, Hadamard rotation + variance normalization, 128-token tiles, calibration-free,
+Triton JIT kernels). Claims ~4x KV capacity at FP16-level accuracy on Qwen3-32B and
+"up to ~2.4x TurboQuant throughput with higher accuracy".
+
+Decision: **do not integrate.** Reasons:
+1. It is a vLLM fork (Python/Triton, paged-attention abstraction), not a library — there
+   is nothing to include in a Rust + AOT-CUDA engine; only the algorithm could be ported
+   (a full kernel project, conflicting with the no-Triton-at-runtime architecture).
+2. KV is not the bottleneck at production contexts: decode full_attn is 5.7 ms/token vs
+   11.6 ms context-flat MLP at 24K after the tiled kernel; KV is already FP8 by default
+   with in-house TQ3/TQ3.5 available. The real long-context bottleneck is prefill
+   (latency-stalled, 274 tok/s at 64K — Next steps item 2).
+3. Same gap as TQ35 would remain: fast attention kernels (sage/flash/split-K/tiled) all
+   exclude quantized-KV dtypes; adding another format doesn't fix that.
+4. Known risk class: sub-4-bit V perturbs verify numerics, which the speculative loops
+   (DFlash/MTP) amplify chaotically into AL swings; NVFP4-KV was already deferred for
+   the same reason. Projected end-to-end gain at <=24K is below the 15% bar.
+
+Kept as the reference recipe if the B1 lane (aggressive KV quant for 64K-262K decode,
+where K4V2 would shrink KV ~8.6 GB -> ~3.6 GB at 262K and recover the fused-store VRAM
+margin) is ever reopened. Recorded in `docs/code-inventory.md` §2.5.
+
+Files: docs only. Inventory updated: yes.
+
 <!-- Newest entries above this line's successors; everything below is the legacy journal migrated verbatim from AGENT.md on 2026-06-10 (roughly chronological, oldest first; the two undated sections summarise the 2026-05 era status). -->
 
 ## Current optimization status
