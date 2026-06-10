@@ -8,7 +8,8 @@
 > file is the consolidated state. If you change a default, a dispatch condition, or add an
 > env var, **update this file in the same commit.**
 >
-> Last full audit: 2026-06-10 (HEAD `0f91793`).
+> Last full audit: 2026-06-10 (HEAD `0f91793`); dead-code purge + CPU CI added
+> the same day on `chore/rationalization` (see §2.4 for what was removed).
 
 ## 1. Main use case
 
@@ -73,19 +74,23 @@ activated by flag/env. **NEG** = built, benchmarked negative/neutral, kept in tr
 | Component | Opt-in | Files | Measured result |
 |---|---|---|---|
 | Productive spin / L2 prefetch on idle SMs | `QWEN36_PRODUCTIVE_SPIN=1` (+`_CTAS`, default 128) | `kernels-cuda/decode_gemv/l2_prefetch.cu`, `DecodeAuxStreams` in engine | ≤+0.5% = noise (2026-05-19). Decode graph already keeps weights L2-resident |
-| Per-block megakernel Stage F.4 (fused MLP block) | `QWEN36_MEGAKERNEL_FULL_ATTN_STAGE_F4=1` | `kernels-cuda/megakernel/full_attn_block_sm120.cu` | **−4.0% MTP=0** (2026-05-23). cuBLASLt wins the MLP GEMM shape |
 | Interpreter L2 prefetch lookahead | `QWEN36_INTERPRETER_PREFETCH=1` | `kernels-cuda/interpreter/prefetch.cuh` | negative on both MTP=0 and MTP=4 (2026-06-09) |
 | FA-tiled drafter attention | `QWEN36_DRAFTER_ATTENTION_FLASH=1` | `kernels-cuda/drafter_attention_flash.cu` | per-iter parity with v1 (not compute-bound) + numerical drift at ctx≳120 degrading AL (2026-06-09) |
 | Drafter sliding-window knobs | `QWEN36_DRAFTER_SWA_WINDOW=N`, `QWEN36_DRAFTER_SWA_ALL=1` | `crates/drafter/src/forward.rs` | dead lever: geomean-negative chaotic reshuffle (2026-06-09) |
 
 ### 2.4 Dead code
 
+**Removed 2026-06-10** (branch `chore/rationalization` — recover from git history if ever needed):
+
+- **Mirage CUTLASS megakernel GEMM** (`kernels-cuda/megakernel/nvfp4_matvec_sm120.cu` + stub, `QWEN36_USE_MEGAKERNEL_GEMM`): never executed — the SM120 body was guarded by `CUTLASS_ARCH_MMA_SM120_SUPPORTED` without including the header defining it, so every call silently fell back to cuBLASLt. Its "validated parity" claims tested cuBLASLt against itself. Superseded by the Direction B gemv. Analysis kept in `docs/mirage-megakernel.md`.
+- **Per-block megakernel, all stages** (`kernels-cuda/megakernel/full_attn_block_sm120.cu`, `QWEN36_MEGAKERNEL_FULL_ATTN_STAGE_F4`): only Stage F.4 was wired and it benched **−4.0% MTP=0**; the other stages had no engine call site. The persistent-grid + work-stealing + spinlock-barrier pattern (and its two bring-up bugs) is documented in `AGENT.md` § 2026-05-23.
+- **Triton AOT placeholder** (`scripts/triton_aot.py`): never implemented.
+
+Still in tree:
+
 | Component | Files | Why dead | Recommendation |
 |---|---|---|---|
-| Mirage CUTLASS megakernel GEMM | `kernels-cuda/megakernel/nvfp4_matvec_sm120.cu` (+ `nvfp4_matvec_stub.cu`) | guards SM120 body with `CUTLASS_ARCH_MMA_SM120_SUPPORTED` but never includes the header defining it → always `NOT_IMPLEMENTED` → silent cuBLASLt fallback. `QWEN36_USE_MEGAKERNEL_GEMM=1` therefore does nothing real. Its "validated parity" claims tested cuBLASLt against itself. | delete or fix the include before ever trusting it; superseded by Direction B gemv |
-| Megakernel stages A, B.1–B.3, C, E, F.1, F.2 | `full_attn_block_sm120.cu` | smoke-covered but **no engine call site** (only F.4 is wired, itself negative). B.3/E have Rust FFI, no caller. | keep as the canonical persistent-grid + work-stealing + barrier reference, or delete; do not assume they run |
 | L2 access-window primitives | `crates/kernels/src/memory.rs` (`cuda_set/clear_l2_access_window`), `kernels-cuda/runtime.cu` | wired end-to-end, **zero call sites**; pinning DeltaNet state gave no gain (graph replay already keeps it hot) | keep as primitive; don't rediscover |
-| Triton AOT script | `scripts/triton_aot.py` | placeholder, "not yet implemented" | delete candidate |
 
 ### 2.5 Tried and reverted / falsified — do NOT rebuild without addressing the recorded blocker
 
@@ -131,7 +136,7 @@ not in Rust — grep there, not in `engine.rs`, when wondering which kernel runs
 
 **Drafter attention** (`drafter_attention.cu`): naive v1 by default; FA-tiled variant opt-in (negative, §2.3).
 
-## 4. Environment variable reference (complete, 90 vars)
+## 4. Environment variable reference (complete, 88 vars)
 
 Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
 
@@ -153,7 +158,6 @@ Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
 |---|---|---|
 | `QWEN36_DECODE_GEMV_DISABLE` | off | kill-switch for the hand-rolled NVFP4 decode gemv → cuBLASLt |
 | `QWEN36_DECODE_GEMV` | on | back-compat: `=0` same as DISABLE |
-| `QWEN36_USE_MEGAKERNEL_GEMM` | 0 | routes to the **dead** CUTLASS megakernel — currently a silent no-op (see §2.4) |
 
 ### 4.3 Decode interpreter (Rust, `engine.rs:99–440`, `interpreter.rs:677`)
 
@@ -283,7 +287,12 @@ in `crates/kernels/src/backend.rs` + the typed spec module + `smoke.cu`** (see A
 | `decode_parity.py`, `dflash_parity.py` | PyTorch parity (64-layer decode boundaries / drafter fixtures) |
 | `drafter_al_eval.sh` | 6-prompt AL geomean battery — **the only valid way to judge drafter-quality changes** |
 | `dflash_bench_sweep.py` | DFlash vs MTP=3 sweep driver |
-| `triton_aot.py` | placeholder, unimplemented |
+
+CI: `.github/workflows/ci.yml` runs the CPU loop on every push/PR — fmt,
+clippy with and without the cuda feature (the cuda-feature clippy compiles all
+GPU-gated Rust without linking), and the workspace tests. The GPU gates
+(`build_cuda.sh`, `smoke_cuda.sh`, `verify_perf_gate.sh`) remain local and
+mandatory before merging anything that touches kernels or the engine hot path.
 
 Docs: `doc.md` = design spec (start here for intent). `AGENT.md` = agent rules + dated
 experiment journal (the source of the verdicts summarized in §2). `docs/*.md` = operational

@@ -10,7 +10,7 @@ Full design intent: `doc.md`. Operational docs: `docs/`.
 
 **Before building anything new, read `docs/code-inventory.md`** — the consolidated map of
 every component (active / opt-in / archived-negative / dead), the default dispatch paths,
-and all 90 env vars. This file (AGENT.md) is the chronological journal; the inventory is
+and every `QWEN36_*` env var. This file (AGENT.md) is the chronological journal; the inventory is
 the current state. Several past sessions rebuilt code that already existed — check the
 inventory first, and update it in the same commit when you change a default or add a flag.
 
@@ -468,7 +468,12 @@ kernel launches and keeping activations in registers/SMEM between sub-ops
 (per-block megakernel), not from prefetch tricks adjacent to the existing
 flow.
 
-### 2026-05-23 — Per-block megakernel (Phase 2) — **NEGATIVE result, disabled by default**
+### 2026-05-23 — Per-block megakernel (Phase 2) — **NEGATIVE result; code REMOVED 2026-06-10**
+
+> The stage kernels, smoke coverage, Rust FFI and the
+> `QWEN36_MEGAKERNEL_FULL_ATTN_STAGE_F4` gate described below were deleted on
+> the `chore/rationalization` branch (recover from git history if needed).
+> The write-up stays as the record of the pattern and its bring-up bugs.
 
 Phase 2 of the megakernel roadmap built the per-block megakernel pattern
 described by AlpinDale's RTX 5090 post: persistent grid + atomic
@@ -544,7 +549,12 @@ gains need to attack different bottlenecks — KV-cache quantization
 (B1), attention algorithm changes (Sage2++ retry, EAGLE-3), or weight
 layout — not kernel fusion.
 
-### Mirage megakernel branch (`feat/mirage-megakernel`) — **dead code, kept for reference**
+### Mirage megakernel branch (`feat/mirage-megakernel`) — **dead code; REMOVED from main 2026-06-10**
+
+> `kernels-cuda/megakernel/nvfp4_matvec_sm120.cu` (+ stub) and the
+> `QWEN36_USE_MEGAKERNEL_GEMM` dispatch were deleted on the
+> `chore/rationalization` branch — the kernel never executed (see WARNING
+> below). The analysis survives in `docs/mirage-megakernel.md`.
 
 > **WARNING:** the file `kernels-cuda/megakernel/nvfp4_matvec_sm120.cu` does not actually run its CUTLASS path. It guards the SM120 body with `#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)` but never includes `<cutlass/arch/config.h>` (the header that defines the macro). So the `#if` evaluates to false at preprocessing and the function returns `NOT_IMPLEMENTED` for every shape, falling back to cuBLASLt silently. The parity claims below were never actually testing the megakernel — they were testing cuBLASLt twice. Discovered 2026-05-04 during Direction B development; documented in `docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md`. Direction B uses a hand-rolled gemv kernel (`kernels-cuda/decode_gemv/`) with verified parity instead. The megakernel scaffolding is left in place because the existing dispatch wiring + CUTLASS dependency are reusable for any future CUTLASS-based experiment, but **do not trust the "validated parity" claim below without re-running the gate.**
 

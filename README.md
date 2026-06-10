@@ -84,7 +84,7 @@ cargo run -p qwen36-fp4 --features cuda -- gpu-load --model-dir /path/to/model -
 
 ## CUDA Runtime Knobs
 
-The list below is a partial selection. The complete reference (90 env vars, defaults
+The list below is a partial selection. The complete reference (88 env vars, defaults
 verified in code, plus the component status map) is in
 [docs/code-inventory.md](docs/code-inventory.md).
 
