@@ -148,11 +148,32 @@ Gardé (correct par construction, nécessaire pour depth 6+ où rows
 monte). Les 30 ms/cycle des deux vrais coupables (quantize_rows 14.5 +
 split-K 16) restent le travail à faire.
 
-**Reste à faire (priorisé)** : (a) `nvfp4_quantize_rows` à rows≤5 —
-élargir la grille/fusionner (14.5 ms/cycle en jeu) ; (b) le split-K à
-784 µs/launch sur q=5 — lire le n_splits effectif sous capture
-(`attention.cu` + engine bucket) ; (c) puis steps 3-4 du plan (depth 6,
-routing). Le plan est mis à jour en tête de fichier.
+**Fix #2 (même session, diagnostic utilisateur : ops.cu:1081, un bloc de
+32 threads par groupe de 16 valeurs)** : `nvfp4_quantize_rows` réécrit en
+warp-par-groupe, 8 groupes par bloc de 256, zéro syncthreads (max par
+shfl, commutatif → bit-identique ; vieux kernel supprimé). Smoke + parité
+verts, MTP=0 stable 64.8. **Mesuré : e2e NEUTRE aussi (38.9 tok/s,
+cycle 78.3 ms).**
+
+**LEÇON STRUCTURANTE (deux fixes "évidents" neutres de suite)** : les
+sommes par kernel du node-trace ne sont PAS le chemin critique du cycle.
+Le multi-graph verify exécute les petits nœuds (quantize, fp8 drafts)
+**en concurrence** avec les gros — les raccourcir ne change pas le wall.
+Le chemin critique est la chaîne séquentielle inter-couches :
+FP4 GEMM → split-K attention (784 µs × 16 layers, dépendances série)
+→ DeltaNet, plus les 4 forwards de draft séquentiels. Conséquence :
+- (a) ✅ fait (hygiène, bit-exact, garde) mais ne comptez plus les µs
+  des petits nœuds ;
+- (b) le SEUL levier restant à fort ROI est le kernel split-K lui-même
+  (chemin critique) : **LUT FP8 256 entrées** (à porter de
+  attention_decode_tiled.cu, remplace le ldexpf branchy) puis
+  **occupancy 2 CTA/SM** (tile KV SMEM réduit/double-buffered façon sage
+  pipeline). Ne PAS faire de tile M=8 (probe M=16 : ~8% seulement).
+- Vérifier les ~6 quantizes/couche du chunk verify (redondance
+  possible : le décode fusionne rmsnorm+quantize, le prefill multi-row
+  les sépare) — mais sur le chemin critique seulement.
+- Steps 3-4 (depth 6, routing) après (b) : à acc/position ~0.73, depth 6
+  n'ajoute ~+0.35 tok/cycle que si le coût marginal du chunk est faible.
 
 ### 2026-06-10 — lm_head FP8 e4m3 (voie de repêchage de la probe FP4) — SHIPPED
 
