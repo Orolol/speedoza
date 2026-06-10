@@ -570,14 +570,6 @@ pub struct GpuForwardBuffers {
     pub attn_partial_max: CudaDeviceBuffer,
     /// `[q_heads, n_splits]` FP32 — per-split softmax denominator.
     pub attn_partial_denom: CudaDeviceBuffer,
-    /// Scratch for per-block megakernel phase barriers. The full-attn
-    /// Stage B.3 path uses two u32 words (one barrier per fused phase);
-    /// later Stage C / Stage E launches reuse the same buffer with more
-    /// words. Sized for the worst case so callers can grow phase counts
-    /// without re-allocation. Caller is responsible for zeroing the
-    /// active prefix on the active stream (`memset_async`) before each
-    /// launch — kernels do not self-clear so they stay graph-captureable.
-    pub megakernel_barrier_state: CudaDeviceBuffer,
     /// Reusable instruction buffer for the opt-in decode-interpreter final
     /// logits program (`final RMSNorm + LM_HEAD_TILED`).
     pub interpreter_logits_instructions: CudaDeviceBuffer,
@@ -614,16 +606,6 @@ pub struct GpuForwardBuffers {
     /// Reusable counter buffer for `interpreter_attention_instructions`.
     pub interpreter_attention_counters: CudaDeviceBuffer,
 }
-
-/// Per-launch barrier-state byte count consumed by the full-attn
-/// megakernel paths. Stage B.3 uses 2 phase barriers × 4 bytes; Stage C
-/// uses 5; Stage E uses 6. Worst case fits in 32 bytes; we round up to
-/// 64 to keep the scratch comfortably above all current and near-future
-/// phase counts without bloating allocator pressure.
-pub const MEGAKERNEL_BARRIER_STATE_BYTES: usize = 64;
-/// Bytes the caller must zero before each Stage B.3 launch (two phase
-/// barriers). Wider Stages will own their own constants once they land.
-pub const MEGAKERNEL_BARRIER_STAGE_B_Q_PROJ_BYTES: usize = 2 * 4;
 
 /// Must match the smallest supported split size in `kernels-cuda/attention.cu`.
 /// Runtime scratch is sized for this worst case so decode can choose larger
@@ -894,10 +876,6 @@ impl GpuForwardBuffers {
             attn_partial_acc: CudaDeviceBuffer::alloc(attn_partial_acc_bytes.max(1))?,
             attn_partial_max: CudaDeviceBuffer::alloc(attn_partial_scalar_bytes.max(1))?,
             attn_partial_denom: CudaDeviceBuffer::alloc(attn_partial_scalar_bytes.max(1))?,
-            // Zero-initialise so the very first decode-time Stage B.3
-            // launch sees a clean barrier even on the cold path; per-launch
-            // resets after that use the async path on the active stream.
-            megakernel_barrier_state: CudaDeviceBuffer::zeroed(MEGAKERNEL_BARRIER_STATE_BYTES)?,
             interpreter_logits_instructions: CudaDeviceBuffer::alloc(
                 3 * size_of::<InterpreterInstruction>(),
             )?,
@@ -953,7 +931,6 @@ impl GpuForwardBuffers {
             self.attn_partial_acc.bytes(),
             self.attn_partial_max.bytes(),
             self.attn_partial_denom.bytes(),
-            self.megakernel_barrier_state.bytes(),
             self.interpreter_logits_instructions.bytes(),
             self.interpreter_logits_counters.bytes(),
             self.interpreter_norm_instructions.bytes(),

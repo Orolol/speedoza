@@ -1,7 +1,7 @@
 // Body of the Direction B NVFP4 GEMV kernel, extracted as a `__device__`
-// template function so the per-block megakernel
-// (kernels-cuda/megakernel/full_attn_block_sm120.cu) can call the same
-// MMA loop without duplicating ~330 lines of inline PTX + cp.async
+// template function so other fused callers (e.g. the decode interpreter's
+// GEMV opcode in kernels-cuda/interpreter/opcodes/nvfp4_gemv.cuh) can call
+// the same MMA loop without duplicating ~330 lines of inline PTX + cp.async
 // pipeline + cross-warp reduction logic.
 //
 // The body is mechanically lifted from the original __global__ template
@@ -20,8 +20,8 @@
 //     __shared__ uint8_t smem[]`).
 //   - Pass `m_tile_idx ∈ [0, ceil(M/16))` — the row-tile this invocation
 //     owns. The non-persistent grid-shaped use ships `blockIdx.x`; a
-//     persistent megakernel can call the body in a loop with an atomic
-//     work counter (Stage F.1 onward).
+//     persistent caller can call the body in a loop with an atomic
+//     work counter.
 //   - Caller is responsible for the M, K alignment gates the dispatcher
 //     enforces (M % 16 == 0; K % (kWarpsPerBlockTpl * 64) == 0).
 

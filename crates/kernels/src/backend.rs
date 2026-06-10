@@ -8,10 +8,9 @@ use crate::interpreter::InterpreterProgramSpec;
 use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
     Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, Conv1dUpdateSpec,
-    CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec, MegakernelFullAttnStageBQProjSpec,
-    MegakernelFullAttnStageESpec, MegakernelFullAttnStageF4Spec, Nvfp4MatVecSpec,
-    Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, QProjDeinterleaveSpec,
-    QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
+    CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec,
+    Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec,
+    RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
 };
 use crate::rmsnorm::RmsNormSpec;
 use crate::rope::PartialRopeSpec;
@@ -158,47 +157,6 @@ pub trait KernelBackend: Send + Sync {
         Err(CoreError::UnsupportedNoCuda("copy_strided_rows"))
     }
 
-    /// Per-block megakernel Stage B.3 (RMSNorm + NVFP4 quantize + Q proj
-    /// GEMV fused into one launch). Optional fast path for the full-attn
-    /// layer hot loop; the runtime falls back to the standalone kernels
-    /// when this returns `UnsupportedNoCuda`.
-    fn megakernel_full_attn_stage_b_q_proj(
-        &self,
-        _spec: &MegakernelFullAttnStageBQProjSpec,
-    ) -> Result<()> {
-        Err(CoreError::UnsupportedNoCuda(
-            "megakernel_full_attn_stage_b_q_proj",
-        ))
-    }
-
-    /// Per-block megakernel Stage E (o_proj NVFP4 GEMV + residual + post-
-    /// attention RMSNorm + NVFP4 quantize, fused into one launch).
-    /// Optional fast path that closes the attention half of the full-attn
-    /// layer; runtime falls back when this returns `UnsupportedNoCuda`.
-    fn megakernel_full_attn_stage_e_o_proj_residual_norm(
-        &self,
-        _spec: &MegakernelFullAttnStageESpec,
-    ) -> Result<()> {
-        Err(CoreError::UnsupportedNoCuda(
-            "megakernel_full_attn_stage_e_o_proj_residual_norm",
-        ))
-    }
-
-    /// Per-block megakernel Stage F.4 (full MLP block: gate+up GEMV +
-    /// SwiGLU + NVFP4 quantize + down GEMV [+ optional residual add]).
-    /// Pass `residual = NULL` to skip phase 3 — the engine integration
-    /// path uses this so the next layer's input-norm fuse handles the
-    /// residual add. Runtime falls back when this returns
-    /// `UnsupportedNoCuda`.
-    fn megakernel_full_attn_stage_f4_mlp_block(
-        &self,
-        _spec: &MegakernelFullAttnStageF4Spec,
-    ) -> Result<()> {
-        Err(CoreError::UnsupportedNoCuda(
-            "megakernel_full_attn_stage_f4_mlp_block",
-        ))
-    }
-
     /// Stage-0 decode interpreter shell. This is intentionally opt-in/API
     /// level until real opcode bodies are ported into the interpreter.
     fn interpreter_decode_sm120(&self, _spec: &InterpreterProgramSpec) -> Result<()> {
@@ -235,28 +193,13 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::Nvfp4GemmSpec::from(spec);
         // Direction B decode-time gemv path. When enabled and the GEMM is
         // gemv-shaped (n == 1) we try the hand-written kernel first; on
-        // QWEN36_STATUS_NOT_IMPLEMENTED we fall through to the existing
-        // megakernel / cuBLASLt routing. See the Direction B spec under
+        // QWEN36_STATUS_NOT_IMPLEMENTED we fall through to the cuBLASLt
+        // routing. See the Direction B spec under
         // `docs/superpowers/specs/2026-05-04-direction-b-nvfp4-gemv-design.md`.
         if decode_gemv_enabled() && spec.n == 1 {
             let code = unsafe { ffi::qwen36_decode_nvfp4_gemv(&ffi_spec) };
             if code != 5 {
                 return check("qwen36_decode_nvfp4_gemv", code);
-            }
-        }
-        // When the Mirage megakernel path is enabled (env var) we try the
-        // CUTLASS-templated NVFP4 GEMM next. The kernel is being built up
-        // shape-by-shape (`docs/mirage-megakernel.md`); on any unsupported
-        // shape it returns QWEN36_STATUS_NOT_IMPLEMENTED, in which case we
-        // transparently fall back to the cuBLASLt path. This keeps the
-        // engine perf-neutral while individual shapes get migrated.
-        if megakernel_enabled() {
-            let code = unsafe { ffi::qwen36_megakernel_nvfp4_gemm(&ffi_spec) };
-            // 5 == QWEN36_STATUS_NOT_IMPLEMENTED. Any other non-zero is a
-            // real failure and surfaces through `check()` like the rest of
-            // the FFI surface.
-            if code != 5 {
-                return check("qwen36_megakernel_nvfp4_gemm", code);
             }
         }
         check("qwen36_nvfp4_gemm", unsafe {
@@ -458,93 +401,6 @@ impl KernelBackend for CudaBackend {
         })
     }
 
-    fn megakernel_full_attn_stage_b_q_proj(
-        &self,
-        spec: &MegakernelFullAttnStageBQProjSpec,
-    ) -> Result<()> {
-        // The C ABI is a wide flat parameter list (mirroring the standalone
-        // Stage B/C/E entry points which already shipped before this Rust
-        // wrapper). We unpack the Rust spec into individual args at the
-        // call site so callers can keep treating it as an aggregate.
-        check("qwen36_full_attn_block_stage_b_q_proj", unsafe {
-            ffi::qwen36_full_attn_block_stage_b_q_proj(
-                spec.hidden_in,
-                spec.input_norm_weight,
-                spec.q_weight_fp4,
-                spec.q_weight_scale,
-                spec.q_alpha,
-                spec.hidden_normed_out_bf16,
-                spec.quantized_fp4,
-                spec.quantized_scale_e4m3,
-                spec.q_out,
-                spec.barrier_state,
-                spec.hidden_size,
-                spec.q_features,
-                spec.eps,
-                spec.input_tensor_scale,
-            )
-        })
-    }
-
-    fn megakernel_full_attn_stage_e_o_proj_residual_norm(
-        &self,
-        spec: &MegakernelFullAttnStageESpec,
-    ) -> Result<()> {
-        check(
-            "qwen36_full_attn_block_stage_e_o_proj_residual_norm",
-            unsafe {
-                ffi::qwen36_full_attn_block_stage_e_o_proj_residual_norm(
-                    spec.attention_out,
-                    spec.residual_in,
-                    spec.o_proj_fp4,
-                    spec.o_proj_scale,
-                    spec.o_alpha,
-                    spec.post_norm_weight,
-                    spec.attention_quantized_fp4,
-                    spec.attention_quantized_scale,
-                    spec.o_proj_out,
-                    spec.residual_out,
-                    spec.post_normed_out,
-                    spec.post_quantized_fp4,
-                    spec.post_quantized_scale,
-                    spec.barrier_state,
-                    spec.q_features,
-                    spec.hidden_size,
-                    spec.eps,
-                    spec.post_input_tensor_scale,
-                    spec.attention_output_tensor_scale,
-                )
-            },
-        )
-    }
-
-    fn megakernel_full_attn_stage_f4_mlp_block(
-        &self,
-        spec: &MegakernelFullAttnStageF4Spec,
-    ) -> Result<()> {
-        check("qwen36_full_attn_block_stage_f4_mlp_block", unsafe {
-            ffi::qwen36_full_attn_block_stage_f4_mlp_block(
-                spec.hidden_quantized_fp4,
-                spec.hidden_quantized_scale,
-                spec.mlp_gate_up_fp4,
-                spec.mlp_gate_up_scale,
-                spec.gate_up_alpha,
-                spec.mlp_down_fp4,
-                spec.mlp_down_scale,
-                spec.down_alpha,
-                spec.gate_up_out,
-                spec.swiglu_fp4,
-                spec.swiglu_scale,
-                spec.down_out,
-                spec.residual,
-                spec.barrier_state,
-                spec.intermediate,
-                spec.hidden_size,
-                spec.down_input_tensor_scale,
-            )
-        })
-    }
-
     fn interpreter_decode_sm120(&self, spec: &InterpreterProgramSpec) -> Result<()> {
         let ffi_spec = ffi::InterpreterProgramSpec::from(spec);
         check("qwen36_interpreter_decode_sm120", unsafe {
@@ -578,10 +434,9 @@ pub(crate) fn check(kernel: &'static str, code: i32) -> Result<()> {
 }
 
 /// Stream-aware memset entry point. Exposed as a function rather than a
-/// `CudaDeviceBuffer` method so callers that hold a raw `DevicePtr` (e.g.
-/// the engine's per-layer barrier-state slice into a larger arena) can use
-/// it directly. Used by the megakernel integration path so the barrier
-/// reset survives CUDA-graph capture.
+/// `CudaDeviceBuffer` method so callers that hold a raw `DevicePtr` (a
+/// slice into a larger arena) can use it directly; targets the active
+/// stream so the reset survives CUDA-graph capture.
 #[cfg(feature = "cuda")]
 pub(crate) unsafe fn qwen36_cuda_memset_async_raw(dst: DevicePtr, value: i32, bytes: usize) -> i32 {
     unsafe { ffi::qwen36_cuda_memset_async(dst, value, bytes) }
@@ -601,22 +456,6 @@ pub(crate) fn topk_argmax_raw(
         output_token_u32,
     };
     unsafe { ffi::qwen36_topk_argmax(&spec) }
-}
-
-/// Cached env-var lookup gating the CUTLASS-templated NVFP4 GEMM path.
-/// Set `QWEN36_USE_MEGAKERNEL_GEMM=1` to opt in; the default (unset / 0)
-/// keeps the cuBLASLt path active. Cached so the dispatch hot path does
-/// not parse the environment on every GEMM call.
-#[cfg(feature = "cuda")]
-fn megakernel_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("QWEN36_USE_MEGAKERNEL_GEMM").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
 }
 
 /// Cached env-var lookup gating the Direction B decode-time NVFP4 gemv path.
@@ -1666,7 +1505,6 @@ mod ffi {
     #[link(name = "qwen36_fp4_kernels")]
     unsafe extern "C" {
         pub fn qwen36_nvfp4_gemm(spec: *const Nvfp4GemmSpec) -> i32;
-        pub fn qwen36_megakernel_nvfp4_gemm(spec: *const Nvfp4GemmSpec) -> i32;
         pub fn qwen36_decode_nvfp4_gemv(spec: *const Nvfp4GemmSpec) -> i32;
         pub fn qwen36_attention_prefill(spec: *const AttentionPrefillSpec) -> i32;
         pub fn qwen36_deltanet_decode(spec: *const DeltaNetDecodeSpec) -> i32;
@@ -1701,79 +1539,9 @@ mod ffi {
         pub fn qwen36_interpreter_decode_sm120(spec: *const InterpreterProgramSpec) -> i32;
         pub fn qwen36_drafter_attention_block_bf16(spec: *const DrafterAttentionBlockSpec) -> i32;
 
-        // Per-block megakernel Stage B.3: RMSNorm + NVFP4 quantize + Q proj
-        // GEMV fused into one launch. C ABI declared in
-        // `kernels-cuda/include/qwen36_fp4.h`; signature kept in sync via
-        // commit-time integration (the standalone smoke test in
-        // `kernels-cuda/smoke.cu` exercises the byte-exact reference path).
-        pub fn qwen36_full_attn_block_stage_b_q_proj(
-            hidden_in: DevicePtr,
-            input_norm_weight: DevicePtr,
-            q_weight_fp4: DevicePtr,
-            q_weight_scale: DevicePtr,
-            q_alpha: f32,
-            hidden_normed_out_bf16: DevicePtr,
-            quantized_fp4: DevicePtr,
-            quantized_scale_e4m3: DevicePtr,
-            q_out: DevicePtr,
-            barrier_state: DevicePtr,
-            hidden_size: usize,
-            q_features: usize,
-            eps: f32,
-            input_tensor_scale: f32,
-        ) -> i32;
-
-        // Per-block megakernel Stage E: o_proj GEMV + residual + post-attn
-        // RMSNorm + NVFP4 quantize fused. ABI in `qwen36_fp4.h`.
-        pub fn qwen36_full_attn_block_stage_e_o_proj_residual_norm(
-            attention_out: DevicePtr,
-            residual_in: DevicePtr,
-            o_proj_fp4: DevicePtr,
-            o_proj_scale: DevicePtr,
-            o_alpha: f32,
-            post_norm_weight: DevicePtr,
-            attention_quantized_fp4: DevicePtr,
-            attention_quantized_scale: DevicePtr,
-            o_proj_out: DevicePtr,
-            residual_out: DevicePtr,
-            post_normed_out: DevicePtr,
-            post_quantized_fp4: DevicePtr,
-            post_quantized_scale: DevicePtr,
-            barrier_state: DevicePtr,
-            q_features: usize,
-            hidden_size: usize,
-            eps: f32,
-            post_input_tensor_scale: f32,
-            attention_output_tensor_scale: f32,
-        ) -> i32;
-
-        // Per-block megakernel Stage F.4: full MLP block (gate+up GEMV +
-        // SwiGLU + NVFP4 quantize + down GEMV + optional residual add).
-        // Pass `residual.ptr == 0` to skip the in-place residual update.
-        pub fn qwen36_full_attn_block_stage_f4_mlp_block(
-            hidden_quantized_fp4: DevicePtr,
-            hidden_quantized_scale: DevicePtr,
-            mlp_gate_up_fp4: DevicePtr,
-            mlp_gate_up_scale: DevicePtr,
-            gate_up_alpha: f32,
-            mlp_down_fp4: DevicePtr,
-            mlp_down_scale: DevicePtr,
-            down_alpha: f32,
-            gate_up_out: DevicePtr,
-            swiglu_fp4: DevicePtr,
-            swiglu_scale: DevicePtr,
-            down_out: DevicePtr,
-            residual: DevicePtr,
-            barrier_state: DevicePtr,
-            intermediate: usize,
-            hidden_size: usize,
-            down_input_tensor_scale: f32,
-        ) -> i32;
-
         // Captureable variant of `qwen36_cuda_memset` that targets the
-        // active stream. Declared here rather than in qwen36_fp4.h to keep
-        // header churn minimal during the megakernel build-up; the C++
-        // definition lives in runtime.cu next to its sync sibling.
+        // active stream. Declared here rather than in qwen36_fp4.h; the
+        // C++ definition lives in runtime.cu next to its sync sibling.
         pub fn qwen36_cuda_memset_async(dst: DevicePtr, value: i32, bytes: usize) -> i32;
     }
 }
