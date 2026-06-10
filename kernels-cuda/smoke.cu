@@ -6,6 +6,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <math.h>
 #include <random>
 #include <stdio.h>
@@ -3576,6 +3578,128 @@ int main() {
     printf("decode tiled attention parity gate passed (%d cases, BF16+FP8, "
            "pos{255,2047,8191,24575}, append byte-identical)\n",
            cases);
+  }
+
+  // ------------------------------------------------------------------
+  // FP8 lm_head gate: quantize_rows + fp8_matvec vs host reference.
+  // ------------------------------------------------------------------
+  // The FP8 path replaces the BF16 lm_head everywhere (decode logits,
+  // prefill logits, MTP verify rows). Host reference replicates the
+  // quantization exactly (e4m3 RNE via float->fp8->float round trip is
+  // checked against the GPU decode), then the matvec must match it within
+  // accumulation noise AND preserve the argmax of a peaked test vector.
+  {
+    const size_t M = 4096, K = 1024;
+    const int rows = 3;
+    std::mt19937 rng(737373);
+    std::uniform_real_distribution<float> dist(-0.4f, 0.4f);
+    std::vector<float> w_host(M * K), x_host(rows * K);
+    for (auto &v : w_host) v = dist(rng);
+    for (auto &v : x_host) v = dist(rng);
+    // Make row 1234 strongly aligned with input row 0 so the argmax is
+    // unambiguous and must survive quantization.
+    for (size_t k = 0; k < K; ++k) {
+      w_host[1234 * K + k] = 0.4f * (x_host[k] >= 0.0f ? 1.0f : -1.0f);
+    }
+
+    qwen36_device_ptr_t w_dev = dev_alloc<__nv_bfloat16>(M * K);
+    copy_bf16(w_dev, w_host);
+    // Re-read what BF16 actually stored (the host reference must quantize
+    // the BF16-rounded values, not the f32 originals).
+    std::vector<float> w_bf16 = read_bf16(w_dev, M * K);
+
+    qwen36_device_ptr_t w_e4m3 = dev_alloc<uint8_t>(M * K);
+    qwen36_device_ptr_t scales = dev_alloc<float>(M);
+    qwen36_fp8_quantize_rows_spec_t qspec{};
+    qspec.out_features = M;
+    qspec.in_features = K;
+    qspec.weight_bf16 = w_dev;
+    qspec.weight_e4m3 = w_e4m3;
+    qspec.row_scale_f32 = scales;
+    must_status(qwen36_fp8_quantize_rows(&qspec), "fp8 quantize_rows");
+
+    qwen36_device_ptr_t x_dev = dev_alloc<__nv_bfloat16>(rows * K);
+    copy_bf16(x_dev, x_host);
+    std::vector<float> x_bf16 = read_bf16(x_dev, rows * K);
+    qwen36_device_ptr_t y_dev = dev_alloc<__nv_bfloat16>(rows * M);
+    qwen36_fp8_matvec_spec_t mspec{};
+    mspec.out_features = M;
+    mspec.in_features = K;
+    mspec.rows = rows;
+    mspec.input_stride = K;
+    mspec.weight_e4m3 = w_e4m3;
+    mspec.row_scale_f32 = scales;
+    mspec.input_bf16 = x_dev;
+    mspec.output_bf16 = y_dev;
+    must_status(qwen36_fp8_matvec(&mspec), "fp8 matvec");
+
+    // Host reference from the GPU-quantized bytes (decodes the same e4m3).
+    std::vector<uint8_t> e4m3_host(M * K);
+    must_status(qwen36_cuda_memcpy_d2h(e4m3_host.data(), w_e4m3, M * K),
+                "fp8 d2h codes");
+    std::vector<float> scale_host(M);
+    must_status(qwen36_cuda_memcpy_d2h(scale_host.data(), scales, M * 4),
+                "fp8 d2h scales");
+    auto e4m3_decode = [](uint8_t code) -> float {
+      const float sign = (code & 0x80) ? -1.0f : 1.0f;
+      const int exponent = (code >> 3) & 0x0f;
+      const int mantissa = code & 0x07;
+      if (exponent == 0) {
+        return sign * std::ldexp(static_cast<float>(mantissa) / 8.0f, -6);
+      }
+      return sign *
+             std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f,
+                        exponent - 7);
+    };
+    std::vector<float> y_got = read_bf16(y_dev, rows * M);
+    double worst_rel = 0.0;
+    for (int r = 0; r < rows; ++r) {
+      size_t ref_arg = 0, got_arg = 0;
+      float ref_best = -1e30f, got_best = -1e30f;
+      for (size_t m = 0; m < M; ++m) {
+        double acc = 0.0;
+        for (size_t k = 0; k < K; ++k) {
+          acc += static_cast<double>(e4m3_decode(e4m3_host[m * K + k])) *
+                 x_bf16[r * K + k];
+        }
+        const float ref = static_cast<float>(acc) * scale_host[m];
+        const float got = y_got[r * M + m];
+        const double rel = std::abs(got - ref) /
+                           std::max(1e-3, static_cast<double>(std::abs(ref)));
+        worst_rel = std::max(worst_rel, rel);
+        if (ref > ref_best) { ref_best = ref; ref_arg = m; }
+        if (got > got_best) { got_best = got; got_arg = m; }
+      }
+      if (ref_arg != got_arg || (r == 0 && ref_arg != 1234)) {
+        fprintf(stderr,
+                "fp8 lm_head gate FAIL row %d: argmax got %zu ref %zu "
+                "(planted 1234)\n",
+                r, got_arg, ref_arg);
+        exit(1);
+      }
+    }
+    if (worst_rel > 0.02) {
+      fprintf(stderr, "fp8 lm_head gate FAIL: worst rel err %.4f > 0.02\n",
+              worst_rel);
+      exit(1);
+    }
+    // Quantization quality vs the BF16 originals (sanity, not a hard gate):
+    double max_qerr = 0.0;
+    for (size_t i = 0; i < M * K; ++i) {
+      const size_t m = i / K;
+      const float deq = e4m3_decode(e4m3_host[i]) * scale_host[m];
+      max_qerr = std::max(max_qerr,
+                          static_cast<double>(std::abs(deq - w_bf16[i])));
+    }
+    printf("fp8 lm_head gate passed (rows=%d, worst rel %.5f, max quant err "
+           "%.5f)\n",
+           rows, worst_rel, max_qerr);
+
+    dev_free<__nv_bfloat16>(w_dev);
+    dev_free<uint8_t>(w_e4m3);
+    dev_free<float>(scales);
+    dev_free<__nv_bfloat16>(x_dev);
+    dev_free<__nv_bfloat16>(y_dev);
   }
 
   // ------------------------------------------------------------------

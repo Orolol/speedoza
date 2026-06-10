@@ -21,6 +21,30 @@ pub struct Bf16MatVecSpec {
     pub output_bf16: DevicePtr,
 }
 
+/// One-time load-side quantization of a BF16 weight matrix to FP8 e4m3 with
+/// a per-row f32 scale (the lm_head FP8 path).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fp8QuantizeRowsSpec {
+    pub out_features: usize,
+    pub in_features: usize,
+    pub weight_bf16: DevicePtr,
+    pub weight_e4m3: DevicePtr,
+    pub row_scale_f32: DevicePtr,
+}
+
+/// logits = (decode(W_e4m3) * row_scale) @ x for `rows` input rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fp8MatVecSpec {
+    pub out_features: usize,
+    pub in_features: usize,
+    pub rows: usize,
+    pub input_stride: usize,
+    pub weight_e4m3: DevicePtr,
+    pub row_scale_f32: DevicePtr,
+    pub input_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bf16GemmSpec {
     pub m: usize,

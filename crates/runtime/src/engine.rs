@@ -12,12 +12,12 @@ use qwen36_fp4_kernels::{
     AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
     Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode,
     CudaBackend, CudaDeviceBuffer, DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape,
-    DevicePtr, EmbeddingLookupSpec, GdnGateSpec, InterpreterOpcode, InterpreterOpcodeSet,
-    InterpreterProgramSpec, Nvfp4GemmSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
-    PartialRopeSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec,
-    RmsNormSpec, SamplingRowsSpec, SamplingSpec, SwiGluNvfp4QuantizeSpec, SwiGluSpec,
-    attention_decode_spec_abi_bytes, attention_decode_spec_abi_size,
-    deltanet_decode_spec_abi_bytes, deltanet_decode_spec_abi_size,
+    DevicePtr, EmbeddingLookupSpec, Fp8MatVecSpec, Fp8QuantizeRowsSpec, GdnGateSpec,
+    InterpreterOpcode, InterpreterOpcodeSet, InterpreterProgramSpec, Nvfp4GemmSpec,
+    Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec, QProjDeinterleaveSpec,
+    QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec, SamplingRowsSpec, SamplingSpec,
+    SwiGluNvfp4QuantizeSpec, SwiGluSpec, attention_decode_spec_abi_bytes,
+    attention_decode_spec_abi_size, deltanet_decode_spec_abi_bytes, deltanet_decode_spec_abi_size,
     interpreter_opcodes_enabled_from_env,
 };
 use qwen36_fp4_kernels::{KernelBackend, NoCudaBackend};
@@ -85,6 +85,11 @@ fn cuda_env_bool_value(name: &str) -> Option<bool> {
 #[cfg(feature = "cuda")]
 fn cuda_env_bool(name: &str) -> bool {
     cuda_env_bool_value(name).unwrap_or(false)
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_env_bool_default_true(name: &str) -> bool {
+    cuda_env_bool_value(name).unwrap_or(true)
 }
 
 #[cfg(feature = "cuda")]
@@ -763,7 +768,21 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
     /// before each prefill call when DFlash is active.
     #[cfg(feature = "cuda")]
     drafter_hidden_capture: Option<DrafterHiddenCaptureHook>,
+    /// lm_head quantized to FP8 e4m3 with per-row f32 scales at load time
+    /// (default ON; kill: `QWEN36_LM_HEAD_FP8=0`). When `Some`, every
+    /// lm_head matvec/gemm-rows consumer routes through `fp8_matvec` so all
+    /// MTP modes see the same logits (parity-floor requirement). Halves the
+    /// 1.65 ms/token BF16 lm_head read. Offline probe: 0/27 argmax flips.
+    #[cfg(feature = "cuda")]
+    lm_head_fp8: Option<LmHeadFp8>,
     backend: B,
+}
+
+#[cfg(feature = "cuda")]
+struct LmHeadFp8 {
+    tensor_name: String,
+    weight_e4m3: CudaDeviceBuffer,
+    row_scale_f32: CudaDeviceBuffer,
 }
 
 #[cfg(feature = "cuda")]
@@ -954,6 +973,8 @@ impl<B: KernelBackend> Engine<B> {
             decode_aux: None,
             #[cfg(feature = "cuda")]
             drafter_hidden_capture: None,
+            #[cfg(feature = "cuda")]
+            lm_head_fp8: None,
             backend,
         }
     }
@@ -9920,6 +9941,20 @@ impl<B: KernelBackend> Engine<B> {
             .shape
             .get(1)
             .ok_or_else(|| CoreError::Runtime(format!("tensor {} is not a matrix", weight.name)))?;
+        if let Some(fp8) = &self.lm_head_fp8 {
+            if weight.name == fp8.tensor_name {
+                return self.backend.fp8_matvec(&Fp8MatVecSpec {
+                    out_features,
+                    in_features,
+                    rows: 1,
+                    input_stride: in_features,
+                    weight_e4m3: fp8.weight_e4m3.ptr(),
+                    row_scale_f32: fp8.row_scale_f32.ptr(),
+                    input_bf16: input,
+                    output_bf16: output,
+                });
+            }
+        }
         let runtime = self.cuda_runtime()?;
         let workspace = runtime
             .workspace
@@ -9972,6 +10007,20 @@ impl<B: KernelBackend> Engine<B> {
             .shape
             .get(1)
             .ok_or_else(|| CoreError::Runtime(format!("tensor {} is not a matrix", weight.name)))?;
+        if let Some(fp8) = &self.lm_head_fp8 {
+            if weight.name == fp8.tensor_name {
+                return self.backend.fp8_matvec(&Fp8MatVecSpec {
+                    out_features,
+                    in_features,
+                    rows,
+                    input_stride: in_features,
+                    weight_e4m3: fp8.weight_e4m3.ptr(),
+                    row_scale_f32: fp8.row_scale_f32.ptr(),
+                    input_bf16: input,
+                    output_bf16: output,
+                });
+            }
+        }
         let runtime = self.cuda_runtime()?;
         let workspace = runtime
             .workspace
@@ -10719,7 +10768,62 @@ impl Engine<CudaBackend> {
         engine.gpu_prefill = Some(gpu_prefill);
         engine.mlp_fused = mlp_fused;
         engine.linear_attn_in_proj_fused = linear_attn_in_proj_fused;
+        engine.build_lm_head_fp8()?;
         Ok(engine)
+    }
+
+    /// One-time GPU quantization of the BF16 lm_head to FP8 e4m3 + per-row
+    /// f32 scales (default ON; kill: `QWEN36_LM_HEAD_FP8=0`). All lm_head
+    /// consumers (decode logits, prefill logits, MTP verify rows) then read
+    /// 1 byte/weight instead of 2. Must be all-or-nothing across consumers:
+    /// mixing FP8 and BF16 logits across MTP modes would break the MTP
+    /// parity floor on borderline-argmax tokens.
+    #[cfg(feature = "cuda")]
+    fn build_lm_head_fp8(&mut self) -> Result<()> {
+        if !cuda_env_bool_default_true("QWEN36_LM_HEAD_FP8") {
+            return Ok(());
+        }
+        // The opt-in interpreter logits slice (QWEN36_INTERPRETER_LOGITS)
+        // reads the BF16 lm_head via its LM_HEAD_TILED opcode; mixing it
+        // with FP8 logits elsewhere would diverge across paths. The
+        // diagnostic mode wins.
+        if decode_interpreter_logits_enabled() {
+            return Ok(());
+        }
+        let manifest = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+        let lm_head = manifest.lm_head.clone();
+        let out_features = *lm_head.shape.first().ok_or_else(|| {
+            CoreError::Runtime(format!("tensor {} has empty shape", lm_head.name))
+        })?;
+        let in_features = *lm_head.shape.get(1).ok_or_else(|| {
+            CoreError::Runtime(format!("tensor {} is not a matrix", lm_head.name))
+        })?;
+        if in_features % 16 != 0 {
+            return Ok(()); // shape outside the fp8_matvec contract: keep BF16
+        }
+        let weights = self.cuda_weights()?;
+        let weight_bf16 = self.tensor_ptr(weights, &lm_head)?;
+        let weight_e4m3 = CudaDeviceBuffer::alloc(out_features * in_features)
+            .map_err(|err| CoreError::Runtime(format!("lm_head fp8 alloc: {err}")))?;
+        let row_scale_f32 = CudaDeviceBuffer::alloc(out_features * size_of::<f32>())
+            .map_err(|err| CoreError::Runtime(format!("lm_head fp8 scale alloc: {err}")))?;
+        self.backend.fp8_quantize_rows(&Fp8QuantizeRowsSpec {
+            out_features,
+            in_features,
+            weight_bf16,
+            weight_e4m3: weight_e4m3.ptr(),
+            row_scale_f32: row_scale_f32.ptr(),
+        })?;
+        qwen36_fp4_kernels::cuda_synchronize()?;
+        self.lm_head_fp8 = Some(LmHeadFp8 {
+            tensor_name: lm_head.name.clone(),
+            weight_e4m3,
+            row_scale_f32,
+        });
+        Ok(())
     }
 
     pub fn gpu_weight_summary(&self) -> Option<(usize, u64)> {

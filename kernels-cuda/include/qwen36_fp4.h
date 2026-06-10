@@ -91,6 +91,29 @@ typedef struct {
   size_t workspace_bytes;
 } qwen36_bf16_gemm_spec_t;
 
+// FP8 (e4m3) lm_head path: weights quantized at load time on the GPU with a
+// per-row f32 scale; the matvec reads 1 byte/element instead of 2 (the
+// lm_head BF16 read was 1.65 ms/token at 86% of DRAM peak — FP8 halves it).
+// Probe gate 2026-06-10: 0/27 argmax flips on real final_normed vectors.
+typedef struct {
+  size_t out_features; // M (rows of the weight matrix)
+  size_t in_features;  // K
+  qwen36_device_ptr_t weight_bf16;    // [M, K] input (read)
+  qwen36_device_ptr_t weight_e4m3;    // [M, K] output (written)
+  qwen36_device_ptr_t row_scale_f32;  // [M] output (written)
+} qwen36_fp8_quantize_rows_spec_t;
+
+typedef struct {
+  size_t out_features; // M
+  size_t in_features;  // K
+  size_t rows;         // input rows (1 decode; up to 5 for MTP verify)
+  size_t input_stride; // elements between input rows
+  qwen36_device_ptr_t weight_e4m3;   // [M, K]
+  qwen36_device_ptr_t row_scale_f32; // [M]
+  qwen36_device_ptr_t input_bf16;    // [rows, input_stride]
+  qwen36_device_ptr_t output_bf16;   // [rows, M]
+} qwen36_fp8_matvec_spec_t;
+
 typedef struct {
   size_t q_heads;
   size_t kv_heads;
@@ -606,6 +629,8 @@ int qwen36_sample_rows(const qwen36_sampling_rows_spec_t *spec);
 int qwen36_topk_argmax(const qwen36_topk_argmax_spec_t *spec);
 int qwen36_embedding_lookup(const qwen36_embedding_lookup_spec_t *spec);
 int qwen36_bf16_matvec(const qwen36_bf16_matvec_spec_t *spec);
+int qwen36_fp8_quantize_rows(const qwen36_fp8_quantize_rows_spec_t *spec);
+int qwen36_fp8_matvec(const qwen36_fp8_matvec_spec_t *spec);
 int qwen36_nvfp4_matvec(const qwen36_nvfp4_matvec_spec_t *spec);
 int qwen36_nvfp4_quantize_bf16(const qwen36_nvfp4_quantize_spec_t *spec);
 int qwen36_nvfp4_quantize_rows(const qwen36_nvfp4_quantize_rows_spec_t *spec);

@@ -8,9 +8,10 @@ use crate::interpreter::InterpreterProgramSpec;
 use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
     Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, Conv1dUpdateSpec,
-    CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec,
-    Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec,
-    RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
+    CopyStridedRowsSpec, EmbeddingLookupSpec, Fp8MatVecSpec, Fp8QuantizeRowsSpec, GdnGateSpec,
+    Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec,
+    QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, SigmoidGateSpec,
+    SigmoidGateStridedSpec,
 };
 use crate::rmsnorm::RmsNormSpec;
 use crate::rope::PartialRopeSpec;
@@ -99,6 +100,14 @@ pub trait KernelBackend: Send + Sync {
 
     fn bf16_matvec(&self, _spec: &Bf16MatVecSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("bf16_matvec"))
+    }
+
+    fn fp8_quantize_rows(&self, _spec: &Fp8QuantizeRowsSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("fp8_quantize_rows"))
+    }
+
+    fn fp8_matvec(&self, _spec: &Fp8MatVecSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("fp8_matvec"))
     }
 
     fn bf16_gemm(&self, _spec: &Bf16GemmSpec) -> Result<()> {
@@ -303,6 +312,20 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::EmbeddingLookupSpec::from(spec);
         check("qwen36_embedding_lookup", unsafe {
             ffi::qwen36_embedding_lookup(&ffi_spec)
+        })
+    }
+
+    fn fp8_quantize_rows(&self, spec: &Fp8QuantizeRowsSpec) -> Result<()> {
+        let ffi_spec = ffi::Fp8QuantizeRowsSpec::from(spec);
+        check("qwen36_fp8_quantize_rows", unsafe {
+            ffi::qwen36_fp8_quantize_rows(&ffi_spec)
+        })
+    }
+
+    fn fp8_matvec(&self, spec: &Fp8MatVecSpec) -> Result<()> {
+        let ffi_spec = ffi::Fp8MatVecSpec::from(spec);
+        check("qwen36_fp8_matvec", unsafe {
+            ffi::qwen36_fp8_matvec(&ffi_spec)
         })
     }
 
@@ -1057,6 +1080,54 @@ mod ffi {
         pub output_bf16: DevicePtr,
     }
 
+    #[repr(C)]
+    pub struct Fp8QuantizeRowsSpec {
+        pub out_features: usize,
+        pub in_features: usize,
+        pub weight_bf16: DevicePtr,
+        pub weight_e4m3: DevicePtr,
+        pub row_scale_f32: DevicePtr,
+    }
+
+    impl From<&crate::ops::Fp8QuantizeRowsSpec> for Fp8QuantizeRowsSpec {
+        fn from(value: &crate::ops::Fp8QuantizeRowsSpec) -> Self {
+            Self {
+                out_features: value.out_features,
+                in_features: value.in_features,
+                weight_bf16: value.weight_bf16,
+                weight_e4m3: value.weight_e4m3,
+                row_scale_f32: value.row_scale_f32,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct Fp8MatVecSpec {
+        pub out_features: usize,
+        pub in_features: usize,
+        pub rows: usize,
+        pub input_stride: usize,
+        pub weight_e4m3: DevicePtr,
+        pub row_scale_f32: DevicePtr,
+        pub input_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+    }
+
+    impl From<&crate::ops::Fp8MatVecSpec> for Fp8MatVecSpec {
+        fn from(value: &crate::ops::Fp8MatVecSpec) -> Self {
+            Self {
+                out_features: value.out_features,
+                in_features: value.in_features,
+                rows: value.rows,
+                input_stride: value.input_stride,
+                weight_e4m3: value.weight_e4m3,
+                row_scale_f32: value.row_scale_f32,
+                input_bf16: value.input_bf16,
+                output_bf16: value.output_bf16,
+            }
+        }
+    }
+
     impl From<&crate::ops::Bf16MatVecSpec> for Bf16MatVecSpec {
         fn from(value: &crate::ops::Bf16MatVecSpec) -> Self {
             Self {
@@ -1530,6 +1601,8 @@ mod ffi {
         pub fn qwen36_embedding_lookup(spec: *const EmbeddingLookupSpec) -> i32;
         pub fn qwen36_bf16_gemm(spec: *const Bf16GemmSpec) -> i32;
         pub fn qwen36_bf16_matvec(spec: *const Bf16MatVecSpec) -> i32;
+        pub fn qwen36_fp8_quantize_rows(spec: *const Fp8QuantizeRowsSpec) -> i32;
+        pub fn qwen36_fp8_matvec(spec: *const Fp8MatVecSpec) -> i32;
         pub fn qwen36_nvfp4_matvec(spec: *const Nvfp4MatVecSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_bf16(spec: *const Nvfp4QuantizeSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_rows(spec: *const Nvfp4QuantizeRowsSpec) -> i32;

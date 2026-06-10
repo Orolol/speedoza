@@ -54,6 +54,7 @@ activated by flag/env. **NEG** = built, benchmarked negative/neutral, kept in tr
 | DeltaNet decode + chunked prefill | `kernels-cuda/deltanet.cu`, `deltanet_prefill.cu` | 48 linear-attention layers; chunked prefill default ON |
 | Elementwise/fused ops | `kernels-cuda/ops.cu` | rmsnorm (+nvfp4-quantize), swiglu (+nvfp4-quantize), conv1d (+gdn-gate fused), sampling, embedding, q_proj deinterleave/gate |
 | Partial RoPE | in `ops.cu` / `crates/kernels/src/rope.rs` | 64 of 256 dims |
+| lm_head FP8 e4m3 | `kernels-cuda/fp8_matvec.cu`, `engine.rs build_lm_head_fp8` | **default ON** (kill: `QWEN36_LM_HEAD_FP8=0`): lm_head quantized on-GPU at load (per-row f32 scales), all consumers (decode/prefill logits, MTP verify rows) read 1 B/weight. Offline probe 0/27 argmax flips; smoke gate vs host reference. Self-disables under `QWEN36_INTERPRETER_LOGITS` (BF16 opcode) — tree-MTP top-k keeps BF16 (NEG lane) |
 | KV cache dtype | engine + attention kernels | `EngineConfig::default` is FP8 (`engine.rs:602`) **but the CLI overrides per command**: `chat`/`bench` default **BF16**, DFlash paths default **FP8** (`cli/main.rs cuda_kv_cache_dtype` call sites); `QWEN36_KV_CACHE_DTYPE` overrides all. Discovered 2026-06-10 — perf numbers from bench/chat are BF16-KV numbers |
 | MTP chain controller + verify graphs | `crates/mtp/src/lib.rs`, engine | opt-in by CLI flag but fully on the supported path; MTP=1 two-token graph, MTP=2/3/4 chunked verify + multi-graph |
 | Decode interpreter (whole-layer fused launches) | `kernels-cuda/interpreter/`, `crates/kernels/src/interpreter.rs`, `crates/runtime/src/interpreter_compile.rs` | **AUTO**: enabled iff `mtp_speculative_tokens > 0` (+7.3% MTP=4), disabled at MTP=0 (would regress −5%). `QWEN36_INTERPRETER_DECODE=0|1|auto` |
@@ -149,6 +150,7 @@ Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
 | Var | Default | Effect |
 |---|---|---|
 | `QWEN36_ATTENTION_SAGE_PREFILL` | **1** | `0` falls back to flash BF16 prefill (`attention.cu:2565`) |
+| `QWEN36_LM_HEAD_FP8` | **1** | `0` keeps the BF16 lm_head (cuBLASLt gemvx). FP8 halves the 1.65 ms/token lm_head read (`fp8_matvec.cu`) |
 | `QWEN36_SAGE_PIPELINE` | **1** | `0` disables the sage prefill cp.async pipeline (FP8: staged raw KV tiles; BF16: V copied async directly into SMEM). Bit-identical to legacy (smoke-gated); kill switch only (`attention_sage_prefill.cu`) |
 | `QWEN36_ATTENTION_FLASH_PREFILL` | **1** | `0` falls back to scalar GQA prefill (`attention.cu:2578`) |
 | `QWEN36_VERIFY_FLASH_SPLITK` | **1** | `0` forces scalar GQA for 2–32-token verify chunks (`attention.cu:2655`) |

@@ -97,6 +97,51 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-10 — lm_head FP8 e4m3 (voie de repêchage de la probe FP4) — SHIPPED
+
+La probe offline FP8 (même harness que la probe FP4 tueuse, mêmes 27
+vecteurs réels) : **0 flip top-1, |Δlogit| moyen 0.045 (3× sous le FP4)**
+→ implémentation.
+
+**Design** (default ON, kill `QWEN36_LM_HEAD_FP8=0`) :
+- `kernels-cuda/fp8_matvec.cu` : `fp8_quantize_rows` (quantization GPU
+  one-shot au chargement : amax par ligne → scale f32 = amax/448, encode
+  e4m3 RNE hardware via `__nv_cvt_float_to_fp8`) +
+  `fp8_matvec` (1 warp/ligne, 8 lignes/CTA, B en SMEM f32, décode
+  `__nv_cvt_fp8x2_to_halfraw2`, accum f32, scale par ligne appliqué à la
+  sortie — exact pour l'argmax par ligne).
+- Engine : `build_lm_head_fp8()` à l'init ; dispatch dans les DEUX choke
+  points (`bf16_matvec` + `bf16_gemm_rows`) par nom de tenseur → **tous**
+  les consommateurs lm_head (logits décode, logits prefill, verify MTP
+  batché) basculent ensemble — exigence du parity floor (mixer FP8/BF16
+  selon le mode divergerait sur les tokens borderline). Exceptions
+  documentées : top-k tree (lane NEG, reste BF16) ; se désactive sous
+  `QWEN36_INTERPRETER_LOGITS` (opcode BF16).
+
+**Bug de bring-up** (pour mémoire) : la première version du quantizer
+faisait un `__shfl_xor_sync(0xffffffff, …)` dans une branche à 8 threads
+actifs → deadlock GPU (100% util, 194 W, smoke suspendu). Réduction
+finale re-écrite en linéaire thread-0.
+
+Gates : smoke `fp8 lm_head gate` (quantize+matvec vs référence host :
+worst rel 0.39%, argmax planté préservé, 3 rows) ; e2e TOUS verts :
+- decode-vs-prefill-check : argmax_match=true, cos 0.9977 (inchangé) ;
+- dump-logits FP8 on/off : top-1 identique sur 4 prompts (code, FR,
+  corpus 6K chars, hello world) ;
+- MTP parity floor : 10/10 identiques ;
+- fmt + clippy (±cuda) + tests workspace verts.
+
+**Perf (dashboard corpus, ctx 3072, max-new 128)** :
+- MTP=0 : **61.8 → 65.2 / 65.2 / 64.7 tok/s (+5.4%)**. Cumul du jour sur
+  cette cellule : 59.4 → 65.2 (**+9.8%** = routing down→cuBLASLt + lm_head
+  FP8).
+- MTP=4 : 39.3 vs 39.5 baseline — bruit, pas de régression (le lm_head
+  y est amorti sur les tokens acceptés, gain attendu plus faible).
+
+Files: kernels-cuda/fp8_matvec.cu (new), include/qwen36_fp4.h (+2 specs
+ABI, miroirs backend.rs/ops.rs/lib.rs), engine.rs, smoke.cu,
+build_cuda.sh. Inventory: oui (§2.1 + env).
+
 ### 2026-06-10 — GEMV par shape : mlp.down routé vers cuBLASLt (+4.1% MTP=0) ; profondeur de pipeline falsifiée — SHIPPED + NEGATIVE
 
 Nouvel instrument : `kernels-cuda/tools/gemv_shape_bench.cu` — microbench

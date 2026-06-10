@@ -33,6 +33,7 @@ EXTRA_SRC+=(kernels-cuda/drafter_attention_flash.cu)
   kernels-cuda/attention_flash_splitk.cu \
   kernels-cuda/attention_decode_tiled.cu \
   kernels-cuda/attention_sage_prefill.cu \
+  kernels-cuda/fp8_matvec.cu \
   kernels-cuda/turboquant.cu \
   kernels-cuda/ops.cu \
   kernels-cuda/runtime.cu \
