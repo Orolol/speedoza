@@ -590,17 +590,18 @@ fn mtp_postnorm_hidden_enabled() -> bool {
     !cuda_env_bool_value("QWEN36_MTP_PRENORM_HIDDEN").unwrap_or(false)
 }
 
-/// lm_head FP8 e4m3 (W8A16), default ON since 2026-06-11 night: halves the
-/// logits-GEMV weight reads (N=1 785 us = 90% peak vs cuBLAS BF16 1.65 ms;
-/// batched verify N=5 1.78 ms vs 2.2 ms) and frees the BF16 lm_head
-/// (−1.18 GiB resident). Gates: parity floor 10/10 (identical text), chat
-/// MTP acceptance unchanged, MTP=0 +1.8%. Known trade-off: the raw-corpus
-/// short-ctx cell loses ~0.12 draft acceptance to low-margin argmax flips —
-/// production regimes are clean and the MTP auto-fallback bounds the rest.
-/// `QWEN36_LM_HEAD_FP8=0` restores the BF16 lm_head.
+/// lm_head FP8 e4m3 (W8A16). AUTO policy (2026-06-11 night): enabled iff
+/// the engine runs WITHOUT speculative drafting (mtp == 0) — the MTP head's
+/// draft recursion feeds each step the previous step's lm_head argmax, so
+/// FP8 low-margin flips COMPOUND down the chain (measured on realistic
+/// chat @8K: per-position 0.8/0.8/0.73 -> 0.8/0.53/0.47, acceptance
+/// 0.77 -> 0.589, tok/s −29%, deterministic). At mtp == 0 the flips don't
+/// compound and FP8 is a pure win: GEMV 785 us = 90% peak (cuBLAS BF16:
+/// 1.65 ms), +1.8% decode, −1.18 GiB resident, floor 10/10.
+/// `QWEN36_LM_HEAD_FP8=1` forces ON (experiments), `=0` forces OFF.
 #[cfg(feature = "cuda")]
-fn cuda_lm_head_fp8_enabled() -> bool {
-    cuda_env_bool_value("QWEN36_LM_HEAD_FP8").unwrap_or(true)
+fn cuda_lm_head_fp8_enabled(mtp_speculative_tokens: usize) -> bool {
+    cuda_env_bool_value("QWEN36_LM_HEAD_FP8").unwrap_or(mtp_speculative_tokens == 0)
 }
 
 #[cfg(feature = "cuda")]
@@ -10823,7 +10824,7 @@ impl Engine<CudaBackend> {
         // its weight reads). Done before the fused-store builds so the
         // transient (BF16 + e4m3 coexisting) lands at the init-memory low
         // point.
-        let lm_head_fp8 = if cuda_lm_head_fp8_enabled()
+        let lm_head_fp8 = if cuda_lm_head_fp8_enabled(engine.config.mtp_speculative_tokens)
             && !engine.config.keep_bf16_lm_head
             && manifest.lm_head.dtype == qwen36_fp4_core::TensorDtype::Bf16
             && manifest.lm_head.shape.len() == 2
