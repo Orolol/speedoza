@@ -97,6 +97,24 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-11 (nuit) — PR #11 (fused argmax, draft du 17 mai) rebasée sur un mois de divergence et mergée en opt-in — NEGATIVE au bench
+
+Demande utilisateur : merger la seule PR ouverte. Résolution de 7
+fichiers en conflit (purge rationalization, plomberie FP8 lm_head,
+sélecteurs prénorm — unions propres, `decode_e2m1` reste purgé).
+Gates : build+clippy 0, smoke 100% (cas fused-argmax inclus), floor
+vert défaut ET flag (sorties identiques).
+
+Mesure (`QWEN36_MTP_FUSED_ARGMAX=1`, MTP=4 @128 pur, ×2 runs) :
+**+4 à +6.6 ms/cycle** vs cuBLAS matvec + argmax séparés, acceptance
+strictement inchangée. La fusion supprime le buffer logits mais le
+kernel fusionné (réduction atomique pleine-vocab) perd plus que les
+~174 µs d'argmax économisés. Classé §2.3 archived-negative ; opt-in
+conservé comme instrument (le concept redevient intéressant si un
+futur kernel lm_head écrit déjà ses réductions par blocs).
+
+Files: merge de la branche speedoza-mtp-fused-sample. Inventory: oui.
+
 ### 2026-06-11 (nuit, fin) — CORRECTION lm_head FP8 : les flips composent dans la récursion de draft → politique AUTO (ON ssi MTP=0) ; grille de régimes re-mesurée sur le main à jour — SHIPPED
 
 **Correction de l'entrée précédente.** Le « production regimes clean »
