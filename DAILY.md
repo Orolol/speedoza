@@ -97,6 +97,55 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-11 (nuit) — lm_head FP8 e4m3 : kernel + plomberie complets, N=1 à 90% du pic, opt-in en attendant N>1 et l'arbitrage acceptance court-ctx — WIP
+
+Lane temps-de-cycle, suite de la probe verte du matin (0/28 flips).
+Livré sur cette branche (`QWEN36_LM_HEAD_FP8=1`, défaut OFF) :
+
+- **Kernels** (`kernels-cuda/lm_head_fp8.cu`) : quantize one-shot
+  BF16→e4m3 + scales per-row (amax/448, cast saturant — le contrat
+  exact de la probe), et GEMV W8A16 N-RHS (N≤16, dispatch templaté,
+  register-blocking R lignes/warp, x via __ldg L1-résident).
+- **Plomberie** : FFI/backend, store `LmHeadFp8Store`, quantize à
+  l'init PUIS drop du lm_head BF16 (−2.37 +1.19 = **−1.18 GiB** ;
+  poids résidents 18.3 → 10.2 → **7.82 GiB** avec le levier 1) ;
+  TOUS les consommateurs routés via `lm_head_matvec`/`_matmul_rows`
+  (décode, MTP head ×2, verify batché, DFlash verify_block, recovery),
+  chunking N≤16 pour les blocs DFlash ≤32, interpreter-logits gated off
+  sous FP8.
+
+**Leçon kernel chèrement payée** : v1 avec tile X en SMEM +
+__syncthreads par tile = **2456 µs (29% du pic)** — les barrières
+sérialisent les rounds (latence load X non recouverte) ; les loads
+uint4 n'y changent rien (2615 µs). v2 streaming pur sans barrière
+(x en __ldg, X = 10-130 KB L1/L2-résident) = **790 µs = 1.61 TB/s =
+90% du pic**, mieux que cuBLAS BF16 (86%). La v3 register-blockée
+(R lignes/warp pour amortir x à N>1) est dans l'arbre mais mesurée
+sous contention GPU — à re-mesurer au calme.
+
+**Mesures (GPU calme, .so v2)** :
+| gate | résultat |
+|---|---|
+| floor hello/hello world × MTP {0..4} | **10/10**, texte identique au BF16 |
+| chat MTP=4 ~2K (régime production) | 49 acc / 2 rej — identique BF16 |
+| MTP=0 @3K | 59.8 → **60.9** (+1.8%) |
+| MTP=4 @3K corpus | acc 0.512 (=) mais tok/s 38.2 → 35.5 : le call
+batché N=6 (~2.6 ms) ne bat pas encore cuBLAS (2.2 ms) |
+| MTP=4 @128 corpus | **acc 0.477 → 0.354 (déterministe)** — flips
+argmax aux positions à faible marge (régime corpus court uniquement ;
+chat intact) → tok/s 47.9 → 38.2 |
+
+**Verdict** : opt-in, défaut OFF. Pour flipper ON il faut : (a) N>1
+plus rapide que cuBLAS (R-blocking à re-mesurer, ou x en SMEM chargé
+UNE fois sans barrière par tile), (b) arbitrer le couplage acceptance
+du cell @128 (les régimes production — chat, ctx ≥3K — sont propres ;
+c'est la cellule corpus-court du dashboard qui paie). Le gain VRAM
+(−1.18 GiB) suit le même flag.
+
+Files: kernels-cuda/lm_head_fp8.cu (new), include/qwen36_fp4.h,
+scripts/build_cuda.sh, crates/kernels/{ops,backend,lib}.rs,
+crates/runtime/{engine,gpu}.rs. Inventory: oui (table env).
+
 ### 2026-06-11 (nuit) — Oracle vLLM exécuté : notre acceptance = la référence, régime pour régime — le dossier « acceptance trop basse » est CLOS — DECISION
 
 vLLM (checkout dmtp `/home/orosius/workspace/vllm`, 0.21.1rc1.dev53,

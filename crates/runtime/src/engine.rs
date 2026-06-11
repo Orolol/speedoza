@@ -582,11 +582,24 @@ fn cuda_deltanet_chunked_prefill_enabled() -> bool {
 /// - RECURSION: `QWEN36_MTP_PRENORM_RECURSION=1` feeds the pre-`mtp.norm`
 ///   head output to the next draft step — also worse (positions 2..4
 ///   collapse to 0.34/0.18/0.05 at ctx 128).
+///
 /// Defaults stay on the historical post-norm wiring; the flags remain as
 /// the experiment harness. See DAILY.md 2026-06-11.
 #[cfg(feature = "cuda")]
 fn mtp_postnorm_hidden_enabled() -> bool {
     !cuda_env_bool_value("QWEN36_MTP_PRENORM_HIDDEN").unwrap_or(false)
+}
+
+/// lm_head FP8 e4m3 (W8A16), OPT-IN (`QWEN36_LM_HEAD_FP8=1`): halves the
+/// logits-GEMV weight reads and frees the BF16 lm_head (−1.18 GiB). Status
+/// 2026-06-11 (WIP): N=1 kernel at 90% peak BW (790 us vs cuBLAS 1.65 ms),
+/// MTP=0 +2%, parity floor 10/10, chat-regime MTP acceptance unchanged —
+/// but the raw-corpus ctx-128 cell loses ~0.12 draft acceptance (low-margin
+/// argmax flips, deterministic) and the batched N>1 verify call is not yet
+/// faster than cuBLAS. Default stays OFF until both are settled.
+#[cfg(feature = "cuda")]
+fn cuda_lm_head_fp8_enabled() -> bool {
+    cuda_env_bool_value("QWEN36_LM_HEAD_FP8").unwrap_or(false)
 }
 
 #[cfg(feature = "cuda")]
@@ -765,6 +778,7 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
     /// holds for the shipped Qwen3.6 NVFP4 checkpoint.
     #[cfg(feature = "cuda")]
     pub mlp_fused: Option<MlpFusedStore>,
+    pub lm_head_fp8: Option<crate::gpu::LmHeadFp8Store>,
     /// Pre-concatenated DeltaNet in_proj_qkv/_b/_a/_z NVFP4 weights for the
     /// decode linear-attention fast path (one combined cuBLASLt FP4 GEMM
     /// instead of four). Indexed by global layer index; `None` for full-attn
@@ -976,6 +990,7 @@ impl<B: KernelBackend> Engine<B> {
             gpu_prefill: None,
             #[cfg(feature = "cuda")]
             mlp_fused: None,
+            lm_head_fp8: None,
             #[cfg(feature = "cuda")]
             linear_attn_in_proj_fused: None,
             #[cfg(feature = "cuda")]
@@ -1064,13 +1079,6 @@ impl<B: KernelBackend> Engine<B> {
             let weights = self.cuda_weights()?;
             self.tensor_ptr(weights, &manifest.final_norm)?
         };
-        let lm_head_weight = {
-            let manifest = self.weights.as_ref().ok_or_else(|| {
-                CoreError::Runtime("verify_block_batched: missing weights manifest".to_owned())
-            })?;
-            let weights = self.cuda_weights()?;
-            self.tensor_ptr(weights, &manifest.lm_head)?
-        };
 
         let hidden = self.topology.hidden_size;
         let vocab = self.topology.vocab_size;
@@ -1108,16 +1116,8 @@ impl<B: KernelBackend> Engine<B> {
             direct_weight: false,
         })?;
 
-        self.backend.bf16_gemm(&Bf16GemmSpec {
-            m: vocab,
-            n: k,
-            k: hidden,
-            a_bf16: lm_head_weight,
-            b_bf16: prefill_normed_ptr,
-            c_bf16: logits_buf.ptr(),
-            workspace,
-            workspace_bytes,
-        })?;
+        self.lm_head_matmul_rows(prefill_normed_ptr, logits_buf.ptr(), k)?;
+        let _ = (workspace, workspace_bytes);
 
         self.backend
             .sample_rows(&qwen36_fp4_kernels::SamplingRowsSpec {
@@ -3711,11 +3711,7 @@ impl<B: KernelBackend> Engine<B> {
         )?;
         if emit_logits {
             let last_hidden = Self::ptr_offset(prefill.normed.ptr(), (tokens - 1) * hidden * 2)?;
-            self.bf16_matvec(
-                &manifest.lm_head,
-                last_hidden,
-                self.cuda_forward()?.logits.ptr(),
-            )?;
+            self.lm_head_matvec(last_hidden, self.cuda_forward()?.logits.ptr())?;
         }
         Ok(())
     }
@@ -3815,11 +3811,7 @@ impl<B: KernelBackend> Engine<B> {
             forward.prenorm_hidden.ptr(),
             forward.normed.ptr(),
         )?;
-        self.bf16_matvec(
-            &manifest.lm_head,
-            forward.normed.ptr(),
-            forward.logits.ptr(),
-        )
+        self.lm_head_matvec(forward.normed.ptr(), forward.logits.ptr())
     }
 
     #[cfg(feature = "cuda")]
@@ -4198,11 +4190,7 @@ impl<B: KernelBackend> Engine<B> {
                     self.topology.hidden_size,
                 )?;
             }
-            self.bf16_matvec(
-                &manifest.lm_head,
-                forward.normed.ptr(),
-                forward.logits.ptr(),
-            )?;
+            self.lm_head_matvec(forward.normed.ptr(), forward.logits.ptr())?;
             if let Some(logits_start) = logits_start {
                 qwen36_fp4_kernels::cuda_synchronize()?;
                 prof_logits_ms += logits_start.elapsed().as_secs_f64() * 1000.0;
@@ -4291,13 +4279,9 @@ impl<B: KernelBackend> Engine<B> {
 
     #[cfg(feature = "cuda")]
     fn prefill_row_logits(&self, row: usize) -> Result<()> {
-        let manifest = self
-            .weights
-            .as_ref()
-            .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
         let prefill = self.cuda_prefill()?;
         let hidden = Self::ptr_offset(prefill.normed.ptr(), row * self.topology.hidden_size * 2)?;
-        self.bf16_matvec(&manifest.lm_head, hidden, self.cuda_forward()?.logits.ptr())
+        self.lm_head_matvec(hidden, self.cuda_forward()?.logits.ptr())
     }
 
     #[cfg(feature = "cuda")]
@@ -4312,8 +4296,8 @@ impl<B: KernelBackend> Engine<B> {
             .weights
             .as_ref()
             .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
-        self.bf16_gemm_rows(
-            &manifest.lm_head,
+        let _ = manifest;
+        self.lm_head_matmul_rows(
             self.cuda_prefill()?.normed.ptr(),
             self.cuda_forward()?.mtp_logits.ptr(),
             rows,
@@ -4822,6 +4806,7 @@ impl<B: KernelBackend> Engine<B> {
             if decode_interpreter_logits_enabled()
                 && position_device_i32 == DevicePtr::NULL
                 && self.config.mtp_speculative_tokens == 0
+                && self.lm_head_fp8.is_none()
             {
                 self.run_interpreter_final_logits(manifest, weights, forward)?;
             } else {
@@ -4834,11 +4819,7 @@ impl<B: KernelBackend> Engine<B> {
                     forward.prenorm_hidden.ptr(),
                     forward.normed.ptr(),
                 )?;
-                self.bf16_matvec(
-                    &manifest.lm_head,
-                    forward.normed.ptr(),
-                    forward.logits.ptr(),
-                )?;
+                self.lm_head_matvec(forward.normed.ptr(), forward.logits.ptr())?;
             }
             if dump_decode {
                 if let Some(dir) = &dump_dir {
@@ -10010,6 +9991,60 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    /// lm_head logits for a single hidden vector — FP8 W8A16 when the store
+    /// is active, BF16 cuBLAS otherwise.
+    fn lm_head_matvec(&self, input: DevicePtr, output: DevicePtr) -> Result<()> {
+        if let Some(store) = &self.lm_head_fp8 {
+            return self
+                .backend
+                .lm_head_fp8_gemv(&qwen36_fp4_kernels::LmHeadFp8GemvSpec {
+                    rows: store.rows,
+                    cols: store.cols,
+                    n: 1,
+                    weight_e4m3: store.weight_e4m3.ptr(),
+                    row_scales_f32: store.row_scales_f32.ptr(),
+                    input_bf16: input,
+                    output_bf16: output,
+                });
+        }
+        let manifest = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+        self.bf16_matvec(&manifest.lm_head, input, output)
+    }
+
+    /// Batched lm_head logits: input [rows, hidden] row-major, output
+    /// [rows, vocab] row-major. The FP8 kernel caps one launch at
+    /// QWEN36_LM_HEAD_FP8_MAX_N rows; larger batches (DFlash verify blocks
+    /// up to 32) are chunked.
+    fn lm_head_matmul_rows(&self, input: DevicePtr, output: DevicePtr, rows: usize) -> Result<()> {
+        if let Some(store) = &self.lm_head_fp8 {
+            const MAX_N: usize = 16;
+            let mut done = 0_usize;
+            while done < rows {
+                let n = (rows - done).min(MAX_N);
+                self.backend
+                    .lm_head_fp8_gemv(&qwen36_fp4_kernels::LmHeadFp8GemvSpec {
+                        rows: store.rows,
+                        cols: store.cols,
+                        n,
+                        weight_e4m3: store.weight_e4m3.ptr(),
+                        row_scales_f32: store.row_scales_f32.ptr(),
+                        input_bf16: Self::ptr_offset(input, done * store.cols * 2)?,
+                        output_bf16: Self::ptr_offset(output, done * store.rows * 2)?,
+                    })?;
+                done += n;
+            }
+            return Ok(());
+        }
+        let manifest = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+        self.bf16_gemm_rows(&manifest.lm_head, input, output, rows)
+    }
+
     fn bf16_matvec(&self, weight: &TensorInfo, input: DevicePtr, output: DevicePtr) -> Result<()> {
         let out_features = *weight
             .shape
@@ -10757,6 +10792,51 @@ impl Engine<CudaBackend> {
         }
         let mut gpu_weights = GpuWeightStore::upload_required(model, &manifest, include_mtp)?;
         let mut engine = Self::new(model.layout.topology.clone(), config, CudaBackend);
+        // lm_head FP8: quantize from the just-uploaded BF16 weight, then drop
+        // the BF16 original (net ~-1.2 GiB resident; every logits GEMV halves
+        // its weight reads). Done before the fused-store builds so the
+        // transient (BF16 + e4m3 coexisting) lands at the init-memory low
+        // point.
+        let lm_head_fp8 = if cuda_lm_head_fp8_enabled()
+            && manifest.lm_head.dtype == qwen36_fp4_core::TensorDtype::Bf16
+            && manifest.lm_head.shape.len() == 2
+            && manifest.lm_head.shape[1] % 4 == 0
+        {
+            let rows = manifest.lm_head.shape[0];
+            let cols = manifest.lm_head.shape[1];
+            let weight_bf16 = gpu_weights
+                .tensor(&manifest.lm_head.name)
+                .ok_or_else(|| {
+                    CoreError::Runtime("lm_head weight missing from GPU store".to_owned())
+                })?
+                .ptr();
+            let weight_e4m3 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(rows * cols)?;
+            let row_scales_f32 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(rows * 4)?;
+            engine
+                .backend
+                .lm_head_fp8_quantize(&qwen36_fp4_kernels::LmHeadFp8QuantizeSpec {
+                    rows,
+                    cols,
+                    weight_bf16,
+                    weight_e4m3: weight_e4m3.ptr(),
+                    row_scales_f32: row_scales_f32.ptr(),
+                })?;
+            qwen36_fp4_kernels::cuda_synchronize()?;
+            let freed = gpu_weights.remove(&manifest.lm_head.name);
+            eprintln!(
+                "engine: lm_head BF16 -> FP8 e4m3 per-row ({:.2} GiB freed, {:.2} GiB resident; QWEN36_LM_HEAD_FP8=0 to disable)",
+                freed as f64 / f64::from(1_u32 << 30),
+                (rows * cols + rows * 4) as f64 / f64::from(1_u32 << 30),
+            );
+            Some(crate::gpu::LmHeadFp8Store {
+                weight_e4m3,
+                row_scales_f32,
+                rows,
+                cols,
+            })
+        } else {
+            None
+        };
         let mtp_kv_cache_bytes = if include_mtp {
             engine
                 .mtp_kv_cache_plane_bytes()?
@@ -10846,6 +10926,7 @@ impl Engine<CudaBackend> {
         engine.gpu_forward = Some(gpu_forward);
         engine.gpu_prefill = Some(gpu_prefill);
         engine.mlp_fused = mlp_fused;
+        engine.lm_head_fp8 = lm_head_fp8;
         engine.linear_attn_in_proj_fused = linear_attn_in_proj_fused;
         Ok(engine)
     }
