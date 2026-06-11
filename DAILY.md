@@ -97,6 +97,57 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-11 (soir) — Enquête VRAM : le « modèle 19 GB » devient 28.3 GiB résidents + ~1 GiB runtime — comptabilité complète, 3 leviers — DECISION
+
+Question utilisateur : les poids font 18.3 GiB sur disque, pourquoi OOM
+à ctx 3K sur 32 GB ? Réponse mesurée (gpu-load `gpu_memory_report` +
+timeline nvidia-smi 0.2 s pendant un bench complet) :
+
+**Comptabilité au cell 3K MTP=4 (max_context 3328) :**
+
+| poste | GiB | détail |
+|---|---:|---|
+| poids uploadés (TOUS les tenseurs disque) | 18.29 | layers NVFP4 12.14, embed BF16 2.37, **lm_head BF16 2.37**, scales 1.42 (+ tête MTP 0.79 si MTP>0) |
+| **fused stores = poids DUPLIQUÉS** | **8.12** | MlpFusedStore 5.98 + LinearAttnInProjFused 2.14 — les originaux gate/up + in_proj_{qkv,b,a,z} restent uploadés (le chemin prefill les lit) |
+| buffers prefill (capacity = max_context ici) | 0.67 | 5 buffers « wide » (2·intermediate) de 110 MiB |
+| runtime | 1.01 | workspace 256 MiB, KV 104, état DeltaNet 72, **deltanet/conv leaf_checkpoints 576 MiB — tree-MTP (lane NEGATIVE, K=1 défaut) alloués INCONDITIONNELLEMENT** |
+| forward + checkpoints MTP + divers | 0.13 | attn_partials 38 MiB, mtp_logits 2.4 MiB… |
+| **total engine** | **~28.3** | |
+| + externe (desktop/autres) | 1.3-1.7 | variable |
+| + graphs CUDA + plans cuBLASLt (post-load) | ~0.5-1.5 | vu au décode |
+| **pic mesuré bench MTP=4 @3K** | **31.9-32.0 / 32.6** | le cliff |
+
+**Timeline d'un bench** (poll 0.2 s) : montée régulière 1.6 → 23.0 GiB
+en ~5 s (upload per-tensor), puis **+8.9 GiB en UN pas à t=5.3 s = build
+des fused stores** (concat D2D, rapide), plateau 31.9 pendant
+prefill+décode. L'OOM @3328 frappe pendant le build du
+LinearAttnInProjFused — le malloc de 42 598 400 octets observé partout
+= **16640×5120/2 = le poids FP4 d'UN layer de ce store** (×48 layers).
+(Pourquoi gpu-load semblait plafonner à 21 GiB : le build se produit
+~100 ms avant l'exit, le poll 0.15 s le rate ; le rapport JSON, lui,
+compte juste. Le champ `uploaded_model_tensors` du rapport est correct.)
+
+**Réponse courte : oui on devrait OOM** — 18.3 de poids + 8.1 de
+DOUBLONS fused + 2.4 de buffers ≈ 28.8, il ne reste ~2 GiB de marge sur
+32.6 et le moindre desktop/agent externe la mange.
+
+**Leviers, par ROI :**
+1. **Prefill-path fusion → drop des originaux : −8.1 GiB.** Le vrai fix.
+   Le prefill lirait les poids fusionnés (sorties column-major à strider
+   dans swiglu/conv1d/gdn_gate — le chantier décrit dans les notes de
+   mai, jamais fait). Régler ça tue le cliff définitivement.
+2. **lm_head FP8 : −1.27 GiB** (remplace le BF16) — déjà planifié lane
+   temps-de-cycle, double dividende.
+3. **leaf_checkpoints tree-MTP lazy : −0.58 GiB, trivial** — n'allouer
+   que si `mtp_tree_leaves > 1` (gpu.rs:686-695 ; nécessite de passer
+   l'info dans `GpuRuntimeBuffers::allocate`, engine.rs — à faire après
+   le commit de la lane acceptance).
+4. (palliatif existant : `QWEN36_LONG_CONTEXT_MODE=1` désactive les
+   fused = −8.1 GiB contre ~−9% de décode.)
+
+Files: docs only (les fixes 2-3 attendent le commit engine.rs de la
+lane acceptance). Artefacts : /tmp/gpuload_*.json, /tmp/poll_bench.txt.
+
 ### 2026-06-11 (après-midi) — Probe lm_head FP8 e4m3 : 0 flip / 28 — lane OUVERTE (implémentation scopée, en attente) — DECISION
 
 Probe de falsification offline (`scripts/lmhead_fp8_probe.py`, méthode du
