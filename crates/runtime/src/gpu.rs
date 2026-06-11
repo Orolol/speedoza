@@ -148,6 +148,25 @@ pub struct LinearAttnInProjFused {
     pub combined_out_features: usize,
 }
 
+/// lm_head quantized to FP8 e4m3 with per-row scales (W8A16). Replaces the
+/// BF16 lm_head entirely at engine init (the BF16 original is dropped from
+/// the weight store): every logits GEMV reads half the bytes, and the
+/// resident footprint shrinks by ~1.2 GiB on the shipped checkpoint.
+/// Probe basis: scripts/lmhead_fp8_probe.py (0/28 argmax flips, per-row).
+#[derive(Debug)]
+pub struct LmHeadFp8Store {
+    pub weight_e4m3: CudaDeviceBuffer,
+    pub row_scales_f32: CudaDeviceBuffer,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl LmHeadFp8Store {
+    pub fn total_bytes(&self) -> u64 {
+        self.weight_e4m3.bytes() as u64 + self.row_scales_f32.bytes() as u64
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LinearAttnInProjFusedStore {
     /// Indexed by global layer_index. `None` for full-attention layers.

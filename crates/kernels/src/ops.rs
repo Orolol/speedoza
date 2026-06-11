@@ -22,6 +22,26 @@ pub struct Bf16MatVecSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LmHeadFp8QuantizeSpec {
+    pub rows: usize,
+    pub cols: usize,
+    pub weight_bf16: DevicePtr,
+    pub weight_e4m3: DevicePtr,
+    pub row_scales_f32: DevicePtr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LmHeadFp8GemvSpec {
+    pub rows: usize,
+    pub cols: usize,
+    pub n: usize,
+    pub weight_e4m3: DevicePtr,
+    pub row_scales_f32: DevicePtr,
+    pub input_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bf16GemmSpec {
     pub m: usize,
     pub n: usize,

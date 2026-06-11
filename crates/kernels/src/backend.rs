@@ -101,6 +101,14 @@ pub trait KernelBackend: Send + Sync {
         Err(CoreError::UnsupportedNoCuda("bf16_matvec"))
     }
 
+    fn lm_head_fp8_quantize(&self, _spec: &crate::ops::LmHeadFp8QuantizeSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("lm_head_fp8_quantize"))
+    }
+
+    fn lm_head_fp8_gemv(&self, _spec: &crate::ops::LmHeadFp8GemvSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("lm_head_fp8_gemv"))
+    }
+
     fn bf16_gemm(&self, _spec: &Bf16GemmSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("bf16_gemm"))
     }
@@ -296,6 +304,20 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::EmbeddingLookupSpec::from(spec);
         check("qwen36_embedding_lookup", unsafe {
             ffi::qwen36_embedding_lookup(&ffi_spec)
+        })
+    }
+
+    fn lm_head_fp8_quantize(&self, spec: &crate::ops::LmHeadFp8QuantizeSpec) -> Result<()> {
+        let ffi_spec = ffi::LmHeadFp8QuantizeSpec::from(spec);
+        check("qwen36_lm_head_fp8_quantize", unsafe {
+            ffi::qwen36_lm_head_fp8_quantize(&ffi_spec)
+        })
+    }
+
+    fn lm_head_fp8_gemv(&self, spec: &crate::ops::LmHeadFp8GemvSpec) -> Result<()> {
+        let ffi_spec = ffi::LmHeadFp8GemvSpec::from(spec);
+        check("qwen36_lm_head_fp8_gemv", unsafe {
+            ffi::qwen36_lm_head_fp8_gemv(&ffi_spec)
         })
     }
 
@@ -1042,6 +1064,52 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct LmHeadFp8QuantizeSpec {
+        pub rows: usize,
+        pub cols: usize,
+        pub weight_bf16: DevicePtr,
+        pub weight_e4m3: DevicePtr,
+        pub row_scales_f32: DevicePtr,
+    }
+
+    impl From<&crate::ops::LmHeadFp8QuantizeSpec> for LmHeadFp8QuantizeSpec {
+        fn from(value: &crate::ops::LmHeadFp8QuantizeSpec) -> Self {
+            Self {
+                rows: value.rows,
+                cols: value.cols,
+                weight_bf16: value.weight_bf16,
+                weight_e4m3: value.weight_e4m3,
+                row_scales_f32: value.row_scales_f32,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct LmHeadFp8GemvSpec {
+        pub rows: usize,
+        pub cols: usize,
+        pub n: usize,
+        pub weight_e4m3: DevicePtr,
+        pub row_scales_f32: DevicePtr,
+        pub input_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+    }
+
+    impl From<&crate::ops::LmHeadFp8GemvSpec> for LmHeadFp8GemvSpec {
+        fn from(value: &crate::ops::LmHeadFp8GemvSpec) -> Self {
+            Self {
+                rows: value.rows,
+                cols: value.cols,
+                n: value.n,
+                weight_e4m3: value.weight_e4m3,
+                row_scales_f32: value.row_scales_f32,
+                input_bf16: value.input_bf16,
+                output_bf16: value.output_bf16,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct Bf16MatVecSpec {
         pub out_features: usize,
         pub in_features: usize,
@@ -1523,6 +1591,8 @@ mod ffi {
         pub fn qwen36_embedding_lookup(spec: *const EmbeddingLookupSpec) -> i32;
         pub fn qwen36_bf16_gemm(spec: *const Bf16GemmSpec) -> i32;
         pub fn qwen36_bf16_matvec(spec: *const Bf16MatVecSpec) -> i32;
+        pub fn qwen36_lm_head_fp8_quantize(spec: *const LmHeadFp8QuantizeSpec) -> i32;
+        pub fn qwen36_lm_head_fp8_gemv(spec: *const LmHeadFp8GemvSpec) -> i32;
         pub fn qwen36_nvfp4_matvec(spec: *const Nvfp4MatVecSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_bf16(spec: *const Nvfp4QuantizeSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_rows(spec: *const Nvfp4QuantizeRowsSpec) -> i32;
