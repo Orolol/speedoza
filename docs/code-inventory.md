@@ -76,6 +76,7 @@ activated by flag/env. **NEG** = built, benchmarked negative/neutral, kept in tr
 | Productive spin / L2 prefetch on idle SMs | `QWEN36_PRODUCTIVE_SPIN=1` (+`_CTAS`, default 128) | `kernels-cuda/decode_gemv/l2_prefetch.cu`, `DecodeAuxStreams` in engine | ≤+0.5% = noise (2026-05-19). Decode graph already keeps weights L2-resident |
 | Interpreter L2 prefetch lookahead | `QWEN36_INTERPRETER_PREFETCH=1` | `kernels-cuda/interpreter/prefetch.cuh` | negative on both MTP=0 and MTP=4 (2026-06-09) |
 | FA-tiled drafter attention | `QWEN36_DRAFTER_ATTENTION_FLASH=1` | `kernels-cuda/drafter_attention_flash.cu` | per-iter parity with v1 (not compute-bound) + numerical drift at ctx≳120 degrading AL (2026-06-09) |
+| Chunk GEMV multi-N (verify N=2..8 via l'atome m16n8k64) | `QWEN36_CHUNK_GEMV=1` | `kernels-cuda/decode_gemv/` (`nvfp4_gemm_chunk_body`) | NEUTRE (~50 µs/appel = parité cuBLASLt sur le mix verify ; le puits réel = overhead par appel × ~491 appels/cycle, pas l'efficacité cuBLASLt). Parité smoke n=5 vs cuBLASLt. Fondation du M-tiling à venir (2026-06-12) |
 | MTP fused lm_head matvec+argmax | `QWEN36_MTP_FUSED_ARGMAX=1` | `kernels-cuda/ops.cu` (`qwen36_bf16_matvec_argmax_rows`) | +4 à +6.6 ms/cycle MTP=4 @128 vs cuBLAS matvec + argmax séparés, acceptance inchangée (2026-06-11, PR #11 mergée en opt-in) |
 | Drafter sliding-window knobs | `QWEN36_DRAFTER_SWA_WINDOW=N`, `QWEN36_DRAFTER_SWA_ALL=1` | `crates/drafter/src/forward.rs` | dead lever: geomean-negative chaotic reshuffle (2026-06-09) |
 
