@@ -97,6 +97,88 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-11 — MTP recovery steps 0–1 : l'« acceptance collapse » est falsifié — le coupable est le coût de cycle (75 ms plancher, 4 puits nsys) — SHIPPED (instrumentation) + FALSIFIED (hypothèses 1a/1b/multi-graph)
+
+**Step 0 (instrumentation) SHIPPED.** `run_bench_mtp_multi` émet maintenant
+accepted/**proposed** (`mtp_proposed_draft_tokens`, `mtp_draft_acceptance_rate`
+= acceptés/proposés — l'ancien `mtp_acceptance_rate` divisait par
+accepted+cycles_rejetés, trompeur), l'acceptance **par position**
+(`mtp_acceptance_rate_per_position`) et `mtp_full_accept_cycles`. Colonne
+`AL / acc` dans `bench_dashboard.sh`. Cellules MTP=4 re-benchées (corpus
+dashboard, max-new 128, GPU non contendu, commit 8d43046+) :
+
+| ctx | decode tok/s | acc/draft | par position (1→4) | ms/cycle | MTP=0 ms/tok (baseline 06-10) | ratio |
+|---|---:|---:|---|---:|---:|---:|
+| 128   | 38.8 | 0.477 | 0.75 / 0.55 / 0.41 / 0.20 | 75.0 | 19.1 | 3.9× |
+| 3072  | 38.3 | 0.497 | 0.77 / 0.60 / 0.36 / 0.26 | 77.6 | 16.8 | 4.6× |
+| 8192  | 42.0 | 0.550 | 0.73 / 0.63 / 0.50 / 0.35 | 76.2 | 18.6 | 4.1× |
+| 24576 | 23.0 | 0.488 | 0.75 / 0.52 / 0.43 / 0.24 | 103.9* | 21.2 | 4.9× |
+
+(*24K : 5.57 s de décode incluent 1.00 s de setup MTP (prefill du head) ;
+(5.57−1.00)/44 cycles. `mtp_verify_seconds` ≈ 99% du décode partout.)
+
+**Lecture qui change le plan : l'acceptance est PLATE à ~0.5 sur tous les
+ctx — il n'y a PAS d'effondrement long-ctx.** Avec 1+4×0.5 ≈ 2.9 tok/cycle,
+MTP=4 gagnerait si le cycle coûtait < 2.9× un token MTP=0 ; il en coûte
+3.9–4.9×. Le problème est le coût de cycle, l'acceptance est second ordre.
+
+**Step 1 (A/B, MTP=4) : les trois suspects sont hors de cause.**
+
+| config | ctx | tok/s | acc/draft |
+|---|---|---:|---:|
+| BASE | 128 / 3072 | 38.8 / 38.3 | 0.477 / 0.497 |
+| `QWEN36_DELTANET_CHUNKED_PREFILL=0` | 128 / 3072 | **43.9** / 34.5 | 0.472 / 0.366 |
+| `QWEN36_ATTENTION_SAGE_PREFILL=0` | 3072 | 37.6 | 0.506 |
+| `QWEN36_MTP_MULTI_GRAPH_DISABLE=1` | 3072 | **43.1** | 0.503 |
+
+1. (1a) chunked DeltaNet : acceptance inchangée @128, reshuffle chaotique
+   @3K (0.366, classe de bruit AL) — PAS la cause. MAIS −9 ms/cycle @128 :
+   le kernel WY-form est PLUS CHER que le décode séquentiel sur un chunk
+   de 5 tokens (confirmé nsys : 6.3 ms/cycle de `deltanet_prefill`).
+2. (1b) sage : neutre (le verify chunk ne passe pas par sage). PAS la cause.
+3. Multi-graph : acceptance identique — exonéré. ET le chemin host-launch
+   est PLUS RAPIDE que le graph fast path (43.1 vs 38.3 tok/s @3K).
+4. **Chat vs bench (même texte, ~2K tokens)** : chat templaté accepte
+   ~0.82/draft (`mtp.stats` 49 acc / 2 rej sur 64 tokens) vs 0.50 corpus
+   brut. Le « 0.92–0.98 de mai » était le régime synthétique/chat. **Le
+   régime dashboard (continuation de corpus brut) sous-estime l'acceptance
+   de production chat** — le routing (step 4) devra en tenir compte ; pas
+   de régression moteur à chercher.
+
+**Décomposition nsys du cycle (node-trace, ctx=128 → trace ≈ pur verify ;
+74.5 ms/cycle reconstruits = la mesure)** — quatre puits :
+
+| puits | ms/cycle | détail |
+|---|---:|---|
+| GEMM FP4 chunk N=5 (cutlass3x) | 24.2 | 552 inst/cycle — chemin chunk SANS les fused stores (gate/up/qkv séparés) ; ~2× l'efficacité GEMV décode pour les mêmes octets de poids |
+| attention verify | 15.6 | `flash_splitk` 26 inst/cycle à **535 µs @ ctx 128** (!) — n_splits vient du bucket de capture (≥128 splits quasi vides) ; + `attention_prefill` 1.6 |
+| lm_head BF16 (gemvx) | 15.8 | **18.6 appels/cycle à 690 µs** + 33.8 petits appels — ~19 GEMV vocab par cycle au lieu d'1-2 GEMM N=5 batchés |
+| DeltaNet WY chunk | 6.3 | 87 inst/cycle ; le séquentiel serait ~1-2 ms (cf. probe 1a) |
+| reste (gemv drafts 3.2, wmma BF16 head 2.6, rmsnorm 2.2, quantize 1.4, 7.3 argmax/cycle 1.3, divers) | ~12.6 | |
+
+Le step 2 du plan (porter tiled-v2 sur le chemin verify) ne couvre que le
+puits attention (~14 ms). Re-scope : les 4 puits sont indépendants et
+cumulables → cycle ~75 → ~30-35 ms ⇒ à acceptance 0.5, ~85-95 tok/s MTP=4
+(vs 59.4 MTP=0 @3K). Ordre suggéré par ROI : (a) lm_head batching (appels
+spammés, pas de kernel à écrire), (b) splits dimensionnés sur le ctx réel
+(pas le bucket), (c) verify DeltaNet → séquentiel (kill-switch déjà
+probant), (d) GEMM chunk fusionnés. Chaque fix garde les gates du plan
+(smoke, parity floor, dashboard before/after).
+
+**Découverte VRAM (bug usabilité)** : bench MTP=4 @3K culmine à
+**32.0/32.6 GiB** — le moteur frôle le plafond. `chat` MTP=4 avec un
+prompt ~3K **OOM** (malloc 42.6 MB, la goutte d'eau ; reproductible,
+indépendant de `QWEN36_MAX_CONTEXT` et du multi-graph). Le delta
+chat-vs-bench (~quelques dizaines de Mo) suffit à basculer. À traiter
+avec le budget VRAM (les fused stores +8 GB sont le gros poste).
+
+Traces : `/tmp/mtp4_ctx*.json`, `/tmp/mtp4_{128,3k}_trace.nsys-rep`,
+`/tmp/mtp4_128_cuda_gpu_kern_sum.csv`.
+Files: `crates/cli/src/main.rs` (instrumentation + probe
+`interpreter-overhead-bench` resté de la session interpreter, commité en
+instrument), `scripts/bench_dashboard.sh`, `docs/mtp-recovery-plan.md`
+(addendum). Inventory: oui (ligne dashboard).
+
 ### 2026-06-10 — P5 plancher système : clock-lock impossible en conteneur, le reste < 1% — DECISION (différé)
 
 `nvidia-smi -lgc` est refusé (conteneur Vast non privilégié) — le lock

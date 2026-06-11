@@ -287,7 +287,7 @@ in `crates/kernels/src/backend.rs` + the typed spec module + `smoke.cu`** (see A
 |---|---|
 | `build_cuda.sh` / `smoke_cuda.sh` | build `.so` (sm_120a) / run kernel smoke suite |
 | `verify_perf_gate.sh` | **run before/after any perf change** — DFlash split-K + MTP interpreter gates vs baselines |
-| `bench_dashboard.sh` | **THE perf dashboard** (roadmap P0): fixed grid MTP {0,4} × ctx {128,3K,8K,24K} on the frozen `benches/data/bench_corpus_91k.txt` + 2 DFlash cells; every roadmap perf item cites before/after from this script |
+| `bench_dashboard.sh` | **THE perf dashboard** (roadmap P0): fixed grid MTP {0,4} × ctx {128,3K,8K,24K} on the frozen `benches/data/bench_corpus_91k.txt` + 2 DFlash cells; every roadmap perf item cites before/after from this script. MTP cells report accepted/proposed draft acceptance (`AL / acc` column); per-position acceptance arrays land in the JSONL (2026-06-11) |
 | `nsight_audit.sh` | ncu DRAM-bandwidth audit of the decode hot path (sizes the P3 lane) |
 | `bench_matrix.sh`, `bench_tq35_contexts.sh`, `bench_attention_ab.sh`, `profile_bench.sh` | bench sweeps / A-B / nsys profiling |
 | `quality_tq35.sh` | TQ35 vs BF16 KV logits quality |

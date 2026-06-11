@@ -113,6 +113,24 @@ enum Command {
         kv: KvArg,
     },
     CudaDiag,
+    /// Measure the interpreter substrate cost with chained no-op
+    /// instructions. This is a design gate for full-stack decode programs:
+    /// it times FALLBACK_TRAMPOLINE instructions plus interpreter barriers,
+    /// without loading a model.
+    InterpreterOverheadBench {
+        /// No-op instruction counts to benchmark. Values are comma-separated.
+        #[arg(long, value_delimiter = ',', default_value = "1,64,128,256,512")]
+        instruction_counts: Vec<usize>,
+        /// Explicit interpreter CTA counts to benchmark. Values are comma-separated.
+        #[arg(long, value_delimiter = ',', default_value = "24,48,128")]
+        cta_counts: Vec<u32>,
+        #[arg(long, default_value_t = 20)]
+        iterations: usize,
+        #[arg(long, default_value_t = 2)]
+        warmup: usize,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Tokenize {
         #[arg(long)]
         model_dir: PathBuf,
@@ -380,6 +398,31 @@ fn main() -> Result<()> {
             #[cfg(not(feature = "cuda"))]
             {
                 anyhow::bail!("cuda-diag requires rebuilding qwen36 with --features cuda")
+            }
+        }
+        Command::InterpreterOverheadBench {
+            instruction_counts,
+            cta_counts,
+            iterations,
+            warmup,
+            json,
+        } => {
+            #[cfg(feature = "cuda")]
+            {
+                interpreter_overhead_bench(
+                    &instruction_counts,
+                    &cta_counts,
+                    iterations,
+                    warmup,
+                    json,
+                )?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (instruction_counts, cta_counts, iterations, warmup, json);
+                anyhow::bail!(
+                    "interpreter-overhead-bench requires rebuilding qwen36 with --features cuda"
+                );
             }
         }
         Command::Tokenize {
@@ -709,6 +752,159 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn interpreter_overhead_bench(
+    instruction_counts: &[usize],
+    cta_counts: &[u32],
+    iterations: usize,
+    warmup: usize,
+    json: bool,
+) -> Result<()> {
+    use qwen36_fp4_kernels::{
+        CudaBackend, CudaDeviceBuffer, InterpreterProgramSpec, KernelBackend, cuda_synchronize,
+    };
+
+    if iterations == 0 {
+        anyhow::bail!("--iterations must be > 0");
+    }
+
+    let mut instruction_counts = instruction_counts.to_vec();
+    if !instruction_counts.contains(&1) {
+        instruction_counts.push(1);
+    }
+    instruction_counts.sort_unstable();
+    instruction_counts.dedup();
+    if instruction_counts.iter().any(|&count| count == 0) {
+        anyhow::bail!("--instruction-counts must all be > 0");
+    }
+
+    let mut cta_counts = cta_counts.to_vec();
+    cta_counts.sort_unstable();
+    cta_counts.dedup();
+    if cta_counts.is_empty() || cta_counts.iter().any(|&count| count == 0) {
+        anyhow::bail!("--cta-counts must all be > 0");
+    }
+
+    let max_instruction_count = *instruction_counts
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("missing instruction counts"))?;
+    let max_counter_count = max_instruction_count.saturating_mul(2).max(1);
+    let counters = CudaDeviceBuffer::zeroed(max_counter_count * std::mem::size_of::<i32>())?;
+    let backend = CudaBackend;
+
+    let mut rows = Vec::new();
+    if !json {
+        println!(
+            "{:>5} {:>6} {:>10} {:>12} {:>14} {:>14}",
+            "CTAs", "noops", "launch_us", "delta_us", "extra_us/op", "iters"
+        );
+    }
+    for &cta_count in &cta_counts {
+        let mut baseline_us = None;
+        for &instruction_count in &instruction_counts {
+            let program = chained_trampoline_program(instruction_count).finish();
+            let instruction_bytes = interpreter_instruction_bytes(&program.instructions);
+            let instructions = CudaDeviceBuffer::alloc(instruction_bytes.len())?;
+            instructions.copy_from_host(instruction_bytes)?;
+            let spec = InterpreterProgramSpec {
+                instructions: instructions.ptr(),
+                instruction_count: program.instructions.len(),
+                counters_i32: counters.ptr(),
+                counter_count: max_counter_count,
+                cta_count,
+                flags: 0,
+            };
+
+            for _ in 0..warmup {
+                counters.memset_async(0)?;
+                backend.interpreter_decode_sm120(&spec)?;
+                cuda_synchronize()?;
+            }
+
+            let started = Instant::now();
+            for _ in 0..iterations {
+                counters.memset_async(0)?;
+                backend.interpreter_decode_sm120(&spec)?;
+                cuda_synchronize()?;
+            }
+            let elapsed = started.elapsed();
+            let us_per_launch = elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
+            if instruction_count == 1 {
+                baseline_us = Some(us_per_launch);
+            }
+            let baseline = baseline_us.unwrap_or(us_per_launch);
+            let delta_vs_one_us = us_per_launch - baseline;
+            let per_extra_instruction_us = if instruction_count > 1 {
+                delta_vs_one_us / (instruction_count - 1) as f64
+            } else {
+                0.0
+            };
+            let row = serde_json::json!({
+                "cta_count": cta_count,
+                "noop_instructions": instruction_count,
+                "program_instructions_including_exit": program.instructions.len(),
+                "counter_count": max_counter_count,
+                "iterations": iterations,
+                "warmup": warmup,
+                "us_per_launch": us_per_launch,
+                "delta_vs_one_instruction_us": delta_vs_one_us,
+                "per_extra_instruction_us": per_extra_instruction_us,
+            });
+            if !json {
+                println!(
+                    "{:>5} {:>6} {:>10.3} {:>12.3} {:>14.4} {:>14}",
+                    row["cta_count"].as_u64().unwrap_or_default(),
+                    row["noop_instructions"].as_u64().unwrap_or_default(),
+                    row["us_per_launch"].as_f64().unwrap_or_default(),
+                    row["delta_vs_one_instruction_us"]
+                        .as_f64()
+                        .unwrap_or_default(),
+                    row["per_extra_instruction_us"].as_f64().unwrap_or_default(),
+                    row["iterations"].as_u64().unwrap_or_default(),
+                );
+                io::stdout().flush()?;
+            }
+            rows.push(row);
+        }
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn chained_trampoline_program(instruction_count: usize) -> qwen36_fp4_kernels::InterpreterProgram {
+    use qwen36_fp4_kernels::InterpreterInstruction;
+
+    let mut program = qwen36_fp4_kernels::InterpreterProgram::new();
+    for idx in 0..instruction_count {
+        let publish_counter = (idx * 2) as u32;
+        let arrival_counter = publish_counter + 1;
+        let mut instruction = InterpreterInstruction::fallback_trampoline()
+            .with_publish(publish_counter, 1)
+            .with_arrival_counter(arrival_counter);
+        if idx > 0 {
+            instruction = instruction.with_dep(((idx - 1) * 2) as u32, 1);
+        }
+        program.push(instruction);
+    }
+    program
+}
+
+#[cfg(feature = "cuda")]
+fn interpreter_instruction_bytes(
+    instructions: &[qwen36_fp4_kernels::InterpreterInstruction],
+) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            instructions.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(instructions),
+        )
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1619,6 +1815,10 @@ fn run_bench_mtp_multi(
     let mut generated = 0_usize;
     let mut accepted_draft_tokens = 0_usize;
     let mut rejected_draft_tokens = 0_usize;
+    let mut proposed_draft_tokens = 0_usize;
+    let mut proposed_per_position = vec![0_usize; draft_window];
+    let mut accepted_per_position = vec![0_usize; draft_window];
+    let mut full_accept_cycles = 0_usize;
     let mut main_decode_steps = 0_usize;
     let mut mtp_decode_steps = draft_tokens.len();
     let mut rollback_recoveries = 0_usize;
@@ -1641,6 +1841,9 @@ fn run_bench_mtp_multi(
             generated += chain.generated_tokens;
             main_decode_steps += chain.cycles;
             accepted_draft_tokens += chain.accepted_draft_tokens;
+            // Assume-accept chains propose the full window every cycle; no
+            // per-cycle detail comes back, so per-position stays untracked here.
+            proposed_draft_tokens += chain.cycles * draft_window;
             mtp_decode_steps += chain.cycles * draft_window;
             current_token = chain.next_token;
             draft_tokens = chain.next_draft_tokens;
@@ -1669,6 +1872,19 @@ fn run_bench_mtp_multi(
         mtp_verify_seconds += verify_start.elapsed().as_secs_f64();
         main_decode_steps += 1;
         accepted_draft_tokens += verify.accepted_drafts;
+        proposed_draft_tokens += verify_count;
+        for slot in proposed_per_position.iter_mut().take(verify_count) {
+            *slot += 1;
+        }
+        for slot in accepted_per_position
+            .iter_mut()
+            .take(verify.accepted_drafts)
+        {
+            *slot += 1;
+        }
+        if verify.accepted_drafts == verify_count {
+            full_accept_cycles += 1;
+        }
         if verify.rejected {
             rejected_draft_tokens += 1;
             rollback_recoveries += 1;
@@ -1690,6 +1906,17 @@ fn run_bench_mtp_multi(
     let decode_seconds = decode_start.elapsed().as_secs_f64();
     let total_seconds = total_start.elapsed().as_secs_f64();
     let evaluated_drafts = accepted_draft_tokens + rejected_draft_tokens;
+    let acceptance_rate_per_position: Vec<f64> = proposed_per_position
+        .iter()
+        .zip(accepted_per_position.iter())
+        .map(|(&proposed, &accepted)| {
+            if proposed > 0 {
+                accepted as f64 / proposed as f64
+            } else {
+                0.0
+            }
+        })
+        .collect();
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -1713,6 +1940,16 @@ fn run_bench_mtp_multi(
             } else {
                 0.0
             },
+            "mtp_proposed_draft_tokens": proposed_draft_tokens,
+            "mtp_draft_acceptance_rate": if proposed_draft_tokens > 0 {
+                accepted_draft_tokens as f64 / proposed_draft_tokens as f64
+            } else {
+                0.0
+            },
+            "mtp_full_accept_cycles": full_accept_cycles,
+            "mtp_proposed_per_position": proposed_per_position,
+            "mtp_accepted_per_position": accepted_per_position,
+            "mtp_acceptance_rate_per_position": acceptance_rate_per_position,
             "main_decode_steps": main_decode_steps,
             "mtp_decode_steps": mtp_decode_steps,
             "mtp_rollback_recoveries": rollback_recoveries,
