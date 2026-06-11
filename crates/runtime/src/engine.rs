@@ -1213,6 +1213,17 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    /// Seed the device-side sampled-token slot with a host-known token so
+    /// the plain decode graph can take over from a host-driven loop (MTP
+    /// auto-fallback): `enable_decode_graph` forwards exactly this token at
+    /// the current position.
+    pub fn seed_sampled_token(&self, token: u32) -> Result<()> {
+        self.cuda_forward()?
+            .sampled_token_u32
+            .copy_from_host(&token.to_ne_bytes())?;
+        Ok(())
+    }
+
     pub fn read_sampled_token(&self) -> Result<u32> {
         self.synchronize_active_stream_for_host_read()?;
         let mut token = [0_u8; 4];
@@ -9746,6 +9757,15 @@ impl<B: KernelBackend> Engine<B> {
         else {
             return Ok(None);
         };
+        // The unfused gate/up weights are dropped at init when the fused
+        // stores serve decode+prefill; this opcode binds the unfused layout,
+        // so bow out and let the host fused-MLP path run instead. (First
+        // reachable via the MTP auto-fallback capturing a Decode graph with
+        // the interpreter auto-enabled.)
+        if weights.tensor(&gate_weight.name).is_none() || weights.tensor(&up_weight.name).is_none()
+        {
+            return Ok(None);
+        }
 
         if !decode_interpreter_mlp_supports(hidden, intermediate) {
             return Ok(None);

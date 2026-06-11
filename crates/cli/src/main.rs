@@ -68,6 +68,40 @@ fn env_flag_enabled(name: &str) -> bool {
     })
 }
 
+/// MTP online auto-fallback (recovery-plan step 4): after
+/// `QWEN36_MTP_FALLBACK_WINDOW` verify cycles, if the observed per-draft
+/// acceptance is below `QWEN36_MTP_FALLBACK_MIN_ACCEPTANCE`, stop
+/// speculating and finish the generation on the plain decode graph —
+/// `--mtp-speculative-tokens N` then never loses much to MTP=0 on
+/// low-acceptance content. `QWEN36_MTP_AUTO_FALLBACK=0` disables (use for
+/// pure-MTP perf measurements, e.g. dashboard before/after work).
+#[cfg(feature = "cuda")]
+fn mtp_auto_fallback_enabled() -> bool {
+    !matches!(
+        std::env::var("QWEN36_MTP_AUTO_FALLBACK").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn mtp_fallback_window() -> usize {
+    std::env::var("QWEN36_MTP_FALLBACK_WINDOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
+
+/// Default 0.55: with today's verify-cycle cost (3.2-4.6x an MTP=0 token),
+/// chain MTP-4 only breaks even above ~0.55 draft acceptance even at short
+/// context. Lower this as the cycle gets cheaper.
+#[cfg(feature = "cuda")]
+fn mtp_fallback_min_acceptance() -> f64 {
+    std::env::var("QWEN36_MTP_FALLBACK_MIN_ACCEPTANCE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.55)
+}
+
 #[cfg(feature = "cuda")]
 fn cuda_kv_cache_dtype(default: KvCacheDtype) -> KvCacheDtype {
     match std::env::var("QWEN36_KV_CACHE_DTYPE")
@@ -1081,6 +1115,13 @@ fn run_chat_mtp_multi(
     let mut generated = 0_usize;
     let mut accepted_draft_tokens = 0_usize;
     let mut rejected_draft_tokens = 0_usize;
+    let mut proposed_draft_tokens = 0_usize;
+    let mut verify_cycles = 0_usize;
+    let auto_fallback = mtp_auto_fallback_enabled();
+    let fallback_window = mtp_fallback_window();
+    let fallback_min_acceptance = mtp_fallback_min_acceptance();
+    let mut fallback_active = false;
+    let mut took_fallback = false;
 
     while generated < max_new_tokens {
         let text = tokenizer.decode(&[current_token], true)?;
@@ -1088,6 +1129,10 @@ fn run_chat_mtp_multi(
         io::stdout().flush()?;
         generated += 1;
         if current_token == 248044 || generated >= max_new_tokens {
+            break;
+        }
+        if fallback_active {
+            took_fallback = true;
             break;
         }
         if draft_tokens.is_empty() {
@@ -1104,8 +1149,19 @@ fn run_chat_mtp_multi(
             draft_window,
         )?;
         accepted_draft_tokens += verify.accepted_drafts;
+        proposed_draft_tokens += verify_count;
+        verify_cycles += 1;
         if verify.rejected {
             rejected_draft_tokens += 1;
+        }
+        if auto_fallback
+            && !fallback_active
+            && verify_cycles >= fallback_window
+            && proposed_draft_tokens > 0
+            && (accepted_draft_tokens as f64 / proposed_draft_tokens as f64)
+                < fallback_min_acceptance
+        {
+            fallback_active = true;
         }
 
         let mut stopped = false;
@@ -1129,16 +1185,53 @@ fn run_chat_mtp_multi(
         draft_tokens = verify.next_draft_tokens;
     }
 
+    if took_fallback && generated < max_new_tokens {
+        // Acceptance cannot pay for the verify cycle on this content —
+        // finish on the plain decode graph (the MTP=0 chat loop shape).
+        engine.seed_sampled_token(current_token)?;
+        let mut graph_on = false;
+        while generated < max_new_tokens {
+            if graph_on {
+                engine.decode_graph_step()?;
+            } else {
+                engine.enable_decode_graph()?;
+                graph_on = true;
+            }
+            qwen36_fp4_runtime::cuda_synchronize()?;
+            let token = engine.read_sampled_token()?;
+            let text = tokenizer.decode(&[token], true)?;
+            print!("{text}");
+            io::stdout().flush()?;
+            generated += 1;
+            if token == 248044 {
+                break;
+            }
+        }
+        if graph_on {
+            engine.disable_decode_graph()?;
+        }
+    }
+
     if std::env::var("QWEN36_MTP_STATS").is_ok() {
         let drafts = accepted_draft_tokens + rejected_draft_tokens;
         eprintln!(
-            "mtp.stats accepted={} rejected={} acceptance_rate={:.4}",
+            "mtp.stats accepted={} rejected={} acceptance_rate={:.4} draft_acceptance={:.4} fallback={}",
             accepted_draft_tokens,
             rejected_draft_tokens,
             if drafts > 0 {
                 accepted_draft_tokens as f64 / drafts as f64
             } else {
                 0.0
+            },
+            if proposed_draft_tokens > 0 {
+                accepted_draft_tokens as f64 / proposed_draft_tokens as f64
+            } else {
+                0.0
+            },
+            if took_fallback {
+                format!("cycle{verify_cycles}")
+            } else {
+                "none".to_owned()
             }
         );
     }
@@ -1819,6 +1912,10 @@ fn run_bench_mtp_multi(
     let mut proposed_per_position = vec![0_usize; draft_window];
     let mut accepted_per_position = vec![0_usize; draft_window];
     let mut full_accept_cycles = 0_usize;
+    let auto_fallback = mtp_auto_fallback_enabled();
+    let fallback_window = mtp_fallback_window();
+    let fallback_min_acceptance = mtp_fallback_min_acceptance();
+    let mut fallback_cycle: Option<usize> = None;
     let mut main_decode_steps = 0_usize;
     let mut mtp_decode_steps = draft_tokens.len();
     let mut rollback_recoveries = 0_usize;
@@ -1899,6 +1996,39 @@ fn run_bench_mtp_multi(
         })?;
         mtp_decode_steps += verify.next_draft_tokens.len();
         draft_tokens = verify.next_draft_tokens;
+
+        if auto_fallback
+            && fallback_cycle.is_none()
+            && main_decode_steps >= fallback_window
+            && proposed_draft_tokens > 0
+            && (accepted_draft_tokens as f64 / proposed_draft_tokens as f64)
+                < fallback_min_acceptance
+        {
+            fallback_cycle = Some(main_decode_steps);
+            break;
+        }
+    }
+
+    // Auto-fallback: observed acceptance cannot pay for the verify cycle —
+    // finish the run on the plain decode graph from the committed state.
+    if fallback_cycle.is_some() && generated < max_new_tokens {
+        engine.seed_sampled_token(current_token)?;
+        let mut graph_on = false;
+        while generated < max_new_tokens {
+            generated += 1;
+            if generated >= max_new_tokens {
+                break;
+            }
+            if graph_on {
+                engine.decode_graph_step()?;
+            } else {
+                engine.enable_decode_graph()?;
+                graph_on = true;
+            }
+        }
+        if graph_on {
+            engine.disable_decode_graph()?;
+        }
     }
 
     qwen36_fp4_runtime::cuda_synchronize()?;
@@ -1947,6 +2077,8 @@ fn run_bench_mtp_multi(
                 0.0
             },
             "mtp_full_accept_cycles": full_accept_cycles,
+            "mtp_fallback_cycle": fallback_cycle,
+            "mtp_fallback_min_acceptance": fallback_min_acceptance,
             "mtp_proposed_per_position": proposed_per_position,
             "mtp_accepted_per_position": accepted_per_position,
             "mtp_acceptance_rate_per_position": acceptance_rate_per_position,
