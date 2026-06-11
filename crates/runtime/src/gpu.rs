@@ -76,6 +76,21 @@ impl GpuWeightStore {
         self.tensors.get(name)
     }
 
+    /// Remove a tensor from the store, freeing its device memory. Returns
+    /// the bytes released (0 if the tensor was not resident). Any later
+    /// lookup of the name fails loudly through the usual "tensor missing"
+    /// error path rather than reading freed memory.
+    pub fn remove(&mut self, name: &str) -> u64 {
+        match self.tensors.remove(name) {
+            Some(tensor) => {
+                let bytes = tensor.buffer.bytes() as u64;
+                self.total_bytes = self.total_bytes.saturating_sub(bytes);
+                bytes
+            }
+            None => 0,
+        }
+    }
+
     pub fn scalar_f32(&self, name: &str) -> Option<f32> {
         self.tensor(name).and_then(GpuTensor::scalar_f32)
     }
@@ -141,7 +156,14 @@ pub struct LinearAttnInProjFusedStore {
 }
 
 impl LinearAttnInProjFusedStore {
-    pub fn build(weights: &GpuWeightStore, manifest: &ModelWeightsManifest) -> Result<Self> {
+    /// See `MlpFusedStore::build` for the `drop_sources` contract (frees
+    /// each layer's original in_proj qkv/b/a/z weight + block_scale once
+    /// its fused copy is built, keeping the init peak near steady-state).
+    pub fn build(
+        weights: &mut GpuWeightStore,
+        manifest: &ModelWeightsManifest,
+        drop_sources: bool,
+    ) -> Result<Self> {
         let mut layers: Vec<Option<LinearAttnInProjFused>> =
             Vec::with_capacity(manifest.layers.len());
         let mut total_bytes = 0_u64;
@@ -152,6 +174,25 @@ impl LinearAttnInProjFusedStore {
                     total_bytes += entry.combined_weight.bytes() as u64
                         + entry.combined_block_scale.bytes() as u64;
                     layers.push(Some(entry));
+                    if drop_sources {
+                        cuda_synchronize()?;
+                        for binding in [
+                            &linear.in_proj_qkv,
+                            &linear.in_proj_b,
+                            &linear.in_proj_a,
+                            &linear.in_proj_z,
+                        ] {
+                            if let LinearWeightBinding::Nvfp4 {
+                                weight,
+                                block_scale,
+                                ..
+                            } = binding
+                            {
+                                weights.remove(&weight.name);
+                                weights.remove(&block_scale.name);
+                            }
+                        }
+                    }
                 }
                 LayerWeights::FullAttention(_) => layers.push(None),
             }
@@ -348,10 +389,17 @@ fn build_linear_attn_layer_fused(
 }
 
 impl MlpFusedStore {
+    /// `drop_sources` frees each layer's original gate/up weight +
+    /// block_scale right after its fused copy is built (synchronizing
+    /// first so the D2D concat has retired). This keeps the init memory
+    /// peak at ~steady-state + one layer instead of steady-state + the
+    /// full unfused set — without it, engine init needs ~8 GiB of
+    /// headroom it immediately gives back.
     pub fn build(
-        weights: &GpuWeightStore,
+        weights: &mut GpuWeightStore,
         manifest: &ModelWeightsManifest,
         intermediate_size: usize,
+        drop_sources: bool,
     ) -> Result<Self> {
         let mut layers = Vec::with_capacity(manifest.layers.len());
         let mut total_bytes = 0_u64;
@@ -369,6 +417,20 @@ impl MlpFusedStore {
             total_bytes +=
                 entry.combined_weight.bytes() as u64 + entry.combined_block_scale.bytes() as u64;
             layers.push(entry);
+            if drop_sources {
+                cuda_synchronize()?;
+                for binding in [&common.mlp_gate_proj, &common.mlp_up_proj] {
+                    if let LinearWeightBinding::Nvfp4 {
+                        weight,
+                        block_scale,
+                        ..
+                    } = binding
+                    {
+                        weights.remove(&weight.name);
+                        weights.remove(&block_scale.name);
+                    }
+                }
+            }
         }
         // MTP head MLP weights ship as BF16 in the Qwen3.6 checkpoint (not
         // NVFP4), so they cannot use the fused FP4 GEMM path. Skip them here;
@@ -960,17 +1022,23 @@ impl GpuPrefillBuffers {
     ) -> Result<Self> {
         let capacity = capacity.max(1);
         let hidden_bytes = capacity * topology.hidden_size * 2;
-        let mut wide_bf16_values = topology
+        let wide_bf16_values = topology
             .intermediate_size
             .max(topology.hidden_size)
             .max(topology.linear_attention_qkv_dim())
             .max(topology.linear_attention_value_dim())
             .max(topology.full_attention_q_dim_with_gate())
             .max(topology.full_attention_q_dim());
-        if fused_mlp_prefill {
-            wide_bf16_values = wide_bf16_values.max(2 * topology.intermediate_size);
-        }
+        // Only block_out receives the fused-MLP combined GEMM output
+        // [tokens, 2*intermediate]; the other wide buffers keep the unfused
+        // width (sizing all five to 2I would cost ~4 x capacity*I*2 extra).
+        let block_out_values = if fused_mlp_prefill {
+            wide_bf16_values.max(2 * topology.intermediate_size)
+        } else {
+            wide_bf16_values
+        };
         let wide_bytes = capacity * wide_bf16_values * 2;
+        let block_out_bytes = capacity * block_out_values * 2;
         let activation_fp4_bytes = capacity * wide_bf16_values.div_ceil(2);
         let activation_scale_bytes = vec16_scale_bytes(wide_bf16_values, capacity);
         let linear_heads = topology.linear_num_value_heads;
@@ -979,7 +1047,7 @@ impl GpuPrefillBuffers {
             hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
             residual: CudaDeviceBuffer::alloc(hidden_bytes)?,
             normed: CudaDeviceBuffer::alloc(hidden_bytes)?,
-            block_out: CudaDeviceBuffer::alloc(wide_bytes)?,
+            block_out: CudaDeviceBuffer::alloc(block_out_bytes)?,
             qkv: CudaDeviceBuffer::alloc(wide_bytes)?,
             aux: CudaDeviceBuffer::alloc(wide_bytes)?,
             aux2: CudaDeviceBuffer::alloc(wide_bytes)?,

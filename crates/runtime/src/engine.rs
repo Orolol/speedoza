@@ -554,7 +554,12 @@ fn cuda_linear_attn_fused_enabled(max_context: usize) -> bool {
 
 #[cfg(feature = "cuda")]
 fn cuda_prefill_fused_mlp_enabled(max_context: usize) -> bool {
-    cuda_mlp_fused_enabled(max_context) && cuda_env_bool("QWEN36_PREFILL_FUSED_MLP")
+    // Default ON since 2026-06-11: prefill consumes the fused gate+up store
+    // (combined GEMM + strided deinterleave), which lets engine init drop
+    // the unfused projection weights (~8 GiB). `=0` restores the unfused
+    // prefill path (and keeps the duplicates resident).
+    cuda_mlp_fused_enabled(max_context)
+        && cuda_env_bool_value("QWEN36_PREFILL_FUSED_MLP").unwrap_or(true)
 }
 
 #[cfg(feature = "cuda")]
@@ -10672,7 +10677,7 @@ impl Engine<CudaBackend> {
                     .to_owned(),
             ));
         }
-        let gpu_weights = GpuWeightStore::upload_required(model, &manifest, include_mtp)?;
+        let mut gpu_weights = GpuWeightStore::upload_required(model, &manifest, include_mtp)?;
         let mut engine = Self::new(model.layout.topology.clone(), config, CudaBackend);
         let mtp_kv_cache_bytes = if include_mtp {
             engine
@@ -10710,24 +10715,53 @@ impl Engine<CudaBackend> {
             && cuda_mlp_fused_enabled(engine.config.max_context);
         let gpu_prefill =
             GpuPrefillBuffers::allocate(&engine.topology, prefill_capacity, fused_mlp_prefill)?;
-        let mlp_fused = if cuda_mlp_fused_enabled(engine.config.max_context)
-            || cuda_prefill_fused_mlp_enabled(engine.config.max_context)
-        {
+        // With BOTH decode and prefill consuming the fused stores, the
+        // original per-projection NVFP4 weights (MLP gate/up + DeltaNet
+        // in_proj qkv/b/a/z, ~8 GiB on the shipped checkpoint) have no
+        // remaining reader: every hot path goes through the fused copies and
+        // the only other consumers are metadata/scale lookups, which stay
+        // resident. The builders free each layer's sources as soon as its
+        // fused copy is built, keeping the init peak near steady-state. Any
+        // overlooked code path that still asks for a dropped tensor fails
+        // loudly with "tensor missing" instead of reading freed memory.
+        // QWEN36_KEEP_UNFUSED_WEIGHTS=1 keeps the duplicates resident
+        // (debugging escape hatch).
+        let build_mlp_fused = cuda_mlp_fused_enabled(engine.config.max_context)
+            || cuda_prefill_fused_mlp_enabled(engine.config.max_context);
+        let build_in_proj_fused = cuda_linear_attn_fused_enabled(engine.config.max_context)
+            || cuda_prefill_fused_linear_attn_enabled(engine.config.max_context);
+        let drop_unfused = build_mlp_fused
+            && build_in_proj_fused
+            && cuda_prefill_fused_mlp_enabled(engine.config.max_context)
+            && cuda_prefill_fused_linear_attn_enabled(engine.config.max_context)
+            && !cuda_env_bool("QWEN36_KEEP_UNFUSED_WEIGHTS");
+        let resident_before_fused = gpu_weights.total_bytes();
+        let mlp_fused = if build_mlp_fused {
             Some(MlpFusedStore::build(
-                &gpu_weights,
+                &mut gpu_weights,
                 &manifest,
                 engine.topology.intermediate_size,
+                drop_unfused,
             )?)
         } else {
             None
         };
-        let linear_attn_in_proj_fused = if cuda_linear_attn_fused_enabled(engine.config.max_context)
-            || cuda_prefill_fused_linear_attn_enabled(engine.config.max_context)
-        {
-            Some(LinearAttnInProjFusedStore::build(&gpu_weights, &manifest)?)
+        let linear_attn_in_proj_fused = if build_in_proj_fused {
+            Some(LinearAttnInProjFusedStore::build(
+                &mut gpu_weights,
+                &manifest,
+                drop_unfused,
+            )?)
         } else {
             None
         };
+        if drop_unfused {
+            let freed = resident_before_fused.saturating_sub(gpu_weights.total_bytes());
+            eprintln!(
+                "engine: dropped {:.2} GiB of unfused projection weights (fused stores serve decode+prefill; QWEN36_KEEP_UNFUSED_WEIGHTS=1 to keep)",
+                freed as f64 / f64::from(1_u32 << 30)
+            );
+        }
         engine.weights = Some(manifest);
         engine.gpu_weights = Some(gpu_weights);
         engine.gpu_buffers = Some(gpu_buffers);

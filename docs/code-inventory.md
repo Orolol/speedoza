@@ -43,7 +43,7 @@ activated by flag/env. **NEG** = built, benchmarked negative/neutral, kept in tr
 | Component | Files | Notes |
 |---|---|---|
 | Engine (prefill chunked + decode CUDA graph) | `crates/runtime/src/engine.rs` | the core; graph captured at first decode, replayed after |
-| Fused weight stores (gate+up MLP; DeltaNet 4-way in_proj) | `crates/runtime/src/gpu.rs` (`MlpFusedStore`, `LinearAttnInProjFusedStore`) | ON only when `max_context < 8192` (auto long-context mode disables them to save ~8 GB VRAM) |
+| Fused weight stores (gate+up MLP; DeltaNet 4-way in_proj) | `crates/runtime/src/gpu.rs` (`MlpFusedStore`, `LinearAttnInProjFusedStore`) | ON only when `max_context < 8192` (auto long-context mode disables them to save ~8 GB VRAM). Since 2026-06-11 prefill ALSO consumes them (combined GEMM + strided deinterleave) and engine init drops the unfused originals layer-by-layer during the build (−8.1 GiB resident AND at init peak); `QWEN36_KEEP_UNFUSED_WEIGHTS=1` keeps the duplicates |
 | NVFP4 GEMM via cuBLASLt | `kernels-cuda/nvfp4_gemm.cu` | prefill GEMMs + decode fallback shapes |
 | Hand-rolled NVFP4 decode GEMV ("Direction B") | `kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu` | **default ON** for n==1, m%16==0, k%512==0 shapes; +14.5% MTP=0. Kill: `QWEN36_DECODE_GEMV_DISABLE=1` |
 | Sage INT8 prefill attention | `kernels-cuda/attention_sage_prefill.cu` | **default ON** for chunks ≥1024 tokens (see §3) |
@@ -201,8 +201,9 @@ Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
 | `QWEN36_DECODE_ATTENTION_BUCKET_DISABLE` | off | size splits from configured `max_context` (old behavior) |
 | `QWEN36_CUDA_WORKSPACE_BYTES` / `_MIB` | 256 MiB | GPU workspace |
 | `QWEN36_DISABLE_MLP_FUSED` / `QWEN36_DISABLE_LINEAR_ATTN_FUSED` | off | kill fused stores individually |
-| `QWEN36_PREFILL_FUSED_MLP` | 0 | opt-in fused-MLP on the prefill path |
-| `QWEN36_PREFILL_FUSED_LINEAR_ATTN_DISABLE` | off | kill fused in_proj on the prefill path |
+| `QWEN36_PREFILL_FUSED_MLP` | **on** (2026-06-11) | `=0` restores the unfused prefill MLP path AND keeps the ~8 GiB weight duplicates resident (the init drop requires both prefill-fused flags) |
+| `QWEN36_PREFILL_FUSED_LINEAR_ATTN_DISABLE` | off | kill fused in_proj on the prefill path (also keeps duplicates resident) |
+| `QWEN36_KEEP_UNFUSED_WEIGHTS` | off | `=1` keeps the unfused gate/up + in_proj originals resident next to the fused stores (debugging; pre-2026-06-11 memory behaviour) |
 | `QWEN36_DELTANET_CHUNKED_PREFILL` | **on** | `=0` disables chunked DeltaNet prefill |
 | `QWEN36_DELTANET_SEQ_SHORT_CHUNK` | **off** | `=1` routes ≤8-token chunks (speculative verify windows) to sequential DeltaNet — kernel +12% MTP=4 @128 but acceptance drops with ctx (0.50→0.35 @3K, −19%); opt-in for experiments only (2026-06-11) |
 
