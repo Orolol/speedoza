@@ -97,6 +97,61 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-11 (après-midi) — Verify attention : q-heads dans la grille du split-K — SHIPPED (+18% MTP=4 court ctx, +20% synthétique, bit-exact)
+
+Lane « temps de cycle » (l'acceptance est traitée en parallèle par un
+autre agent — aucun changement de numerics ici, le fix est bit-exact).
+
+**Chaîne d'investigation** (chaque hypothèse tuée par une mesure) :
+1. Multi-graph OFF (+12% ce matin) re-A/B sur .so frais : wash à ctx 128
+   (−5 ms/cycle structurel mais reshuffle d'acceptance 0.48→0.41) — pas
+   un levier fiable, défaut inchangé.
+2. Théorie « 128 splits vides du bucket de capture » : FALSIFIÉE deux
+   fois — nsys host-launch ≈ capture (434 vs 535 µs/instance), et
+   l'override `QWEN36_DECODE_ATTENTION_N_SPLITS=4` ne change rien (le
+   dispatch flash split-K calcule son n_splits localement :
+   `attention.cu` ≈ l. 2660, ceil(ctx/64) capé à 48).
+3. Vérité terrain via sqlite nsys (`gridX/Y/Z`) : **grid = (4, 1, 3) =
+   12 CTAs de 128 threads sur 192 SMs à ctx 128** — ~6% d'occupation.
+   Le kernel bouclait les 6 q-heads par kv-head EN SÉRIE dans le CTA,
+   en rechargeant Q/K/V et en réinitialisant le softmax à chaque
+   itération (états indépendants par construction).
+
+**Fix** (`attention_flash_splitk.cu`) : grid.y énumère désormais
+(q_tile, qh_local) — un CTA par q-head au lieu de la boucle série.
+12 → 72 CTAs à ctx 128 ; (4,6,48) = 1152 au cap. Bit-exact par
+construction (mêmes séquences FP par partial, seul le CTA porteur
+change) — confirmé E2E : acceptance ET nombre de cycles strictement
+identiques sur toutes les cellules.
+
+| mesure (MTP=4, corpus, max-new 128) | avant | après | delta |
+|---|---:|---:|---:|
+| ctx 128 tok/s | 39.9 | **47.2** | **+18.4%** |
+| ctx 128 ms/cycle | 72.9 | 61.6 | −11.3 ms |
+| ctx 8192 tok/s | 42.5 | 43.3 | +2% |
+| ctx 24576 ms/cycle (corrigé setup) | 101.2 | 104.5 | neutre (bruit) |
+| perf gate MTP=4 synthétique | 94.4 | **113.7-114.0** | **+20%** |
+| perf gate DFlash 3K split-K (AL) | ~143 (8.3) | 150.3 (8.3) | +5% |
+| perf gate MTP=0 | 52.1 | 52.1 | inchangé ✓ |
+
+(ctx 3072 non mesurable : la cellule OOM dès ~1.7 GB de VRAM externe —
+le plafond VRAM du matin est maintenant un blocant de mesure sur GPU
+partagé.)
+
+**Résiduel long-ctx identifié** : le kernel relit le KV une fois PAR
+q-head (6×) — neutre à 24K car la grille y était déjà saturée et le
+trafic inchangé. Prochain cran pour le long ctx : inverser les boucles
+(charger le tile K/V une fois, servir les 6 q-heads — coût : 6× l'état
+softmax/o_frags en registres) ou le port tiled-v2 du plan.
+
+Gates : smoke 144/144 (bit-identique scratch+engine), parity floor
+10/10, perf gate ci-dessus. Files: `kernels-cuda/attention_flash_splitk.cu`.
+Inventory: pas de flag nouveau (même dispatch). Aussi :
+`scripts/lmhead_fp8_probe.py` (instrument committé, en attente des
+dumps `final_normed` pour trancher le puits lm_head FP8 — la probe du
+06-10 vivait dans /tmp de l'instance Vast, perdue ; celle-ci est dans
+le repo).
+
 ### 2026-06-11 — MTP recovery steps 0–1 : l'« acceptance collapse » est falsifié — le coupable est le coût de cycle (75 ms plancher, 4 puits nsys) — SHIPPED (instrumentation) + FALSIFIED (hypothèses 1a/1b/multi-graph)
 
 **Step 0 (instrumentation) SHIPPED.** `run_bench_mtp_multi` émet maintenant
@@ -217,6 +272,45 @@ routing DeltaNet séquentiel : NEGATIVE.**
    (6.3 ms/cycle) reste ouvert mais exige un fix consistency-aware
    (p.ex. verify chunké MAIS état carried recalé, ou drafts générés
    depuis les hidden states du même kernel).
+
+**Addendum acceptance (même jour) — la courbe par position était une
+survie de préfixe, pas une précision conditionnelle.** Les tableaux
+`mtp_acceptance_rate_per_position` doivent se lire comme
+`P(accepte au moins jusqu'au rang k)`. La précision conditionnelle du
+head, `P(rang k accepte | rangs < k acceptés)`, est nettement moins
+catastrophique sur les traces existantes : ctx 128 = 0.75/0.73/0.75/0.50,
+ctx 3072 = 0.77/0.78/0.60/0.73, ctx 8192 = 0.73/0.86/0.80/0.70,
+ctx 24576 = 0.75/0.70/0.82/0.56. Le `~0.5` global est donc surtout le
+produit d'une chaîne top-1 cumulative, pas un head qui tombe à 25% au
+rang 4. Instrumentation ajoutée : `bench` JSON sort maintenant
+`mtp_conditional_acceptance_rate_per_position`, et `chat` sous
+`QWEN36_MTP_STATS=1` sort proposed/draft_acceptance/per-position au même
+format que bench.
+
+Avis après relecture : le `~0.5` global était sur-interprété, mais le
+premier rang autour de 0.73–0.77 reste franchement trop bas pour un MTP
+sain ; on devrait viser ~0.90–0.95 sur un head aligné. Prochaine
+discrimination ajoutée dans le code : `QWEN36_MTP_RANK_AUDIT=1` force le
+host path MTP multi et capture le top-k (8 par défaut, ou valeur 2..8)
+de chaque draft au moment exact où le head le produit. `chat` imprime
+`mtp.rank_audit ... hit_rate_per_position=...`; `bench` JSON ajoute
+`mtp_rank_audit_*`. Si le vrai token est souvent dans le top-8 au rang 1,
+on regarde étalonnage/top-1 ; s'il manque le top-8, il faut traiter
+alignement runtime ou parité numérique MTP head. Gates locaux : `cargo
+fmt --all -- --check`, `cargo check -p qwen36-fp4 --features cuda`,
+`cargo clippy -p qwen36-fp4 --features cuda -- -D warnings`.
+
+Bench GPU relancé après retour driver (`target/release/qwen36`, corpus fixe,
+MTP=4, 64 tokens, `QWEN36_MTP_RANK_AUDIT=1`; `ctx=3072` nécessite
+`QWEN36_LONG_CONTEXT_MODE=1` sur cette machine, sinon OOM près du plafond
+VRAM). Résultat : le vrai token est très souvent dans le top-8 même quand
+top-1 rate, donc la priorité devient marge/argmax calibration ou drift
+numérique qui fragilise le rang 1, pas un MTP head totalement hors cible.
+Table first-position top-1 / top-8 : ctx128 **0.76 / 0.96**, ctx3072
+**0.895 / 0.947**, ctx8192 **0.64 / 0.88**, ctx24576 **0.80 / 1.00**.
+Draft acceptance globale : 0.411 / 0.603 / 0.411 / 0.571. Zoom ctx8192 :
+top-2/top-4/top-8 au rang 1 = **0.84 / 0.88 / 0.88** ; la majorité du
+manque top-1 est très proche de l'argmax, mais pas exclusivement en rang 2.
 
 ### 2026-06-10 — P5 plancher système : clock-lock impossible en conteneur, le reste < 1% — DECISION (différé)
 
