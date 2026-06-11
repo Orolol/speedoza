@@ -1,0 +1,912 @@
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
+// Code review prompt: Rust CUDA inference cache and scheduler.
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub key: String,
+    pub tokens: Vec<u32>,
+    pub created_at: Instant,
+    pub ttl: Duration,
+}
+
+pub struct PrefixCache {
+    entries: HashMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl PrefixCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: HashMap::new(), lru: VecDeque::new(), max_entries }
+    }
+
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Vec<u32>> {
+        let entry = self.entries.get(key)?;
+        if now.duration_since(entry.created_at) > entry.ttl {
+            self.entries.remove(key);
+            return None;
+        }
+        self.lru.retain(|k| k != key);
+        self.lru.push_back(key.to_string());
+        Some(entry.tokens.clone())
+    }
+
+    pub fn insert(&mut self, key: String, tokens: Vec<u32>, ttl: Duration, now: Instant) {
+        let entry = CacheEntry { key: key.clone(), tokens, created_at: now, ttl };
+        self.entries.insert(key.clone(), entry);
+        self.lru.retain(|k| k != &key);
+        self.lru.push_back(key);
+        while self.entries.len() > self.max_entries {
+            if let Some(old) = self.lru.pop_front() { self.entries.remove(&old); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_hit_then_expiry() {
+        let mut cache = PrefixCache::new(8);
+        let now = Instant::now();
+        cache.insert("chat:alpha".into(), vec![1, 2, 3], Duration::from_secs(30), now);
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(1)), Some(vec![1, 2, 3]));
+        assert_eq!(cache.get("chat:alpha", now + Duration::from_secs(60)), None);
+    }
+}
