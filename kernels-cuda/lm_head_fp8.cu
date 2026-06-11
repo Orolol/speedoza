@@ -85,7 +85,10 @@ __global__ void lm_head_fp8_quantize_kernel(const __nv_bfloat16 *weight,
 // R independent DRAM streams stay in flight per warp. No shared memory,
 // no barriers. R shrinks as N grows to keep acc[R][N] in registers.
 template <int N> __host__ __device__ constexpr int lm_head_fp8_rows_per_warp() {
-  return N <= 2 ? 4 : (N <= 8 ? 2 : 1);
+  // N=1 measured FASTER without row blocking (790 vs 883 us — x reuse is
+  // worthless at one RHS and the extra registers cost occupancy); blocking
+  // pays once several x loads amortize per weight byte.
+  return N == 1 ? 1 : (N <= 8 ? 2 : 1);
 }
 
 template <int N>

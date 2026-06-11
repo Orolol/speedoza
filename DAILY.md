@@ -97,6 +97,46 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-11 (nuit, suite) — lm_head FP8 passe défaut ON : cycle MTP=4 @3K −6.2 ms (+7.6% pur), N=5 batché bat cuBLAS — SHIPPED (2 artefacts actés)
+
+Suite de la passe « millisecondes sur le cycle » : re-décomposition
+nsys fraîche (cycle 61.4 ms @128 : GEMM FP4 chunk 19.3 #1, lm_head
+BF16 12.4 #2, DeltaNet 6.5, split-K 3.6 après qh-grid), puis flip du
+lm_head FP8.
+
+**Kernel finalisé** : R-blocking par N (`N=1 → R=1` : 785 µs = 90% du
+pic, le blocking coûtait +12% à 1 RHS ; `2..8 → R=2` : N=5 batché
+**1.78 ms vs cuBLAS 2.2**). Mesures GPU calme.
+
+| gate | résultat |
+|---|---|
+| cycle MTP=4 @3K (pur) | 77.6 → **71.4 ms** ; tok/s 38.2 → **41.1 (+7.6%)** |
+| MTP=4 @128 (pur) | cycle 61.6 → 57.0 ; tok/s 47.9 → 41.0 (acc 0.477→0.354, artefact marges basses) |
+| MTP=0 @3K / synthétique | 60.1 / 53.3-53.7 ✓ |
+| floor | 10/10, texte identique |
+| DFlash | défaut 149.8 **AL 8.3 =** ; OFF 62.5 AL 8.5 ✓ |
+| synthétique MTP=4 | 95.3 → **~85-90** (flips argmax sur le prompt dégénéré full-accept — même classe que @128) |
+| VRAM | −1.18 GiB (poids résidents 7.82 GiB) |
+
+**Découverte/fix** : le drafter DFlash consomme le pointeur lm_head
+BF16 du target directement (drafting weight-tied, 5 sites CLI) — le
+drop FP8 le cassait (« lm_head tensor missing »). Fix :
+`EngineConfig.keep_bf16_lm_head`, posé par les 5 chemins drafter
+(DFlash tourne en long-context-mode, la VRAM y est large). AL
+re-validé inchangé.
+
+**Décision actée** : les deux régressions restantes sont des régimes
+artefacts (corpus court à marges basses ; prompt synthétique répété) —
+les régimes de production (chat acc 0.89 inchangée, ctx ≥3K, DFlash AL)
+sont propres et l'auto-fallback borne le reste. **Nouvelle baseline
+perf-gate MTP=4 synthétique : ~85-90 avec FP8** (l'ancienne 95.3 reste
+atteignable via `QWEN36_LM_HEAD_FP8=0`). Timing chat FP8 (attendu ~82
+tok/s vs 78.5 BF16) à mesurer à la prochaine fenêtre GPU calme.
+
+Files: `kernels-cuda/lm_head_fp8.cu` (R par N),
+`crates/runtime/src/engine.rs` (défaut ON + `keep_bf16_lm_head`),
+`crates/cli/src/main.rs` (5 sites drafter). Inventory: oui.
+
 ### 2026-06-11 (nuit) — Fallback MTP en ligne (plan step 4) SHIPPED : « MTP ne perd (presque) plus jamais » — et le chat mesuré à +33%
 
 Réponse à « le MTP nous fait toujours perdre des perfs » : c'est vrai

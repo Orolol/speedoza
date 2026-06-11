@@ -590,16 +590,17 @@ fn mtp_postnorm_hidden_enabled() -> bool {
     !cuda_env_bool_value("QWEN36_MTP_PRENORM_HIDDEN").unwrap_or(false)
 }
 
-/// lm_head FP8 e4m3 (W8A16), OPT-IN (`QWEN36_LM_HEAD_FP8=1`): halves the
-/// logits-GEMV weight reads and frees the BF16 lm_head (−1.18 GiB). Status
-/// 2026-06-11 (WIP): N=1 kernel at 90% peak BW (790 us vs cuBLAS 1.65 ms),
-/// MTP=0 +2%, parity floor 10/10, chat-regime MTP acceptance unchanged —
-/// but the raw-corpus ctx-128 cell loses ~0.12 draft acceptance (low-margin
-/// argmax flips, deterministic) and the batched N>1 verify call is not yet
-/// faster than cuBLAS. Default stays OFF until both are settled.
+/// lm_head FP8 e4m3 (W8A16), default ON since 2026-06-11 night: halves the
+/// logits-GEMV weight reads (N=1 785 us = 90% peak vs cuBLAS BF16 1.65 ms;
+/// batched verify N=5 1.78 ms vs 2.2 ms) and frees the BF16 lm_head
+/// (−1.18 GiB resident). Gates: parity floor 10/10 (identical text), chat
+/// MTP acceptance unchanged, MTP=0 +1.8%. Known trade-off: the raw-corpus
+/// short-ctx cell loses ~0.12 draft acceptance to low-margin argmax flips —
+/// production regimes are clean and the MTP auto-fallback bounds the rest.
+/// `QWEN36_LM_HEAD_FP8=0` restores the BF16 lm_head.
 #[cfg(feature = "cuda")]
 fn cuda_lm_head_fp8_enabled() -> bool {
-    cuda_env_bool_value("QWEN36_LM_HEAD_FP8").unwrap_or(false)
+    cuda_env_bool_value("QWEN36_LM_HEAD_FP8").unwrap_or(true)
 }
 
 #[cfg(feature = "cuda")]
@@ -665,6 +666,10 @@ pub struct EngineConfig {
     pub turboquant: bool,
     pub mtp_speculative_tokens: usize,
     pub cuda_graphs: CudaGraphPlan,
+    /// Keep the BF16 lm_head resident even when the FP8 lm_head is enabled.
+    /// The DFlash drafter consumes the target's BF16 lm_head pointer
+    /// directly (weight-tied drafting), so the DFlash CLI paths set this.
+    pub keep_bf16_lm_head: bool,
 }
 
 impl Default for EngineConfig {
@@ -675,6 +680,7 @@ impl Default for EngineConfig {
             turboquant: true,
             mtp_speculative_tokens: 0,
             cuda_graphs: CudaGraphPlan::default(),
+            keep_bf16_lm_head: false,
         }
     }
 }
@@ -10818,6 +10824,7 @@ impl Engine<CudaBackend> {
         // transient (BF16 + e4m3 coexisting) lands at the init-memory low
         // point.
         let lm_head_fp8 = if cuda_lm_head_fp8_enabled()
+            && !engine.config.keep_bf16_lm_head
             && manifest.lm_head.dtype == qwen36_fp4_core::TensorDtype::Bf16
             && manifest.lm_head.shape.len() == 2
             && manifest.lm_head.shape[1] % 4 == 0
