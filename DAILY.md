@@ -97,6 +97,51 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-11 (après-midi) — Probe lm_head FP8 e4m3 : 0 flip / 28 — lane OUVERTE (implémentation scopée, en attente) — DECISION
+
+Probe de falsification offline (`scripts/lmhead_fp8_probe.py`, méthode du
+06-10) sur **28 vecteurs `final_normed` frais** (24 prompts variés
+FR/EN/code/SQL/JSON/math + 8 tranches de corpus à offsets/tailles
+divers ; collecte : 1 run chat max-new=1 par prompt — le dump par
+position est inaccessible sous graph, `QWEN36_DEBUG_DUMP_DECODE` ne
+bypasse pas la capture). W8A16, accum FP32 :
+
+| variante | top-1 flips | top-5 overlap | \|Δlogit\| mean / max |
+|---|---:|---:|---|
+| per-tensor (amax/448) | 0/28 | 4.96/5 | 0.046 / 0.484 |
+| per-row | 0/28 | 5.00/5 | 0.043 / 0.344 |
+| per-block128 | 0/28 | 5.00/5 | 0.038 / 0.282 |
+
+vs NVFP4 (06-10, item tué) : 1 flip/27, Δ 0.144/1.24. Marge top-1 réf
+de ce set : médiane 4.64, p10 1.95, min 0.86 — **caveat : set moins
+adversarial que celui du 06-10 (p10 0.25, vecteurs mid-génération)** ;
+le verdict de production reste le parity floor E2E après implémentation.
+
+**Pourquoi ça paie double** (lane temps-de-cycle) : le cycle MTP=4 fait
+~6.3 GEMV lm_head pleine-vocab (~2.0-2.2 ms pièce, 13.3 ms/cycle,
+séquentiels — non batchables) ⇒ FP8 ≈ **−6.5 ms/cycle MTP=4** et
+−0.8 ms/token MTP=0 (+4-5%). ET : remplacer (pas doubler) le lm_head
+BF16 [248320×5120] = **−1.27 GB de VRAM** — de quoi rouvrir la cellule
+3K qui OOM au plafond.
+
+**Design scopé** (à implémenter après le commit de l'agent acceptance —
+engine.rs porte ses modifs non commitées) :
+1. Kernel quantize one-shot BF16→e4m3 + scales per-row f32 (GPU, à
+   l'init) ; kernel GEMV W8A16 N-RHS (X^T en SMEM par tuiles de hidden,
+   chaque warp lit sa ligne de poids UNE fois et sert les N vecteurs —
+   N≤13 pour le verify batché).
+2. `GpuWeightStore::upload_required` est par-tenseur → skipper l'upload
+   du lm_head BF16 quand le FP8 est actif (gain net).
+3. Tous les call sites passent par `bf16_matvec/bf16_gemm_rows(&manifest.
+   lm_head, ...)` → router via un store `Option<LmHeadFp8>`.
+4. **Opt-in d'abord** (`QWEN36_LM_HEAD_FP8=1`) : ça change les logits →
+   peut reshuffler l'acceptance — à coordonner avec la lane acceptance
+   avant tout flip de défaut. Gates : smoke quantize+gemv vs réf CPU,
+   floor 10/10, dashboard A/B, perf gate.
+
+Files: scripts/lmhead_fp8_probe.py (committé avec l'entrée précédente).
+Vecteurs : /tmp/lmhead_probe (régénérables via le script ci-dessus).
+
 ### 2026-06-11 (après-midi) — Verify attention : q-heads dans la grille du split-K — SHIPPED (+18% MTP=4 court ctx, +20% synthétique, bit-exact)
 
 Lane « temps de cycle » (l'acceptance est traitée en parallèle par un
@@ -311,6 +356,19 @@ Table first-position top-1 / top-8 : ctx128 **0.76 / 0.96**, ctx3072
 Draft acceptance globale : 0.411 / 0.603 / 0.411 / 0.571. Zoom ctx8192 :
 top-2/top-4/top-8 au rang 1 = **0.84 / 0.88 / 0.88** ; la majorité du
 manque top-1 est très proche de l'argmax, mais pas exclusivement en rang 2.
+
+Audit marges ajouté/exécuté (`QWEN36_MTP_LOGIT_AUDIT=8`, copie full logits
+diagnostic, hors perf gate). First-position, moyennes sur rejets :
+ctx128 rang **4.67**, marge top1-target **1.52** ; ctx3072 rang **141**
+sur seulement 2 rejets, marge **10.38** (outliers nets malgré top-1 global
+haut) ; ctx8192 rang **10.33**, marge **2.00** ; ctx24576 rang **2.00**,
+marge **2.72**. Donc le signal n'est pas un simple tie-break BF16 : les
+targets sont souvent proches/top-k, mais les rejets top-1 ont une marge
+suffisante pour justifier un audit de parité MTP-layer, pas seulement une
+politique de sampling. Le repo a `scripts/decode_parity.py` pour decode
+principal, mais pas encore de harness MTP-head ; prochain patch propre =
+ajouter dumps MTP (`pre_fc_norm_*`, `mtp.fc`, attn, mlp, norm, logits) puis
+étendre la référence PyTorch locale.
 
 ### 2026-06-10 — P5 plancher système : clock-lock impossible en conteneur, le reste < 1% — DECISION (différé)
 
