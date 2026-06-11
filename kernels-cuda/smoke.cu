@@ -121,6 +121,52 @@ void expect_close(float actual, float expected, float tolerance,
 } // namespace
 
 int main() {
+  {
+    constexpr size_t rows = 2;
+    constexpr size_t hidden = 4;
+    constexpr size_t vocab = 6;
+    qwen36_device_ptr_t argmax_input =
+        dev_alloc<__nv_bfloat16>(rows * hidden);
+    qwen36_device_ptr_t argmax_weight =
+        dev_alloc<__nv_bfloat16>(vocab * hidden);
+    qwen36_device_ptr_t argmax_output = dev_alloc<uint32_t>(rows);
+    qwen36_device_ptr_t argmax_mirror = dev_alloc<uint32_t>(1);
+    qwen36_device_ptr_t argmax_workspace = dev_alloc<uint64_t>(rows);
+    copy_bf16(argmax_input, {
+                                1.0f, 0.0f, 0.0f, 0.0f,
+                                0.0f, 1.0f, 0.0f, 0.0f,
+                            });
+    copy_bf16(argmax_weight, {
+                                 0.0f, 0.0f, 0.0f, 0.0f,
+                                 1.0f, 5.0f, 0.0f, 0.0f,
+                                 2.0f, 4.0f, 0.0f, 0.0f,
+                                 3.0f, 3.0f, 0.0f, 0.0f,
+                                 1.0f, 5.0f, 0.0f, 0.0f,
+                                 -1.0f, -1.0f, 0.0f, 0.0f,
+                             });
+    qwen36_bf16_matvec_argmax_rows_spec_t argmax_spec{};
+    argmax_spec.rows = rows;
+    argmax_spec.out_features = vocab;
+    argmax_spec.in_features = hidden;
+    argmax_spec.input_bf16 = argmax_input;
+    argmax_spec.weight_bf16 = argmax_weight;
+    argmax_spec.output_token_u32 = argmax_output;
+    argmax_spec.mirror_last_output_token_u32 = argmax_mirror;
+    argmax_spec.workspace = argmax_workspace;
+    argmax_spec.workspace_bytes = rows * sizeof(uint64_t);
+    must_status(qwen36_bf16_matvec_argmax_rows(&argmax_spec),
+                "bf16 matvec argmax rows");
+    std::vector<uint32_t> argmax_values = read_raw<uint32_t>(argmax_output, rows);
+    uint32_t mirror_value = read_one<uint32_t>(argmax_mirror);
+    if (argmax_values[0] != 3 || argmax_values[1] != 1 ||
+        mirror_value != 1) {
+      fprintf(stderr,
+              "bf16 matvec argmax rows expected [3, 1] mirror=1 got [%u, %u] mirror=%u\n",
+              argmax_values[0], argmax_values[1], mirror_value);
+      exit(1);
+    }
+  }
+
   qwen36_device_ptr_t interpreter_instructions =
       dev_alloc<qwen36_interpreter_instruction_t>(3);
   qwen36_device_ptr_t interpreter_counters = dev_alloc<int32_t>(4);

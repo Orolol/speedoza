@@ -37,11 +37,11 @@ pub use memory::{
 };
 pub use nvfp4_gemm::{CublasLtFp4ScaleMode, Nvfp4GemmPlan, Nvfp4GemmSpec};
 pub use ops::{
-    Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, Conv1dUpdateSpec,
-    CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec, LmHeadFp8GemvSpec,
-    LmHeadFp8QuantizeSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
-    Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec,
-    SigmoidGateSpec, SigmoidGateStridedSpec,
+    Bf16GemmSpec, Bf16MatVecArgmaxRowsSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec,
+    Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec,
+    LmHeadFp8GemvSpec, LmHeadFp8QuantizeSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec,
+    Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec,
+    RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
 };
 pub use rmsnorm::RmsNormSpec;
 pub use rope::PartialRopeSpec;

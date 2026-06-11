@@ -22,6 +22,19 @@ pub struct Bf16MatVecSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bf16MatVecArgmaxRowsSpec {
+    pub rows: usize,
+    pub out_features: usize,
+    pub in_features: usize,
+    pub input_bf16: DevicePtr,
+    pub weight_bf16: DevicePtr,
+    pub output_token_u32: DevicePtr,
+    pub mirror_last_output_token_u32: DevicePtr,
+    pub workspace: DevicePtr,
+    pub workspace_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LmHeadFp8QuantizeSpec {
     pub rows: usize,
     pub cols: usize,

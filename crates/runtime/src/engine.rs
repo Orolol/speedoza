@@ -9,15 +9,15 @@ use qwen36_fp4_core::TensorInfo;
 use qwen36_fp4_core::{CoreError, KvCacheDtype, ModelLayout, ModelTopology, Result};
 #[cfg(feature = "cuda")]
 use qwen36_fp4_kernels::{
-    AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec, Bf16MatVecSpec,
-    Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, CopyStridedRowsSpec, CublasLtFp4ScaleMode,
-    CudaBackend, CudaDeviceBuffer, DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape,
-    DevicePtr, EmbeddingLookupSpec, GdnGateSpec, InterpreterOpcode, InterpreterOpcodeSet,
-    InterpreterProgramSpec, Nvfp4GemmSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec,
-    PartialRopeSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec,
-    RmsNormSpec, SamplingRowsSpec, SamplingSpec, SwiGluNvfp4QuantizeSpec, SwiGluSpec,
-    attention_decode_spec_abi_bytes, attention_decode_spec_abi_size,
-    deltanet_decode_spec_abi_bytes, deltanet_decode_spec_abi_size,
+    AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape, Bf16GemmSpec,
+    Bf16MatVecArgmaxRowsSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec,
+    CopyStridedRowsSpec, CublasLtFp4ScaleMode, CudaBackend, CudaDeviceBuffer, DeltaNetDecodeSpec,
+    DeltaNetPrefillSpec, DeltaNetShape, DevicePtr, EmbeddingLookupSpec, GdnGateSpec,
+    InterpreterOpcode, InterpreterOpcodeSet, InterpreterProgramSpec, Nvfp4GemmSpec,
+    Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, PartialRopeSpec, QProjDeinterleaveSpec,
+    QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, RmsNormSpec, SamplingRowsSpec, SamplingSpec,
+    SwiGluNvfp4QuantizeSpec, SwiGluSpec, attention_decode_spec_abi_bytes,
+    attention_decode_spec_abi_size, deltanet_decode_spec_abi_bytes, deltanet_decode_spec_abi_size,
     interpreter_opcodes_enabled_from_env,
 };
 use qwen36_fp4_kernels::{KernelBackend, NoCudaBackend};
@@ -478,6 +478,11 @@ fn mtp_batched_lm_head_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
+fn mtp_fused_argmax_enabled() -> bool {
+    cuda_env_bool("QWEN36_MTP_FUSED_ARGMAX")
+}
+
+#[cfg(feature = "cuda")]
 fn mtp_tree_disable_enabled() -> bool {
     cuda_env_bool("QWEN36_MTP_TREE_DISABLE")
 }
@@ -935,13 +940,16 @@ impl Drop for DecodeAuxStreams {
 enum DecodeGraphKind {
     Decode,
     MtpDecodeOne,
-    MtpVerifyOne,
+    MtpVerifyOne {
+        fused_argmax: bool,
+    },
     MtpVerifyMulti {
         drafts: usize,
         assume_accept: bool,
         batched_lm_head: bool,
         device_chain: bool,
         device_chain_batch: usize,
+        fused_argmax: bool,
     },
 }
 
@@ -1460,7 +1468,10 @@ impl<B: KernelBackend> Engine<B> {
         let attention_context_limit =
             self.decode_attention_context_limit_for_active_context(start_position + 2);
         if self.decode_graph.as_ref().is_some_and(|graph| {
-            graph.kind == DecodeGraphKind::MtpVerifyOne
+            graph.kind
+                == (DecodeGraphKind::MtpVerifyOne {
+                    fused_argmax: mtp_fused_argmax_enabled(),
+                })
                 && graph.attention_context_limit == attention_context_limit
         }) {
             return Ok(());
@@ -1488,30 +1499,51 @@ impl<B: KernelBackend> Engine<B> {
 
         let capture_result = (|| -> Result<(graph::CudaGraph, graph::CudaGraphExec)> {
             graph::begin_capture(stream_handle)?;
+            let fused_argmax = mtp_fused_argmax_enabled();
             self.prefill_cuda_chunk(2, start_position, start_position_device_i32, false)?;
             self.final_norm_prefill_rows(2)?;
-            self.prefill_row_logits(0)?;
             let verified_token_ptr = self.cuda_forward()?.mtp_verify_token_u32.ptr_at(8)?;
-            self.queue_sample_greedy_into_with_mirror(
-                self.cuda_forward()?.token_u32.ptr(),
-                verified_token_ptr,
-            )?;
-            self.prefill_row_logits(1)?;
+            if fused_argmax {
+                self.prefill_row_argmax_into(
+                    0,
+                    self.cuda_forward()?.token_u32.ptr(),
+                    verified_token_ptr,
+                )?;
+            } else {
+                self.prefill_row_logits(0)?;
+                self.queue_sample_greedy_into_with_mirror(
+                    self.cuda_forward()?.token_u32.ptr(),
+                    verified_token_ptr,
+                )?;
+            }
             let next_token_ptr = self.cuda_forward()?.mtp_verify_token_u32.ptr_at(4)?;
-            self.queue_sample_greedy_into(next_token_ptr)?;
+            if fused_argmax {
+                self.prefill_row_argmax_into(1, next_token_ptr, DevicePtr::NULL)?;
+            } else {
+                self.prefill_row_logits(1)?;
+                self.queue_sample_greedy_into(next_token_ptr)?;
+            }
             self.run_mtp_prefill_chunk_with_tokens(
                 2,
                 start_position,
                 start_position_device_i32,
                 self.mtp_prefill_target_hidden()?,
                 self.cuda_forward()?.mtp_verify_token_u32.ptr(),
-                true,
+                !fused_argmax,
             )?;
             let next_draft_ptr = self.cuda_forward()?.mtp_verify_token_u32.ptr_at(12)?;
-            self.queue_sample_greedy_into_with_mirror(
-                self.cuda_forward()?.sampled_token_u32.ptr(),
-                next_draft_ptr,
-            )?;
+            if fused_argmax {
+                self.prefill_row_argmax_into(
+                    1,
+                    self.cuda_forward()?.sampled_token_u32.ptr(),
+                    next_draft_ptr,
+                )?;
+            } else {
+                self.queue_sample_greedy_into_with_mirror(
+                    self.cuda_forward()?.sampled_token_u32.ptr(),
+                    next_draft_ptr,
+                )?;
+            }
             let raw_graph = graph::end_capture(stream_handle)?;
             let exec = graph::instantiate(raw_graph)?;
             Ok((raw_graph, exec))
@@ -1526,7 +1558,9 @@ impl<B: KernelBackend> Engine<B> {
         };
 
         self.decode_graph = Some(DecodeGraphState {
-            kind: DecodeGraphKind::MtpVerifyOne,
+            kind: DecodeGraphKind::MtpVerifyOne {
+                fused_argmax: mtp_fused_argmax_enabled(),
+            },
             attention_context_limit,
             stream,
             exec,
@@ -1540,7 +1574,11 @@ impl<B: KernelBackend> Engine<B> {
         let graph_state = self.decode_graph.as_ref().ok_or_else(|| {
             CoreError::Runtime("MTP verify graph launch requested before capture".to_owned())
         })?;
-        if graph_state.kind != DecodeGraphKind::MtpVerifyOne {
+        if graph_state.kind
+            != (DecodeGraphKind::MtpVerifyOne {
+                fused_argmax: mtp_fused_argmax_enabled(),
+            })
+        {
             return Err(CoreError::Runtime(
                 "MTP=1 verify graph launch found a different active graph".to_owned(),
             ));
@@ -1566,6 +1604,7 @@ impl<B: KernelBackend> Engine<B> {
         let assume_accept = mtp_assume_accept_enabled();
         let batched_lm_head = mtp_batched_lm_head_enabled();
         let device_chain = assume_accept && mtp_device_chain_enabled();
+        let fused_argmax = mtp_fused_argmax_enabled();
         let device_chain_batch = if device_chain {
             device_chain_batch.max(1)
         } else {
@@ -1583,6 +1622,7 @@ impl<B: KernelBackend> Engine<B> {
                     batched_lm_head,
                     device_chain,
                     device_chain_batch,
+                    fused_argmax: mtp_fused_argmax_enabled(),
                 })
                 && graph.attention_context_limit == attention_context_limit
         }) {
@@ -1622,15 +1662,23 @@ impl<B: KernelBackend> Engine<B> {
                     )?;
                     self.final_norm_prefill_rows(verify_tokens)?;
 
-                    self.prefill_row_logits(draft_count)?;
                     let shifted_next_token_ptr = self
                         .cuda_prefill()?
                         .token_u32
                         .ptr_at((1 + draft_count) * 4)?;
-                    self.queue_sample_greedy_into_with_mirror(
-                        shifted_next_token_ptr,
-                        self.cuda_prefill()?.token_u32.ptr(),
-                    )?;
+                    if fused_argmax {
+                        self.prefill_row_argmax_into(
+                            draft_count,
+                            shifted_next_token_ptr,
+                            self.cuda_prefill()?.token_u32.ptr(),
+                        )?;
+                    } else {
+                        self.prefill_row_logits(draft_count)?;
+                        self.queue_sample_greedy_into_with_mirror(
+                            shifted_next_token_ptr,
+                            self.cuda_prefill()?.token_u32.ptr(),
+                        )?;
+                    }
 
                     self.run_mtp_prefill_chunk_with_tokens(
                         verify_tokens,
@@ -1638,11 +1686,19 @@ impl<B: KernelBackend> Engine<B> {
                         start_position_device_i32,
                         self.mtp_prefill_target_hidden()?,
                         self.cuda_prefill()?.token_u32.ptr_at(4)?,
-                        true,
+                        !fused_argmax,
                     )?;
 
                     let first_next_draft_ptr = self.cuda_prefill()?.token_u32.ptr_at(4)?;
-                    self.queue_sample_greedy_into(first_next_draft_ptr)?;
+                    if fused_argmax {
+                        self.prefill_row_argmax_into(
+                            verify_tokens - 1,
+                            first_next_draft_ptr,
+                            DevicePtr::NULL,
+                        )?;
+                    } else {
+                        self.queue_sample_greedy_into(first_next_draft_ptr)?;
+                    }
 
                     if draft_count > 1 {
                         let hidden = self.topology.hidden_size;
@@ -1676,11 +1732,15 @@ impl<B: KernelBackend> Engine<B> {
                                 position_ptr,
                                 target_hidden,
                                 input_token,
-                                true,
+                                !fused_argmax,
                             )?;
                             let output_token =
                                 self.cuda_prefill()?.token_u32.ptr_at((1 + draft_idx) * 4)?;
-                            self.queue_sample_greedy_into(output_token)?;
+                            if fused_argmax {
+                                self.prefill_row_argmax_into(0, output_token, DevicePtr::NULL)?;
+                            } else {
+                                self.queue_sample_greedy_into(output_token)?;
+                            }
                         }
                     }
 
@@ -1710,7 +1770,6 @@ impl<B: KernelBackend> Engine<B> {
                 )?;
                 self.final_norm_prefill_rows(verify_tokens)?;
                 if !assume_accept && mtp_batched_lm_head_enabled() {
-                    self.prefill_rows_logits_for_mtp_verify(verify_tokens)?;
                     let verified_base_ptr = self
                         .cuda_forward()?
                         .mtp_verify_token_u32
@@ -1719,30 +1778,51 @@ impl<B: KernelBackend> Engine<B> {
                         .cuda_forward()?
                         .mtp_verify_token_u32
                         .ptr_at(draft_count * 4)?;
-                    self.queue_sample_greedy_rows_into(
-                        self.cuda_forward()?.mtp_logits.ptr(),
-                        verify_tokens,
-                        verified_base_ptr,
-                        next_token_ptr,
-                    )?;
+                    if fused_argmax {
+                        self.prefill_rows_argmax_for_mtp_verify(
+                            verify_tokens,
+                            verified_base_ptr,
+                            next_token_ptr,
+                        )?;
+                    } else {
+                        self.prefill_rows_logits_for_mtp_verify(verify_tokens)?;
+                        self.queue_sample_greedy_rows_into(
+                            self.cuda_forward()?.mtp_logits.ptr(),
+                            verify_tokens,
+                            verified_base_ptr,
+                            next_token_ptr,
+                        )?;
+                    }
                 } else {
                     if !assume_accept {
                         for draft_idx in 0..draft_count {
-                            self.prefill_row_logits(draft_idx)?;
                             let verified_ptr = self
                                 .cuda_forward()?
                                 .mtp_verify_token_u32
                                 .ptr_at((MTP_GRAPH_VERIFIED_BASE + draft_idx) * 4)?;
-                            self.queue_sample_greedy_into(verified_ptr)?;
+                            if fused_argmax {
+                                self.prefill_row_argmax_into(
+                                    draft_idx,
+                                    verified_ptr,
+                                    DevicePtr::NULL,
+                                )?;
+                            } else {
+                                self.prefill_row_logits(draft_idx)?;
+                                self.queue_sample_greedy_into(verified_ptr)?;
+                            }
                         }
                     }
 
-                    self.prefill_row_logits(draft_count)?;
                     let next_token_ptr = self
                         .cuda_forward()?
                         .mtp_verify_token_u32
                         .ptr_at(draft_count * 4)?;
-                    self.queue_sample_greedy_into(next_token_ptr)?;
+                    if fused_argmax {
+                        self.prefill_row_argmax_into(draft_count, next_token_ptr, DevicePtr::NULL)?;
+                    } else {
+                        self.prefill_row_logits(draft_count)?;
+                        self.queue_sample_greedy_into(next_token_ptr)?;
+                    }
                 }
 
                 self.run_mtp_prefill_chunk_with_tokens(
@@ -1751,13 +1831,21 @@ impl<B: KernelBackend> Engine<B> {
                     start_position_device_i32,
                     self.mtp_prefill_target_hidden()?,
                     self.cuda_forward()?.mtp_verify_token_u32.ptr(),
-                    true,
+                    !fused_argmax,
                 )?;
                 let first_next_draft_ptr = self
                     .cuda_forward()?
                     .mtp_verify_token_u32
                     .ptr_at(MTP_GRAPH_NEXT_DRAFT_BASE * 4)?;
-                self.queue_sample_greedy_into(first_next_draft_ptr)?;
+                if fused_argmax {
+                    self.prefill_row_argmax_into(
+                        verify_tokens - 1,
+                        first_next_draft_ptr,
+                        DevicePtr::NULL,
+                    )?;
+                } else {
+                    self.queue_sample_greedy_into(first_next_draft_ptr)?;
+                }
 
                 if draft_count > 1 {
                     let hidden = self.topology.hidden_size;
@@ -1793,13 +1881,17 @@ impl<B: KernelBackend> Engine<B> {
                             position_ptr,
                             target_hidden,
                             input_token,
-                            true,
+                            !fused_argmax,
                         )?;
                         let output_token = self
                             .cuda_forward()?
                             .mtp_verify_token_u32
                             .ptr_at(output_slot * 4)?;
-                        self.queue_sample_greedy_into(output_token)?;
+                        if fused_argmax {
+                            self.prefill_row_argmax_into(0, output_token, DevicePtr::NULL)?;
+                        } else {
+                            self.queue_sample_greedy_into(output_token)?;
+                        }
                     }
                 }
             }
@@ -1824,6 +1916,7 @@ impl<B: KernelBackend> Engine<B> {
                 batched_lm_head,
                 device_chain,
                 device_chain_batch,
+                fused_argmax: mtp_fused_argmax_enabled(),
             },
             attention_context_limit,
             stream,
@@ -1855,6 +1948,7 @@ impl<B: KernelBackend> Engine<B> {
                 batched_lm_head: mtp_batched_lm_head_enabled(),
                 device_chain,
                 device_chain_batch,
+                fused_argmax: mtp_fused_argmax_enabled(),
             })
         {
             return Err(CoreError::Runtime(
@@ -1942,6 +2036,7 @@ impl<B: KernelBackend> Engine<B> {
                 batched_lm_head: mtp_batched_lm_head_enabled(),
                 device_chain: true,
                 device_chain_batch: batch,
+                fused_argmax: mtp_fused_argmax_enabled(),
             });
             self.ensure_mtp_verify_graph_multi_tokens(draft_tokens.len(), start_position, batch)?;
             self.launch_mtp_verify_graph_multi_tokens(draft_tokens.len(), batch)?;
@@ -2657,8 +2752,16 @@ impl<B: KernelBackend> Engine<B> {
 
     #[cfg(feature = "cuda")]
     fn sample_prefill_row_to_host(&self, row: usize) -> Result<u32> {
-        self.prefill_row_logits(row)?;
-        self.queue_sample_greedy_to_current_token()?;
+        if mtp_fused_argmax_enabled() {
+            self.prefill_row_argmax_into(
+                row,
+                self.cuda_forward()?.token_u32.ptr(),
+                DevicePtr::NULL,
+            )?;
+        } else {
+            self.prefill_row_logits(row)?;
+            self.queue_sample_greedy_to_current_token()?;
+        }
         self.read_current_token()
     }
 
@@ -2716,13 +2819,17 @@ impl<B: KernelBackend> Engine<B> {
             first_mtp_position,
             DevicePtr::NULL,
             first_target_hidden_bf16,
-            true,
+            !mtp_fused_argmax_enabled(),
         )?;
         let first_out = self
             .cuda_forward()?
             .mtp_verify_token_u32
             .ptr_at(MTP_GRAPH_NEXT_DRAFT_BASE * 4)?;
-        self.queue_sample_greedy_into(first_out)?;
+        if mtp_fused_argmax_enabled() {
+            self.prefill_row_argmax_into(0, first_out, DevicePtr::NULL)?;
+        } else {
+            self.queue_sample_greedy_into(first_out)?;
+        }
 
         for draft_idx in 0..draft_count {
             if draft_idx == 0 {
@@ -2743,13 +2850,17 @@ impl<B: KernelBackend> Engine<B> {
                 DevicePtr::NULL,
                 self.mtp_prefill_recursion_hidden()?,
                 input_token,
-                true,
+                !mtp_fused_argmax_enabled(),
             )?;
             let output_token = self
                 .cuda_forward()?
                 .mtp_verify_token_u32
                 .ptr_at(output_slot * 4)?;
-            self.queue_sample_greedy_into(output_token)?;
+            if mtp_fused_argmax_enabled() {
+                self.prefill_row_argmax_into(0, output_token, DevicePtr::NULL)?;
+            } else {
+                self.queue_sample_greedy_into(output_token)?;
+            }
         }
         self.read_mtp_token_bundle(MTP_GRAPH_NEXT_DRAFT_BASE, draft_count)
     }
@@ -2783,13 +2894,17 @@ impl<B: KernelBackend> Engine<B> {
             start_position,
             DevicePtr::NULL,
             target_hidden_bf16,
-            true,
+            !mtp_fused_argmax_enabled(),
         )?;
         let first_out = self
             .cuda_forward()?
             .mtp_verify_token_u32
             .ptr_at(MTP_GRAPH_NEXT_DRAFT_BASE * 4)?;
-        self.queue_sample_greedy_into(first_out)?;
+        if mtp_fused_argmax_enabled() {
+            self.prefill_row_argmax_into(shifted_tokens.len() - 1, first_out, DevicePtr::NULL)?;
+        } else {
+            self.queue_sample_greedy_into(first_out)?;
+        }
 
         if draft_count > 1 {
             let hidden = self.topology.hidden_size;
@@ -2821,13 +2936,17 @@ impl<B: KernelBackend> Engine<B> {
                     DevicePtr::NULL,
                     target_hidden,
                     input_token,
-                    true,
+                    !mtp_fused_argmax_enabled(),
                 )?;
                 let output_token = self
                     .cuda_forward()?
                     .mtp_verify_token_u32
                     .ptr_at(output_slot * 4)?;
-                self.queue_sample_greedy_into(output_token)?;
+                if mtp_fused_argmax_enabled() {
+                    self.prefill_row_argmax_into(0, output_token, DevicePtr::NULL)?;
+                } else {
+                    self.queue_sample_greedy_into(output_token)?;
+                }
             }
         }
         self.read_mtp_token_bundle(MTP_GRAPH_NEXT_DRAFT_BASE, draft_count)
@@ -2915,7 +3034,9 @@ impl<B: KernelBackend> Engine<B> {
             ))
         })?;
         if need_next_draft {
-            self.activate_existing_graph_stream(DecodeGraphKind::MtpVerifyOne);
+            self.activate_existing_graph_stream(DecodeGraphKind::MtpVerifyOne {
+                fused_argmax: mtp_fused_argmax_enabled(),
+            });
         }
         let mut position_bytes = [0_u8; 8];
         position_bytes[..4].copy_from_slice(&position_0.to_ne_bytes());
@@ -2984,9 +3105,7 @@ impl<B: KernelBackend> Engine<B> {
         self.prefill_cuda_chunk(2, start_position, DevicePtr::NULL, false)?;
         self.final_norm_prefill_rows(2)?;
 
-        self.prefill_row_logits(0)?;
-        self.queue_sample_greedy_to_current_token()?;
-        let verified_token = self.read_current_token()?;
+        let verified_token = self.sample_prefill_row_to_host(0)?;
         if verified_token != draft_token {
             return self.recover_after_mtp_reject(
                 current_token,
@@ -3006,9 +3125,7 @@ impl<B: KernelBackend> Engine<B> {
             });
         }
 
-        self.prefill_row_logits(1)?;
-        self.queue_sample_greedy_to_current_token()?;
-        let next_token = self.read_current_token()?;
+        let next_token = self.sample_prefill_row_to_host(1)?;
 
         if !need_next_draft {
             self.state.advance(2);
@@ -3029,9 +3146,17 @@ impl<B: KernelBackend> Engine<B> {
             start_position,
             DevicePtr::NULL,
             self.mtp_prefill_target_hidden()?,
-            true,
+            !mtp_fused_argmax_enabled(),
         )?;
-        self.queue_sample_greedy()?;
+        if mtp_fused_argmax_enabled() {
+            self.prefill_row_argmax_into(
+                1,
+                self.cuda_forward()?.sampled_token_u32.ptr(),
+                DevicePtr::NULL,
+            )?;
+        } else {
+            self.queue_sample_greedy()?;
+        }
         let next_draft_token = self.read_sampled_token()?;
         self.state.advance(2);
 
@@ -3092,6 +3217,7 @@ impl<B: KernelBackend> Engine<B> {
                 batched_lm_head: mtp_batched_lm_head_enabled(),
                 device_chain: mtp_assume_accept_enabled() && mtp_device_chain_enabled(),
                 device_chain_batch: 1,
+                fused_argmax: mtp_fused_argmax_enabled(),
             });
         }
 
@@ -3539,8 +3665,22 @@ impl<B: KernelBackend> Engine<B> {
                 .token_u32
                 .copy_from_host(&shifted_bytes)?;
             let normed_ptr = self.mtp_prefill_target_hidden()?;
-            self.run_mtp_prefill_chunk(1, start_position, DevicePtr::NULL, normed_ptr, true)?;
-            self.queue_sample_greedy()?;
+            self.run_mtp_prefill_chunk(
+                1,
+                start_position,
+                DevicePtr::NULL,
+                normed_ptr,
+                !mtp_fused_argmax_enabled(),
+            )?;
+            if mtp_fused_argmax_enabled() {
+                self.prefill_row_argmax_into(
+                    0,
+                    self.cuda_forward()?.sampled_token_u32.ptr(),
+                    DevicePtr::NULL,
+                )?;
+            } else {
+                self.queue_sample_greedy()?;
+            }
             Some(self.read_sampled_token()?)
         } else {
             None
@@ -4303,6 +4443,20 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn prefill_row_argmax_into(
+        &self,
+        row: usize,
+        output_token_u32: DevicePtr,
+        mirror_output_token_u32: DevicePtr,
+    ) -> Result<()> {
+        let input = Self::ptr_offset(
+            self.cuda_prefill()?.normed.ptr(),
+            row * self.topology.hidden_size * 2,
+        )?;
+        self.prefill_lm_head_argmax_rows_into(input, 1, output_token_u32, mirror_output_token_u32)
+    }
+
+    #[cfg(feature = "cuda")]
     fn prefill_rows_logits_for_mtp_verify(&self, rows: usize) -> Result<()> {
         if rows == 0 || rows > MTP_MAX_DRAFT_TOKENS + 1 {
             return Err(CoreError::Runtime(format!(
@@ -4319,6 +4473,27 @@ impl<B: KernelBackend> Engine<B> {
             self.cuda_prefill()?.normed.ptr(),
             self.cuda_forward()?.mtp_logits.ptr(),
             rows,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn prefill_rows_argmax_for_mtp_verify(
+        &self,
+        rows: usize,
+        output_token_u32: DevicePtr,
+        mirror_last_output_token_u32: DevicePtr,
+    ) -> Result<()> {
+        if rows == 0 || rows > MTP_MAX_DRAFT_TOKENS + 1 {
+            return Err(CoreError::Runtime(format!(
+                "MTP fused argmax expects 1..={} rows, got {rows}",
+                MTP_MAX_DRAFT_TOKENS + 1
+            )));
+        }
+        self.prefill_lm_head_argmax_rows_into(
+            self.cuda_prefill()?.normed.ptr(),
+            rows,
+            output_token_u32,
+            mirror_last_output_token_u32,
         )
     }
 
@@ -10168,6 +10343,50 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     #[cfg(feature = "cuda")]
+    fn prefill_lm_head_argmax_rows_into(
+        &self,
+        input_bf16: DevicePtr,
+        rows: usize,
+        output_token_u32: DevicePtr,
+        mirror_last_output_token_u32: DevicePtr,
+    ) -> Result<()> {
+        let manifest = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+        let out_features = *manifest.lm_head.shape.first().ok_or_else(|| {
+            CoreError::Runtime(format!("tensor {} has empty shape", manifest.lm_head.name))
+        })?;
+        let in_features = *manifest.lm_head.shape.get(1).ok_or_else(|| {
+            CoreError::Runtime(format!("tensor {} is not a matrix", manifest.lm_head.name))
+        })?;
+        let runtime = self.cuda_runtime()?;
+        let workspace = runtime
+            .workspace
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("MTP fused argmax requires CUDA workspace".into()))?;
+        if workspace.bytes() < rows * std::mem::size_of::<u64>() {
+            return Err(CoreError::Runtime(format!(
+                "MTP fused argmax workspace has {} bytes, needs {}",
+                workspace.bytes(),
+                rows * std::mem::size_of::<u64>()
+            )));
+        }
+        self.backend
+            .bf16_matvec_argmax_rows(&Bf16MatVecArgmaxRowsSpec {
+                rows,
+                out_features,
+                in_features,
+                input_bf16,
+                weight_bf16: self.tensor_ptr(self.cuda_weights()?, &manifest.lm_head)?,
+                output_token_u32,
+                mirror_last_output_token_u32,
+                workspace: workspace.ptr(),
+                workspace_bytes: workspace.bytes(),
+            })
+    }
+
+    #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     fn rmsnorm(
         &self,
@@ -10348,7 +10567,7 @@ impl<B: KernelBackend> Engine<B> {
             DecodeGraphKind::Decode | DecodeGraphKind::MtpDecodeOne => {
                 self.decode_attention_context_limit_for_position(self.state.position)
             }
-            DecodeGraphKind::MtpVerifyOne => {
+            DecodeGraphKind::MtpVerifyOne { .. } => {
                 self.decode_attention_context_limit_for_active_context(self.state.position + 2)
             }
             DecodeGraphKind::MtpVerifyMulti { drafts, .. } => self
