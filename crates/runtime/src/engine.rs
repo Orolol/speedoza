@@ -573,6 +573,27 @@ fn cuda_deltanet_chunked_prefill_enabled() -> bool {
     cuda_env_bool_value("QWEN36_DELTANET_CHUNKED_PREFILL").unwrap_or(true)
 }
 
+/// MTP head input-wiring experiment (2026-06-11, FALSIFIED — keep defaults).
+/// Two independent contracts, both measured on the dashboard corpus 2x2:
+/// - INPUT: which backbone hidden feeds `pre_fc_norm_hidden`.
+///   `QWEN36_MTP_PRENORM_HIDDEN=1` feeds the pre-`model.norm` hidden (the
+///   Qwen3-Next reference contract) — measured WORSE on this checkpoint
+///   (acc 0.30-0.47 vs 0.48-0.50): the shipped head expects post-norm.
+/// - RECURSION: `QWEN36_MTP_PRENORM_RECURSION=1` feeds the pre-`mtp.norm`
+///   head output to the next draft step — also worse (positions 2..4
+///   collapse to 0.34/0.18/0.05 at ctx 128).
+/// Defaults stay on the historical post-norm wiring; the flags remain as
+/// the experiment harness. See DAILY.md 2026-06-11.
+#[cfg(feature = "cuda")]
+fn mtp_postnorm_hidden_enabled() -> bool {
+    !cuda_env_bool_value("QWEN36_MTP_PRENORM_HIDDEN").unwrap_or(false)
+}
+
+#[cfg(feature = "cuda")]
+fn mtp_postnorm_recursion_enabled() -> bool {
+    !cuda_env_bool_value("QWEN36_MTP_PRENORM_RECURSION").unwrap_or(false)
+}
+
 /// Default `max_context` for engines built from `EngineConfig::default()`.
 ///
 /// Deliberately far below the checkpoint's 262_144 `max_position_embeddings`:
@@ -1464,7 +1485,7 @@ impl<B: KernelBackend> Engine<B> {
                 2,
                 start_position,
                 start_position_device_i32,
-                self.cuda_prefill()?.normed.ptr(),
+                self.mtp_prefill_target_hidden()?,
                 self.cuda_forward()?.mtp_verify_token_u32.ptr(),
                 true,
             )?;
@@ -1597,7 +1618,7 @@ impl<B: KernelBackend> Engine<B> {
                         verify_tokens,
                         start_position,
                         start_position_device_i32,
-                        self.cuda_prefill()?.normed.ptr(),
+                        self.mtp_prefill_target_hidden()?,
                         self.cuda_prefill()?.token_u32.ptr_at(4)?,
                         true,
                     )?;
@@ -1608,7 +1629,7 @@ impl<B: KernelBackend> Engine<B> {
                     if draft_count > 1 {
                         let hidden = self.topology.hidden_size;
                         let last_hidden = Self::ptr_offset(
-                            self.cuda_prefill()?.normed.ptr(),
+                            self.mtp_prefill_recursion_hidden()?,
                             (verify_tokens - 1) * hidden * 2,
                         )?;
                         for draft_idx in 1..draft_count {
@@ -1629,7 +1650,7 @@ impl<B: KernelBackend> Engine<B> {
                             let target_hidden = if draft_idx == 1 {
                                 last_hidden
                             } else {
-                                self.cuda_prefill()?.normed.ptr()
+                                self.mtp_prefill_recursion_hidden()?
                             };
                             self.run_mtp_prefill_chunk_with_tokens(
                                 1,
@@ -1710,7 +1731,7 @@ impl<B: KernelBackend> Engine<B> {
                     verify_tokens,
                     start_position,
                     start_position_device_i32,
-                    self.cuda_prefill()?.normed.ptr(),
+                    self.mtp_prefill_target_hidden()?,
                     self.cuda_forward()?.mtp_verify_token_u32.ptr(),
                     true,
                 )?;
@@ -1723,7 +1744,7 @@ impl<B: KernelBackend> Engine<B> {
                 if draft_count > 1 {
                     let hidden = self.topology.hidden_size;
                     let last_hidden = Self::ptr_offset(
-                        self.cuda_prefill()?.normed.ptr(),
+                        self.mtp_prefill_recursion_hidden()?,
                         (verify_tokens - 1) * hidden * 2,
                     )?;
                     for draft_idx in 1..draft_count {
@@ -1746,7 +1767,7 @@ impl<B: KernelBackend> Engine<B> {
                         let target_hidden = if draft_idx == 1 {
                             last_hidden
                         } else {
-                            self.cuda_prefill()?.normed.ptr()
+                            self.mtp_prefill_recursion_hidden()?
                         };
                         self.run_mtp_prefill_chunk_with_tokens(
                             1,
@@ -1984,7 +2005,7 @@ impl<B: KernelBackend> Engine<B> {
                 self.cuda_forward()?.token_u32.ptr(),
                 self.state.position,
                 position_buffer_ptr,
-                self.cuda_forward()?.normed.ptr(),
+                self.mtp_forward_target_hidden()?,
             )?;
             self.queue_sample_greedy_into(self.cuda_forward()?.sampled_token_u32.ptr())?;
             graph::increment_i32(position_buffer_ptr)?;
@@ -2189,7 +2210,7 @@ impl<B: KernelBackend> Engine<B> {
             forward.sampled_token_u32.ptr(),
             target_position,
             DevicePtr::NULL,
-            forward.normed.ptr(),
+            self.mtp_forward_target_hidden()?,
         )
     }
 
@@ -2241,7 +2262,7 @@ impl<B: KernelBackend> Engine<B> {
         if draft_count > 1 {
             let hidden = self.topology.hidden_size;
             let target_hidden = Self::ptr_offset(
-                self.cuda_prefill()?.normed.ptr(),
+                self.mtp_prefill_target_hidden()?,
                 (final_chunk - 1) * hidden * 2,
             )?;
             drafts.extend(self.generate_mtp_drafts_from_target(
@@ -2702,7 +2723,7 @@ impl<B: KernelBackend> Engine<B> {
                 1,
                 position,
                 DevicePtr::NULL,
-                self.cuda_prefill()?.normed.ptr(),
+                self.mtp_prefill_recursion_hidden()?,
                 input_token,
                 true,
             )?;
@@ -2755,7 +2776,7 @@ impl<B: KernelBackend> Engine<B> {
         if draft_count > 1 {
             let hidden = self.topology.hidden_size;
             let last_hidden = Self::ptr_offset(
-                self.cuda_prefill()?.normed.ptr(),
+                self.mtp_prefill_recursion_hidden()?,
                 (shifted_tokens.len() - 1) * hidden * 2,
             )?;
             for draft_idx in 1..draft_count {
@@ -2774,7 +2795,7 @@ impl<B: KernelBackend> Engine<B> {
                 let target_hidden = if draft_idx == 1 {
                     last_hidden
                 } else {
-                    self.cuda_prefill()?.normed.ptr()
+                    self.mtp_prefill_recursion_hidden()?
                 };
                 self.run_mtp_prefill_chunk_with_tokens(
                     1,
@@ -2817,7 +2838,7 @@ impl<B: KernelBackend> Engine<B> {
         self.final_norm_prefill_rows(committed_tokens)?;
 
         let next_draft_tokens = if next_draft_count > 0 {
-            let target_hidden = self.cuda_prefill()?.normed.ptr();
+            let target_hidden = self.mtp_prefill_target_hidden()?;
             let mut shifted_tokens = Vec::with_capacity(committed_tokens);
             shifted_tokens.extend_from_slice(&draft_tokens[..rejected_draft_idx]);
             shifted_tokens.push(verified_token);
@@ -2989,7 +3010,7 @@ impl<B: KernelBackend> Engine<B> {
             2,
             start_position,
             DevicePtr::NULL,
-            self.cuda_prefill()?.normed.ptr(),
+            self.mtp_prefill_target_hidden()?,
             true,
         )?;
         self.queue_sample_greedy()?;
@@ -3178,7 +3199,7 @@ impl<B: KernelBackend> Engine<B> {
         };
         let next_draft_tokens =
             if let (Some(next_token), true) = (next_token, effective_next_draft_count > 0) {
-                let target_hidden = self.cuda_prefill()?.normed.ptr();
+                let target_hidden = self.mtp_prefill_target_hidden()?;
                 let mut shifted_tokens = Vec::with_capacity(verify_tokens);
                 shifted_tokens.extend_from_slice(draft_tokens);
                 shifted_tokens.push(next_token);
@@ -3335,11 +3356,16 @@ impl<B: KernelBackend> Engine<B> {
                 leaf_normed_src,
                 hidden_bytes,
             )?;
+            // Keep the pre-norm view coherent for the prenorm target path.
+            let leaf_prenorm_src = self.cuda_forward()?.prenorm_hidden.ptr();
+            self.cuda_prefill()?
+                .prenorm_hidden
+                .copy_from_device_ptr_at(dst_offset, leaf_prenorm_src, hidden_bytes)?;
 
             let mut shifted_tokens: Vec<u32> = chain_tokens.to_vec();
             shifted_tokens.push(leaf_tokens[accepted_leaf_idx]);
             shifted_tokens.push(result.next_token);
-            let target_hidden = self.cuda_prefill()?.normed.ptr();
+            let target_hidden = self.mtp_prefill_target_hidden()?;
             result.next_chain_drafts = self.generate_mtp_drafts_from_committed_prefill(
                 &shifted_tokens,
                 start_position,
@@ -3355,7 +3381,7 @@ impl<B: KernelBackend> Engine<B> {
 
             let mut shifted_tokens: Vec<u32> = chain_tokens.to_vec();
             shifted_tokens.push(result.next_token);
-            let target_hidden = self.cuda_prefill()?.normed.ptr();
+            let target_hidden = self.mtp_prefill_target_hidden()?;
             result.next_chain_drafts = self.generate_mtp_drafts_from_committed_prefill(
                 &shifted_tokens,
                 start_position,
@@ -3494,7 +3520,7 @@ impl<B: KernelBackend> Engine<B> {
             self.cuda_prefill()?
                 .token_u32
                 .copy_from_host(&shifted_bytes)?;
-            let normed_ptr = self.cuda_prefill()?.normed.ptr();
+            let normed_ptr = self.mtp_prefill_target_hidden()?;
             self.run_mtp_prefill_chunk(1, start_position, DevicePtr::NULL, normed_ptr, true)?;
             self.queue_sample_greedy()?;
             Some(self.read_sampled_token()?)
@@ -3542,14 +3568,19 @@ impl<B: KernelBackend> Engine<B> {
             prefill.hidden.ptr(),
             self.tensor_ptr(self.cuda_weights()?, &manifest.final_norm)?,
             prefill.residual.ptr(),
-            DevicePtr::NULL,
+            prefill.prenorm_hidden.ptr(),
             prefill.normed.ptr(),
         )?;
+        let target_hidden = if mtp_postnorm_hidden_enabled() {
+            prefill.normed.ptr()
+        } else {
+            prefill.prenorm_hidden.ptr()
+        };
         self.run_mtp_prefill_chunk(
             tokens,
             start_position,
             start_position_device_i32,
-            prefill.normed.ptr(),
+            target_hidden,
             emit_logits,
         )
     }
@@ -3666,13 +3697,16 @@ impl<B: KernelBackend> Engine<B> {
             prefill.normed.ptr(),
         )?;
         self.run_mtp_mlp_prefill(&layer.common, prefill, tokens)?;
+        // residual_out materializes the head's PRE-mtp.norm output — the
+        // hidden the next recursive draft step must consume (same contract
+        // as the backbone pre-final-norm hidden).
         self.rmsnorm(
             tokens,
             hidden,
             prefill.hidden.ptr(),
             self.tensor_ptr(weights, &mtp.norm)?,
             prefill.residual.ptr(),
-            DevicePtr::NULL,
+            prefill.prenorm_hidden.ptr(),
             prefill.normed.ptr(),
         )?;
         if emit_logits {
@@ -3770,13 +3804,15 @@ impl<B: KernelBackend> Engine<B> {
             forward.normed.ptr(),
         )?;
         self.run_mtp_mlp_decode(&layer.common, forward)?;
+        // residual_out materializes the head's PRE-mtp.norm output for the
+        // next recursive draft step (see the prefill-variant tail).
         self.rmsnorm(
             1,
             hidden,
             forward.hidden.ptr(),
             self.tensor_ptr(weights, &mtp.norm)?,
             forward.residual.ptr(),
-            DevicePtr::NULL,
+            forward.prenorm_hidden.ptr(),
             forward.normed.ptr(),
         )?;
         self.bf16_matvec(
@@ -4151,7 +4187,7 @@ impl<B: KernelBackend> Engine<B> {
                 last_hidden,
                 self.tensor_ptr(weights, &manifest.final_norm)?,
                 last_residual,
-                DevicePtr::NULL,
+                forward.prenorm_hidden.ptr(),
                 forward.normed.ptr(),
             )?;
             if let Some(dir) = &dump_dir {
@@ -4211,9 +4247,46 @@ impl<B: KernelBackend> Engine<B> {
             prefill.hidden.ptr(),
             self.tensor_ptr(self.cuda_weights()?, &manifest.final_norm)?,
             prefill.residual.ptr(),
-            DevicePtr::NULL,
+            prefill.prenorm_hidden.ptr(),
             prefill.normed.ptr(),
         )
+    }
+
+    /// Target hidden handed to the MTP head from prefill-side rows: the
+    /// pre-norm hidden materialized by the final-norm / mtp.norm rmsnorm
+    /// `residual_out` hook (see `mtp_postnorm_hidden_enabled`).
+    #[cfg(feature = "cuda")]
+    fn mtp_prefill_target_hidden(&self) -> Result<DevicePtr> {
+        let prefill = self.cuda_prefill()?;
+        Ok(if mtp_postnorm_hidden_enabled() {
+            prefill.normed.ptr()
+        } else {
+            prefill.prenorm_hidden.ptr()
+        })
+    }
+
+    /// Hidden handed to a RECURSIVE draft step (the previous head step's
+    /// output rows) — governed by `QWEN36_MTP_POSTNORM_RECURSION`, separate
+    /// from the backbone-input contract above.
+    #[cfg(feature = "cuda")]
+    fn mtp_prefill_recursion_hidden(&self) -> Result<DevicePtr> {
+        let prefill = self.cuda_prefill()?;
+        Ok(if mtp_postnorm_recursion_enabled() {
+            prefill.normed.ptr()
+        } else {
+            prefill.prenorm_hidden.ptr()
+        })
+    }
+
+    /// Forward-side counterpart of `mtp_prefill_target_hidden`.
+    #[cfg(feature = "cuda")]
+    fn mtp_forward_target_hidden(&self) -> Result<DevicePtr> {
+        let forward = self.cuda_forward()?;
+        Ok(if mtp_postnorm_hidden_enabled() {
+            forward.normed.ptr()
+        } else {
+            forward.prenorm_hidden.ptr()
+        })
     }
 
     #[cfg(feature = "cuda")]
@@ -4744,7 +4817,12 @@ impl<B: KernelBackend> Engine<B> {
 
         if emit_logits {
             let logits_start = profile_decode.then(std::time::Instant::now);
-            if decode_interpreter_logits_enabled() && position_device_i32 == DevicePtr::NULL {
+            // The interpreter logits slice does not materialize the pre-norm
+            // hidden the MTP head consumes — keep it off whenever MTP runs.
+            if decode_interpreter_logits_enabled()
+                && position_device_i32 == DevicePtr::NULL
+                && self.config.mtp_speculative_tokens == 0
+            {
                 self.run_interpreter_final_logits(manifest, weights, forward)?;
             } else {
                 self.rmsnorm(
@@ -4753,7 +4831,7 @@ impl<B: KernelBackend> Engine<B> {
                     forward.hidden.ptr(),
                     self.tensor_ptr(weights, &manifest.final_norm)?,
                     forward.residual.ptr(),
-                    DevicePtr::NULL,
+                    forward.prenorm_hidden.ptr(),
                     forward.normed.ptr(),
                 )?;
                 self.bf16_matvec(
@@ -10878,6 +10956,7 @@ impl Engine<CudaBackend> {
             item("hidden", forward.hidden.bytes() as u64),
             item("residual", forward.residual.bytes() as u64),
             item("normed", forward.normed.bytes() as u64),
+            item("prenorm_hidden", forward.prenorm_hidden.bytes() as u64),
             item("block_out", forward.block_out.bytes() as u64),
             item("qkv", forward.qkv.bytes() as u64),
             item("aux", forward.aux.bytes() as u64),
@@ -10971,6 +11050,7 @@ impl Engine<CudaBackend> {
             item("hidden", prefill.hidden.bytes() as u64),
             item("residual", prefill.residual.bytes() as u64),
             item("normed", prefill.normed.bytes() as u64),
+            item("prenorm_hidden", prefill.prenorm_hidden.bytes() as u64),
             item("block_out", prefill.block_out.bytes() as u64),
             item("qkv", prefill.qkv.bytes() as u64),
             item("aux", prefill.aux.bytes() as u64),

@@ -592,6 +592,12 @@ pub struct GpuForwardBuffers {
     pub hidden: CudaDeviceBuffer,
     pub residual: CudaDeviceBuffer,
     pub normed: CudaDeviceBuffer,
+    /// Pre-final-norm hidden (`hidden + residual`, before `model.norm`),
+    /// materialized by the final-norm rmsnorm via its `residual_out` slot.
+    /// This is the hidden the MTP head's `pre_fc_norm_hidden` expects —
+    /// feeding it post-norm `normed` bakes the final-norm γ into the head
+    /// input (the 2026-06-11 acceptance bug).
+    pub prenorm_hidden: CudaDeviceBuffer,
     pub block_out: CudaDeviceBuffer,
     pub qkv: CudaDeviceBuffer,
     pub aux: CudaDeviceBuffer,
@@ -686,6 +692,11 @@ pub struct GpuPrefillBuffers {
     pub hidden: CudaDeviceBuffer,
     pub residual: CudaDeviceBuffer,
     pub normed: CudaDeviceBuffer,
+    /// Pre-final-norm hidden rows (`hidden + residual` before `model.norm`,
+    /// or before `mtp.norm` on the MTP-head forward), materialized via the
+    /// rmsnorm `residual_out` slot. The MTP head consumes THIS, not `normed`
+    /// (see GpuForwardBuffers::prenorm_hidden).
+    pub prenorm_hidden: CudaDeviceBuffer,
     pub block_out: CudaDeviceBuffer,
     pub qkv: CudaDeviceBuffer,
     pub aux: CudaDeviceBuffer,
@@ -915,6 +926,7 @@ impl GpuForwardBuffers {
             hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
             residual: CudaDeviceBuffer::alloc(hidden_bytes)?,
             normed: CudaDeviceBuffer::alloc(hidden_bytes)?,
+            prenorm_hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
             block_out: CudaDeviceBuffer::alloc(hidden_bytes)?,
             qkv: CudaDeviceBuffer::alloc(wide_bytes)?,
             aux: CudaDeviceBuffer::alloc(wide_bytes)?,
@@ -972,6 +984,7 @@ impl GpuForwardBuffers {
             self.hidden.bytes(),
             self.residual.bytes(),
             self.normed.bytes(),
+            self.prenorm_hidden.bytes(),
             self.block_out.bytes(),
             self.qkv.bytes(),
             self.aux.bytes(),
@@ -1047,6 +1060,7 @@ impl GpuPrefillBuffers {
             hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
             residual: CudaDeviceBuffer::alloc(hidden_bytes)?,
             normed: CudaDeviceBuffer::alloc(hidden_bytes)?,
+            prenorm_hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
             block_out: CudaDeviceBuffer::alloc(block_out_bytes)?,
             qkv: CudaDeviceBuffer::alloc(wide_bytes)?,
             aux: CudaDeviceBuffer::alloc(wide_bytes)?,
@@ -1067,6 +1081,7 @@ impl GpuPrefillBuffers {
             self.hidden.bytes(),
             self.residual.bytes(),
             self.normed.bytes(),
+            self.prenorm_hidden.bytes(),
             self.block_out.bytes(),
             self.qkv.bytes(),
             self.aux.bytes(),

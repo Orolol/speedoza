@@ -206,6 +206,7 @@ Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
 | `QWEN36_KEEP_UNFUSED_WEIGHTS` | off | `=1` keeps the unfused gate/up + in_proj originals resident next to the fused stores (debugging; pre-2026-06-11 memory behaviour) |
 | `QWEN36_DELTANET_CHUNKED_PREFILL` | **on** | `=0` disables chunked DeltaNet prefill |
 | `QWEN36_DELTANET_SEQ_SHORT_CHUNK` | **off** | `=1` routes ≤8-token chunks (speculative verify windows) to sequential DeltaNet — kernel +12% MTP=4 @128 but acceptance drops with ctx (0.50→0.35 @3K, −19%); opt-in for experiments only (2026-06-11) |
+| `QWEN36_MTP_PRENORM_HIDDEN` / `QWEN36_MTP_PRENORM_RECURSION` | **off** | `=1` feeds the MTP head pre-norm hiddens (backbone input / recursive step) instead of the post-norm ones — the Qwen3-Next reference contract, measured WORSE on this checkpoint (2x2 FALSIFIED 2026-06-11: the shipped head expects post-norm). Experiment harness only |
 
 ### 4.6 Split-KV tuning (diagnostics; defaults are tuned — don't ship overrides)
 
