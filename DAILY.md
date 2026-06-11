@@ -97,6 +97,54 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-11 (nuit) — Câblage MTP pré-norm : hypothèse séduisante, 2×2 mesuré, FALSIFIED — la tête de CE checkpoint veut le post-norm
+
+Contexte : vLLM afficherait 0.85-0.95 d'acceptance sur ce modèle/quant
+(info utilisateur) vs notre 0.5 corpus. Hypothèse (très plausible sur
+papier) : tous nos chemins passent le hidden **post**-`model.norm`
+(`normed`) comme entrée de la tête MTP, alors que le contrat
+Qwen3-Next/DeepSeek de référence est le hidden **pré**-norm —
+`pre_fc_norm_hidden` re-normalise par-dessus → γ de `model.norm` cuit
+dans l'entrée. Invisible aux parités internes (la réf Python copie le
+même câblage) — exactement la classe de bug que les checks de la lane
+acceptance ne peuvent pas voir. Pareil pour la récursion (drafts ≥2 :
+sortie post-`mtp.norm` réinjectée).
+
+**Instrumentation** : buffer `prenorm_hidden` (forward + prefill)
+matérialisé gratuitement par le slot `residual_out` des rmsnorm
+final_norm/mtp.norm ; sélecteurs distincts pour les DEUX contrats
+(entrée backbone vs récursion) ; audit complet des 19 consommateurs
+(le lm_head batché du verify reste sur `normed`, côté target).
+
+**Mesure 2×2 (corpus dashboard, MTP=4, max-new 128, acc/draft)** :
+
+| input \ récursion | pré | post |
+|---|---|---|
+| **pré** | 0.297 @128 / 0.466 @3K | 0.373 / 0.371 |
+| **post** | 0.497 / 0.389 | **0.477 / 0.497 (historique)** |
+
+**Aucune combinaison ne bat l'historique ; tout le pré-norm est pire**
+(récursion pré-norm : positions 2-4 s'effondrent à 0.34/0.18/0.05).
+⇒ la tête MTP de CE checkpoint a été entraînée/calibrée sur le hidden
+post-norm — son contrat diffère de la réf Qwen3-Next vanilla. Le
+câblage n'est PAS notre écart vs vLLM. Défauts restaurés à l'identique
+(vérifié : acc 0.477, perpos et cycles au bit près, floor sain) ;
+les flags `QWEN36_MTP_PRENORM_{HIDDEN,RECURSION}=1` restent comme
+harnais d'expérience.
+
+**Pistes restantes pour « 0.5 vs 0.85-0.95 »** (par ordre de
+probabilité) :
+1. **Définition de la métrique + régime.** Notre composite
+   accepted/(accepted+cycles_rejetés) = 0.72 corpus et **0.96 en régime
+   chat templaté** — si les chiffres vLLM sont le composite sur du chat
+   (le cas typique des benchs serving), il n'y a PAS d'écart réel.
+   À trancher en demandant la définition/le workload exact.
+2. L'oracle externe de la lane acceptance (vLLM/modelopt sur cette
+   machine) reste le test décisif s'il faut aller plus loin.
+
+Files: `crates/runtime/src/engine.rs`, `crates/runtime/src/gpu.rs`
+(buffer + sélecteurs, défauts inchangés). Inventory: oui (table env).
+
 ### 2026-06-11 (soir) — Levier VRAM 1 SHIPPED : prefill sur poids fusionnés + drop entrelacé des originaux — −8.1 GiB, la cellule 3K revit (pic 32.0 → 23.9 GiB)
 
 Suite directe de l'enquête VRAM (entrée précédente). Branche worktree
