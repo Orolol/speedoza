@@ -184,6 +184,40 @@ Files: `crates/cli/src/main.rs` (instrumentation + probe
 instrument), `scripts/bench_dashboard.sh`, `docs/mtp-recovery-plan.md`
 (addendum). Inventory: oui (ligne dashboard).
 
+**Addendum (même jour, après-midi) — .so périmé détecté, tout re-validé ;
+routing DeltaNet séquentiel : NEGATIVE.**
+
+1. **Incident .so périmé.** Le parity floor MTP (hello/hello world ×
+   {0..4}) était CASSÉ au début de la re-validation (MTP=0 « Hereen » vs
+   MTP≥1 divergent, déterministe) — cause : `target/cuda/*.so` datait du
+   06-09 22:49, ANTÉRIEUR aux commits kernels pullés ce matin (sage
+   cp.async 69f06ed, smoke 13e9313, port d25daca). Rebuild
+   (`build_cuda.sh`) → smoke 100% (sage 8/8 bit-identique) → **floor
+   10/10 vert**. Leçon process : après un pull qui touche
+   `kernels-cuda/`, rebuilder le .so AVANT tout bench/gate — les gates
+   mesurés sur une autre machine ne transfèrent pas.
+2. **Re-validation des mesures du matin sur .so frais** : acceptance et
+   per-position IDENTIQUES au bit près (0.477/0.503/0.550/0.488, mêmes
+   cycles), chat 49 acc/2 rej idem, MTP=0 @3K 59.8 ≈ baseline Vast 59.4.
+   Toutes les conclusions (acceptance plate ~0.5, 4 puits, régime chat)
+   tiennent. Perf gate --quick vert (52.1 / 94.4 / DFlash 3K 63.8 AL 8.5
+   — le drafter EST disponible sur cette machine, contrairement à
+   l'instance Vast : les cellules DFlash du dashboard sont mesurables ici).
+3. **Routing verify-DeltaNet → séquentiel (recette du step 1 du plan) :
+   NEGATIVE, opt-in seulement.** A/B propre sur .so frais
+   (`QWEN36_DELTANET_SEQ_SHORT_CHUNK`, chunks ≤ 8 tokens) :
+   ctx 128 : 45.2 vs 40.4 (+12%, acc inchangée) ; ctx 3072 : **31.6 vs
+   39.2 (−19%), acc 0.503 → 0.352** — reproduit le motif de la probe 1a
+   sur DEUX .so et deux mécanismes : le verify séquentiel après un
+   prompt-prefill chunké désaligne les numerics draft↔verify et
+   l'acceptance s'effondre avec le ctx (consistency dividend inversé).
+   Le gain kernel (−9 ms/cycle) est réel mais le couplage acceptance le
+   tue. Resté dans l'arbre en opt-in (défaut = chunké, sémantique HEAD
+   inchangée, parity floor 10/10 dans les deux états). Le puits DeltaNet
+   (6.3 ms/cycle) reste ouvert mais exige un fix consistency-aware
+   (p.ex. verify chunké MAIS état carried recalé, ou drafts générés
+   depuis les hidden states du même kernel).
+
 ### 2026-06-10 — P5 plancher système : clock-lock impossible en conteneur, le reste < 1% — DECISION (différé)
 
 `nvidia-smi -lgc` est refusé (conteneur Vast non privilégié) — le lock

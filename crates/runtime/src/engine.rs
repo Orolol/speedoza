@@ -513,6 +513,12 @@ fn cuda_prefill_capacity(max_context: usize) -> usize {
 #[cfg(feature = "cuda")]
 const CUDA_LONG_CONTEXT_AUTO_MIN_CONTEXT: usize = 8192;
 
+/// Chunk-length ceiling for the opt-in QWEN36_DELTANET_SEQ_SHORT_CHUNK
+/// routing (sequential DeltaNet for speculative verify windows). Covers MTP
+/// verify windows up to depth 7.
+#[cfg(feature = "cuda")]
+const DELTANET_SEQ_SHORT_CHUNK_MAX_TOKENS: usize = 8;
+
 #[cfg(feature = "cuda")]
 fn cuda_long_context_auto_min_context() -> usize {
     cuda_env_usize("QWEN36_LONG_CONTEXT_AUTO_MIN_CONTEXT")
@@ -5643,7 +5649,17 @@ impl<B: KernelBackend> Engine<B> {
         // Gate on env var + Qwen3.6 shape match (the chunked kernel currently
         // only supports {qk=16, v=48, K=V=128, C=32}).  Falls back to the
         // sequential per-token kernel otherwise.
+        // QWEN36_DELTANET_SEQ_SHORT_CHUNK=1 (opt-in) routes short chunks
+        // (≤ DELTANET_SEQ_SHORT_CHUNK_MAX_TOKENS, i.e. speculative verify
+        // windows) to the sequential kernel. The kernel itself is cheaper
+        // there (+12% MTP=4 at ctx 128, 2026-06-11), but verify numerics
+        // then diverge from the chunked prompt prefill and draft acceptance
+        // drops with context (0.50 → 0.35 at ctx 3072, −19% tok/s) — net
+        // negative on real text, hence opt-in only.
+        let route_short_chunk_sequential = tokens <= DELTANET_SEQ_SHORT_CHUNK_MAX_TOKENS
+            && cuda_env_bool("QWEN36_DELTANET_SEQ_SHORT_CHUNK");
         let use_chunked = cuda_deltanet_chunked_prefill_enabled()
+            && !route_short_chunk_sequential
             && delta_shape.qk_heads == 16
             && delta_shape.v_heads == 48
             && delta_shape.key_dim == 128

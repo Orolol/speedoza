@@ -204,6 +204,7 @@ Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
 | `QWEN36_PREFILL_FUSED_MLP` | 0 | opt-in fused-MLP on the prefill path |
 | `QWEN36_PREFILL_FUSED_LINEAR_ATTN_DISABLE` | off | kill fused in_proj on the prefill path |
 | `QWEN36_DELTANET_CHUNKED_PREFILL` | **on** | `=0` disables chunked DeltaNet prefill |
+| `QWEN36_DELTANET_SEQ_SHORT_CHUNK` | **off** | `=1` routes ≤8-token chunks (speculative verify windows) to sequential DeltaNet — kernel +12% MTP=4 @128 but acceptance drops with ctx (0.50→0.35 @3K, −19%); opt-in for experiments only (2026-06-11) |
 
 ### 4.6 Split-KV tuning (diagnostics; defaults are tuned — don't ship overrides)
 
