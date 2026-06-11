@@ -1,0 +1,33 @@
+# CPU-only CI. CUDA kernels cannot build here (no GPU/nvcc on runners), but
+# `cargo check`/`clippy` with the cuda feature still validate all the
+# feature-gated Rust (FFI decls, dispatch, engine) because they don't link.
+# The GPU gates stay local: ./scripts/build_cuda.sh && ./scripts/smoke_cuda.sh
+# and scripts/verify_perf_gate.sh before any perf-touching merge.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy (no cuda)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: clippy (cuda feature, no link)
+        run: cargo clippy --workspace --all-targets --features qwen36-fp4-kernels/cuda -- -D warnings
+      - name: tests (cpu)
+        run: cargo test --workspace

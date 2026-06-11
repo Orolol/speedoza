@@ -1,5 +1,6 @@
 #include "qwen36_fp4.h"
 #include "active_stream.h"
+#include "interpreter/opcodes/attn_decode_full.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -28,6 +29,17 @@ size_t env_usize_or(const char *name, size_t fallback) {
 bool env_bool_enabled(const char *name) {
   const char *raw = getenv(name);
   return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+}
+
+// `default_value` when env unset/empty; otherwise true unless the first char
+// indicates a falsy value (0, f/F, n/N).
+bool env_bool_or(const char *name, bool default_value) {
+  const char *raw = getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return default_value;
+  }
+  return raw[0] != '0' && raw[0] != 'f' && raw[0] != 'F' && raw[0] != 'n' &&
+         raw[0] != 'N';
 }
 
 constexpr int kKvCacheBf16 = 0;
@@ -987,6 +999,17 @@ __global__ void attention_decode_kernel(
   }
 }
 
+__global__ void attention_decode_bf16_shared_kernel(
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k_new,
+    const __nv_bfloat16 *v_new, __nv_bfloat16 *cache_k,
+    __nv_bfloat16 *cache_v, __nv_bfloat16 *output, size_t position_scalar,
+    const int32_t *position_device, qwen36_attention_shape_t shape) {
+  __shared__ qwen36_interpreter::AttentionDecodeScratch scratch;
+  qwen36_interpreter::attention_decode_bf16_body(
+      blockIdx.x, q, k_new, v_new, cache_k, cache_v, output, position_scalar,
+      position_device, shape, scratch);
+}
+
 // Shared-memory bounds for the GQA-aware prefill kernel below. The current
 // Qwen3.6 config (q_heads=24, kv_heads=4 -> q_per_kv=6, head_dim=256) sits
 // comfortably under both bounds.
@@ -1453,25 +1476,65 @@ __global__ void attention_decode_reduce_kernel(
     qwen36_attention_shape_t shape, int n_splits) {
   __shared__ float gmax;
   __shared__ float gdenom;
+  // Per-warp staging for the block-wide max/sum reductions below.
+  __shared__ float reduce_warp[8];
 
   const size_t qh = blockIdx.x;
   const size_t head_dim = shape.head_dim;
   const size_t d = threadIdx.x;
+  const unsigned lane = threadIdx.x & 31u;
+  const unsigned warp = threadIdx.x >> 5;
+  const unsigned n_warps = (blockDim.x + 31u) >> 5;
 
+  // Block-parallel max/denom scans. The previous thread-0 serial loops
+  // became the decode full-attn bottleneck at large n_splits (2048 splits
+  // at a 128K context bucket ≈ 0.8 ms/layer of single-thread dependent
+  // loads — the residual long-context slide after the tiled split kernel).
+  float local_max = -INFINITY;
+  for (int s = static_cast<int>(threadIdx.x); s < n_splits;
+       s += static_cast<int>(blockDim.x)) {
+    local_max = fmaxf(local_max, partial_max[qh * n_splits + s]);
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max,
+                                                 offset));
+  }
+  if (lane == 0) {
+    reduce_warp[warp] = local_max;
+  }
+  __syncthreads();
   if (threadIdx.x == 0) {
     float m = -INFINITY;
-    for (int s = 0; s < n_splits; ++s) {
-      m = fmaxf(m, partial_max[qh * n_splits + s]);
-    }
-    float dn = 0.0f;
-    for (int s = 0; s < n_splits; ++s) {
-      const float pm = partial_max[qh * n_splits + s];
-      const float pd = partial_denom[qh * n_splits + s];
-      const float scale =
-          isinf(pm) && pm < 0.0f ? 0.0f : expf(pm - m);
-      dn += pd * scale;
+    for (unsigned w = 0; w < n_warps; ++w) {
+      m = fmaxf(m, reduce_warp[w]);
     }
     gmax = m;
+  }
+  __syncthreads();
+
+  const float m_global = gmax;
+  float local_denom = 0.0f;
+  for (int s = static_cast<int>(threadIdx.x); s < n_splits;
+       s += static_cast<int>(blockDim.x)) {
+    const float pm = partial_max[qh * n_splits + s];
+    const float pd = partial_denom[qh * n_splits + s];
+    const float scale = isinf(pm) && pm < 0.0f ? 0.0f : expf(pm - m_global);
+    local_denom += pd * scale;
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_denom += __shfl_xor_sync(0xffffffffu, local_denom, offset);
+  }
+  if (lane == 0) {
+    reduce_warp[warp] = local_denom;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float dn = 0.0f;
+    for (unsigned w = 0; w < n_warps; ++w) {
+      dn += reduce_warp[w];
+    }
     gdenom = dn;
   }
   __syncthreads();
@@ -2339,6 +2402,21 @@ __global__ void attention_prefill_kernel(
 
 } // namespace
 
+// Flash-Decoding split-K prefill (kernels-cuda/attention_flash_splitk.cu).
+// Correct (cos>=0.998 vs scalar GQA, smoke-gated) and saturates the GPU at
+// q<=32 / head_dim=256 / long-KV where the normal flash tile under-grids.
+extern "C" int qwen36_attention_flash_splitk_prefill_bf16(
+    const qwen36_attention_prefill_spec_t *spec, int n_splits);
+
+// Register-tiled decode split kernel (kernels-cuda/attention_decode_tiled.cu).
+// Warp-per-timestep tile + vectorized loads + LUT FP8 decode; same grid,
+// partials layout and cache-append side effect as the v1 split-GQA kernel,
+// so the shared reduce below consumes its output unchanged. Returns
+// NOT_IMPLEMENTED for shapes it does not cover (TQ, head_dim!=256).
+extern "C" int qwen36_attention_decode_split_tiled(
+    const qwen36_attention_decode_spec_t *spec, int n_splits,
+    int split_timesteps_per_block);
+
 extern "C" int
 qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
   if (spec == nullptr) {
@@ -2471,6 +2549,41 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
     return QWEN36_STATUS_SUCCESS;
   }
 
+  // Both the flash and sage prefill kernels use an M=32 Q-tile, which gives
+  // a grid of (kv_heads=4, ceil(tokens/32)).  At short contexts that grid is
+  // too small to saturate the 170 SMs on a 5090, so the scalar GQA kernel
+  // wins (it gets one block per token, 4×T blocks).  Empirically the wmma
+  // and INT8 kernels start winning at T≥1024 (~128 blocks at q_per_kv=6).
+  constexpr size_t kPrefillFlashMinTokens = 1024;
+
+  // SageAttention-style prefill (INT8 Q·K via inline-PTX mma.m16n8k32, BF16
+  // P·V). On by default for the Qwen3.6 hot shape; set
+  // QWEN36_ATTENTION_SAGE_PREFILL=0 to fall back to the BF16 flash kernel.
+  // Selected before the flash path so both share the same eligibility
+  // predicate.
+  const bool sage_eligible =
+      env_bool_or("QWEN36_ATTENTION_SAGE_PREFILL", true) &&
+      spec->tokens >= kPrefillFlashMinTokens && spec->shape.head_dim == 256 &&
+      !tree_mask_present && !is_tq_cache_dtype(spec->kv_cache_dtype) &&
+      spec->shape.kv_heads > 0 &&
+      spec->shape.q_heads % spec->shape.kv_heads == 0;
+  if (sage_eligible) {
+    return qwen36_attention_sage_prefill(spec);
+  }
+
+  // Flash-attention prefill (wmma bf16, head_dim=256, no tree-mask, no TQ
+  // cache).  On by default for the Qwen3.6 hot shape; set
+  // QWEN36_ATTENTION_FLASH_PREFILL=0 to fall back to the scalar GQA kernel.
+  const bool flash_eligible =
+      env_bool_or("QWEN36_ATTENTION_FLASH_PREFILL", true) &&
+      spec->tokens >= kPrefillFlashMinTokens && spec->shape.head_dim == 256 &&
+      !tree_mask_present && !is_tq_cache_dtype(spec->kv_cache_dtype) &&
+      spec->shape.kv_heads > 0 &&
+      spec->shape.q_heads % spec->shape.kv_heads == 0;
+  if (flash_eligible) {
+    return qwen36_attention_flash_prefill(spec);
+  }
+
   // Prefer the GQA-aware kernel for the common Qwen3.6 shape: it lays out
   // the grid as (kv_heads × tokens) instead of (q_heads × tokens) and
   // shares each cache row across the q_per_kv queries that consume it,
@@ -2532,6 +2645,30 @@ qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec) {
     }
     cudaError_t err = cudaGetLastError();
     return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+  }
+  // Flash-Decoding split-K for the small-q / long-KV verify shape
+  // (DFlash q=16 full-attn). Opt-in via QWEN36_VERIFY_FLASH_SPLITK; the
+  // normal flash tile is gated off below 1024 tokens because it under-grids
+  // (4 CTAs at q=16), and the scalar GQA re-reads the full KV per token.
+  // This path tiles the KV across n_splits CTAs to saturate the GPU while
+  // staying numerically faithful (FP32 accum, cos>=0.998 vs scalar).
+  if (!tree_mask_present && env_bool_or("QWEN36_VERIFY_FLASH_SPLITK", true) &&
+      spec->tokens >= 2 && spec->tokens <= 32 && spec->shape.head_dim == 256 &&
+      !is_tq_cache_dtype(spec->kv_cache_dtype) && q_per_kv > 1) {
+    const size_t total_k_iters = (spec->start_position + spec->tokens + 63) / 64;
+    int n_splits = static_cast<int>(total_k_iters);
+    if (n_splits > 48) {
+      n_splits = 48;
+    }
+    if (n_splits < 1) {
+      n_splits = 1;
+    }
+    const int rc = qwen36_attention_flash_splitk_prefill_bf16(spec, n_splits);
+    if (rc != QWEN36_STATUS_NOT_IMPLEMENTED &&
+        rc != QWEN36_STATUS_INVALID_ARGUMENT) {
+      return rc;
+    }
+    // else fall through to the scalar GQA path.
   }
   if (gqa_eligible) {
     if (tree_mask_present) {
@@ -2629,6 +2766,37 @@ qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec) {
         spec->shape.head_dim <= static_cast<size_t>(kGqaMaxHeadDim) &&
         q_per_kv <= static_cast<size_t>(kGqaMaxQPerKv) && q_per_kv > 1 &&
         n_splits >= 32;
+    // Register-tiled v2 for the hot shape (BF16/FP8, head_dim=256). The
+    // serial per-timestep v1 loop is ~28x off KV bandwidth and is the
+    // entire MTP=0 long-context slide; the tiled kernel processes 8
+    // timesteps per iteration with vectorized loads. Same partials +
+    // reduce + cache-append contract. QWEN36_DECODE_TILED_ATTENTION=0
+    // forces the v1 scalar path.
+    const bool tiled_attempted =
+        gqa_split_eligible &&
+        env_bool_or("QWEN36_DECODE_TILED_ATTENTION", true) &&
+        !is_tq_cache_dtype(spec->kv_cache_dtype) &&
+        spec->shape.head_dim == 256;
+    if (tiled_attempted) {
+      const int rc = qwen36_attention_decode_split_tiled(
+          spec, n_splits, split_timesteps_per_block);
+      if (rc == QWEN36_STATUS_SUCCESS) {
+        attention_decode_reduce_kernel<<<
+            static_cast<unsigned int>(spec->shape.q_heads), split_threads, 0,
+            qwen36_internal_active_stream()>>>(
+            ptr<const float>(spec->partial_acc_f32),
+            ptr<const float>(spec->partial_max_f32),
+            ptr<const float>(spec->partial_denom_f32),
+            ptr<__nv_bfloat16>(spec->output_bf16), spec->shape, n_splits);
+        cudaError_t err = cudaGetLastError();
+        return err == cudaSuccess ? QWEN36_STATUS_SUCCESS
+                                  : QWEN36_STATUS_CUDA_ERROR;
+      }
+      if (rc != QWEN36_STATUS_NOT_IMPLEMENTED) {
+        return rc;
+      }
+      // NOT_IMPLEMENTED -> fall through to the v1 scalar split kernel.
+    }
     if (gqa_split_eligible) {
       const dim3 split_grid(static_cast<unsigned int>(spec->shape.kv_heads),
                             static_cast<unsigned int>(n_splits));
@@ -2683,15 +2851,28 @@ qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec) {
   } else if (threads > 256u) {
     threads = 256u;
   }
-  attention_decode_kernel<<<static_cast<unsigned int>(spec->shape.q_heads),
-                            threads, 0, qwen36_internal_active_stream()>>>(
-      ptr<const __nv_bfloat16>(spec->q_bf16),
-      ptr<const __nv_bfloat16>(spec->k_bf16),
-      ptr<const __nv_bfloat16>(spec->v_bf16),
-      ptr<void>(spec->kv_cache_k), ptr<void>(spec->kv_cache_v),
-      ptr<float>(spec->kv_cache_metadata),
-      spec->kv_cache_dtype, ptr<__nv_bfloat16>(spec->output_bf16), spec->position,
-      ptr<const int32_t>(spec->position_device_i32), spec->shape);
+  if (spec->kv_cache_dtype == kKvCacheBf16) {
+    attention_decode_bf16_shared_kernel<<<
+        static_cast<unsigned int>(spec->shape.q_heads), threads, 0,
+        qwen36_internal_active_stream()>>>(
+        ptr<const __nv_bfloat16>(spec->q_bf16),
+        ptr<const __nv_bfloat16>(spec->k_bf16),
+        ptr<const __nv_bfloat16>(spec->v_bf16),
+        ptr<__nv_bfloat16>(spec->kv_cache_k),
+        ptr<__nv_bfloat16>(spec->kv_cache_v),
+        ptr<__nv_bfloat16>(spec->output_bf16), spec->position,
+        ptr<const int32_t>(spec->position_device_i32), spec->shape);
+  } else {
+    attention_decode_kernel<<<static_cast<unsigned int>(spec->shape.q_heads),
+                              threads, 0, qwen36_internal_active_stream()>>>(
+        ptr<const __nv_bfloat16>(spec->q_bf16),
+        ptr<const __nv_bfloat16>(spec->k_bf16),
+        ptr<const __nv_bfloat16>(spec->v_bf16),
+        ptr<void>(spec->kv_cache_k), ptr<void>(spec->kv_cache_v),
+        ptr<float>(spec->kv_cache_metadata), spec->kv_cache_dtype,
+        ptr<__nv_bfloat16>(spec->output_bf16), spec->position,
+        ptr<const int32_t>(spec->position_device_i32), spec->shape);
+  }
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }

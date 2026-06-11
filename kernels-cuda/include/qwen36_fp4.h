@@ -57,8 +57,8 @@ enum {
   QWEN36_STATUS_INVALID_ARGUMENT = 2,
   QWEN36_STATUS_CUDA_ERROR = 3,
   QWEN36_STATUS_CUBLAS_ERROR = 4,
-  // Returned by entry points whose kernel implementation has not yet
-  // landed (e.g. the Mirage megakernel path while it is being built up).
+  // Returned by entry points for shapes their kernel does not support
+  // (e.g. the decode NVFP4 gemv outside its specialised shape set).
   // The Rust runtime treats this as a soft fallback signal so it can route
   // back to the existing cuBLASLt path without breaking parity.
   QWEN36_STATUS_NOT_IMPLEMENTED = 5
@@ -357,6 +357,30 @@ typedef struct {
   qwen36_device_ptr_t output_bf16;
 } qwen36_bf16_matvec_spec_t;
 
+/* lm_head FP8 e4m3 (W8A16). Quantize is a one-shot init pass; the gemv
+ * serves both the single-token logits (n=1) and the batched MTP verify
+ * logits (n <= QWEN36_LM_HEAD_FP8_MAX_N). Layouts: input [n, cols] and
+ * output [n, rows], both row-major BF16. */
+#define QWEN36_LM_HEAD_FP8_MAX_N 16
+
+typedef struct {
+  size_t rows; /* vocab */
+  size_t cols; /* hidden; must be a multiple of 4 */
+  qwen36_device_ptr_t weight_bf16;
+  qwen36_device_ptr_t weight_e4m3;
+  qwen36_device_ptr_t row_scales_f32;
+} qwen36_lm_head_fp8_quantize_spec_t;
+
+typedef struct {
+  size_t rows;
+  size_t cols;
+  size_t n;
+  qwen36_device_ptr_t weight_e4m3;
+  qwen36_device_ptr_t row_scales_f32;
+  qwen36_device_ptr_t input_bf16;
+  qwen36_device_ptr_t output_bf16;
+} qwen36_lm_head_fp8_gemv_spec_t;
+
 typedef struct {
   size_t rows;
   size_t out_features;
@@ -497,6 +521,40 @@ typedef struct {
   qwen36_device_ptr_t output_bf16;
 } qwen36_copy_strided_rows_spec_t;
 
+#define QWEN36_INTERPRETER_MAX_DEPS 4
+#define QWEN36_INTERPRETER_PAYLOAD_U64S 12
+
+typedef struct {
+  uint32_t counter_id;
+  uint32_t target;
+} qwen36_interpreter_dep_t;
+
+typedef struct {
+  uint16_t opcode;
+  uint16_t flags;
+  uint16_t dep_count;
+  uint16_t reserved;
+  uint32_t publishes_counter;
+  uint32_t publish_value;
+  // Per-instruction arrival slot. Every CTA increments this after executing
+  // the opcode body; only the last CTA publishes `publishes_counter`.
+  uint32_t arrival_counter;
+  qwen36_interpreter_dep_t deps[QWEN36_INTERPRETER_MAX_DEPS];
+  // Opaque per-opcode payload. Stage 0 only dispatches fallback/no-op
+  // instructions; future inline opcode bodies reinterpret these slots.
+  uint64_t payload[QWEN36_INTERPRETER_PAYLOAD_U64S];
+} qwen36_interpreter_instruction_t;
+
+typedef struct {
+  qwen36_device_ptr_t instructions;
+  size_t instruction_count;
+  qwen36_device_ptr_t counters_i32;
+  size_t counter_count;
+  // 0 means derive from cudaOccupancyMaxActiveBlocksPerMultiprocessor.
+  uint32_t cta_count;
+  uint32_t flags;
+} qwen36_interpreter_program_t;
+
 int qwen36_cuda_malloc(qwen36_device_allocation_t *out, size_t bytes);
 int qwen36_cuda_free(qwen36_device_ptr_t ptr);
 int qwen36_cuda_memcpy_h2d(qwen36_device_ptr_t dst, const void *src,
@@ -515,28 +573,61 @@ int qwen36_cuda_set_l2_access_window(qwen36_device_ptr_t base, size_t bytes,
                                       float hit_ratio);
 int qwen36_cuda_clear_l2_access_window(void);
 
+// Productive-spin L2 warmup. Read-only walk over `[base, base+bytes)` that
+// pulls every byte into L2 without computing. Launches `target_cta_count`
+// CTAs (default 128 when 0) onto the registered prefetch stream so it can
+// overlap the small-CTA full-attn decode kernel running on the main stream.
+// Returns QWEN36_STATUS_INVALID_ARGUMENT if no prefetch stream is registered.
+int qwen36_l2_prefetch(qwen36_device_ptr_t base, size_t bytes,
+                       int target_cta_count);
+
 int qwen36_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
 
-// Mirage megakernel NVFP4 GEMM: hand-tuned CUTLASS kernel for the hot
-// decode shapes (M » N=1, K=hidden) on Blackwell SM120. Uses the same
-// Nvfp4GemmSpec contract as `qwen36_nvfp4_gemm` so callers can A/B route
-// via env var. Returns QWEN36_STATUS_NOT_IMPLEMENTED for shapes the
-// kernel does not yet specialise; the Rust dispatcher then falls back
-// to the cuBLASLt path. See `docs/mirage-megakernel.md`.
-int qwen36_megakernel_nvfp4_gemm(const qwen36_nvfp4_gemm_spec_t *spec);
+// Stage-0 interpreter shell for decode. It executes a static instruction
+// stream, waits/publishes GMEM counters, initialises the SMEM page allocator,
+// and routes known non-EXIT opcodes through a device-side fallback no-op.
+// Real opcode bodies are added behind the same ABI in later stages.
+int qwen36_interpreter_decode_sm120(const qwen36_interpreter_program_t *program);
+
 // Direction B decode-time NVFP4 gemv: hand-written kernel optimised for the
 // (M, N=1, K) shapes that dominate decode. Reuses `qwen36_nvfp4_gemm_spec_t`.
 // Returns QWEN36_STATUS_NOT_IMPLEMENTED (5) for shapes outside the supported
 // set (M%128==0, K%128==0, N==1); the Rust dispatcher falls back to the
-// existing megakernel/cuBLASLt path on that code, mirroring the Mirage
-// pattern. Gated by `QWEN36_DECODE_GEMV=1`. See
+// existing cuBLASLt path on that code. Gated by `QWEN36_DECODE_GEMV=1`. See
 // `docs/superpowers/specs/2026-05-04-direction-b-nvfp4-gemv-design.md`.
 int qwen36_decode_nvfp4_gemv(const qwen36_nvfp4_gemm_spec_t *spec);
 int qwen36_bf16_gemm(const qwen36_bf16_gemm_spec_t *spec);
 int qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec);
+int qwen36_attention_flash_prefill(const qwen36_attention_prefill_spec_t *spec);
+int qwen36_attention_sage_prefill(const qwen36_attention_prefill_spec_t *spec);
 int qwen36_deltanet_decode(const qwen36_deltanet_decode_spec_t *spec);
 int qwen36_deltanet_prefill(const qwen36_deltanet_prefill_spec_t *spec);
 int qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec);
+
+// DFlash drafter attention (Phase C v1): non-causal BF16 attention with
+// GQA. Caller pre-concatenates K = [k_ctx; k_noise] and V = [v_ctx;
+// v_noise] as a single contiguous buffer of length `kv_seq_len`. No KV
+// cache management inside the kernel; the controller manages append/crop
+// at the Rust layer. `sliding_window = 0` selects full attention; non-
+// zero applies a symmetric SWA mask centred on the query's absolute
+// position (key absolute position is `j`, query absolute position is
+// `kv_seq_len - q_len + q_pos`).
+typedef struct {
+  qwen36_device_ptr_t q_bf16;        // [q_len, q_heads, head_dim]
+  qwen36_device_ptr_t k_bf16;        // [kv_seq_len, kv_heads, head_dim]
+  qwen36_device_ptr_t v_bf16;        // [kv_seq_len, kv_heads, head_dim]
+  qwen36_device_ptr_t output_bf16;   // [q_len, q_heads, head_dim]
+  size_t q_len;
+  size_t kv_seq_len;
+  size_t q_heads;
+  size_t kv_heads;
+  size_t head_dim;
+  size_t sliding_window;             // 0 = full attention
+} qwen36_drafter_attention_block_spec_t;
+
+int qwen36_drafter_attention_block_bf16(
+    const qwen36_drafter_attention_block_spec_t *spec);
+
 int qwen36_turboquant_encode_kv(const qwen36_turboquant_encode_spec_t *spec);
 int qwen36_turboquant_attention(const qwen36_turboquant_attention_spec_t *spec);
 int qwen36_rmsnorm(const qwen36_rmsnorm_spec_t *spec);
@@ -553,6 +644,8 @@ int qwen36_embedding_lookup(const qwen36_embedding_lookup_spec_t *spec);
 int qwen36_bf16_matvec(const qwen36_bf16_matvec_spec_t *spec);
 int qwen36_bf16_matvec_argmax_rows(
     const qwen36_bf16_matvec_argmax_rows_spec_t *spec);
+int qwen36_lm_head_fp8_quantize(const qwen36_lm_head_fp8_quantize_spec_t *spec);
+int qwen36_lm_head_fp8_gemv(const qwen36_lm_head_fp8_gemv_spec_t *spec);
 int qwen36_nvfp4_matvec(const qwen36_nvfp4_matvec_spec_t *spec);
 int qwen36_nvfp4_quantize_bf16(const qwen36_nvfp4_quantize_spec_t *spec);
 int qwen36_nvfp4_quantize_rows(const qwen36_nvfp4_quantize_rows_spec_t *spec);
@@ -595,6 +688,29 @@ void qwen36_set_active_stream(qwen36_cuda_stream_t stream);
 int qwen36_cuda_stream_create(qwen36_cuda_stream_t *out);
 int qwen36_cuda_stream_destroy(qwen36_cuda_stream_t stream);
 int qwen36_cuda_stream_synchronize(qwen36_cuda_stream_t stream);
+
+// Secondary "prefetch" stream used by the decode path to overlap idle-SM L2
+// prefetch (productive spin during full-attn) and any future concurrent
+// work with the main stream. Lifetime is owned by the engine: the
+// engine creates it at boot via `qwen36_cuda_stream_create` (cudaStreamNon-
+// Blocking) and registers it here with `qwen36_set_prefetch_stream`. Kernels
+// that want to dispatch onto it use `qwen36_internal_prefetch_stream` from
+// active_stream.h. Defaults to nullptr (= unused).
+qwen36_cuda_stream_t qwen36_get_prefetch_stream(void);
+void qwen36_set_prefetch_stream(qwen36_cuda_stream_t stream);
+
+// Generic CUDA event handle for cross-stream synchronization. Used by the
+// productive-spin path to record an event on one stream and
+// have another stream wait on it; the pattern is graph-captureable so the
+// decode CUDA graph can include cross-stream waits without re-recording.
+// Events are created with `cudaEventDisableTiming` to avoid the timer cost.
+typedef struct CUevent_st *qwen36_cuda_event_t;
+int qwen36_cuda_event_create(qwen36_cuda_event_t *out);
+int qwen36_cuda_event_destroy(qwen36_cuda_event_t event);
+int qwen36_cuda_event_record(qwen36_cuda_event_t event,
+                             qwen36_cuda_stream_t stream);
+int qwen36_cuda_stream_wait_event(qwen36_cuda_stream_t stream,
+                                  qwen36_cuda_event_t event);
 
 // Opaque handles for CUDA graph plumbing.
 typedef struct CUgraph_st *qwen36_cuda_graph_t;

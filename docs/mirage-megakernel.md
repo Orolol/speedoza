@@ -1,5 +1,14 @@
 # Mirage-style Megakernel for Qwen3.6-27B Decode
 
+> **HISTORICAL — code removed 2026-06-10.** The CUTLASS kernel this doc
+> describes (`kernels-cuda/megakernel/nvfp4_matvec_sm120.cu`) never actually
+> executed (broken `CUTLASS_ARCH_MMA_SM120_SUPPORTED` guard, silent cuBLASLt
+> fallback) and was deleted along with the per-block megakernel
+> (`full_attn_block_sm120.cu`, negative bench result). This doc is kept for
+> the analysis that remains valid (scale-factor layout equivalence, the
+> SwiGLU epilogue-fusion blocker on the `MlpFusedStore` layout). See
+> `docs/code-inventory.md` § 2.5 before re-attempting anything CUTLASS-based.
+
 Branch: `feat/mirage-megakernel`. Long-running, can be reset/rebased without
 pressure on `codex/numerical-parity-guardrails`.
 

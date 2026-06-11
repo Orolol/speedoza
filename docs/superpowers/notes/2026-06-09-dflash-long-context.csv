@@ -1,0 +1,11 @@
+prompt,prompt_tokens,max_new_tokens,dflash_generated,dflash_iters,dflash_tok_s,dflash_al,dflash_decode_s,mtp_tok_s,mtp_al_eff,mtp_decode_s,speedup_dflash_vs_mtp
+tech_xl_500t,400,32,37,16,48.0,2.31,0.77,42.9,3.31,0.75,1.12
+tech_xl_500t,400,128,131,38,69.2,3.45,1.89,55.2,3.56,2.32,1.25
+tech_xl_500t,400,256,257,86,56.2,2.99,4.57,49.2,3.49,5.2,1.14
+code_xl_1500t,802,32,32,17,30.0,1.88,1.07,56.0,3.76,0.57,0.54
+code_xl_1500t,802,128,134,28,74.4,4.79,1.8,51.2,3.65,2.5,1.45
+code_xl_1500t,802,256,256,44,88.6,5.82,2.89,53.6,3.69,4.77,1.65
+prompt,prompt_tokens,max_new_tokens,dflash_generated,dflash_iters,dflash_tok_s,dflash_al,dflash_decode_s,mtp_tok_s,mtp_al_eff,mtp_decode_s,speedup_dflash_vs_mtp
+long_synth_3000t,986,32,33,19,24.1,1.74,1.37,47.6,3.64,0.67,0.51
+long_synth_3000t,986,128,129,67,26.9,1.93,4.79,54.7,3.73,2.34,0.49
+long_synth_3000t,986,256,257,131,26.1,1.96,9.83,44.4,3.55,5.77,0.59

@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::attention::{AttentionDecodeSpec, AttentionPrefillSpec};
 use crate::deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec};
+use crate::drafter_attention::DrafterAttentionBlockSpec;
+use crate::interpreter::InterpreterProgramSpec;
 use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
     Bf16GemmSpec, Bf16MatVecArgmaxRowsSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec,
@@ -23,6 +25,10 @@ pub struct DevicePtr(pub u64);
 
 impl DevicePtr {
     pub const NULL: Self = Self(0);
+
+    pub const fn null() -> Self {
+        Self::NULL
+    }
 
     pub fn offset_bytes(self, bytes: usize) -> Option<Self> {
         self.0.checked_add(bytes as u64).map(Self)
@@ -100,6 +106,14 @@ pub trait KernelBackend: Send + Sync {
         Err(CoreError::UnsupportedNoCuda("bf16_matvec_argmax_rows"))
     }
 
+    fn lm_head_fp8_quantize(&self, _spec: &crate::ops::LmHeadFp8QuantizeSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("lm_head_fp8_quantize"))
+    }
+
+    fn lm_head_fp8_gemv(&self, _spec: &crate::ops::LmHeadFp8GemvSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("lm_head_fp8_gemv"))
+    }
+
     fn bf16_gemm(&self, _spec: &Bf16GemmSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("bf16_gemm"))
     }
@@ -155,6 +169,18 @@ pub trait KernelBackend: Send + Sync {
     fn copy_strided_rows(&self, _spec: &CopyStridedRowsSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("copy_strided_rows"))
     }
+
+    /// Stage-0 decode interpreter shell. This is intentionally opt-in/API
+    /// level until real opcode bodies are ported into the interpreter.
+    fn interpreter_decode_sm120(&self, _spec: &InterpreterProgramSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("interpreter_decode_sm120"))
+    }
+
+    /// DFlash drafter attention (Phase C v1): non-causal BF16 attention
+    /// with caller-managed KV cache (K = [k_ctx; k_noise], V same).
+    fn drafter_attention_block_bf16(&self, _spec: &DrafterAttentionBlockSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("drafter_attention_block_bf16"))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -180,28 +206,13 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::Nvfp4GemmSpec::from(spec);
         // Direction B decode-time gemv path. When enabled and the GEMM is
         // gemv-shaped (n == 1) we try the hand-written kernel first; on
-        // QWEN36_STATUS_NOT_IMPLEMENTED we fall through to the existing
-        // megakernel / cuBLASLt routing. See the Direction B spec under
+        // QWEN36_STATUS_NOT_IMPLEMENTED we fall through to the cuBLASLt
+        // routing. See the Direction B spec under
         // `docs/superpowers/specs/2026-05-04-direction-b-nvfp4-gemv-design.md`.
         if decode_gemv_enabled() && spec.n == 1 {
             let code = unsafe { ffi::qwen36_decode_nvfp4_gemv(&ffi_spec) };
             if code != 5 {
                 return check("qwen36_decode_nvfp4_gemv", code);
-            }
-        }
-        // When the Mirage megakernel path is enabled (env var) we try the
-        // CUTLASS-templated NVFP4 GEMM next. The kernel is being built up
-        // shape-by-shape (`docs/mirage-megakernel.md`); on any unsupported
-        // shape it returns QWEN36_STATUS_NOT_IMPLEMENTED, in which case we
-        // transparently fall back to the cuBLASLt path. This keeps the
-        // engine perf-neutral while individual shapes get migrated.
-        if megakernel_enabled() {
-            let code = unsafe { ffi::qwen36_megakernel_nvfp4_gemm(&ffi_spec) };
-            // 5 == QWEN36_STATUS_NOT_IMPLEMENTED. Any other non-zero is a
-            // real failure and surfaces through `check()` like the rest of
-            // the FFI surface.
-            if code != 5 {
-                return check("qwen36_megakernel_nvfp4_gemm", code);
             }
         }
         check("qwen36_nvfp4_gemm", unsafe {
@@ -298,6 +309,20 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::EmbeddingLookupSpec::from(spec);
         check("qwen36_embedding_lookup", unsafe {
             ffi::qwen36_embedding_lookup(&ffi_spec)
+        })
+    }
+
+    fn lm_head_fp8_quantize(&self, spec: &crate::ops::LmHeadFp8QuantizeSpec) -> Result<()> {
+        let ffi_spec = ffi::LmHeadFp8QuantizeSpec::from(spec);
+        check("qwen36_lm_head_fp8_quantize", unsafe {
+            ffi::qwen36_lm_head_fp8_quantize(&ffi_spec)
+        })
+    }
+
+    fn lm_head_fp8_gemv(&self, spec: &crate::ops::LmHeadFp8GemvSpec) -> Result<()> {
+        let ffi_spec = ffi::LmHeadFp8GemvSpec::from(spec);
+        check("qwen36_lm_head_fp8_gemv", unsafe {
+            ffi::qwen36_lm_head_fp8_gemv(&ffi_spec)
         })
     }
 
@@ -409,6 +434,20 @@ impl KernelBackend for CudaBackend {
             ffi::qwen36_copy_strided_rows(&ffi_spec)
         })
     }
+
+    fn interpreter_decode_sm120(&self, spec: &InterpreterProgramSpec) -> Result<()> {
+        let ffi_spec = ffi::InterpreterProgramSpec::from(spec);
+        check("qwen36_interpreter_decode_sm120", unsafe {
+            ffi::qwen36_interpreter_decode_sm120(&ffi_spec)
+        })
+    }
+
+    fn drafter_attention_block_bf16(&self, spec: &DrafterAttentionBlockSpec) -> Result<()> {
+        let ffi_spec = ffi::DrafterAttentionBlockSpec::from(spec);
+        check("qwen36_drafter_attention_block_bf16", unsafe {
+            ffi::qwen36_drafter_attention_block_bf16(&ffi_spec)
+        })
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -428,6 +467,15 @@ pub(crate) fn check(kernel: &'static str, code: i32) -> Result<()> {
     }
 }
 
+/// Stream-aware memset entry point. Exposed as a function rather than a
+/// `CudaDeviceBuffer` method so callers that hold a raw `DevicePtr` (a
+/// slice into a larger arena) can use it directly; targets the active
+/// stream so the reset survives CUDA-graph capture.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn qwen36_cuda_memset_async_raw(dst: DevicePtr, value: i32, bytes: usize) -> i32 {
+    unsafe { ffi::qwen36_cuda_memset_async(dst, value, bytes) }
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn topk_argmax_raw(
     vocab_size: usize,
@@ -442,22 +490,6 @@ pub(crate) fn topk_argmax_raw(
         output_token_u32,
     };
     unsafe { ffi::qwen36_topk_argmax(&spec) }
-}
-
-/// Cached env-var lookup gating the CUTLASS-templated NVFP4 GEMM path.
-/// Set `QWEN36_USE_MEGAKERNEL_GEMM=1` to opt in; the default (unset / 0)
-/// keeps the cuBLASLt path active. Cached so the dispatch hot path does
-/// not parse the environment on every GEMM call.
-#[cfg(feature = "cuda")]
-fn megakernel_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("QWEN36_USE_MEGAKERNEL_GEMM").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
 }
 
 /// Cached env-var lookup gating the Direction B decode-time NVFP4 gemv path.
@@ -488,6 +520,40 @@ fn decode_gemv_enabled() -> bool {
         );
         !(disabled_by_kill_switch || disabled_by_opt_in_flag)
     })
+}
+
+#[cfg(feature = "cuda")]
+pub fn deltanet_decode_spec_abi_size() -> usize {
+    std::mem::size_of::<ffi::DeltaNetDecodeSpec>()
+}
+
+#[cfg(feature = "cuda")]
+pub fn attention_decode_spec_abi_size() -> usize {
+    std::mem::size_of::<ffi::AttentionDecodeSpec>()
+}
+
+#[cfg(feature = "cuda")]
+pub fn attention_decode_spec_abi_bytes(spec: &AttentionDecodeSpec) -> Vec<u8> {
+    let ffi_spec = ffi::AttentionDecodeSpec::from(spec);
+    unsafe {
+        std::slice::from_raw_parts(
+            (&ffi_spec as *const ffi::AttentionDecodeSpec).cast::<u8>(),
+            std::mem::size_of::<ffi::AttentionDecodeSpec>(),
+        )
+        .to_vec()
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub fn deltanet_decode_spec_abi_bytes(spec: &DeltaNetDecodeSpec) -> Vec<u8> {
+    let ffi_spec = ffi::DeltaNetDecodeSpec::from(spec);
+    unsafe {
+        std::slice::from_raw_parts(
+            (&ffi_spec as *const ffi::DeltaNetDecodeSpec).cast::<u8>(),
+            std::mem::size_of::<ffi::DeltaNetDecodeSpec>(),
+        )
+        .to_vec()
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1039,6 +1105,52 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct LmHeadFp8QuantizeSpec {
+        pub rows: usize,
+        pub cols: usize,
+        pub weight_bf16: DevicePtr,
+        pub weight_e4m3: DevicePtr,
+        pub row_scales_f32: DevicePtr,
+    }
+
+    impl From<&crate::ops::LmHeadFp8QuantizeSpec> for LmHeadFp8QuantizeSpec {
+        fn from(value: &crate::ops::LmHeadFp8QuantizeSpec) -> Self {
+            Self {
+                rows: value.rows,
+                cols: value.cols,
+                weight_bf16: value.weight_bf16,
+                weight_e4m3: value.weight_e4m3,
+                row_scales_f32: value.row_scales_f32,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct LmHeadFp8GemvSpec {
+        pub rows: usize,
+        pub cols: usize,
+        pub n: usize,
+        pub weight_e4m3: DevicePtr,
+        pub row_scales_f32: DevicePtr,
+        pub input_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+    }
+
+    impl From<&crate::ops::LmHeadFp8GemvSpec> for LmHeadFp8GemvSpec {
+        fn from(value: &crate::ops::LmHeadFp8GemvSpec) -> Self {
+            Self {
+                rows: value.rows,
+                cols: value.cols,
+                n: value.n,
+                weight_e4m3: value.weight_e4m3,
+                row_scales_f32: value.row_scales_f32,
+                input_bf16: value.input_bf16,
+                output_bf16: value.output_bf16,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct Bf16MatVecSpec {
         pub out_features: usize,
         pub in_features: usize,
@@ -1445,10 +1557,63 @@ mod ffi {
         }
     }
 
+    #[repr(C)]
+    pub struct InterpreterProgramSpec {
+        pub instructions: DevicePtr,
+        pub instruction_count: usize,
+        pub counters_i32: DevicePtr,
+        pub counter_count: usize,
+        pub cta_count: u32,
+        pub flags: u32,
+    }
+
+    impl From<&crate::interpreter::InterpreterProgramSpec> for InterpreterProgramSpec {
+        fn from(value: &crate::interpreter::InterpreterProgramSpec) -> Self {
+            Self {
+                instructions: value.instructions,
+                instruction_count: value.instruction_count,
+                counters_i32: value.counters_i32,
+                counter_count: value.counter_count,
+                cta_count: value.cta_count,
+                flags: value.flags,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct DrafterAttentionBlockSpec {
+        pub q_bf16: DevicePtr,
+        pub k_bf16: DevicePtr,
+        pub v_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+        pub q_len: usize,
+        pub kv_seq_len: usize,
+        pub q_heads: usize,
+        pub kv_heads: usize,
+        pub head_dim: usize,
+        pub sliding_window: usize,
+    }
+
+    impl From<&crate::drafter_attention::DrafterAttentionBlockSpec> for DrafterAttentionBlockSpec {
+        fn from(value: &crate::drafter_attention::DrafterAttentionBlockSpec) -> Self {
+            Self {
+                q_bf16: value.q_bf16,
+                k_bf16: value.k_bf16,
+                v_bf16: value.v_bf16,
+                output_bf16: value.output_bf16,
+                q_len: value.q_len,
+                kv_seq_len: value.kv_seq_len,
+                q_heads: value.q_heads,
+                kv_heads: value.kv_heads,
+                head_dim: value.head_dim,
+                sliding_window: value.sliding_window,
+            }
+        }
+    }
+
     #[link(name = "qwen36_fp4_kernels")]
     unsafe extern "C" {
         pub fn qwen36_nvfp4_gemm(spec: *const Nvfp4GemmSpec) -> i32;
-        pub fn qwen36_megakernel_nvfp4_gemm(spec: *const Nvfp4GemmSpec) -> i32;
         pub fn qwen36_decode_nvfp4_gemv(spec: *const Nvfp4GemmSpec) -> i32;
         pub fn qwen36_attention_prefill(spec: *const AttentionPrefillSpec) -> i32;
         pub fn qwen36_deltanet_decode(spec: *const DeltaNetDecodeSpec) -> i32;
@@ -1468,6 +1633,8 @@ mod ffi {
         pub fn qwen36_bf16_gemm(spec: *const Bf16GemmSpec) -> i32;
         pub fn qwen36_bf16_matvec(spec: *const Bf16MatVecSpec) -> i32;
         pub fn qwen36_bf16_matvec_argmax_rows(spec: *const Bf16MatVecArgmaxRowsSpec) -> i32;
+        pub fn qwen36_lm_head_fp8_quantize(spec: *const LmHeadFp8QuantizeSpec) -> i32;
+        pub fn qwen36_lm_head_fp8_gemv(spec: *const LmHeadFp8GemvSpec) -> i32;
         pub fn qwen36_nvfp4_matvec(spec: *const Nvfp4MatVecSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_bf16(spec: *const Nvfp4QuantizeSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_rows(spec: *const Nvfp4QuantizeRowsSpec) -> i32;
@@ -1481,5 +1648,12 @@ mod ffi {
         pub fn qwen36_q_proj_deinterleave(spec: *const QProjDeinterleaveSpec) -> i32;
         pub fn qwen36_q_proj_sigmoid_gate(spec: *const QProjSigmoidGateSpec) -> i32;
         pub fn qwen36_copy_strided_rows(spec: *const CopyStridedRowsSpec) -> i32;
+        pub fn qwen36_interpreter_decode_sm120(spec: *const InterpreterProgramSpec) -> i32;
+        pub fn qwen36_drafter_attention_block_bf16(spec: *const DrafterAttentionBlockSpec) -> i32;
+
+        // Captureable variant of `qwen36_cuda_memset` that targets the
+        // active stream. Declared here rather than in qwen36_fp4.h; the
+        // C++ definition lives in runtime.cu next to its sync sibling.
+        pub fn qwen36_cuda_memset_async(dst: DevicePtr, value: i32, bytes: usize) -> i32;
     }
 }
