@@ -97,6 +97,50 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-11 (nuit, fin) — CORRECTION lm_head FP8 : les flips composent dans la récursion de draft → politique AUTO (ON ssi MTP=0) ; grille de régimes re-mesurée sur le main à jour — SHIPPED
+
+**Correction de l'entrée précédente.** Le « production regimes clean »
+était faux : la grille chat/code × ctx de l'agent dmtp (harnais
+`target/quick_chat_code_context_harness.py`) re-déroulée sur le main à
+jour a montré UNE cellule effondrée — chat@8K : acc 0.770 → 0.589,
+tok/s 62.4 → 44.9. A/B au prompt identique, reproduit au bit près :
+FP8=0 restaure exactement 0.770/63.1. **Le mécanisme** (per-position) :
+position 1 inchangée (0.80), positions 2-4 effondrées
+(0.8/0.8/0.73 → 0.53/0.53/0.47) — la récursion du head MTP consomme
+l'argmax lm_head du step précédent, donc les flips FP8 à faible marge
+SE COMPOSENT le long de la chaîne. La probe offline (0/28) ne pouvait
+pas le voir : elle testait des positions isolées, pas la composition.
+Leçon de classe verify-perturbation ajoutée : **toute perturbation des
+logits doit être évaluée sur la châine de drafts, pas par-position.**
+
+**Fix** : `QWEN36_LM_HEAD_FP8` devient **auto = ON ssi mtp==0** (tri-état,
+`=1`/`=0` forcent). Validé : chat@8K MTP4 (auto→BF16) **64.7 / acc
+0.787** (au-dessus des 62.4 d'origine grâce au travail cycle) ; MTP=0
+corpus 3K (auto→FP8) **61.6 tok/s** (record cellule) ; floor sain ; le
+gate synthétique MTP=4 revient à sa baseline BF16 (la note « nouvelle
+baseline ~85-90 » de l'entrée précédente est ANNULÉE).
+
+**Grille de régimes complète sur le main à jour (pure-MTP, max-new 64,
+vs la table du binaire d'avant les merges du jour)** :
+
+| cellule | MTP0 | MTP4 | DFlash (AL) |
+|---|---|---|---|
+| chat 1K | 49.7 (+7%) | 32.3 (acc 0.34) | 54.1 (2.3) |
+| chat 8K | 55.8 (+5%) | **64.7** (0.79, auto-BF16) | 38.4 (3.0) |
+| chat 32K | 46.2 (+9%) | 42.5 (0.80, +15%) | 24.0 (5.0) |
+| code 1K | 53.0 | 52.3 (0.59) | **215.6 (9.4)** |
+| code 8K | 55.8 | 65.4→attendu ~69 BF16 (0.84) | **117.7 (9.5, +7%)** |
+| code 32K | 46.2 | **52.2** (0.98, +6%) | 9.0 (1.8, effondré) |
+
+Routage qui s'en déduit (step 4, défauts à câbler) : DFlash sur code
+≤8K (110-216 tok/s), MTP=4 à 8K+ (gagne dès acc ≥0.8), MTP=0/fallback
+sur chat court et 32K-chat ; DFlash JAMAIS ≥16K (AL 1.8). Le 32K-chat
+(acc 0.80, perd encore −8%) ne basculera qu'avec le cycle long-ctx
+(relecture KV ×6 du split-K — inversion de boucle au backlog).
+
+Files: crates/runtime/src/engine.rs (politique auto). Inventory: oui.
+Artefacts : target/quick_chat_code_context_runs/20260611-164651/ (worktree).
+
 ### 2026-06-11 (nuit, suite) — lm_head FP8 passe défaut ON : cycle MTP=4 @3K −6.2 ms (+7.6% pur), N=5 batché bat cuBLAS — SHIPPED (2 artefacts actés)
 
 Suite de la passe « millisecondes sur le cycle » : re-décomposition
