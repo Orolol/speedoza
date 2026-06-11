@@ -97,6 +97,45 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-11 (nuit) — Oracle vLLM exécuté : notre acceptance = la référence, régime pour régime — le dossier « acceptance trop basse » est CLOS — DECISION
+
+vLLM (checkout dmtp `/home/orosius/workspace/vllm`, 0.21.1rc1.dev53,
+method `qwen3_5_mtp`, k=4, greedy, MÊME métrique accepted/draft_tokens
+vérifiée dans `v1/spec_decode/metrics.py`) sur le MÊME checkpoint,
+les deux régimes (script : `scripts/vllm_acceptance_oracle.py`) :
+
+| régime | vLLM acc/draft (par-pos) | notre moteur |
+|---|---|---|
+| corpus brut 4×8000 chars | **0.518** (0.76/0.57/0.41/0.33) | 0.50 (0.75/0.55/0.41/0.20) |
+| chat templaté 4 prompts | **0.778** (0.92/0.82/0.74/0.64) | 0.82 (composite 0.96) |
+
+**Courbes par position quasi superposées.** Conclusions :
+1. **Aucun bug d'acceptance chez nous** — validation externe définitive,
+   après : parités internes (Codex), câblage 2×2 (FALSIFIED, entrée
+   précédente), code vLLM identique au nôtre (post-norm sur les deux
+   contrats, `qwen3_5_mtp.py` l.137/158, `Qwen3NextModel.forward`
+   retourne post-`self.norm`), et maintenant l'oracle runtime.
+2. ~0.5 en continuation brute = la vraie capacité de la tête MTP de ce
+   checkpoint ; ~0.78-0.82 en chat. La réf « 0.85-0.95 » venait d'un
+   autre workload/définition.
+3. **Tout le déficit MTP=4 vs MTP=0 du dashboard est donc du coût de
+   cycle** (75 ms ctx-flat, 4 puits nsys — entrées du matin) ; le
+   levier acceptance restant est la qualité du drafter (lane fine-tune
+   roadmap P2), pas le runtime.
+4. Bonus dashboard : le régime corpus-brut sous-estime structurellement
+   l'acceptance de production chat — confirmé par la référence.
+
+Incident à retenir (consigné en mémoire agent) : le premier run vLLM a
+planté la machine (profiling encodeur vision du wrapper VL → JIT torch
+ninja NON bridé → 32 jobs nvcc → 64 Go RAM saturés). Le run qui a
+réussi : `systemd-run --user --scope -p MemoryMax=40G -p CPUQuota=800%`
++ `MAX_JOBS=4` + `limit_mm_per_prompt={"image":0,"video":0}` + watchdog
+RAM. Le checkpoint local a maintenant les `preprocessor_config.json`
+récupérés de `Qwen/Qwen3.6-27B` (requis par vLLM).
+
+Files: `scripts/vllm_acceptance_oracle.py` (new). Inventory: n/a (hors
+moteur).
+
 ### 2026-06-11 (nuit) — Câblage MTP pré-norm : hypothèse séduisante, 2×2 mesuré, FALSIFIED — la tête de CE checkpoint veut le post-norm
 
 Contexte : vLLM afficherait 0.85-0.95 d'acceptance sur ce modèle/quant
