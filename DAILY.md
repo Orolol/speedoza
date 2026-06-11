@@ -97,6 +97,62 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-11 (soir) — Levier VRAM 1 SHIPPED : prefill sur poids fusionnés + drop entrelacé des originaux — −8.1 GiB, la cellule 3K revit (pic 32.0 → 23.9 GiB)
+
+Suite directe de l'enquête VRAM (entrée précédente). Branche worktree
+`vram-lever1` (l'agent acceptance a engine.rs/main.rs non commités sur
+main — à merger après lui).
+
+**Ce qui a changé** (le chemin fused-prefill MLP existait depuis le
+04-05, complet — GEMM combiné [2I,T] + 2 `copy_strided_rows` de
+désentrelacement + swiglu standard — mais opt-in et jamais validé ;
+le fused-prefill in_proj était déjà ON par défaut) :
+1. `QWEN36_PREFILL_FUSED_MLP` **défaut OFF → ON** (`=0` pour revenir).
+2. **Drop entrelacé** : `MlpFusedStore::build` /
+   `LinearAttnInProjFusedStore::build` libèrent les sources de chaque
+   layer sitôt sa copie fusionnée construite (sync par layer) —
+   indispensable : le drop post-build gardait le PIC d'init à ~28.5 GiB
+   et l'init OOMait dès ~1.7 GiB de VRAM externe (vérifié : OOM sur le
+   malloc 42.6 MB du build in_proj, GPU quasi libre). Gated : les deux
+   flags prefill-fused actifs + les deux stores construits +
+   `QWEN36_KEEP_UNFUSED_WEIGHTS≠1`.
+3. `GpuWeightStore::remove` (accès post-drop → erreur « tensor
+   missing », jamais de lecture de mémoire libérée). Buffers prefill :
+   seul `block_out` passe à 2I (les 4 autres buffers wide restent à I —
+   évite +0.5-1.4 GiB de sur-allocation).
+
+**Audit des lecteurs des originaux avant drop** : décode = stores
+fusionnés (défaut), prefill MLP = fused (ce commit), prefill in_proj =
+fused (défaut), interpreter = `fused.combined_weight` (vérifié lignes
+~8661+), MLP tête MTP = tenseurs `mtp.*` BF16 distincts (non droppés),
+`common_nvfp4_quant`/destructurations = métadonnées + scales (gardés).
+Fallbacks unfused = inatteignables stores présents ; sinon erreur
+bruyante.
+
+**Mesures (RTX 5090, corpus dashboard)** :
+
+| mesure | avant | après |
+|---|---:|---:|
+| poids résidents | 18.29 GiB | **10.19 GiB** (drop 8.10 confirmé au log) |
+| pic init gpu-load 3328/MTP=4 | OOM dès ~1.7 GiB externes | **22.0 GiB** |
+| pic bench cell 3K MTP=4 | 32.0 GiB (OOM fréquent) | **23.9 GiB** (~8.7 GiB de marge) |
+| cell 3K MTP=4 decode / prefill | 39.2 / 2761 (06-10) | 38.2 / **3013** |
+| A/B ctx128 fused=1 vs =0 | — | 45.9 vs 45.4 tok/s, acc 0.477 = , cycles 44 = |
+| parity floor | 10/10 | **10/10** |
+| perf gate | 52.1 / DFlash AL 8.3 | 51.8 / DFlash 143.1 **AL 8.3 =** |
+| MTP=4 synthétique | 113.7 (matin) | 106.6 (−6%, désentrelacement sur régime verify-dominé ; >> 94.4 pré-qh-grid) |
+
+Le `chat` MTP=4 à prompt ~3K (l'OOM utilisateur du matin) repasse aussi.
+Reste connu : le résiduel synthétique −6% est récupérable avec un
+swiglu lisant directement [gate||up] (zéro copie, comme
+`swiglu_nvfp4_quantize` côté décode) — petit kernel, noté. Les
+leviers 2 (lm_head FP8, −1.27 GiB) et 3 (leaf_checkpoints tree-MTP
+lazy, −0.58 GiB) restent ouverts.
+
+Files: `crates/runtime/src/engine.rs`, `crates/runtime/src/gpu.rs`.
+Inventory: oui (§2.1 fused stores + table env :
+`QWEN36_PREFILL_FUSED_MLP` **on**, `QWEN36_KEEP_UNFUSED_WEIGHTS` new).
+
 ### 2026-06-11 (soir) — Enquête VRAM : le « modèle 19 GB » devient 28.3 GiB résidents + ~1 GiB runtime — comptabilité complète, 3 leviers — DECISION
 
 Question utilisateur : les poids font 18.3 GiB sur disque, pourquoi OOM
