@@ -97,6 +97,37 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-12 — GEMM chunk N≤8 via l'atome MMA : kernel correct (parité smoke) mais NEUTRE — le puits re-diagnostiqué : overhead par appel × 491 appels, pas cuBLASLt — opt-in, fondation M-tiling
+
+Hypothèse de départ : cuBLASLt à N=5 tourne à ~34% du pic → étendre le
+GEMV décode m16n8k64 (qui réplique sa dimension N à N=1) à N≤8 rend le
+chunk quasi gratuit. Implémenté proprement : colonnes B réelles dans
+l'atome (coordonnée N = lane>>2), stride SMEM paddé +16 (anti
+bank-conflict), SFB par colonne, réduction élargie [2×8×8×warps] (un
+bug d'indexation half/row attrapé par le gate de parité smoke ajouté —
+diagnostic propre : lignes échantillonnées parfaites, max_abs ~2e38 →
+cellules non écrites), budget SMEM gardé ≤99 KB, N=1 intouché
+(bit-identique, hors du chemin modifié).
+
+**Mesure (nsys, MTP=4 @128 pur)** : le kernel prend tout (21 600 inst,
+cutlass3x → ~11 ms résiduels) à **50 µs/appel — la parité cuBLASLt**
+(48.8), E2E −1.5 ms/cycle = bruit. **Le re-diagnostic est la vraie
+valeur** : à ces shapes, cuBLASLt n'était PAS inefficace — le coût est
+structurel : ~491 lancements GEMM/cycle dont chacun re-stage B par CTA
+m16 (gate-up : 2 176 CTAs × 12.8 KB = 28 MB re-lus ≈ +31% des octets
+poids), barrières et queues comprises. Le chemin du gain : **M-tiling**
+(64-128 lignes/CTA, B stagé une fois — architecture du kernel
+compatible, itération substantielle) et/ou réduction du NOMBRE
+d'appels (fusion q/k/v du chunk, jamais faite).
+
+Resté opt-in (`QWEN36_CHUNK_GEMV=1`), défaut cuBLASLt inchangé (floor
+re-validé). Le gate de parité smoke (n=5, K {1024,512}) reste comme
+fondation de l'itération M-tiling.
+
+Files: kernels-cuda/decode_gemv/{nvfp4_gemv_mma_kernel.cuh,
+nvfp4_gemv_sm120.cu}, crates/kernels/src/backend.rs,
+kernels-cuda/smoke.cu. Inventory: oui.
+
 ### 2026-06-11 (nuit) — PR #11 (fused argmax, draft du 17 mai) rebasée sur un mois de divergence et mergée en opt-in — NEGATIVE au bench
 
 Demande utilisateur : merger la seule PR ouverte. Résolution de 7

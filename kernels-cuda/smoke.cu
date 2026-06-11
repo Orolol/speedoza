@@ -1839,6 +1839,98 @@ int main() {
     return 1;
   }
 
+  // --- Chunk GEMM (multi-N gemv) parity vs cuBLASLt -----------------------
+  // The MTP verify chunk shape: n activation rows through the same FP4
+  // weights. Quantize n=5 distinct rows, run both paths on identical
+  // quantized inputs, compare all n*M outputs (FP32 accumulation order
+  // differs, so tolerance-based).
+  for (const size_t chunk_k : {size_t(1024), size_t(512)}) {
+    const size_t chunk_m = 64;
+    const size_t chunk_n = 5;
+    qwen36_device_ptr_t ck_act = dev_alloc<__nv_bfloat16>(chunk_n * chunk_k);
+    qwen36_device_ptr_t ck_b_fp4 = dev_alloc<uint8_t>(chunk_n * chunk_k / 2);
+    qwen36_device_ptr_t ck_b_scale =
+        dev_alloc<uint8_t>(((chunk_k / 16 + 3) / 4) * 4 * 128 * 4 + 4096);
+    qwen36_device_ptr_t ck_b_global = dev_alloc<float>(1);
+    std::vector<float> ck_act_host(chunk_n * chunk_k);
+    for (size_t r = 0; r < chunk_n; ++r) {
+      for (size_t k = 0; k < chunk_k; ++k) {
+        ck_act_host[r * chunk_k + k] =
+            0.25f * static_cast<float>((r * 37 + k * 13) % 17) -
+            2.0f + 0.5f * static_cast<float>(r);
+      }
+    }
+    copy_bf16(ck_act, ck_act_host);
+    qwen36_nvfp4_quantize_rows_spec_t ck_q{};
+    ck_q.rows = chunk_n;
+    ck_q.values = chunk_k;
+    ck_q.input_bf16 = ck_act;
+    ck_q.output_fp4 = ck_b_fp4;
+    ck_q.output_scale_e4m3 = ck_b_scale;
+    ck_q.output_tensor_scale_f32 = ck_b_global;
+    ck_q.input_tensor_scale_f32 = 1.0f;
+    must_status(qwen36_nvfp4_quantize_rows(&ck_q), "chunk gemv quantize rows");
+
+    qwen36_device_ptr_t ck_w = dev_alloc<uint8_t>(chunk_m * chunk_k / 2);
+    qwen36_device_ptr_t ck_w_scale = dev_alloc<uint8_t>(chunk_m * chunk_k / 16 + 4096);
+    std::vector<uint8_t> ck_w_host(chunk_m * chunk_k / 2);
+    for (size_t i = 0; i < ck_w_host.size(); ++i) {
+      ck_w_host[i] = static_cast<uint8_t>((i * 73 + 11) % 251);
+    }
+    copy_raw<uint8_t>(ck_w, ck_w_host);
+    std::vector<uint8_t> ck_ws_host(chunk_m * chunk_k / 16 + 4096, 0x38);
+    copy_raw<uint8_t>(ck_w_scale, ck_ws_host);
+
+    qwen36_device_ptr_t ck_out_ref = dev_alloc<__nv_bfloat16>(chunk_n * chunk_m);
+    qwen36_device_ptr_t ck_out_gemv = dev_alloc<__nv_bfloat16>(chunk_n * chunk_m);
+    qwen36_device_ptr_t ck_ws = dev_alloc<uint8_t>(4 * 1024 * 1024);
+    qwen36_nvfp4_gemm_spec_t ck_spec{};
+    ck_spec.m = chunk_m;
+    ck_spec.n = chunk_n;
+    ck_spec.k = chunk_k;
+    ck_spec.a_fp4 = ck_w;
+    ck_spec.a_scale = ck_w_scale;
+    ck_spec.b_fp4 = ck_b_fp4;
+    ck_spec.b_scale = ck_b_scale;
+    ck_spec.b_scale_2 = ck_b_global;
+    ck_spec.c_bf16 = ck_out_ref;
+    ck_spec.workspace = ck_ws;
+    ck_spec.workspace_bytes = 4 * 1024 * 1024;
+    ck_spec.alpha = 1.0f;
+    must_status(qwen36_nvfp4_gemm(&ck_spec), "chunk gemm cublaslt ref");
+
+    ck_spec.c_bf16 = ck_out_gemv;
+    must_status(qwen36_decode_nvfp4_gemv(&ck_spec), "chunk gemv multi-n");
+
+    std::vector<float> ck_ref = read_bf16(ck_out_ref, chunk_n * chunk_m);
+    std::vector<float> ck_got = read_bf16(ck_out_gemv, chunk_n * chunk_m);
+    double dot = 0, nr = 0, ng = 0;
+    float max_abs = 0;
+    for (size_t i = 0; i < ck_ref.size(); ++i) {
+      dot += (double)ck_ref[i] * ck_got[i];
+      nr += (double)ck_ref[i] * ck_ref[i];
+      ng += (double)ck_got[i] * ck_got[i];
+      max_abs = fmaxf(max_abs, fabsf(ck_ref[i] - ck_got[i]));
+    }
+    const double cos = dot / (sqrt(nr) * sqrt(ng) + 1e-12);
+    if (cos < 0.9999 || max_abs > 0.75f) {
+      fprintf(stderr,
+              "chunk gemv n=5 K=%zu parity failed: cos=%.6f max_abs=%.4f\n",
+              chunk_k, cos, max_abs);
+      for (size_t m = 0; m < 2; ++m) {
+        fprintf(stderr, "  m=%zu ref:", m);
+        for (size_t c = 0; c < chunk_n; ++c)
+          fprintf(stderr, " %8.2f", ck_ref[c * chunk_m + m]);
+        fprintf(stderr, "\n  m=%zu got:", m);
+        for (size_t c = 0; c < chunk_n; ++c)
+          fprintf(stderr, " %8.2f", ck_got[c * chunk_m + m]);
+        fprintf(stderr, "\n");
+      }
+      exit(1);
+    }
+  }
+  printf("chunk gemv multi-n parity gate passed (n=5, K {1024, 512}, vs cuBLASLt)\n");
+
   const size_t interp_gemv_m = 16;
   const size_t interp_gemv_k = 1024;
   const size_t interp_gemv_scale_bytes = 8192;

@@ -209,7 +209,8 @@ impl KernelBackend for CudaBackend {
         // QWEN36_STATUS_NOT_IMPLEMENTED we fall through to the cuBLASLt
         // routing. See the Direction B spec under
         // `docs/superpowers/specs/2026-05-04-direction-b-nvfp4-gemv-design.md`.
-        if decode_gemv_enabled() && spec.n == 1 {
+        let gemv_n_ok = spec.n == 1 || (spec.n <= 8 && chunk_gemv_enabled());
+        if decode_gemv_enabled() && gemv_n_ok {
             let code = unsafe { ffi::qwen36_decode_nvfp4_gemv(&ffi_spec) };
             if code != 5 {
                 return check("qwen36_decode_nvfp4_gemv", code);
@@ -520,6 +521,19 @@ fn decode_gemv_enabled() -> bool {
         );
         !(disabled_by_kill_switch || disabled_by_opt_in_flag)
     })
+}
+
+/// Multi-N (2..=8) chunk GEMMs through the hand-rolled MMA kernel.
+/// OPT-IN (`QWEN36_CHUNK_GEMV=1`), measured NEUTRAL 2026-06-12: ~50 us/call
+/// = cuBLASLt parity on the verify-chunk shape mix — the sink is per-call
+/// overhead (B re-staged per m16-tile CTA, ~491 launches/cycle), not
+/// cuBLASLt inefficiency. The win needs M-tiling (stage B once per 64-128
+/// rows); this kernel + its parity gate are the foundation for that.
+fn chunk_gemv_enabled() -> bool {
+    matches!(
+        std::env::var("QWEN36_CHUNK_GEMV").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
 }
 
 #[cfg(feature = "cuda")]

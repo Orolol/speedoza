@@ -119,6 +119,30 @@ nvfp4_gemv_mma_kernel_tpl<8>(const uint8_t *, const uint8_t *, const uint8_t *,
                              const uint8_t *, float, __nv_bfloat16 *, size_t,
                              size_t);
 
+// Multi-N chunk wrapper (2 <= n <= 8): real activation columns in the
+// atom's N dimension. Same launch shape as the N=1 GEMV; the body and the
+// smem helper live in nvfp4_gemv_mma_kernel.cuh.
+template <int kWarpsPerBlockTpl>
+__global__ void __launch_bounds__(kWarpsPerBlockTpl * 32)
+nvfp4_gemm_chunk_kernel_tpl(const uint8_t *__restrict__ a_fp4,
+                            const uint8_t *__restrict__ a_scale,
+                            const uint8_t *__restrict__ b_fp4,
+                            const uint8_t *__restrict__ b_scale, float alpha,
+                            __nv_bfloat16 *__restrict__ output, size_t M,
+                            size_t K, unsigned n) {
+  qwen36_gemv::nvfp4_gemm_chunk_body<kWarpsPerBlockTpl>(
+      blockIdx.x, a_fp4, a_scale, b_fp4, b_scale, alpha, output, M, K, n);
+}
+
+template __global__ void
+nvfp4_gemm_chunk_kernel_tpl<16>(const uint8_t *, const uint8_t *,
+                                const uint8_t *, const uint8_t *, float,
+                                __nv_bfloat16 *, size_t, size_t, unsigned);
+template __global__ void
+nvfp4_gemm_chunk_kernel_tpl<8>(const uint8_t *, const uint8_t *,
+                               const uint8_t *, const uint8_t *, float,
+                               __nv_bfloat16 *, size_t, size_t, unsigned);
+
 namespace {
 
 template <typename T> T *as_device_ptr(qwen36_device_ptr_t p) {
@@ -149,7 +173,7 @@ extern "C" int qwen36_decode_nvfp4_gemv(
   constexpr size_t kAlign16 = 16u * static_cast<size_t>(kKPerMma);  // 1024
   constexpr size_t kAlign8 = 8u * static_cast<size_t>(kKPerMma);    // 512
 
-  if (spec->n != 1 || (spec->m % 16) != 0) {
+  if (spec->n < 1 || spec->n > 8 || (spec->m % 16) != 0) {
     return QWEN36_STATUS_NOT_IMPLEMENTED;
   }
 
@@ -166,6 +190,55 @@ extern "C" int qwen36_decode_nvfp4_gemv(
   const size_t K = spec->k;
   const dim3 grid(static_cast<unsigned>(gemv_div_ceil(M, kRowsPerBlock)), 1, 1);
   cudaStream_t stream = qwen36_internal_active_stream();
+
+  if (spec->n > 1) {
+    // Chunk path (MTP verify, n = drafts+1). SMEM holds n padded activation
+    // columns + the A tiles + the widened reduction; refuse shapes that
+    // would exceed the sm_120a 99 KB cap so cuBLASLt picks them up.
+    constexpr size_t kSmemCap = 99 * 1024;
+    const unsigned n = static_cast<unsigned>(spec->n);
+    const size_t smem_bytes =
+        chosen_warps == 16
+            ? qwen36_gemv::nvfp4_gemm_chunk_smem_bytes<16>(K, n)
+            : qwen36_gemv::nvfp4_gemm_chunk_smem_bytes<8>(K, n);
+    if (smem_bytes > kSmemCap) {
+      return QWEN36_STATUS_NOT_IMPLEMENTED;
+    }
+    if (chosen_warps == 16) {
+      static bool attr_set_16 = false;
+      if (!attr_set_16) {
+        cudaFuncSetAttribute(nvfp4_gemm_chunk_kernel_tpl<16>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(kSmemCap));
+        attr_set_16 = true;
+      }
+      const dim3 block(16u * 32u, 1, 1);
+      nvfp4_gemm_chunk_kernel_tpl<16><<<grid, block, smem_bytes, stream>>>(
+          as_device_ptr<const uint8_t>(spec->a_fp4),
+          as_device_ptr<const uint8_t>(spec->a_scale),
+          as_device_ptr<const uint8_t>(spec->b_fp4),
+          as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
+          as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K, n);
+    } else {
+      static bool attr_set_8 = false;
+      if (!attr_set_8) {
+        cudaFuncSetAttribute(nvfp4_gemm_chunk_kernel_tpl<8>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(kSmemCap));
+        attr_set_8 = true;
+      }
+      const dim3 block(8u * 32u, 1, 1);
+      nvfp4_gemm_chunk_kernel_tpl<8><<<grid, block, smem_bytes, stream>>>(
+          as_device_ptr<const uint8_t>(spec->a_fp4),
+          as_device_ptr<const uint8_t>(spec->a_scale),
+          as_device_ptr<const uint8_t>(spec->b_fp4),
+          as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
+          as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K, n);
+    }
+    cudaError_t err = cudaGetLastError();
+    return err == cudaSuccess ? QWEN36_STATUS_SUCCESS
+                              : QWEN36_STATUS_CUDA_ERROR;
+  }
 
   // Smem footprint lives in the shared body helper so standalone and
   // interpreter call sites stay ABI-equivalent.
