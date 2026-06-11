@@ -97,6 +97,47 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-11 (nuit) — Fallback MTP en ligne (plan step 4) SHIPPED : « MTP ne perd (presque) plus jamais » — et le chat mesuré à +33%
+
+Réponse à « le MTP nous fait toujours perdre des perfs » : c'est vrai
+en continuation de corpus brut (acceptance 0.5 = capacité réelle de la
+tête, vLLM identique), faux en chat — mesuré ce soir :
+
+| régime (~2-3K ctx) | MTP=0 | MTP=4 pur | MTP=4 + fallback |
+|---|---:|---:|---:|
+| **chat templaté** (T257−T1) | 59.0 | **78.5 (+33%)** | 78.5 (`fallback=none`, acc/draft 0.89) |
+| corpus brut, max-new 512 | 59.8 | 38.2 (−36%) | **55.8 (−7%)**, trigger cycle 8 |
+| corpus brut, max-new 128 | 52.3 | 47.9 | 43.1 (run trop court pour amortir trigger+capture) |
+
+**Mécanique** : compteurs accepted/proposed dans les boucles chat+bench ;
+après `QWEN36_MTP_FALLBACK_WINDOW` (8) cycles, si acceptance/draft <
+`QWEN36_MTP_FALLBACK_MIN_ACCEPTANCE` (0.55 = break-even au coût de
+cycle actuel : MTP-4 gagne ssi 1+4·acc > cycle/token ≈ 3.2-4.6×), la
+génération finit sur le graphe décode plain. Raccord :
+`Engine::seed_sampled_token(current)` → `enable_decode_graph()` (qui
+forwarde ce token à la position courante) → `decode_graph_step()` en
+boucle — l'état MTP committé est déjà cohérent. `QWEN36_MTP_AUTO_FALLBACK=0`
+pour les mesures pure-MTP (le dashboard le force désormais : ses
+cellules MTP restent des before/after kernel comparables).
+
+**Bug attrapé par le garde-fou du levier 1** : la capture du graphe
+Decode avec interpreter actif (mtp>0) — combinaison inédite créée par
+le fallback — bindait les gate/up NON-fusionnés (droppés) dans le
+programme MLP interpreter → « tensor … was not uploaded » au lieu d'une
+lecture de mémoire libérée. Fix : le builder MLP interpreter retourne
+None si les poids unfused ne sont plus résidents (le chemin host
+fusionné prend le relais ; l'interpreter régresse de toute façon sur du
+décode MTP=0-shaped).
+
+Gates : floor 10/10 ; chat défaut sans trigger ; fallback forcé
+(window=2) raccord sain ; cellules corpus ci-dessus. Le seuil 0.55
+DOIT redescendre à mesure que le cycle se réduit (chaque ms de cycle
+gagnée élargit la zone où la spéculation reste active).
+
+Files: crates/cli/src/main.rs (boucles + knobs),
+crates/runtime/src/engine.rs (seed_sampled_token + garde interpreter),
+scripts/bench_dashboard.sh. Inventory: oui.
+
 ### 2026-06-11 (nuit) — lm_head FP8 e4m3 : kernel + plomberie complets, N=1 à 90% du pic, opt-in en attendant N>1 et l'arbitrage acceptance court-ctx — WIP
 
 Lane temps-de-cycle, suite de la probe verte du matin (0/28 flips).

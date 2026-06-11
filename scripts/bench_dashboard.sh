@@ -32,6 +32,10 @@ JSONL="target/dashboard-${STAMP}.jsonl"
 MAX_NEW="${MAX_NEW_TOKENS:-128}"
 
 export QWEN36_FP4_KERNEL_LIB_DIR="$ROOT/target/cuda"
+# Dashboard cells measure the PURE MTP path (kernel-work before/afters);
+# the production default since 2026-06-11 is the online auto-fallback
+# (QWEN36_MTP_AUTO_FALLBACK, drops to plain decode below 0.55 acceptance).
+export QWEN36_MTP_AUTO_FALLBACK=0
 export LD_LIBRARY_PATH="$ROOT/target/cuda:${LD_LIBRARY_PATH:-}"
 
 QUICK=0
