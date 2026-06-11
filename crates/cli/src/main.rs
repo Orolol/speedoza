@@ -2479,6 +2479,7 @@ fn drafter_step_smoke(
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
     let target_config = EngineConfig {
+        keep_bf16_lm_head: true,
         max_context: ctx_len.saturating_add(block_size).max(256),
         kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Fp8),
         ..EngineConfig::default()
@@ -2734,6 +2735,7 @@ fn run_chat_dflash(
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
     let target_config = EngineConfig {
+        keep_bf16_lm_head: true,
         max_context: prompt_len
             .saturating_add(max_new_tokens)
             .saturating_add(block_size)
@@ -2988,6 +2990,7 @@ fn drafter_chat_smoke(
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
     let target_config = EngineConfig {
+        keep_bf16_lm_head: true,
         max_context: prompt_len
             .saturating_add(max_new_tokens)
             .saturating_add(block_size)
@@ -3279,6 +3282,7 @@ fn drafter_iter_smoke(
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
     let target_config = EngineConfig {
+        keep_bf16_lm_head: true,
         // Verify advances target state by up to block_size positions.
         max_context: ctx_len
             .saturating_add(block_size)
@@ -3463,6 +3467,7 @@ fn drafter_handoff_smoke(
     let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
     let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
     let target_config = EngineConfig {
+        keep_bf16_lm_head: true,
         max_context: prompt_tokens_count.max(256),
         kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Fp8),
         ..EngineConfig::default()
