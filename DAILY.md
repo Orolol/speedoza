@@ -152,18 +152,23 @@ MTP=4 gagnerait si le cycle coûtait < 2.9× un token MTP=0 ; il en coûte
 |---|---:|---|
 | GEMM FP4 chunk N=5 (cutlass3x) | 24.2 | 552 inst/cycle — chemin chunk SANS les fused stores (gate/up/qkv séparés) ; ~2× l'efficacité GEMV décode pour les mêmes octets de poids |
 | attention verify | 15.6 | `flash_splitk` 26 inst/cycle à **535 µs @ ctx 128** (!) — n_splits vient du bucket de capture (≥128 splits quasi vides) ; + `attention_prefill` 1.6 |
-| lm_head BF16 (gemvx) | 15.8 | **18.6 appels/cycle à 690 µs** + 33.8 petits appels — ~19 GEMV vocab par cycle au lieu d'1-2 GEMM N=5 batchés |
+| lm_head BF16 (gemvx) | 15.8 | distribution bimodale : **~6.3 vrais lm_head/cycle à ~2.0-2.2 ms** (1 batché verify N=6 + ~5 séquentiels draft/next-token — la récursion de draft dépend de l'argmax précédent, NON batchable) + ~12 micro-gemvx 10 µs + 33.8 projections head 88 µs (3.0 ms) |
 | DeltaNet WY chunk | 6.3 | 87 inst/cycle ; le séquentiel serait ~1-2 ms (cf. probe 1a) |
 | reste (gemv drafts 3.2, wmma BF16 head 2.6, rmsnorm 2.2, quantize 1.4, 7.3 argmax/cycle 1.3, divers) | ~12.6 | |
 
 Le step 2 du plan (porter tiled-v2 sur le chemin verify) ne couvre que le
 puits attention (~14 ms). Re-scope : les 4 puits sont indépendants et
 cumulables → cycle ~75 → ~30-35 ms ⇒ à acceptance 0.5, ~85-95 tok/s MTP=4
-(vs 59.4 MTP=0 @3K). Ordre suggéré par ROI : (a) lm_head batching (appels
-spammés, pas de kernel à écrire), (b) splits dimensionnés sur le ctx réel
-(pas le bucket), (c) verify DeltaNet → séquentiel (kill-switch déjà
-probant), (d) GEMM chunk fusionnés. Chaque fix garde les gates du plan
-(smoke, parity floor, dashboard before/after).
+(vs 59.4 MTP=0 @3K). Ordre suggéré par ROI/effort : (a) attention — splits
+dimensionnés sur le ctx réel plutôt que le bucket de capture, ou port
+tiled-v2 (−13 ms) ; (b) verify DeltaNet ≤8 tokens → kernel séquentiel
+(dispatch engine, le kill-switch a déjà prouvé le gain ; −5 ms) ;
+(c) lm_head FP8 e4m3 — la voie de repêchage du 06-10 vaut ~×4 plus à
+MTP=4 qu'à MTP=0 (~6 lm_head/cycle ⇒ −6-7 ms) ; re-passer la probe
+argmax-parity en FP8 d'abord ; (d) GEMM chunk N=5 fusionnés/optimisés
+(le plus gros puits, 24 ms, mais le plus lourd — la fusion prefill-path
+n'a jamais été faite). Chaque fix garde les gates du plan (smoke, parity
+floor, dashboard before/after).
 
 **Découverte VRAM (bug usabilité)** : bench MTP=4 @3K culmine à
 **32.0/32.6 GiB** — le moteur frôle le plafond. `chat` MTP=4 avec un

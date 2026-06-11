@@ -8,10 +8,11 @@
 > the verify cycle: ~75 ms ctx-flat (3.9–4.9× an MTP=0 token), nsys-decomposed
 > into FOUR independent sinks — unfused N=5 FP4 chunk GEMMs (24 ms), verify
 > attention with bucket-derived mostly-empty splits (15.6 ms — flash split-K
-> DOES run, contra step 2's assumption), ~19 lm_head GEMV calls/cycle
-> (15.8 ms), WY-form DeltaNet on 5-token chunks (6.3 ms, sequential is
-> cheaper). Step 2 should be read as "fix the four sinks", attention being
-> only one of them. Step 3's per-position gate data: acceptance decays
+> DOES run, contra step 2's assumption), ~6.3 full-vocab lm_head GEMVs/cycle
+> at ~2 ms each (13.3 ms — the draft recursion is sequential, so the fix is
+> a cheaper lm_head e.g. FP8 e4m3, not batching), WY-form DeltaNet on
+> 5-token chunks (6.3 ms, sequential is cheaper). Step 2 should be read as
+> "fix the four sinks", attention being only one of them. Step 3's per-position gate data: acceptance decays
 > 0.75 → 0.55 → 0.43 → 0.25 at depth 4 — depth 6/8 pays little until the
 > cycle is cheap. Also: MTP=4 @3K peaks at 32.0/32.6 GiB VRAM; chat MTP=4
 > OOMs at ~3K prompts (bench survives by ~tens of MB).
