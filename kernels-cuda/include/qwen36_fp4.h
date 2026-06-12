@@ -426,6 +426,40 @@ typedef struct {
   size_t workspace_bytes;
 } qwen36_lm_head_top2_margin_spec_t;
 
+/* Two-stage exact lm_head argmax, v2 ("top-8 rescore"): stage 1 verdict
+ * that rescores the top-8 FP8 candidates against the BF16 weight instead
+ * of guarding on the top1-top2 margin (v1 fell back ~42% on the
+ * tight-margin MTP-head rows). Per row of the FP8-path logits:
+ *   - block top-2 pass (shared with the v1 entry) -> workspace
+ *   - select the top-8 BLOCK WINNERS + guard bound
+ *         B = max(9th winner, max block-v2)
+ *     (a block hiding two leaders raises its v2 -> B -> guard fails ->
+ *     conservative full fallback, never a silent miss)
+ *   - rescore the 8 candidates against weight_bf16/input_bf16 in FP64
+ *     accumulation (8 x cols FMAs, order-stable)
+ *   - guard: best_rescored >= B + eps certifies every non-candidate
+ *     (bf16 logit <= fp8 logit + e_max <= B + e_max); recommended
+ *     eps ~ 1.5x the probe e_max (0.344) = 0.5.
+ * Outputs match the v1 contract: tokens written unconditionally,
+ * flags_u32[row]=1 when certified (else the predicated full BF16 rescore
+ * runs), optional mirror of the last row, fallback counter. Workspace:
+ * rows * QWEN36_LM_HEAD_TOP2_BLOCKS * 16 bytes. */
+typedef struct {
+  size_t rows;
+  size_t vocab;
+  size_t cols;
+  float eps;
+  qwen36_device_ptr_t logits_bf16;  /* [rows, vocab] FP8-path logits */
+  qwen36_device_ptr_t weight_bf16;  /* [vocab, cols] lm_head */
+  qwen36_device_ptr_t input_bf16;   /* [rows, cols] hidden vectors */
+  qwen36_device_ptr_t tokens_u32;
+  qwen36_device_ptr_t flags_u32;
+  qwen36_device_ptr_t mirror_last_token_u32;
+  qwen36_device_ptr_t fallback_count_u32;
+  qwen36_device_ptr_t workspace;
+  size_t workspace_bytes;
+} qwen36_lm_head_top8_rescore_spec_t;
+
 typedef struct {
   size_t out_features;
   size_t in_features;
@@ -684,6 +718,7 @@ int qwen36_bf16_matvec_argmax_rows(
 int qwen36_lm_head_fp8_quantize(const qwen36_lm_head_fp8_quantize_spec_t *spec);
 int qwen36_lm_head_fp8_gemv(const qwen36_lm_head_fp8_gemv_spec_t *spec);
 int qwen36_lm_head_top2_margin(const qwen36_lm_head_top2_margin_spec_t *spec);
+int qwen36_lm_head_top8_rescore(const qwen36_lm_head_top8_rescore_spec_t *spec);
 int qwen36_nvfp4_matvec(const qwen36_nvfp4_matvec_spec_t *spec);
 int qwen36_nvfp4_quantize_bf16(const qwen36_nvfp4_quantize_spec_t *spec);
 int qwen36_nvfp4_quantize_rows(const qwen36_nvfp4_quantize_rows_spec_t *spec);

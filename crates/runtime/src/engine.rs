@@ -10410,10 +10410,12 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     /// Two-stage exact argmax over `rows` hidden vectors (margin mode):
-    /// FP8 GEMV into `forward.mtp_logits`, top-2 + margin guard writing
-    /// tokens/flags, then the flag-predicated BF16 matvec+argmax rescore
-    /// (rare). Entirely device-side — no host sync, CUDA-graph-capturable.
-    /// Bit-exact vs the BF16 argmax when eps >= 2*max|dlogit|.
+    /// FP8 GEMV into `forward.mtp_logits`, then the stage-1 verdict —
+    /// v2 default: top-8 candidate rescore vs the BF16 weight (FP64
+    /// accumulation) with guard `best >= max(9th, max block-v2) + eps`;
+    /// v1 via QWEN36_LM_HEAD_MARGIN_SCOPE=top2: top1-top2 margin guard —
+    /// then the flag-predicated full BF16 matvec+argmax rescore (rare).
+    /// Entirely device-side — no host sync, CUDA-graph-capturable.
     #[cfg(feature = "cuda")]
     fn lm_head_two_stage_argmax_rows(
         &self,
@@ -10453,32 +10455,58 @@ impl<B: KernelBackend> Engine<B> {
                 workspace.bytes()
             )));
         }
-        // The top-2 pair fully consumes the workspace before the rescore's
-        // memset reuses it (same stream, sequential) — sharing is safe.
-        self.backend
-            .lm_head_top2_margin(&qwen36_fp4_kernels::LmHeadTop2MarginSpec {
-                rows,
-                vocab: margin.store.rows,
-                eps: margin.eps,
-                logits_bf16: logits,
-                tokens_u32: output_token_u32,
-                flags_u32: margin.flags_u32.ptr(),
-                mirror_last_token_u32: mirror_last_output_token_u32,
-                fallback_count_u32: margin.fallback_count_u32.ptr(),
-                workspace: workspace.ptr(),
-                workspace_bytes: workspace.bytes(),
-            })?;
         let manifest = self
             .weights
             .as_ref()
             .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+        let weight_bf16 = self.tensor_ptr(self.cuda_weights()?, &manifest.lm_head)?;
+        // v2 (default): top-8 candidate rescore — flat ~30 us against the
+        // BF16 weight in FP64 accumulation, guard vs max(9th winner, max
+        // block-v2). v1 (top1-top2 margin guard, ~42% fallback on MTP-head
+        // rows) stays reachable via QWEN36_LM_HEAD_MARGIN_SCOPE=top2 for
+        // A/Bs. Either stage-1 fully consumes the workspace before the
+        // predicated rescore's memset reuses it (same stream, sequential).
+        let use_top2 = std::env::var("QWEN36_LM_HEAD_MARGIN_SCOPE")
+            .is_ok_and(|scope| scope == "top2");
+        if use_top2 {
+            self.backend
+                .lm_head_top2_margin(&qwen36_fp4_kernels::LmHeadTop2MarginSpec {
+                    rows,
+                    vocab: margin.store.rows,
+                    eps: margin.eps,
+                    logits_bf16: logits,
+                    tokens_u32: output_token_u32,
+                    flags_u32: margin.flags_u32.ptr(),
+                    mirror_last_token_u32: mirror_last_output_token_u32,
+                    fallback_count_u32: margin.fallback_count_u32.ptr(),
+                    workspace: workspace.ptr(),
+                    workspace_bytes: workspace.bytes(),
+                })?;
+        } else {
+            self.backend
+                .lm_head_top8_rescore(&qwen36_fp4_kernels::LmHeadTop8RescoreSpec {
+                    rows,
+                    vocab: margin.store.rows,
+                    cols: margin.store.cols,
+                    eps: margin.eps,
+                    logits_bf16: logits,
+                    weight_bf16,
+                    input_bf16,
+                    tokens_u32: output_token_u32,
+                    flags_u32: margin.flags_u32.ptr(),
+                    mirror_last_token_u32: mirror_last_output_token_u32,
+                    fallback_count_u32: margin.fallback_count_u32.ptr(),
+                    workspace: workspace.ptr(),
+                    workspace_bytes: workspace.bytes(),
+                })?;
+        }
         self.backend
             .bf16_matvec_argmax_rows(&Bf16MatVecArgmaxRowsSpec {
                 rows,
                 out_features: margin.store.rows,
                 in_features: margin.store.cols,
                 input_bf16,
-                weight_bf16: self.tensor_ptr(self.cuda_weights()?, &manifest.lm_head)?,
+                weight_bf16,
                 output_token_u32,
                 mirror_last_output_token_u32,
                 workspace: workspace.ptr(),
