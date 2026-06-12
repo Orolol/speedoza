@@ -551,6 +551,7 @@ fn decode_gemv_enabled() -> bool {
 /// overhead (B re-staged per m16-tile CTA, ~491 launches/cycle), not
 /// cuBLASLt inefficiency. The win needs M-tiling (stage B once per 64-128
 /// rows); this kernel + its parity gate are the foundation for that.
+#[allow(dead_code)]
 fn chunk_gemv_enabled() -> bool {
     matches!(
         std::env::var("QWEN36_CHUNK_GEMV").ok().as_deref(),

@@ -4,12 +4,12 @@ use std::path::PathBuf;
 #[cfg(feature = "cuda")]
 use std::time::Instant;
 
-use anyhow::Result;
 #[cfg(not(feature = "cuda"))]
 use anyhow::bail;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use qwen36_fp4_core::{KvCacheDtype, MemoryBudget, ModelTopology, QWEN36_TEXT_NVFP4_MTP_MODEL_ID};
-use qwen36_fp4_drafter::DFlashDrafter;
+use qwen36_fp4_drafter::{DFlashDrafter, Eagle3Drafter};
 use qwen36_fp4_loader::{
     MappedModel, discover_model_layout_with_id, read_topology, write_model_layout_json,
 };
@@ -103,6 +103,24 @@ fn mtp_fallback_min_acceptance() -> f64 {
 }
 
 #[cfg(feature = "cuda")]
+fn eagle3_draft_tokens() -> usize {
+    std::env::var("QWEN36_EAGLE3_DRAFT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(8)
+}
+
+#[cfg(feature = "cuda")]
+fn eagle3_min_confidence() -> f32 {
+    std::env::var("QWEN36_EAGLE3_P_MIN")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .unwrap_or(0.5)
+}
+
+#[cfg(feature = "cuda")]
 fn cuda_kv_cache_dtype(default: KvCacheDtype) -> KvCacheDtype {
     match std::env::var("QWEN36_KV_CACHE_DTYPE")
         .ok()
@@ -184,9 +202,20 @@ enum Command {
         #[arg(long)]
         drafter_dir: PathBuf,
     },
+    /// Validate an EAGLE3 drafter checkpoint
+    /// (`LlamaForCausalLMEagle3`, e.g. Ex0bit/Qwen3.6-27B-PRISM-EAGLE3).
+    ValidateEagle3Drafter {
+        #[arg(long)]
+        drafter_dir: PathBuf,
+    },
     /// Upload a DFlash drafter checkpoint to the GPU and report per-tensor
     /// VRAM usage. Smoke for the drafter device path; no forward pass yet.
     DrafterLoad {
+        #[arg(long)]
+        drafter_dir: PathBuf,
+    },
+    /// Upload an EAGLE3 drafter checkpoint to the GPU and report VRAM usage.
+    Eagle3Load {
         #[arg(long)]
         drafter_dir: PathBuf,
     },
@@ -297,8 +326,14 @@ enum Command {
     Chat {
         #[arg(long)]
         model_dir: PathBuf,
+        #[arg(
+            long,
+            required_unless_present = "prompt_file",
+            conflicts_with = "prompt_file"
+        )]
+        prompt: Option<String>,
         #[arg(long)]
-        prompt: String,
+        prompt_file: Option<PathBuf>,
         #[arg(long, default_value_t = 256)]
         max_new_tokens: usize,
         #[arg(long, default_value_t = 0)]
@@ -378,12 +413,15 @@ enum KvArg {
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum DrafterArg {
-    /// No DFlash drafter; the chat path uses chain/tree MTP via
+    /// No external drafter; the chat path uses chain/tree MTP via
     /// `--mtp-speculative-tokens`.
     None,
     /// DFlash drafter (`z-lab/Qwen3.6-27B-DFlash` style) end-to-end:
     /// drafter propose + batched verify per iteration.
     Dflash,
+    /// EAGLE3 drafter (`LlamaForCausalLMEagle3`) with optional top-1
+    /// confidence cutoff.
+    Eagle3,
 }
 
 impl From<KvArg> for KvCacheDtype {
@@ -395,6 +433,14 @@ impl From<KvArg> for KvCacheDtype {
             KvArg::Turboquant35 => Self::TurboQuant35,
         }
     }
+}
+
+fn read_prompt_arg(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Result<String> {
+    if let Some(path) = prompt_file {
+        return std::fs::read_to_string(&path)
+            .with_context(|| format!("read prompt file {}", path.display()));
+    }
+    prompt.ok_or_else(|| anyhow::anyhow!("--prompt or --prompt-file is required"))
 }
 
 fn main() -> Result<()> {
@@ -502,6 +548,36 @@ fn main() -> Result<()> {
                 }))?,
             );
         }
+        Command::ValidateEagle3Drafter { drafter_dir } => {
+            let drafter = Eagle3Drafter::open(&drafter_dir)?;
+            let config = &drafter.config;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "drafter_dir": drafter.drafter_dir.display().to_string(),
+                    "architectures": config.architectures,
+                    "hidden_size": config.hidden_size,
+                    "intermediate_size": config.intermediate_size,
+                    "num_hidden_layers": config.num_hidden_layers,
+                    "num_attention_heads": config.num_attention_heads,
+                    "num_key_value_heads": config.num_key_value_heads,
+                    "head_dim": config.head_dim,
+                    "vocab_size": config.vocab_size,
+                    "draft_vocab_size": config.draft_vocab_size,
+                    "compressed_vocab": config.uses_compressed_vocab(),
+                    "d2t_entries": drafter.d2t.as_ref().map(Vec::len).unwrap_or(0),
+                    "target_token_entries": drafter.target_token_ids.as_ref().map(Vec::len).unwrap_or(0),
+                    "target_layer_ids": config.aux_layer_ids(),
+                    "fc_shape": drafter.manifest.fc.shape,
+                    "fc_in_features": config.fc_in_features(),
+                    "attention_in_features": config.attention_in_features(),
+                    "lm_head_shape": drafter.manifest.lm_head.shape,
+                    "tensors_validated": drafter.manifest.tensor_count(),
+                    "rope_theta": config.rope_theta,
+                    "rope_scaling": config.rope_scaling,
+                }))?,
+            );
+        }
         Command::ValidateWeights { model_dir } => {
             let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
             let manifest = ModelWeightsManifest::from_layout(&layout)?;
@@ -544,6 +620,19 @@ fn main() -> Result<()> {
                 let _ = drafter_dir;
                 anyhow::bail!(
                     "drafter-load requires the cuda feature; rebuild with --features cuda"
+                );
+            }
+        }
+        Command::Eagle3Load { drafter_dir } => {
+            #[cfg(feature = "cuda")]
+            {
+                eagle3_load(drafter_dir)?;
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = drafter_dir;
+                anyhow::bail!(
+                    "eagle3-load requires the cuda feature; rebuild with --features cuda"
                 );
             }
         }
@@ -667,12 +756,14 @@ fn main() -> Result<()> {
         Command::Chat {
             model_dir,
             prompt,
+            prompt_file,
             max_new_tokens,
             mtp_speculative_tokens,
             mtp_tree_leaves,
             drafter,
             drafter_dir,
         } => {
+            let prompt = read_prompt_arg(prompt, prompt_file)?;
             if mtp_tree_leaves == 0 || mtp_tree_leaves > 8 {
                 anyhow::bail!("--mtp-tree-leaves must be in 1..=8, got {mtp_tree_leaves}");
             }
@@ -694,8 +785,26 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            if drafter == DrafterArg::Eagle3 {
+                let drafter_dir = drafter_dir.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--drafter eagle3 requires --drafter-dir <path to EAGLE3 drafter>"
+                    )
+                })?;
+                #[cfg(feature = "cuda")]
+                {
+                    return run_chat_eagle3(model_dir, drafter_dir, prompt, max_new_tokens);
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = (model_dir, drafter_dir, prompt, max_new_tokens);
+                    anyhow::bail!(
+                        "chat --drafter eagle3 requires the cuda feature; rebuild with --features cuda"
+                    );
+                }
+            }
             if drafter_dir.is_some() {
-                anyhow::bail!("--drafter-dir is only valid with --drafter dflash");
+                anyhow::bail!("--drafter-dir is only valid with --drafter dflash|eagle3");
             }
             run_chat(
                 model_dir,
@@ -2470,6 +2579,43 @@ fn drafter_load(drafter_dir: PathBuf) -> Result<()> {
 }
 
 #[cfg(feature = "cuda")]
+fn eagle3_load(drafter_dir: PathBuf) -> Result<()> {
+    use qwen36_fp4_drafter::{Eagle3Drafter, Eagle3DrafterDevice};
+
+    let drafter = Eagle3Drafter::open(&drafter_dir)?;
+    let manifest = drafter.manifest.clone();
+    let device = Eagle3DrafterDevice::upload(&drafter)?;
+    let report = device.report(&manifest);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "drafter_dir": drafter.drafter_dir.display().to_string(),
+            "hidden_size": drafter.config.hidden_size,
+            "intermediate_size": drafter.config.intermediate_size,
+            "num_hidden_layers": drafter.config.num_hidden_layers,
+            "num_attention_heads": drafter.config.num_attention_heads,
+            "num_key_value_heads": drafter.config.num_key_value_heads,
+            "head_dim": drafter.config.head_dim,
+            "vocab_size": drafter.config.vocab_size,
+            "draft_vocab_size": drafter.config.draft_vocab_size,
+            "compressed_vocab": drafter.config.uses_compressed_vocab(),
+            "d2t_entries": drafter.d2t.as_ref().map(Vec::len).unwrap_or(0),
+            "target_token_entries": drafter.target_token_ids.as_ref().map(Vec::len).unwrap_or(0),
+            "target_layer_ids": drafter.config.aux_layer_ids(),
+            "tensor_count": report.tensor_count,
+            "vram_bytes": {
+                "layer": report.layer_bytes,
+                "fc": report.fc_bytes,
+                "norm": report.norm_bytes,
+                "lm_head": report.lm_head_bytes,
+                "total": report.total_bytes,
+            },
+        }))?,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn drafter_step_smoke(
     model_dir: PathBuf,
     drafter_dir: PathBuf,
@@ -2964,6 +3110,302 @@ fn run_chat_dflash(
         iters,
         acceptance_length,
         avg_accept,
+        decode_seconds,
+        tokens_per_second,
+        total_seconds,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_chat_eagle3(
+    model_dir: PathBuf,
+    drafter_dir: PathBuf,
+    prompt: String,
+    max_new_tokens: usize,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    use qwen36_fp4_drafter::{
+        Eagle3Drafter, Eagle3DrafterDevice, Eagle3Forward, Eagle3ForwardWorkspace,
+        TargetHiddenCapture,
+    };
+    use qwen36_fp4_kernels::CudaBackend;
+
+    let chat_start = Instant::now();
+    if max_new_tokens == 0 {
+        return Ok(());
+    }
+
+    let tokenizer = QwenTokenizer::from_model_dir(&model_dir)?;
+    let messages = vec![ChatMessage {
+        role: "user".to_owned(),
+        content: prompt,
+    }];
+    let prompt_tokens = tokenizer.encode_chat(&messages, true)?;
+    if prompt_tokens.is_empty() {
+        anyhow::bail!("prompt produced 0 tokens");
+    }
+    let prompt_len = prompt_tokens.len();
+
+    let drafter = Eagle3Drafter::open(&drafter_dir)?;
+    if drafter.config.head_dim != 128 {
+        anyhow::bail!(
+            "chat --drafter eagle3 only supports head_dim=128, got {}",
+            drafter.config.head_dim,
+        );
+    }
+    let draft_tokens_per_iter = eagle3_draft_tokens();
+    let eagle3_p_min = eagle3_min_confidence();
+    let target_vocab_size = drafter.config.vocab_size;
+    let eos_token_id: u32 = 248044;
+
+    let layout = discover_model_layout_with_id(&model_dir, QWEN36_TEXT_NVFP4_MTP_MODEL_ID)?;
+    if layout.topology.hidden_size != drafter.config.hidden_size {
+        anyhow::bail!(
+            "target hidden_size {} does not match EAGLE3 hidden_size {}",
+            layout.topology.hidden_size,
+            drafter.config.hidden_size,
+        );
+    }
+    if layout.topology.vocab_size != drafter.config.vocab_size {
+        anyhow::bail!(
+            "target vocab_size {} does not match EAGLE3 vocab_size {}",
+            layout.topology.vocab_size,
+            drafter.config.vocab_size,
+        );
+    }
+    let mapped_model = MappedModel::open_with_layout(&model_dir, layout)?;
+    let target_config = EngineConfig {
+        max_context: prompt_len
+            .saturating_add(max_new_tokens)
+            .saturating_add(draft_tokens_per_iter)
+            .saturating_add(16)
+            .max(256),
+        kv_cache_dtype: cuda_kv_cache_dtype(KvCacheDtype::Fp8),
+        ..EngineConfig::default()
+    };
+    let mut engine = Engine::cuda_with_mapped_weights(&mapped_model, target_config)?;
+
+    let drafter_device = Eagle3DrafterDevice::upload(&drafter)?;
+    let capture_max_tokens = prompt_len.max(draft_tokens_per_iter + 1);
+    let capture = Arc::new(TargetHiddenCapture::alloc_for_layers(
+        drafter.config.hidden_size,
+        drafter.config.aux_layer_ids(),
+        capture_max_tokens,
+    )?);
+    let capture_for_hook = capture.clone();
+    let hook: qwen36_fp4_runtime::DrafterHiddenCaptureHook =
+        Arc::new(move |layer_idx, residual_ptr, tokens| {
+            capture_for_hook
+                .capture_layer(&CudaBackend, layer_idx, residual_ptr, tokens)
+                .map_err(|e| qwen36_fp4_core::CoreError::Runtime(format!("eagle3 handoff: {e}")))
+        });
+
+    capture.set_write_row(0);
+    engine.set_drafter_hidden_capture(Some(hook));
+    engine.prefill(&prompt_tokens)?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+
+    engine.queue_sample_greedy_to_current_token()?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+    let mut seed_token = engine.read_current_token()?;
+
+    let target_embed_ptr = {
+        let manifest = engine
+            .weights
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("engine has no weights manifest after prefill"))?;
+        let gpu_weights = engine
+            .gpu_weights
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("engine has no GPU weights after prefill"))?;
+        gpu_weights
+            .tensor(&manifest.embed_tokens.name)
+            .ok_or_else(|| anyhow::anyhow!("embed_tokens tensor missing"))?
+            .ptr()
+    };
+
+    let kv_cache_max_len = prompt_len
+        .saturating_add(max_new_tokens)
+        .saturating_add(draft_tokens_per_iter)
+        .saturating_add(16);
+    let workspace = Eagle3ForwardWorkspace::alloc(&drafter.config, kv_cache_max_len)?;
+    let mut pos_bytes = Vec::with_capacity(kv_cache_max_len * 4);
+    for p in 0..kv_cache_max_len {
+        pos_bytes.extend_from_slice(&(p as i32).to_le_bytes());
+    }
+    workspace.position_ids_buffer().copy_from_host(&pos_bytes)?;
+
+    let backend = CudaBackend;
+    let mut forward = Eagle3Forward::new(&drafter_device, &drafter.config, workspace)?;
+    forward.reset_kv_cache();
+
+    let mut initial_token_ids: Vec<u32> = prompt_tokens.iter().skip(1).copied().collect();
+    initial_token_ids.push(seed_token);
+    let mut last_hidden = forward.append_aux_rows(
+        &backend,
+        target_embed_ptr,
+        target_vocab_size,
+        &initial_token_ids,
+        capture.output_ptr(),
+    )?;
+    qwen36_fp4_runtime::cuda_synchronize()?;
+
+    let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
+    let mut iter_accepts: Vec<usize> = Vec::new();
+    let mut proposed_draft_tokens = 0_usize;
+    let mut accepted_draft_tokens = 0_usize;
+    let mut rejected_draft_tokens = 0_usize;
+    let mut confidence_cutoff_iters = 0_usize;
+    let mut confidence_sum = 0.0_f64;
+    let mut confidence_count = 0_usize;
+    let mut stdout = io::stdout();
+
+    let decode_start = Instant::now();
+    while generated.len() < max_new_tokens {
+        let generated_before_iter = generated.len();
+        let draft_chain = forward.draft_chain(
+            &backend,
+            target_embed_ptr,
+            target_vocab_size,
+            last_hidden,
+            draft_tokens_per_iter,
+            eagle3_p_min,
+            |draft_id| drafter.map_draft_token(draft_id),
+        )?;
+        qwen36_fp4_runtime::cuda_synchronize()?;
+        if draft_chain.stopped_by_confidence {
+            confidence_cutoff_iters += 1;
+        }
+        proposed_draft_tokens += draft_chain.tokens.len();
+        for draft in &draft_chain.tokens {
+            if draft.confidence.is_finite() {
+                confidence_sum += f64::from(draft.confidence);
+                confidence_count += 1;
+            }
+        }
+        let drafts: Vec<u32> = draft_chain
+            .tokens
+            .iter()
+            .map(|draft| draft.target_id)
+            .collect();
+
+        capture.set_write_row(0);
+        let mut verify_input = Vec::with_capacity(drafts.len() + 1);
+        verify_input.push(seed_token);
+        verify_input.extend_from_slice(&drafts);
+        let argmaxes = engine.verify_block_batched(&verify_input)?;
+
+        let mut accepted = 0_usize;
+        let mut bonus_token: u32 = 0;
+        for (i, &drafted) in drafts.iter().enumerate() {
+            if argmaxes[i] == drafted {
+                accepted += 1;
+            } else {
+                bonus_token = argmaxes[i];
+                break;
+            }
+        }
+        if accepted == drafts.len() {
+            bonus_token = argmaxes[drafts.len()];
+        }
+        iter_accepts.push(accepted);
+        accepted_draft_tokens += accepted;
+        if accepted < drafts.len() {
+            rejected_draft_tokens += 1;
+        }
+
+        let committed_target_position = prompt_len + generated_before_iter + accepted + 1;
+        engine.crop_state_position(committed_target_position.min(engine.state.position))?;
+
+        let mut iter_committed: Vec<u32> = Vec::with_capacity(accepted + 2);
+        if generated_before_iter == 0 {
+            iter_committed.push(seed_token);
+        }
+        iter_committed.extend(drafts.iter().copied().take(accepted));
+        iter_committed.push(bonus_token);
+
+        let remaining = max_new_tokens - generated.len();
+        let truncated_to_limit = iter_committed.len() > remaining;
+        if truncated_to_limit {
+            iter_committed.truncate(remaining);
+        }
+
+        let text = tokenizer.decode(&iter_committed, true).unwrap_or_default();
+        write!(stdout, "{text}")?;
+        stdout.flush().ok();
+
+        let mut hit_eos = false;
+        for &token in &iter_committed {
+            generated.push(token);
+            if token == eos_token_id {
+                hit_eos = true;
+                break;
+            }
+        }
+        if hit_eos || truncated_to_limit {
+            break;
+        }
+
+        let mut next_token_ids: Vec<u32> = Vec::with_capacity(accepted + 1);
+        next_token_ids.extend(drafts.iter().copied().take(accepted));
+        next_token_ids.push(bonus_token);
+        last_hidden = forward.append_aux_rows(
+            &backend,
+            target_embed_ptr,
+            target_vocab_size,
+            &next_token_ids,
+            capture.output_ptr(),
+        )?;
+        qwen36_fp4_runtime::cuda_synchronize()?;
+        seed_token = bonus_token;
+    }
+    let decode_seconds = decode_start.elapsed().as_secs_f64();
+    let total_seconds = chat_start.elapsed().as_secs_f64();
+    engine.set_drafter_hidden_capture(None);
+
+    let tokens_per_second = if decode_seconds > 0.0 {
+        generated.len() as f64 / decode_seconds
+    } else {
+        0.0
+    };
+    let iters = iter_accepts.len();
+    let avg_accept = if iters > 0 {
+        iter_accepts.iter().sum::<usize>() as f64 / iters as f64
+    } else {
+        0.0
+    };
+    let acceptance_length = if iters > 0 {
+        generated.len() as f64 / iters as f64
+    } else {
+        0.0
+    };
+    let acceptance_rate = if proposed_draft_tokens > 0 {
+        accepted_draft_tokens as f64 / proposed_draft_tokens as f64
+    } else {
+        0.0
+    };
+    let avg_confidence = if confidence_count > 0 {
+        confidence_sum / confidence_count as f64
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "\n[eagle3] generated {} tokens in {} iters | AL={:.2} avg_accept={:.2} draft_tokens={} p_min={:.2} | draft_accept={}/{} ({:.4}) rejected={} cutoffs={} avg_conf={:.3} | decode {:.2}s ({:.1} tok/s) | total {:.2}s",
+        generated.len(),
+        iters,
+        acceptance_length,
+        avg_accept,
+        draft_tokens_per_iter,
+        eagle3_p_min,
+        accepted_draft_tokens,
+        proposed_draft_tokens,
+        acceptance_rate,
+        rejected_draft_tokens,
+        confidence_cutoff_iters,
+        avg_confidence,
         decode_seconds,
         tokens_per_second,
         total_seconds,

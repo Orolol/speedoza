@@ -101,6 +101,48 @@ Expected summary for the target checkpoint:
 
 This check verifies the per-layer tensor names and NVFP4 triplets: packed `weight`, `weight_scale`, and `weight_scale_2`. It also verifies the bf16 exceptions for embeddings, lm head, MTP, and DeltaNet conv1d weights.
 
+## Optional EAGLE3 Drafter
+
+The EAGLE3 path expects a local `LlamaForCausalLMEagle3` checkpoint trained
+for the same Qwen3.6 target. The current integration was built against:
+
+```text
+Ex0bit/Qwen3.6-27B-PRISM-EAGLE3
+```
+
+Download and validate:
+
+```bash
+EAGLE3_DIR=/models/Qwen3.6-27B-PRISM-EAGLE3
+hf download Ex0bit/Qwen3.6-27B-PRISM-EAGLE3 \
+  --local-dir "$EAGLE3_DIR"
+
+cargo run -p qwen36-fp4 -- validate-eagle3-drafter \
+  --drafter-dir "$EAGLE3_DIR"
+```
+
+For a CUDA smoke load:
+
+```bash
+cargo run -p qwen36-fp4 --features cuda -- eagle3-load \
+  --drafter-dir "$EAGLE3_DIR"
+```
+
+Runtime usage is opt-in:
+
+```bash
+cargo run -p qwen36-fp4 --features cuda -- chat \
+  --model-dir "$MODEL_DIR" \
+  --prompt "Bonjour" \
+  --max-new-tokens 128 \
+  --drafter eagle3 \
+  --drafter-dir "$EAGLE3_DIR"
+```
+
+The runtime uses a greedy EAGLE3 chain with llama.cpp-style defaults:
+`QWEN36_EAGLE3_DRAFT_TOKENS=8` and `QWEN36_EAGLE3_P_MIN=0.5`.
+`QWEN36_EAGLE3_P_MIN=0` restores the previous no-cutoff fast path.
+
 ## Local Directory Hygiene
 
 Do not commit:
