@@ -335,6 +335,164 @@ lm_head_top2_pass2_kernel(const Top2WsEntry *__restrict__ ws,
   }
 }
 
+// ---------------------------------------------------------------------------
+// v2 stage-1 verdict: top-8 candidate rescore. One CTA per row, after the
+// shared block-top-2 pass. Phases (256 threads = 8 warps):
+//   1. load the 240 block winners (v1, i1) into SMEM; block-reduce the max
+//      of all block v2s (any non-winner is bounded by it).
+//   2. warp 0 runs 9 max-extraction passes over the winners: passes 0..7
+//      pick the candidates, pass 8 yields the 9th-best winner. Guard bound
+//      B = max(9th winner, max block v2) bounds EVERY non-candidate.
+//   3. warp w rescores candidate w: <input_row, weight[cand_w]> with FP64
+//      lane partials + FP64 shuffle reduce — order-stable to ~1e-12, so
+//      near-tie flips vs an exact dot are out of the picture.
+//   4. thread 0: best rescored candidate -> token; guard_ok iff
+//      best >= B + eps (every non-candidate bf16 logit <= fp8 + e_max).
+constexpr int kTop8Candidates = 8;
+constexpr int kTop8Threads = 256;
+
+__global__ void __launch_bounds__(kTop8Threads)
+lm_head_top8_rescore_kernel(const Top2WsEntry *__restrict__ ws,
+                            const __nv_bfloat16 *__restrict__ weight,
+                            const __nv_bfloat16 *__restrict__ input,
+                            uint32_t *__restrict__ tokens,
+                            uint32_t *__restrict__ flags,
+                            uint32_t *__restrict__ mirror_last,
+                            uint32_t *__restrict__ fallback_count, size_t rows,
+                            size_t vocab, size_t cols,
+                            unsigned blocks_per_row, float eps) {
+  __shared__ float winner_v[kTop2Blocks];
+  __shared__ uint32_t winner_i[kTop2Blocks];
+  __shared__ float warp_max_v2[kTop8Threads / 32];
+  __shared__ float cand_v[kTop8Candidates];
+  __shared__ uint32_t cand_i[kTop8Candidates];
+  __shared__ float ninth_v;
+  __shared__ double rescored[kTop8Candidates];
+
+  const size_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const unsigned warp = threadIdx.x >> 5;
+  const unsigned lane = threadIdx.x & 31;
+
+  float my_max_v2 = -INFINITY;
+  for (unsigned b = threadIdx.x; b < blocks_per_row; b += kTop8Threads) {
+    const Top2WsEntry e = ws[row * blocks_per_row + b];
+    winner_v[b] = e.v1;
+    winner_i[b] = e.i1;
+    my_max_v2 = fmaxf(my_max_v2, e.v2);
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    my_max_v2 = fmaxf(my_max_v2, __shfl_down_sync(0xffffffffu, my_max_v2, offset));
+  }
+  if (lane == 0) {
+    warp_max_v2[warp] = my_max_v2;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    // 9 extraction passes over <=240 winners, lane-strided + shuffle
+    // reduce; the winning slot is cleared between passes.
+    for (int k = 0; k <= kTop8Candidates; ++k) {
+      float best = -INFINITY;
+      unsigned best_slot = 0xffffffffu;
+      for (unsigned b = lane; b < blocks_per_row; b += 32u) {
+        const float v = winner_v[b];
+        // Deterministic tie-break toward the smaller token id.
+        if (v > best ||
+            (v == best && best_slot != 0xffffffffu &&
+             winner_i[b] < winner_i[best_slot])) {
+          best = v;
+          best_slot = b;
+        }
+      }
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, best, offset);
+        const unsigned os = __shfl_down_sync(0xffffffffu, best_slot, offset);
+        if (ov > best ||
+            (ov == best && os != 0xffffffffu &&
+             (best_slot == 0xffffffffu || winner_i[os] < winner_i[best_slot]))) {
+          best = ov;
+          best_slot = os;
+        }
+      }
+      best_slot = __shfl_sync(0xffffffffu, best_slot, 0);
+      best = __shfl_sync(0xffffffffu, best, 0);
+      if (lane == 0) {
+        if (k < kTop8Candidates) {
+          cand_v[k] = best;
+          cand_i[k] = best_slot == 0xffffffffu ? 0xffffffffu
+                                               : winner_i[best_slot];
+        } else {
+          ninth_v = best;
+        }
+      }
+      if (lane == 0 && best_slot != 0xffffffffu && k < kTop8Candidates) {
+        winner_v[best_slot] = -INFINITY;
+      }
+      __syncwarp();
+    }
+  }
+  __syncthreads();
+
+  // Phase 3: warp w rescores candidate w (skip replicated/empty slots).
+  if (warp < kTop8Candidates) {
+    const uint32_t cand = cand_i[warp];
+    double sum = 0.0;
+    if (cand != 0xffffffffu && static_cast<size_t>(cand) < vocab) {
+      const __nv_bfloat16 *w_row = weight + static_cast<size_t>(cand) * cols;
+      const __nv_bfloat16 *x_row = input + row * cols;
+      for (size_t c = lane; c < cols; c += 32u) {
+        sum += static_cast<double>(__bfloat162float(w_row[c])) *
+               static_cast<double>(__bfloat162float(x_row[c]));
+      }
+    } else {
+      sum = -INFINITY;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) {
+      rescored[warp] = cand == 0xffffffffu ? -INFINITY : sum;
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    double best = -INFINITY;
+    uint32_t best_token = 0;
+    for (int k = 0; k < kTop8Candidates; ++k) {
+      const double v = rescored[k];
+      const uint32_t tok = cand_i[k];
+      if (tok != 0xffffffffu &&
+          (v > best || (v == best && tok < best_token))) {
+        best = v;
+        best_token = tok;
+      }
+    }
+    float max_v2_all = -INFINITY;
+    const unsigned n_warps = kTop8Threads / 32;
+    for (unsigned w = 0; w < n_warps; ++w) {
+      max_v2_all = fmaxf(max_v2_all, warp_max_v2[w]);
+    }
+    const float bound = fmaxf(ninth_v, max_v2_all);
+    const bool guard_ok =
+        best >= static_cast<double>(bound) + static_cast<double>(eps);
+    tokens[row] = best_token;
+    flags[row] = guard_ok ? 1u : 0u;
+    if (mirror_last != nullptr && row + 1 == rows) {
+      *mirror_last = best_token;
+    }
+    if (!guard_ok && fallback_count != nullptr) {
+      atomicAdd(fallback_count, 1u);
+    }
+  }
+}
+
 template <int N>
 void launch_lm_head_fp8_gemv(const qwen36_lm_head_fp8_gemv_spec_t *spec) {
   constexpr int rows_per_cta = lm_head_fp8_rows_per_warp<N>() * kGemvWarpsPerCta;
@@ -393,6 +551,40 @@ qwen36_lm_head_top2_margin(const qwen36_lm_head_top2_margin_spec_t *spec) {
       ptr<uint32_t>(spec->mirror_last_token_u32),
       ptr<uint32_t>(spec->fallback_count_u32), spec->rows, kTop2Blocks,
       spec->eps);
+  return cudaGetLastError() == cudaSuccess ? QWEN36_STATUS_SUCCESS
+                                           : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int
+qwen36_lm_head_top8_rescore(const qwen36_lm_head_top8_rescore_spec_t *spec) {
+  if (spec == nullptr || spec->rows == 0 || spec->vocab == 0 ||
+      spec->cols == 0 || spec->logits_bf16.ptr == 0 ||
+      spec->weight_bf16.ptr == 0 || spec->input_bf16.ptr == 0 ||
+      spec->tokens_u32.ptr == 0 || spec->flags_u32.ptr == 0 ||
+      spec->workspace.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const size_t ws_needed = spec->rows * kTop2Blocks * sizeof(Top2WsEntry);
+  if (spec->workspace_bytes < ws_needed) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  cudaStream_t stream = qwen36_internal_active_stream();
+  const dim3 grid1(kTop2Blocks, static_cast<unsigned>(spec->rows));
+  lm_head_top2_pass1_kernel<<<grid1, kTop2Threads, 0, stream>>>(
+      ptr<const __nv_bfloat16>(spec->logits_bf16),
+      ptr<Top2WsEntry>(spec->workspace), spec->rows, spec->vocab);
+  if (cudaGetLastError() != cudaSuccess) {
+    return QWEN36_STATUS_CUDA_ERROR;
+  }
+  lm_head_top8_rescore_kernel<<<static_cast<unsigned>(spec->rows),
+                                kTop8Threads, 0, stream>>>(
+      ptr<const Top2WsEntry>(spec->workspace),
+      ptr<const __nv_bfloat16>(spec->weight_bf16),
+      ptr<const __nv_bfloat16>(spec->input_bf16),
+      ptr<uint32_t>(spec->tokens_u32), ptr<uint32_t>(spec->flags_u32),
+      ptr<uint32_t>(spec->mirror_last_token_u32),
+      ptr<uint32_t>(spec->fallback_count_u32), spec->rows, spec->vocab,
+      spec->cols, kTop2Blocks, spec->eps);
   return cudaGetLastError() == cudaSuccess ? QWEN36_STATUS_SUCCESS
                                            : QWEN36_STATUS_CUDA_ERROR;
 }

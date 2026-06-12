@@ -63,6 +63,27 @@ pub const fn lm_head_top2_workspace_bytes(rows: usize) -> usize {
     rows * 240 * 16
 }
 
+/// v2 stage-1 verdict of the two-stage exact lm_head argmax: rescores the
+/// top-8 FP8 candidates against the BF16 weight (FP64 accumulation) and
+/// certifies via `best_rescored >= max(9th winner, max block-v2) + eps`.
+/// Same output contract as [`LmHeadTop2MarginSpec`]; same workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LmHeadTop8RescoreSpec {
+    pub rows: usize,
+    pub vocab: usize,
+    pub cols: usize,
+    pub eps: f32,
+    pub logits_bf16: DevicePtr,
+    pub weight_bf16: DevicePtr,
+    pub input_bf16: DevicePtr,
+    pub tokens_u32: DevicePtr,
+    pub flags_u32: DevicePtr,
+    pub mirror_last_token_u32: DevicePtr,
+    pub fallback_count_u32: DevicePtr,
+    pub workspace: DevicePtr,
+    pub workspace_bytes: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LmHeadFp8QuantizeSpec {
     pub rows: usize,

@@ -40,6 +40,7 @@ pub use ops::{
     Bf16GemmSpec, Bf16MatVecArgmaxRowsSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec,
     Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec,
     lm_head_top2_workspace_bytes, LmHeadFp8GemvSpec, LmHeadFp8QuantizeSpec, LmHeadTop2MarginSpec,
+    LmHeadTop8RescoreSpec,
     Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec,
     Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec,
     RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,

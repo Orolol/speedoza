@@ -97,6 +97,49 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-12 (suite 2) — lm_head deux étages **v2 top-8 rescore** — SHIPPED opt-in : @128 acc bit-identique + decode +21.7% (cycle −13 ms), fallbacks 42% → 6%
+
+v2 du levier n°1, conçue sur le diagnostic de l'entrée précédente : au
+lieu de garder sur top1−top2 (42% de fallback sur les lignes serrées de
+la tête MTP), on re-score TOUJOURS les 8 meilleures candidates FP8
+contre le poids BF16. Kernel `qwen36_lm_head_top8_rescore` (1 CTA/ligne,
+après le pass1 top-2 par bloc partagé avec v1) : sélection top-8 des
+GAGNANTS de blocs + borne de garde **B = max(9e gagnant, max des v2 de
+blocs)** — un bloc qui cache deux leaders gonfle son v2 → garde échoue →
+fallback complet conservateur, jamais de miss silencieux ; re-score des
+8 candidates en **accumulation FP64** (8×5120 FMA ≈ gratuit,
+ordre-stable ~1e-12) ; garde finale `best ≥ B + ε` (ε recommandé 0.5 ≈
+1.5× e_max). v1 reste accessible (`QWEN36_LM_HEAD_MARGIN_SCOPE=top2`).
+
+**Mesures (bench MTP=4, fallback OFF, baselines de la même session)** :
+
+| cellule | base | v1 (ε=1.0) | v2 (ε=0.5) | acc v2 | fb v1→v2 |
+|---|---|---|---|---|---|
+| 128/128 | 39.6 | 40.9 (+3.2%) | **48.2 (+21.7%)** | **0.4772727272727273 = bit-identique** | 187→**29** |
+| 8192/128 | 39.3 | 31.0 | 33.8 | 0.4114583333333333 (= trajectoire-loterie v1/fused) | 206→28 |
+| 24576/128 | 24.3 | 30.0 | 29.4 (+21% vs base) | 0.578 (= v1) | 105→13 |
+
+La cellule propre (@128, acc identique 16 déc.) : **cycle 73.5 → 60.4 ms
+= −13 ms** (le bucket lm_head 12.2 ms + le GEMM verify wmma 2.3 +
+sample_argmax 1.2 remplacés par ~10×0.75 ms de chaîne FP8+top8).
+Fallbacks ~6% (vs 42% en v1) — la garde vs la 8e valeur est la bonne.
+@8K : la ligne à faible marge du cycle 6 tombe toujours en garde-échec →
+re-score complet PR #11 → même flip → même trajectoire (cohérent avec la
+classe ; la loterie reste bornée aux ~6% de lignes garde-échouées).
+
+Verdict : **SHIPPED opt-in** (`QWEN36_LM_HEAD_FP8_MARGIN=0.5`). Défaut
+ON différé : à valider sur la grille de régimes complète (couplage avec
+la lane acceptance) — la loterie résiduelle vit dans le re-score complet
+des ~6% ; la tuer = re-dot FP64 complet prédiqué au lieu du kernel PR
+#11 (backlog, petit). Gates : smoke top8 (5/5 certifiés, parité argmax
+host-FP64 ; le gate a d'abord attrapé une DONNÉE dégénérée — pattern
+périodique mod 251 → 16 copies exactes par ligne → ties exacts → garde
+refuse, comportement correct), floor par construction (défaut intouché).
+
+Files: kernels-cuda/{lm_head_fp8.cu,smoke.cu,include/qwen36_fp4.h},
+crates/kernels/src/{ops,backend,lib}.rs, crates/runtime/src/engine.rs.
+Inventory: oui.
+
 ### 2026-06-12 (suite) — Chasse au "bug latent PR #11 @8K" : CORRECTION — pas de bug de câblage ; 3e instance de la classe verify-perturbation (flip d'ordre d'accumulation sur ligne à faible marge)
 
 Instrument : trace de tokens par cycle dans le bench

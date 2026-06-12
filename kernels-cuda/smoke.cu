@@ -325,6 +325,98 @@ int main() {
       }
     }
     printf("lm_head fp8 gemv batched-vs-single parity gate passed (n=5)\n");
+
+    // v2 stage-1 (top-8 rescore) end-to-end on the same synthetic store:
+    // FP8 logits -> candidate selection -> FP64 rescore vs the BF16
+    // weight. Ground truth: host FP64 argmax of the bf16-rounded dot.
+    // Inputs are 0.9x copies of distinct weight rows, so each row's true
+    // winner is unambiguous and the guard should certify every row.
+    {
+      // The base weight pattern is periodic mod 251 -> rows repeat every
+      // 251 rows (exact duplicates => exact top ties => the guard
+      // rightfully refuses to certify). Overwrite the planted rows with
+      // unique high-energy patterns so each input has one unambiguous
+      // winner, then re-quantize the mutated store.
+      std::vector<float> xs_host(n * cols);
+      std::vector<size_t> planted(n);
+      for (size_t j = 0; j < n; ++j) {
+        planted[j] = 37 + j * 911;
+        for (size_t c = 0; c < cols; ++c) {
+          const float v =
+              2.5f - 0.3f * static_cast<float>((c * 7 + j * 13 + 3) % 17);
+          w_host[planted[j] * cols + c] = v;
+          xs_host[j * cols + c] =
+              0.9f * __bfloat162float(__float2bfloat16(v));
+        }
+      }
+      copy_bf16(w_bf16, w_host);
+      must_status(qwen36_lm_head_fp8_quantize(&q), "lm_head fp8 requantize");
+      copy_bf16(x_dev, xs_host);
+      must_status(qwen36_lm_head_fp8_gemv(&g), "lm_head fp8 gemv for top8");
+
+      qwen36_device_ptr_t t8_tokens = dev_alloc<uint32_t>(n);
+      qwen36_device_ptr_t t8_flags = dev_alloc<uint32_t>(n);
+      qwen36_device_ptr_t t8_fb = dev_alloc<uint32_t>(1);
+      copy_raw<uint32_t>(t8_fb, {0u});
+      qwen36_device_ptr_t t8_ws = dev_alloc<uint8_t>(n * 240 * 16);
+      qwen36_lm_head_top8_rescore_spec_t t8{};
+      t8.rows = n;
+      t8.vocab = rows;
+      t8.cols = cols;
+      t8.eps = 0.5f;
+      t8.logits_bf16 = y_batch;
+      t8.weight_bf16 = w_bf16;
+      t8.input_bf16 = x_dev;
+      t8.tokens_u32 = t8_tokens;
+      t8.flags_u32 = t8_flags;
+      t8.mirror_last_token_u32 = qwen36_device_ptr_t{0};
+      t8.fallback_count_u32 = t8_fb;
+      t8.workspace = t8_ws;
+      t8.workspace_bytes = n * 240 * 16;
+      must_status(qwen36_lm_head_top8_rescore(&t8), "lm_head top8 rescore");
+
+      std::vector<uint32_t> tok = read_raw<uint32_t>(t8_tokens, n);
+      std::vector<uint32_t> flg = read_raw<uint32_t>(t8_flags, n);
+      size_t certified = 0;
+      for (size_t j = 0; j < n; ++j) {
+        // Host FP64 argmax over bf16-rounded weight x bf16-rounded input.
+        double best = -1e300;
+        size_t best_r = 0;
+        for (size_t r = 0; r < rows; ++r) {
+          double s = 0.0;
+          for (size_t c = 0; c < cols; ++c) {
+            s += static_cast<double>(__bfloat162float(
+                     __float2bfloat16(w_host[r * cols + c]))) *
+                 static_cast<double>(__bfloat162float(
+                     __float2bfloat16(xs_host[j * cols + c])));
+          }
+          if (s > best) {
+            best = s;
+            best_r = r;
+          }
+        }
+        if (flg[j]) {
+          certified++;
+          if (tok[j] != best_r) {
+            fprintf(stderr,
+                    "top8 rescore row %zu: certified token %u != host argmax "
+                    "%zu (planted %zu)\n",
+                    j, tok[j], best_r, planted[j]);
+            exit(1);
+          }
+        }
+      }
+      if (certified < n - 1) {
+        fprintf(stderr,
+                "top8 rescore certified only %zu/%zu rows on well-separated "
+                "synthetic data\n",
+                certified, n);
+        exit(1);
+      }
+      printf("lm_head top8 rescore gate passed (%zu/%zu certified, host-FP64 "
+             "argmax parity)\n",
+             certified, n);
+    }
   }
 
   qwen36_device_ptr_t interpreter_instructions =

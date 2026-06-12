@@ -118,6 +118,10 @@ pub trait KernelBackend: Send + Sync {
         Err(CoreError::UnsupportedNoCuda("lm_head_top2_margin"))
     }
 
+    fn lm_head_top8_rescore(&self, _spec: &crate::ops::LmHeadTop8RescoreSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("lm_head_top8_rescore"))
+    }
+
     fn bf16_gemm(&self, _spec: &Bf16GemmSpec) -> Result<()> {
         Err(CoreError::UnsupportedNoCuda("bf16_gemm"))
     }
@@ -335,6 +339,13 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::LmHeadTop2MarginSpec::from(spec);
         check("qwen36_lm_head_top2_margin", unsafe {
             ffi::qwen36_lm_head_top2_margin(&ffi_spec)
+        })
+    }
+
+    fn lm_head_top8_rescore(&self, spec: &crate::ops::LmHeadTop8RescoreSpec) -> Result<()> {
+        let ffi_spec = ffi::LmHeadTop8RescoreSpec::from(spec);
+        check("qwen36_lm_head_top8_rescore", unsafe {
+            ffi::qwen36_lm_head_top8_rescore(&ffi_spec)
         })
     }
 
@@ -1132,6 +1143,43 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct LmHeadTop8RescoreSpec {
+        pub rows: usize,
+        pub vocab: usize,
+        pub cols: usize,
+        pub eps: f32,
+        pub logits_bf16: DevicePtr,
+        pub weight_bf16: DevicePtr,
+        pub input_bf16: DevicePtr,
+        pub tokens_u32: DevicePtr,
+        pub flags_u32: DevicePtr,
+        pub mirror_last_token_u32: DevicePtr,
+        pub fallback_count_u32: DevicePtr,
+        pub workspace: DevicePtr,
+        pub workspace_bytes: usize,
+    }
+
+    impl From<&crate::ops::LmHeadTop8RescoreSpec> for LmHeadTop8RescoreSpec {
+        fn from(value: &crate::ops::LmHeadTop8RescoreSpec) -> Self {
+            Self {
+                rows: value.rows,
+                vocab: value.vocab,
+                cols: value.cols,
+                eps: value.eps,
+                logits_bf16: value.logits_bf16,
+                weight_bf16: value.weight_bf16,
+                input_bf16: value.input_bf16,
+                tokens_u32: value.tokens_u32,
+                flags_u32: value.flags_u32,
+                mirror_last_token_u32: value.mirror_last_token_u32,
+                fallback_count_u32: value.fallback_count_u32,
+                workspace: value.workspace,
+                workspace_bytes: value.workspace_bytes,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct TopkArgmaxSpec {
         pub vocab_size: usize,
         pub k: usize,
@@ -1692,6 +1740,7 @@ mod ffi {
         pub fn qwen36_bf16_matvec(spec: *const Bf16MatVecSpec) -> i32;
         pub fn qwen36_bf16_matvec_argmax_rows(spec: *const Bf16MatVecArgmaxRowsSpec) -> i32;
         pub fn qwen36_lm_head_top2_margin(spec: *const LmHeadTop2MarginSpec) -> i32;
+        pub fn qwen36_lm_head_top8_rescore(spec: *const LmHeadTop8RescoreSpec) -> i32;
         pub fn qwen36_lm_head_fp8_quantize(spec: *const LmHeadFp8QuantizeSpec) -> i32;
         pub fn qwen36_lm_head_fp8_gemv(spec: *const LmHeadFp8GemvSpec) -> i32;
         pub fn qwen36_nvfp4_matvec(spec: *const Nvfp4MatVecSpec) -> i32;
