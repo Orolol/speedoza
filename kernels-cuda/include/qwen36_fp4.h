@@ -677,6 +677,11 @@ int qwen36_deltanet_decode(const qwen36_deltanet_decode_spec_t *spec);
  * value restores the default (resident when eligible: gated, tokens > 1,
  * key_dim = value_dim = 128; env kill: QWEN36_DELTANET_RESIDENT=0). */
 void qwen36_deltanet_set_resident(int mode);
+/* Test/bench hook for the chunked-prefill tiny-chunk (T <= 16) fast path:
+ * 1 forces ON, 0 forces OFF (full C=32 phases), other values restore the
+ * default (on unless QWEN36_DELTANET_TINY_CHUNK=0). Bit-exact by
+ * construction; gated by memcmp in smoke. */
+void qwen36_deltanet_prefill_set_tiny(int mode);
 int qwen36_deltanet_prefill(const qwen36_deltanet_prefill_spec_t *spec);
 int qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec);
 
