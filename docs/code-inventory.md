@@ -21,13 +21,14 @@ qwen36 chat  --model-dir <m> --prompt "<text>" --max-new-tokens 256 [--mtp-specu
 qwen36 bench --model-dir <m> --prompt-tokens N --max-new-tokens M [--prompt-file <f>] [--mtp-speculative-tokens 0..4]
 ```
 
-Three production decode modes, in order of typical throughput:
+Production decode modes, in order of typical throughput:
 
 | Mode | Activation | Status |
 |---|---|---|
 | Base decode (MTP=0) | default | captured CUDA graph, ~50 tok/s, near-flat to 24K ctx |
 | Chain MTP 1–4 | `--mtp-speculative-tokens N` | ~2.3× at MTP=4 full-accept; interpreter auto-enables |
 | DFlash speculative | `--drafter dflash --drafter-dir <d>` + `QWEN36_LONG_CONTEXT_MODE=1` | 1.8× geo-mean vs MTP=3, up to 3.8× on code; loses >5K-token prompts with short gen |
+| EAGLE3 speculative | `--drafter eagle3 --drafter-dir <d>` | experimental chain path with llama.cpp-style `draft_n=8` / `p_min=0.5` defaults; validates `LlamaForCausalLMEagle3` checkpoints and uses target hidden-state capture + batched verify |
 
 Everything else in the repo is support (loading, validation, parity, profiling) or
 archived experiments.
@@ -43,7 +44,7 @@ activated by flag/env. **NEG** = built, benchmarked negative/neutral, kept in tr
 | Component | Files | Notes |
 |---|---|---|
 | Engine (prefill chunked + decode CUDA graph) | `crates/runtime/src/engine.rs` | the core; graph captured at first decode, replayed after |
-| Fused weight stores (gate+up MLP; DeltaNet 4-way in_proj) | `crates/runtime/src/gpu.rs` (`MlpFusedStore`, `LinearAttnInProjFusedStore`) | ON only when `max_context < 8192` (auto long-context mode disables them to save ~8 GB VRAM) |
+| Fused weight stores (gate+up MLP; DeltaNet 4-way in_proj) | `crates/runtime/src/gpu.rs` (`MlpFusedStore`, `LinearAttnInProjFusedStore`) | ON only when `max_context < 8192` (auto long-context mode disables them to save ~8 GB VRAM). Since 2026-06-11 prefill ALSO consumes them (combined GEMM + strided deinterleave) and engine init drops the unfused originals layer-by-layer during the build (−8.1 GiB resident AND at init peak); `QWEN36_KEEP_UNFUSED_WEIGHTS=1` keeps the duplicates |
 | NVFP4 GEMM via cuBLASLt | `kernels-cuda/nvfp4_gemm.cu` | prefill GEMMs + decode fallback shapes |
 | Hand-rolled NVFP4 decode GEMV ("Direction B") | `kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu` | **default ON** for n==1, m%16==0, k%512==0 shapes; +14.5% MTP=0. Kill: `QWEN36_DECODE_GEMV_DISABLE=1`. **Exception (2026-06-10):** the mlp.down shape (M=5120, K=17408) routes straight to cuBLASLt — measured 55.4 vs 68.0 µs cold-data (`tools/gemv_shape_bench`), +4.1% MTP=0 e2e |
 | Sage INT8 prefill attention | `kernels-cuda/attention_sage_prefill.cu` | **default ON** for chunks ≥1024 tokens (see §3) |
@@ -54,7 +55,6 @@ activated by flag/env. **NEG** = built, benchmarked negative/neutral, kept in tr
 | DeltaNet decode + chunked prefill | `kernels-cuda/deltanet.cu`, `deltanet_prefill.cu` | 48 linear-attention layers; chunked prefill default ON |
 | Elementwise/fused ops | `kernels-cuda/ops.cu` | rmsnorm (+nvfp4-quantize), swiglu (+nvfp4-quantize), conv1d (+gdn-gate fused), sampling, embedding, q_proj deinterleave/gate |
 | Partial RoPE | in `ops.cu` / `crates/kernels/src/rope.rs` | 64 of 256 dims |
-| lm_head FP8 e4m3 | `kernels-cuda/fp8_matvec.cu`, `engine.rs build_lm_head_fp8` | **default ON** (kill: `QWEN36_LM_HEAD_FP8=0`): lm_head quantized on-GPU at load (per-row f32 scales), all consumers (decode/prefill logits, MTP verify rows) read 1 B/weight. Offline probe 0/27 argmax flips; smoke gate vs host reference. Self-disables under `QWEN36_INTERPRETER_LOGITS` (BF16 opcode) — tree-MTP top-k keeps BF16 (NEG lane) |
 | KV cache dtype | engine + attention kernels | `EngineConfig::default` is FP8 (`engine.rs:602`) **but the CLI overrides per command**: `chat`/`bench` default **BF16**, DFlash paths default **FP8** (`cli/main.rs cuda_kv_cache_dtype` call sites); `QWEN36_KV_CACHE_DTYPE` overrides all. Discovered 2026-06-10 — perf numbers from bench/chat are BF16-KV numbers |
 | MTP chain controller + verify graphs | `crates/mtp/src/lib.rs`, engine | opt-in by CLI flag but fully on the supported path; MTP=1 two-token graph, MTP=2/3/4 chunked verify + multi-graph |
 | Decode interpreter (whole-layer fused launches) | `kernels-cuda/interpreter/`, `crates/kernels/src/interpreter.rs`, `crates/runtime/src/interpreter_compile.rs` | **AUTO**: enabled iff `mtp_speculative_tokens > 0` (+7.3% MTP=4), disabled at MTP=0 (would regress −5%). `QWEN36_INTERPRETER_DECODE=0|1|auto` |
@@ -64,6 +64,7 @@ activated by flag/env. **NEG** = built, benchmarked negative/neutral, kept in tr
 | Component | Activation | Files | Notes |
 |---|---|---|---|
 | DFlash drafter (block-diffusion speculative decoding) | `chat --drafter dflash --drafter-dir <d>`, requires `QWEN36_LONG_CONTEXT_MODE=1` (VRAM) | `crates/drafter/*`, `kernels-cuda/drafter_attention.cu` | z-lab 2B BF16 drafter; verify goes through prefill chunks (split-K kernel). AL is content-sensitive, not length-sensitive (eval battery: `scripts/drafter_al_eval.sh`, geomean baseline 5.10) |
+| EAGLE3 drafter | `validate-eagle3-drafter`, `eagle3-load`, `chat --drafter eagle3 --drafter-dir <d>` | `crates/drafter/src/eagle3*.rs`, CLI | Supports Qwen3.6-style `LlamaForCausalLMEagle3` BF16 checkpoints, including compressed `d2t` draft vocab precomputed to target ids. Runtime is greedy chain with optional top-1 confidence cutoff (`QWEN36_EAGLE3_P_MIN`, default 0.5) and reuses the DFlash hidden-capture hook + batched verify. Current main drops unfused target weights before drafter upload, so short-context runs no longer require `QWEN36_LONG_CONTEXT_MODE=1`. |
 | TurboQuant 3/3.5 KV cache | `QWEN36_KV_CACHE_DTYPE=tq3|tq35` | `kernels-cuda/turboquant.cu` | int-quantized KV; TQ dtypes exclude flash/sage/tiled kernels (scalar paths only) |
 | Tree-MTP (K>1 leaves) | `--mtp-tree-leaves K` | `crates/mtp`, engine, top-K kernel, tree-mask attention | **functional but 2.7–4× SLOWER than chain** (leaves go through single-token forwards). Phase-2 (batched leaf forward) never built. Default K=1 = chain. |
 | GQA tiled prefill (2/4-token tiles) | `QWEN36_PREFILL_GQA_TILE2=1` / `QWEN36_PREFILL_GQA_TILE_TOKENS=2\|4` | `attention.cu` | experimental first step toward tiled prefill; superseded in practice by flash/sage |
@@ -77,6 +78,10 @@ activated by flag/env. **NEG** = built, benchmarked negative/neutral, kept in tr
 | Productive spin / L2 prefetch on idle SMs | `QWEN36_PRODUCTIVE_SPIN=1` (+`_CTAS`, default 128) | `kernels-cuda/decode_gemv/l2_prefetch.cu`, `DecodeAuxStreams` in engine | ≤+0.5% = noise (2026-05-19). Decode graph already keeps weights L2-resident |
 | Interpreter L2 prefetch lookahead | `QWEN36_INTERPRETER_PREFETCH=1` | `kernels-cuda/interpreter/prefetch.cuh` | negative on both MTP=0 and MTP=4 (2026-06-09) |
 | FA-tiled drafter attention | `QWEN36_DRAFTER_ATTENTION_FLASH=1` | `kernels-cuda/drafter_attention_flash.cu` | per-iter parity with v1 (not compute-bound) + numerical drift at ctx≳120 degrading AL (2026-06-09) |
+| Chunk GEMV multi-N (verify N=2..8 via l'atome m16n8k64) | `QWEN36_CHUNK_GEMV=1` | `kernels-cuda/decode_gemv/` (`nvfp4_gemm_chunk_body`) | NÉGATIF E2E (2026-06-12) : ~50 µs/appel = parité cuBLASLt au chrono kernel, MAIS perturbation des logits de verify (ordre d'accumulation) → acceptance de chaîne 0.477→0.416 @128 = −8% tokens/cycle. Garder OFF. Parité smoke n=5 vs cuBLASLt |
+| M-tiling du chunk GEMV (T tuiles m16/CTA, B stagé une fois) | `QWEN36_CHUNK_GEMV_MTILE=N` (défaut 1) | `nvfp4_gemm_chunk_body` (m_tile_first/count), hook `qwen36_nvfp4_chunk_gemv_set_mtile` | NÉGATIF, monotone en T (2026-06-12) : T1 36.8 > T4 35.3 > T8 35.1 > adaptatif 34.4 tok/s — 2 barrières CTA + prologue sérialisés × T ; le bucket est borné latence/lancements, pas octets. Sweep smoke T {1,2,3,4} |
+| MTP fused lm_head matvec+argmax | `QWEN36_MTP_FUSED_ARGMAX=1` | `kernels-cuda/ops.cu` (`qwen36_bf16_matvec_argmax_rows`) | +4 à +6.6 ms/cycle MTP=4 @128 (2026-06-11, PR #11 opt-in). CORRECTION 2026-06-12 : la divergence @8K n'est PAS un bug de câblage — le kernel recalcule le matvec (ordre warp-stride ≠ cuBLAS) → flip d'argmax sur ligne verify à faible marge = 3e instance de la classe verify-perturbation (trace : cycle 6 verified[0], cycles 1-5 + reject cycle 3 identiques ; les deux kernels default row-wise/batché s'accordent entre eux) |
+| lm_head argmax exact deux étages — **v2 top-8 rescore** (scan FP8 → top-8 candidates → re-score FP64 vs BF16 → garde vs max(9e, max v2-blocs) → fallback complet prédiqué) | `QWEN36_LM_HEAD_FP8_MARGIN=<ε>` (**reco 0.5**) ; debug : `QWEN36_LM_HEAD_MARGIN_SCOPE=top2` (v1), `=rows1` (bisection) | `kernels-cuda/lm_head_fp8.cu` (`qwen36_lm_head_top8_rescore`, `qwen36_lm_head_top2_margin`), `ops.cu` (skip_flags), `engine.rs` (`lm_head_two_stage_argmax_rows`) | **SHIPPED opt-in (2026-06-12)** : @128 acc bit-identique (16 déc.) + decode 39.6→48.2 (+21.7%, cycle −13 ms) ; fallbacks 42% (v1) → ~6% (v2) ; @8K/24K = trajectoires-loterie connues (flips bornés aux ~6% de gardes échouées → re-score PR #11). Défaut ON différé à la validation grille de régimes. JSON bench : `lm_head_margin_fallbacks`. Gates smoke : top8 (5/5 certifiés, parité host-FP64), top2+marge, GEMV FP8 n=5 batched-vs-single bit-exact |
 | Drafter sliding-window knobs | `QWEN36_DRAFTER_SWA_WINDOW=N`, `QWEN36_DRAFTER_SWA_ALL=1` | `crates/drafter/src/forward.rs` | dead lever: geomean-negative chaotic reshuffle (2026-06-09) |
 
 ### 2.4 Dead code
@@ -141,16 +146,15 @@ not in Rust — grep there, not in `engine.rs`, when wondering which kernel runs
 
 **Drafter attention** (`drafter_attention.cu`): naive v1 by default; FA-tiled variant opt-in (negative, §2.3).
 
-## 4. Environment variable reference (complete, 88 vars)
+## 4. Environment variable reference (complete, 90 vars)
 
-Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
+Defaults verified in code 2026-06-12. "bool" vars accept `1/true/yes/on`.
 
 ### 4.1 Kernel-path toggles (read in CUDA code via `getenv`)
 
 | Var | Default | Effect |
 |---|---|---|
 | `QWEN36_ATTENTION_SAGE_PREFILL` | **1** | `0` falls back to flash BF16 prefill (`attention.cu:2565`) |
-| `QWEN36_LM_HEAD_FP8` | **1** | `0` keeps the BF16 lm_head (cuBLASLt gemvx). FP8 halves the 1.65 ms/token lm_head read (`fp8_matvec.cu`) |
 | `QWEN36_SAGE_PIPELINE` | **1** | `0` disables the sage prefill cp.async pipeline (FP8: staged raw KV tiles; BF16: V copied async directly into SMEM). Bit-identical to legacy (smoke-gated); kill switch only (`attention_sage_prefill.cu`) |
 | `QWEN36_ATTENTION_FLASH_PREFILL` | **1** | `0` falls back to scalar GQA prefill (`attention.cu:2578`) |
 | `QWEN36_VERIFY_FLASH_SPLITK` | **1** | `0` forces scalar GQA for 2–32-token verify chunks (`attention.cu:2655`) |
@@ -205,9 +209,14 @@ Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
 | `QWEN36_DECODE_ATTENTION_BUCKET_DISABLE` | off | size splits from configured `max_context` (old behavior) |
 | `QWEN36_CUDA_WORKSPACE_BYTES` / `_MIB` | 256 MiB | GPU workspace |
 | `QWEN36_DISABLE_MLP_FUSED` / `QWEN36_DISABLE_LINEAR_ATTN_FUSED` | off | kill fused stores individually |
-| `QWEN36_PREFILL_FUSED_MLP` | 0 | opt-in fused-MLP on the prefill path |
-| `QWEN36_PREFILL_FUSED_LINEAR_ATTN_DISABLE` | off | kill fused in_proj on the prefill path |
+| `QWEN36_PREFILL_FUSED_MLP` | **on** (2026-06-11) | `=0` restores the unfused prefill MLP path AND keeps the ~8 GiB weight duplicates resident (the init drop requires both prefill-fused flags) |
+| `QWEN36_PREFILL_FUSED_LINEAR_ATTN_DISABLE` | off | kill fused in_proj on the prefill path (also keeps duplicates resident) |
+| `QWEN36_KEEP_UNFUSED_WEIGHTS` | off | `=1` keeps the unfused gate/up + in_proj originals resident next to the fused stores (debugging; pre-2026-06-11 memory behaviour) |
 | `QWEN36_DELTANET_CHUNKED_PREFILL` | **on** | `=0` disables chunked DeltaNet prefill |
+| `QWEN36_DELTANET_SEQ_SHORT_CHUNK` | **off** | `=1` routes ≤8-token chunks (speculative verify windows) to sequential DeltaNet — kernel +12% MTP=4 @128 but acceptance drops with ctx (0.50→0.35 @3K, −19%); opt-in for experiments only (2026-06-11) |
+| `QWEN36_MTP_AUTO_FALLBACK` | **on** (2026-06-11) | online fallback (recovery-plan step 4): after `QWEN36_MTP_FALLBACK_WINDOW` (8) verify cycles, if draft acceptance < `QWEN36_MTP_FALLBACK_MIN_ACCEPTANCE` (0.55 ≈ break-even at today's cycle cost), finish the generation on the plain decode graph. Chat ~2K: no trigger (acc 0.89), MTP=4 +33% vs MTP=0; corpus 3K @512 toks: 38.2 → 55.8 tok/s (−7% vs MTP=0, converges longer). `=0` for pure-MTP measurements (the dashboard sets it) |
+| `QWEN36_LM_HEAD_FP8` | **auto** = ON ssi MTP=0 (2026-06-11 nuit) | quantizes lm_head to e4m3 per-row at init and DROPS the BF16 original (−1.18 GiB; GEMV 785 µs = 90% peak vs cuBLAS 1.65 ms; floor 10/10). **OFF dès que la tête MTP drafte** : la récursion de draft mange l'argmax du step précédent → les flips FP8 à faible marge SE COMPOSENT dans la chaîne (mesuré chat@8K : per-position 0.8/0.8/0.73 → 0.8/0.53/0.47, acc 0.77→0.589, tok/s −29%, déterministe). DFlash garde aussi son BF16 (`EngineConfig.keep_bf16_lm_head`, le drafter lit le pointeur target). `=1`/`=0` forcent |
+| `QWEN36_MTP_PRENORM_HIDDEN` / `QWEN36_MTP_PRENORM_RECURSION` | **off** | `=1` feeds the MTP head pre-norm hiddens (backbone input / recursive step) instead of the post-norm ones — the Qwen3-Next reference contract, measured WORSE on this checkpoint (2x2 FALSIFIED 2026-06-11: the shipped head expects post-norm). Experiment harness only |
 
 ### 4.6 Split-KV tuning (diagnostics; defaults are tuned — don't ship overrides)
 
@@ -224,6 +233,8 @@ Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
 |---|---|---|
 | `QWEN36_DRAFTER_SWA_WINDOW` | checkpoint (2048) | override sliding window — **proven dead lever** |
 | `QWEN36_DRAFTER_SWA_ALL` | 0 | apply window to the full-attention layer too |
+| `QWEN36_EAGLE3_DRAFT_TOKENS` | 8 | number of EAGLE3 chain draft tokens proposed per speculative iteration |
+| `QWEN36_EAGLE3_P_MIN` | 0.5 | minimum EAGLE3 top-1 softmax confidence to keep extending a draft chain; `0` restores the previous no-cutoff fast path |
 
 ### 4.8 Debug / profiling / parity
 
@@ -291,8 +302,8 @@ in `crates/kernels/src/backend.rs` + the typed spec module + `smoke.cu`** (see A
 |---|---|
 | `build_cuda.sh` / `smoke_cuda.sh` | build `.so` (sm_120a) / run kernel smoke suite |
 | `verify_perf_gate.sh` | **run before/after any perf change** — DFlash split-K + MTP interpreter gates vs baselines |
-| `bench_dashboard.sh` | **THE perf dashboard** (roadmap P0): fixed grid MTP {0,4} × ctx {128,3K,8K,24K} on the frozen `benches/data/bench_corpus_91k.txt` + 2 DFlash cells; every roadmap perf item cites before/after from this script |
-| `nsight_audit.sh` | ncu DRAM-bandwidth audit of the decode hot path (sizes the P3 lane); ncu needs host counter perms — fall back to nsys `--cuda-graph-trace=node` |
+| `bench_dashboard.sh` | **THE perf dashboard** (roadmap P0): fixed grid MTP {0,4} × ctx {128,3K,8K,24K} on the frozen `benches/data/bench_corpus_91k.txt` + 2 DFlash cells; every roadmap perf item cites before/after from this script. MTP cells report accepted/proposed draft acceptance (`AL / acc` column); per-position acceptance arrays land in the JSONL (2026-06-11) |
+| `nsight_audit.sh` | ncu DRAM-bandwidth audit of the decode hot path (sizes the P3 lane) |
 | `kernels-cuda/tools/gemv_shape_bench.cu` | cold-data per-shape gemv-vs-cuBLASLt microbench (build line in its header) — the instrument behind the per-shape routing |
 | `bench_matrix.sh`, `bench_tq35_contexts.sh`, `bench_attention_ab.sh`, `profile_bench.sh` | bench sweeps / A-B / nsys profiling |
 | `quality_tq35.sh` | TQ35 vs BF16 KV logits quality |

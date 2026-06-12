@@ -11,10 +11,13 @@
 // attention_flash_prefill tile: the KV sequence is partitioned across
 // `n_splits` CTAs (grid.z), each computing a partial online-softmax over
 // its KV chunk. A second reduce pass merges the per-split (m, l, O)
-// partials via log-sum-exp. With n_splits ~48 the grid becomes
-// (4 × 1 × 48) = 192 CTAs, saturating the GPU while staying numerically
-// identical (FP32 accumulators) to the full-KV tile — so it does NOT carry
-// the precision/AL drift of the scalar split-GQA path.
+// partials via log-sum-exp. grid.y enumerates (q_tile, qh_local) pairs —
+// one CTA per q_head (2026-06-11; previously a serial in-CTA q_head loop,
+// which left the verify shape at (4 × 1 × n_splits) CTAs ≈ 6% occupancy at
+// short ctx). With n_splits ~48 the grid is (4 × 6 × 48) = 1152 CTAs,
+// saturating the GPU while staying numerically identical (FP32
+// accumulators) to the full-KV tile — so it does NOT carry the
+// precision/AL drift of the scalar split-GQA path.
 //
 // Tile: M=32 Q-rows (q<=32; verify uses 16, upper rows padded), N=64 KV
 // rows per K-iter, D=256 head_dim, 4 warps, wmma m16n16k16 BF16 + FP32
@@ -97,13 +100,21 @@ __global__ void attention_flash_splitk_kernel(
     const int32_t *start_position_device, size_t tokens,
     qwen36_attention_shape_t shape, int n_splits) {
   const size_t kvh = blockIdx.x;
-  const size_t q_tile_idx = blockIdx.y;
+  const size_t q_per_kv = shape.q_heads / shape.kv_heads;
+  // grid.y enumerates (q_tile, qh_local) pairs: one CTA per q_head instead
+  // of a serial in-CTA q_head loop. At the verify shape (1 q-tile) this is
+  // the difference between 12 and 72 CTAs on a 192-SM part — the kernel was
+  // measured at 6% occupancy (grid (4,1,3), 550 us at ctx 128, 2026-06-11).
+  // Per-(qh, split) arithmetic is unchanged: every qh iteration already
+  // reloaded its own Q/K/V tiles and reset its softmax state, so the
+  // partials are bit-identical to the looped version.
+  const size_t q_tile_idx = blockIdx.y / q_per_kv;
+  const size_t qh_local = blockIdx.y % q_per_kv;
   const size_t split = blockIdx.z;
   const size_t token_base = q_tile_idx * kSkM;
   if (token_base >= tokens) {
     return;
   }
-  const size_t q_per_kv = shape.q_heads / shape.kv_heads;
   const size_t head_dim = shape.head_dim;
   const float qk_scale = rsqrtf(static_cast<float>(head_dim));
   const int warp_id = threadIdx.x >> 5;
@@ -153,7 +164,7 @@ __global__ void attention_flash_splitk_kernel(
   float *sm_l = sm_m + kSkM;
   float *sm_alpha = sm_l + kSkM;
 
-  for (size_t qh_local = 0; qh_local < q_per_kv; ++qh_local) {
+  {
     const size_t qh = kvh * q_per_kv + qh_local;
 
     // ---- load Q tile [M × D] for this q_head ----
@@ -553,9 +564,11 @@ extern "C" int qwen36_attention_flash_splitk_prefill_bf16(
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(smem_bytes));
 
-  const dim3 grid(static_cast<unsigned int>(spec->shape.kv_heads),
-                  static_cast<unsigned int>((tokens + kSkM - 1) / kSkM),
-                  static_cast<unsigned int>(n_splits));
+  const size_t q_per_kv = spec->shape.q_heads / spec->shape.kv_heads;
+  const dim3 grid(
+      static_cast<unsigned int>(spec->shape.kv_heads),
+      static_cast<unsigned int>(((tokens + kSkM - 1) / kSkM) * q_per_kv),
+      static_cast<unsigned int>(n_splits));
   attention_flash_splitk_kernel<<<grid, kSkThreads, smem_bytes,
                                   qwen36_internal_active_stream()>>>(
       reinterpret_cast<const __nv_bfloat16 *>(

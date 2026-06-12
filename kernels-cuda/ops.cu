@@ -22,6 +22,20 @@ __device__ bool better_score(float candidate, uint32_t candidate_idx,
          (candidate == current && candidate_idx < current_idx);
 }
 
+__device__ uint32_t ordered_float_key(float value) {
+  const uint32_t bits = __float_as_uint(value);
+  return (bits & 0x80000000u) != 0 ? ~bits : (bits ^ 0x80000000u);
+}
+
+__device__ unsigned long long argmax_atomic_key(float score, uint32_t token) {
+  if (!isfinite(score)) {
+    return 0;
+  }
+  const uint64_t score_key = static_cast<uint64_t>(ordered_float_key(score));
+  const uint64_t tie_key = static_cast<uint64_t>(0xffffffffu - token);
+  return static_cast<unsigned long long>((score_key << 32) | tie_key);
+}
+
 __device__ float decode_e4m3(uint8_t code) {
   const int sign = (code & 0x80) != 0 ? -1 : 1;
   const int exponent = (code >> 3) & 0x0f;
@@ -434,6 +448,70 @@ __global__ void bf16_matvec_kernel(const __nv_bfloat16 *input,
   extern __shared__ float scratch[];
   qwen36_interpreter::bf16_matvec_row_body(blockIdx.x, input, weight, output,
                                            in_features, scratch, blockDim.x);
+}
+
+constexpr int kBf16ArgmaxRowsPerBlock = 8;
+constexpr int kBf16ArgmaxLanesPerRow = 32;
+constexpr int kBf16ArgmaxThreadsPerBlock =
+    kBf16ArgmaxRowsPerBlock * kBf16ArgmaxLanesPerRow;
+
+__global__ void __launch_bounds__(kBf16ArgmaxThreadsPerBlock)
+bf16_matvec_argmax_rows_kernel(const __nv_bfloat16 *__restrict__ input,
+                               const __nv_bfloat16 *__restrict__ weight,
+                               unsigned long long *__restrict__ best_keys,
+                               const uint32_t *__restrict__ skip_flags,
+                               size_t rows, size_t out_features,
+                               size_t in_features) {
+  const unsigned warp_id = threadIdx.x >> 5;
+  const unsigned lane = threadIdx.x & 31;
+  const size_t row = blockIdx.y;
+  const size_t vocab = blockIdx.x * kBf16ArgmaxRowsPerBlock + warp_id;
+  if (row >= rows || vocab >= out_features) {
+    return;
+  }
+  // Two-stage lm_head: a non-zero flag means the FP8 margin guard already
+  // settled this row — the whole grid slice exits on one cached read.
+  if (skip_flags != nullptr && skip_flags[row] != 0u) {
+    return;
+  }
+
+  const __nv_bfloat16 *row_input = input + row * in_features;
+  const __nv_bfloat16 *row_weight = weight + vocab * in_features;
+  float sum = 0.0f;
+  for (size_t col = lane; col < in_features; col += kBf16ArgmaxLanesPerRow) {
+    sum += __bfloat162float(row_input[col]) *
+           __bfloat162float(row_weight[col]);
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(0xffffffff, sum, offset);
+  }
+  if (lane == 0) {
+    const unsigned long long key =
+        argmax_atomic_key(sum, static_cast<uint32_t>(vocab));
+    atomicMax(best_keys + row, key);
+  }
+}
+
+__global__ void bf16_matvec_argmax_rows_finalize_kernel(
+    const unsigned long long *__restrict__ best_keys,
+    uint32_t *__restrict__ output_tokens,
+    uint32_t *__restrict__ mirror_last_output_token,
+    const uint32_t *__restrict__ skip_flags, size_t rows) {
+  const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  if (skip_flags != nullptr && skip_flags[row] != 0u) {
+    return;  // stage-1 token stands; leave output and mirror untouched
+  }
+  const unsigned long long key = best_keys[row];
+  const uint32_t token =
+      key == 0 ? 0u : 0xffffffffu - static_cast<uint32_t>(key & 0xffffffffull);
+  output_tokens[row] = token;
+  if (mirror_last_output_token != nullptr && row + 1 == rows) {
+    *mirror_last_output_token = token;
+  }
 }
 
 // Lookup table for E2M1 (FP4) decode. Index 0..7 = positive magnitudes,
@@ -1020,6 +1098,57 @@ extern "C" int qwen36_bf16_matvec(const qwen36_bf16_matvec_spec_t *spec) {
       ptr<const __nv_bfloat16>(spec->weight_bf16),
       ptr<__nv_bfloat16>(spec->output_bf16), spec->in_features);
   cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int qwen36_bf16_matvec_argmax_rows(
+    const qwen36_bf16_matvec_argmax_rows_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->rows == 0 || spec->out_features == 0 || spec->in_features == 0 ||
+      spec->input_bf16.ptr == 0 || spec->weight_bf16.ptr == 0 ||
+      spec->output_token_u32.ptr == 0 || spec->workspace.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const size_t workspace_needed = spec->rows * sizeof(unsigned long long);
+  if (spec->workspace_bytes < workspace_needed) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+
+  cudaStream_t stream = qwen36_internal_active_stream();
+  cudaError_t err =
+      cudaMemsetAsync(ptr<unsigned long long>(spec->workspace), 0,
+                      workspace_needed, stream);
+  if (err != cudaSuccess) {
+    return QWEN36_STATUS_CUDA_ERROR;
+  }
+
+  const dim3 grid(
+      static_cast<unsigned int>(
+          div_ceil_size(spec->out_features, kBf16ArgmaxRowsPerBlock)),
+      static_cast<unsigned int>(spec->rows));
+  bf16_matvec_argmax_rows_kernel<<<grid, kBf16ArgmaxThreadsPerBlock, 0,
+                                   stream>>>(
+      ptr<const __nv_bfloat16>(spec->input_bf16),
+      ptr<const __nv_bfloat16>(spec->weight_bf16),
+      ptr<unsigned long long>(spec->workspace),
+      ptr<const uint32_t>(spec->skip_flags_u32), spec->rows,
+      spec->out_features, spec->in_features);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    return QWEN36_STATUS_CUDA_ERROR;
+  }
+
+  const int threads = 128;
+  const unsigned int blocks =
+      static_cast<unsigned int>(div_ceil_size(spec->rows, threads));
+  bf16_matvec_argmax_rows_finalize_kernel<<<blocks, threads, 0, stream>>>(
+      ptr<const unsigned long long>(spec->workspace),
+      ptr<uint32_t>(spec->output_token_u32),
+      ptr<uint32_t>(spec->mirror_last_output_token_u32),
+      ptr<const uint32_t>(spec->skip_flags_u32), spec->rows);
+  err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
 

@@ -76,6 +76,21 @@ impl GpuWeightStore {
         self.tensors.get(name)
     }
 
+    /// Remove a tensor from the store, freeing its device memory. Returns
+    /// the bytes released (0 if the tensor was not resident). Any later
+    /// lookup of the name fails loudly through the usual "tensor missing"
+    /// error path rather than reading freed memory.
+    pub fn remove(&mut self, name: &str) -> u64 {
+        match self.tensors.remove(name) {
+            Some(tensor) => {
+                let bytes = tensor.buffer.bytes() as u64;
+                self.total_bytes = self.total_bytes.saturating_sub(bytes);
+                bytes
+            }
+            None => 0,
+        }
+    }
+
     pub fn scalar_f32(&self, name: &str) -> Option<f32> {
         self.tensor(name).and_then(GpuTensor::scalar_f32)
     }
@@ -133,6 +148,25 @@ pub struct LinearAttnInProjFused {
     pub combined_out_features: usize,
 }
 
+/// lm_head quantized to FP8 e4m3 with per-row scales (W8A16). Replaces the
+/// BF16 lm_head entirely at engine init (the BF16 original is dropped from
+/// the weight store): every logits GEMV reads half the bytes, and the
+/// resident footprint shrinks by ~1.2 GiB on the shipped checkpoint.
+/// Probe basis: scripts/lmhead_fp8_probe.py (0/28 argmax flips, per-row).
+#[derive(Debug)]
+pub struct LmHeadFp8Store {
+    pub weight_e4m3: CudaDeviceBuffer,
+    pub row_scales_f32: CudaDeviceBuffer,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl LmHeadFp8Store {
+    pub fn total_bytes(&self) -> u64 {
+        self.weight_e4m3.bytes() as u64 + self.row_scales_f32.bytes() as u64
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LinearAttnInProjFusedStore {
     /// Indexed by global layer_index. `None` for full-attention layers.
@@ -141,7 +175,14 @@ pub struct LinearAttnInProjFusedStore {
 }
 
 impl LinearAttnInProjFusedStore {
-    pub fn build(weights: &GpuWeightStore, manifest: &ModelWeightsManifest) -> Result<Self> {
+    /// See `MlpFusedStore::build` for the `drop_sources` contract (frees
+    /// each layer's original in_proj qkv/b/a/z weight + block_scale once
+    /// its fused copy is built, keeping the init peak near steady-state).
+    pub fn build(
+        weights: &mut GpuWeightStore,
+        manifest: &ModelWeightsManifest,
+        drop_sources: bool,
+    ) -> Result<Self> {
         let mut layers: Vec<Option<LinearAttnInProjFused>> =
             Vec::with_capacity(manifest.layers.len());
         let mut total_bytes = 0_u64;
@@ -152,6 +193,25 @@ impl LinearAttnInProjFusedStore {
                     total_bytes += entry.combined_weight.bytes() as u64
                         + entry.combined_block_scale.bytes() as u64;
                     layers.push(Some(entry));
+                    if drop_sources {
+                        cuda_synchronize()?;
+                        for binding in [
+                            &linear.in_proj_qkv,
+                            &linear.in_proj_b,
+                            &linear.in_proj_a,
+                            &linear.in_proj_z,
+                        ] {
+                            if let LinearWeightBinding::Nvfp4 {
+                                weight,
+                                block_scale,
+                                ..
+                            } = binding
+                            {
+                                weights.remove(&weight.name);
+                                weights.remove(&block_scale.name);
+                            }
+                        }
+                    }
                 }
                 LayerWeights::FullAttention(_) => layers.push(None),
             }
@@ -348,10 +408,17 @@ fn build_linear_attn_layer_fused(
 }
 
 impl MlpFusedStore {
+    /// `drop_sources` frees each layer's original gate/up weight +
+    /// block_scale right after its fused copy is built (synchronizing
+    /// first so the D2D concat has retired). This keeps the init memory
+    /// peak at ~steady-state + one layer instead of steady-state + the
+    /// full unfused set — without it, engine init needs ~8 GiB of
+    /// headroom it immediately gives back.
     pub fn build(
-        weights: &GpuWeightStore,
+        weights: &mut GpuWeightStore,
         manifest: &ModelWeightsManifest,
         intermediate_size: usize,
+        drop_sources: bool,
     ) -> Result<Self> {
         let mut layers = Vec::with_capacity(manifest.layers.len());
         let mut total_bytes = 0_u64;
@@ -369,6 +436,20 @@ impl MlpFusedStore {
             total_bytes +=
                 entry.combined_weight.bytes() as u64 + entry.combined_block_scale.bytes() as u64;
             layers.push(entry);
+            if drop_sources {
+                cuda_synchronize()?;
+                for binding in [&common.mlp_gate_proj, &common.mlp_up_proj] {
+                    if let LinearWeightBinding::Nvfp4 {
+                        weight,
+                        block_scale,
+                        ..
+                    } = binding
+                    {
+                        weights.remove(&weight.name);
+                        weights.remove(&block_scale.name);
+                    }
+                }
+            }
         }
         // MTP head MLP weights ship as BF16 in the Qwen3.6 checkpoint (not
         // NVFP4), so they cannot use the fused FP4 GEMM path. Skip them here;
@@ -530,6 +611,12 @@ pub struct GpuForwardBuffers {
     pub hidden: CudaDeviceBuffer,
     pub residual: CudaDeviceBuffer,
     pub normed: CudaDeviceBuffer,
+    /// Pre-final-norm hidden (`hidden + residual`, before `model.norm`),
+    /// materialized by the final-norm rmsnorm via its `residual_out` slot.
+    /// This is the hidden the MTP head's `pre_fc_norm_hidden` expects —
+    /// feeding it post-norm `normed` bakes the final-norm γ into the head
+    /// input (the 2026-06-11 acceptance bug).
+    pub prenorm_hidden: CudaDeviceBuffer,
     pub block_out: CudaDeviceBuffer,
     pub qkv: CudaDeviceBuffer,
     pub aux: CudaDeviceBuffer,
@@ -624,6 +711,11 @@ pub struct GpuPrefillBuffers {
     pub hidden: CudaDeviceBuffer,
     pub residual: CudaDeviceBuffer,
     pub normed: CudaDeviceBuffer,
+    /// Pre-final-norm hidden rows (`hidden + residual` before `model.norm`,
+    /// or before `mtp.norm` on the MTP-head forward), materialized via the
+    /// rmsnorm `residual_out` slot. The MTP head consumes THIS, not `normed`
+    /// (see GpuForwardBuffers::prenorm_hidden).
+    pub prenorm_hidden: CudaDeviceBuffer,
     pub block_out: CudaDeviceBuffer,
     pub qkv: CudaDeviceBuffer,
     pub aux: CudaDeviceBuffer,
@@ -736,7 +828,7 @@ impl GpuRuntimeBuffers {
 }
 
 impl MtpKvSnapshotLayout {
-    pub const VERIFY_TOKENS: usize = 17; // chain=8 + K=8 + 1 (current); depth 6/8 unlock 2026-06-10
+    pub const VERIFY_TOKENS: usize = 13; // bumped from 5: chain=4 + K=8 + 1 (current) = 13
 
     fn new(topology: &ModelTopology, kv_cache: &crate::kv_cache::KvCachePlan) -> Result<Self> {
         if kv_cache.max_context == 0 {
@@ -853,6 +945,7 @@ impl GpuForwardBuffers {
             hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
             residual: CudaDeviceBuffer::alloc(hidden_bytes)?,
             normed: CudaDeviceBuffer::alloc(hidden_bytes)?,
+            prenorm_hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
             block_out: CudaDeviceBuffer::alloc(hidden_bytes)?,
             qkv: CudaDeviceBuffer::alloc(wide_bytes)?,
             aux: CudaDeviceBuffer::alloc(wide_bytes)?,
@@ -866,9 +959,9 @@ impl GpuForwardBuffers {
             token_u32: CudaDeviceBuffer::alloc(4)?,
             position_i32: CudaDeviceBuffer::alloc(4)?,
             logits: CudaDeviceBuffer::alloc(topology.vocab_size * 2)?,
-            mtp_logits: CudaDeviceBuffer::alloc(topology.vocab_size * 9 * 2)?,
+            mtp_logits: CudaDeviceBuffer::alloc(topology.vocab_size * 5 * 2)?,
             sampled_token_u32: CudaDeviceBuffer::alloc(4)?,
-            mtp_verify_token_u32: CudaDeviceBuffer::alloc(96)?,
+            mtp_verify_token_u32: CudaDeviceBuffer::alloc(64)?,
             leaf_tokens_u32: CudaDeviceBuffer::alloc(MTP_TREE_MAX_LEAVES * 4)?,
             tree_ancestor_bitmap_u64: CudaDeviceBuffer::alloc(
                 MtpKvSnapshotLayout::VERIFY_TOKENS * 8,
@@ -910,6 +1003,7 @@ impl GpuForwardBuffers {
             self.hidden.bytes(),
             self.residual.bytes(),
             self.normed.bytes(),
+            self.prenorm_hidden.bytes(),
             self.block_out.bytes(),
             self.qkv.bytes(),
             self.aux.bytes(),
@@ -960,17 +1054,23 @@ impl GpuPrefillBuffers {
     ) -> Result<Self> {
         let capacity = capacity.max(1);
         let hidden_bytes = capacity * topology.hidden_size * 2;
-        let mut wide_bf16_values = topology
+        let wide_bf16_values = topology
             .intermediate_size
             .max(topology.hidden_size)
             .max(topology.linear_attention_qkv_dim())
             .max(topology.linear_attention_value_dim())
             .max(topology.full_attention_q_dim_with_gate())
             .max(topology.full_attention_q_dim());
-        if fused_mlp_prefill {
-            wide_bf16_values = wide_bf16_values.max(2 * topology.intermediate_size);
-        }
+        // Only block_out receives the fused-MLP combined GEMM output
+        // [tokens, 2*intermediate]; the other wide buffers keep the unfused
+        // width (sizing all five to 2I would cost ~4 x capacity*I*2 extra).
+        let block_out_values = if fused_mlp_prefill {
+            wide_bf16_values.max(2 * topology.intermediate_size)
+        } else {
+            wide_bf16_values
+        };
         let wide_bytes = capacity * wide_bf16_values * 2;
+        let block_out_bytes = capacity * block_out_values * 2;
         let activation_fp4_bytes = capacity * wide_bf16_values.div_ceil(2);
         let activation_scale_bytes = vec16_scale_bytes(wide_bf16_values, capacity);
         let linear_heads = topology.linear_num_value_heads;
@@ -979,7 +1079,8 @@ impl GpuPrefillBuffers {
             hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
             residual: CudaDeviceBuffer::alloc(hidden_bytes)?,
             normed: CudaDeviceBuffer::alloc(hidden_bytes)?,
-            block_out: CudaDeviceBuffer::alloc(wide_bytes)?,
+            prenorm_hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
+            block_out: CudaDeviceBuffer::alloc(block_out_bytes)?,
             qkv: CudaDeviceBuffer::alloc(wide_bytes)?,
             aux: CudaDeviceBuffer::alloc(wide_bytes)?,
             aux2: CudaDeviceBuffer::alloc(wide_bytes)?,
@@ -999,6 +1100,7 @@ impl GpuPrefillBuffers {
             self.hidden.bytes(),
             self.residual.bytes(),
             self.normed.bytes(),
+            self.prenorm_hidden.bytes(),
             self.block_out.bytes(),
             self.qkv.bytes(),
             self.aux.bytes(),

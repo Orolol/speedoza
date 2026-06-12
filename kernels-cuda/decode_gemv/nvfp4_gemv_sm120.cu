@@ -63,6 +63,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <cstdlib>
 
 // We deliberately AVOID including <cutlass/...> or <cute/...> here even
 // though that header defines the MMA atom we want. Pulling cute into a
@@ -119,6 +120,78 @@ nvfp4_gemv_mma_kernel_tpl<8>(const uint8_t *, const uint8_t *, const uint8_t *,
                              const uint8_t *, float, __nv_bfloat16 *, size_t,
                              size_t);
 
+// Multi-N chunk wrapper (2 <= n <= 8): real activation columns in the
+// atom's N dimension. M-tiled: each CTA owns `m_tiles_per_cta` consecutive
+// m16 tiles and loops over them with B staged once (the B re-staging is
+// n/16 of the weight bytes at T=1 — +31% at n=5 — divided by T). The body
+// and the smem helper live in nvfp4_gemv_mma_kernel.cuh.
+template <int kWarpsPerBlockTpl>
+__global__ void __launch_bounds__(kWarpsPerBlockTpl * 32)
+nvfp4_gemm_chunk_kernel_tpl(const uint8_t *__restrict__ a_fp4,
+                            const uint8_t *__restrict__ a_scale,
+                            const uint8_t *__restrict__ b_fp4,
+                            const uint8_t *__restrict__ b_scale, float alpha,
+                            __nv_bfloat16 *__restrict__ output, size_t M,
+                            size_t K, unsigned n, unsigned m_tiles_per_cta) {
+  const unsigned num_tiles =
+      static_cast<unsigned>((M + qwen36_gemv::kRowsPerBlock - 1) /
+                            qwen36_gemv::kRowsPerBlock);
+  const unsigned first = blockIdx.x * m_tiles_per_cta;
+  if (first >= num_tiles) {
+    return;
+  }
+  const unsigned remaining = num_tiles - first;
+  const unsigned count =
+      remaining < m_tiles_per_cta ? remaining : m_tiles_per_cta;
+  qwen36_gemv::nvfp4_gemm_chunk_body<kWarpsPerBlockTpl>(
+      first, count, a_fp4, a_scale, b_fp4, b_scale, alpha, output, M, K, n);
+}
+
+template __global__ void
+nvfp4_gemm_chunk_kernel_tpl<16>(const uint8_t *, const uint8_t *,
+                                const uint8_t *, const uint8_t *, float,
+                                __nv_bfloat16 *, size_t, size_t, unsigned,
+                                unsigned);
+template __global__ void
+nvfp4_gemm_chunk_kernel_tpl<8>(const uint8_t *, const uint8_t *,
+                               const uint8_t *, const uint8_t *, float,
+                               __nv_bfloat16 *, size_t, size_t, unsigned,
+                               unsigned);
+
+// M-tiles per CTA for the chunk path. Default 1: the T-sweep on the real
+// model (2026-06-12, MTP=4 ctx=128, bit-identical outputs across T) measured
+// MONOTONE degradation — T1 36.8 tok/s > T4 35.3 > T8 35.1 > shape-adaptive
+// 6/3/1 34.4. Mechanism: each sub-tile pays two serial CTA-wide barriers +
+// a cp.async prologue (~5-8 us) that at T=1 ran concurrently in independent
+// CTAs, while resident warps/SM (and thus memory-level parallelism) don't
+// change with T — so the B re-staging bytes saved (n/16 of weight bytes / T)
+// were not the binding resource. Override for re-exploration:
+// QWEN36_CHUNK_GEMV_MTILE (read once per process; the test hook below lets
+// smoke sweep T without re-exec).
+static int g_chunk_mtile_override = -2;  // -2 = env unread, -1 = default
+
+extern "C" void qwen36_nvfp4_chunk_gemv_set_mtile(int mtile) {
+  g_chunk_mtile_override = mtile >= 1 ? mtile : -2;
+}
+
+static unsigned chunk_gemv_pick_mtile(size_t num_tiles) {
+  if (g_chunk_mtile_override == -2) {
+    int v = -1;
+    if (const char *e = getenv("QWEN36_CHUNK_GEMV_MTILE")) {
+      const int parsed = atoi(e);
+      if (parsed >= 1 && parsed <= 64) {
+        v = parsed;
+      }
+    }
+    g_chunk_mtile_override = v;
+  }
+  if (g_chunk_mtile_override >= 1) {
+    return static_cast<unsigned>(g_chunk_mtile_override);
+  }
+  (void)num_tiles;
+  return 1u;
+}
+
 namespace {
 
 template <typename T> T *as_device_ptr(qwen36_device_ptr_t p) {
@@ -149,7 +222,7 @@ extern "C" int qwen36_decode_nvfp4_gemv(
   constexpr size_t kAlign16 = 16u * static_cast<size_t>(kKPerMma);  // 1024
   constexpr size_t kAlign8 = 8u * static_cast<size_t>(kKPerMma);    // 512
 
-  if (spec->n != 1 || (spec->m % 16) != 0) {
+  if (spec->n < 1 || spec->n > 8 || (spec->m % 16) != 0) {
     return QWEN36_STATUS_NOT_IMPLEMENTED;
   }
 
@@ -166,6 +239,61 @@ extern "C" int qwen36_decode_nvfp4_gemv(
   const size_t K = spec->k;
   const dim3 grid(static_cast<unsigned>(gemv_div_ceil(M, kRowsPerBlock)), 1, 1);
   cudaStream_t stream = qwen36_internal_active_stream();
+
+  if (spec->n > 1) {
+    // Chunk path (MTP verify, n = drafts+1). SMEM holds n padded activation
+    // columns + the A tiles + the widened reduction; refuse shapes that
+    // would exceed the sm_120a 99 KB cap so cuBLASLt picks them up.
+    constexpr size_t kSmemCap = 99 * 1024;
+    const unsigned n = static_cast<unsigned>(spec->n);
+    const size_t smem_bytes =
+        chosen_warps == 16
+            ? qwen36_gemv::nvfp4_gemm_chunk_smem_bytes<16>(K, n)
+            : qwen36_gemv::nvfp4_gemm_chunk_smem_bytes<8>(K, n);
+    if (smem_bytes > kSmemCap) {
+      return QWEN36_STATUS_NOT_IMPLEMENTED;
+    }
+    const size_t num_tiles = gemv_div_ceil(M, kRowsPerBlock);
+    const unsigned mtile = chunk_gemv_pick_mtile(num_tiles);
+    const dim3 grid_chunk(
+        static_cast<unsigned>(gemv_div_ceil(num_tiles, mtile)), 1, 1);
+    if (chosen_warps == 16) {
+      static bool attr_set_16 = false;
+      if (!attr_set_16) {
+        cudaFuncSetAttribute(nvfp4_gemm_chunk_kernel_tpl<16>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(kSmemCap));
+        attr_set_16 = true;
+      }
+      const dim3 block(16u * 32u, 1, 1);
+      nvfp4_gemm_chunk_kernel_tpl<16>
+          <<<grid_chunk, block, smem_bytes, stream>>>(
+              as_device_ptr<const uint8_t>(spec->a_fp4),
+              as_device_ptr<const uint8_t>(spec->a_scale),
+              as_device_ptr<const uint8_t>(spec->b_fp4),
+              as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
+              as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K, n, mtile);
+    } else {
+      static bool attr_set_8 = false;
+      if (!attr_set_8) {
+        cudaFuncSetAttribute(nvfp4_gemm_chunk_kernel_tpl<8>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(kSmemCap));
+        attr_set_8 = true;
+      }
+      const dim3 block(8u * 32u, 1, 1);
+      nvfp4_gemm_chunk_kernel_tpl<8>
+          <<<grid_chunk, block, smem_bytes, stream>>>(
+              as_device_ptr<const uint8_t>(spec->a_fp4),
+              as_device_ptr<const uint8_t>(spec->a_scale),
+              as_device_ptr<const uint8_t>(spec->b_fp4),
+              as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
+              as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K, n, mtile);
+    }
+    cudaError_t err = cudaGetLastError();
+    return err == cudaSuccess ? QWEN36_STATUS_SUCCESS
+                              : QWEN36_STATUS_CUDA_ERROR;
+  }
 
   // Smem footprint lives in the shared body helper so standalone and
   // interpreter call sites stay ABI-equivalent.

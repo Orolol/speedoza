@@ -57,20 +57,29 @@ impl TargetHiddenCapture {
     /// derived as `target_layer_id + 1` to match the transformers
     /// `hidden_states[layer_id + 1]` index.
     pub fn alloc(config: &DFlashConfig, max_tokens: usize) -> Result<Self> {
+        Self::alloc_for_layers(
+            config.hidden_size,
+            &config.dflash_config.target_layer_ids,
+            max_tokens,
+        )
+    }
+
+    pub fn alloc_for_layers(
+        hidden_size: usize,
+        target_layer_ids: &[usize],
+        max_tokens: usize,
+    ) -> Result<Self> {
         if max_tokens == 0 {
             bail!("max_tokens must be > 0");
         }
-        let hidden_size = config.hidden_size;
-        let n_target_layers = config.dflash_config.target_layer_ids.len();
+        let n_target_layers = target_layer_ids.len();
         if n_target_layers == 0 {
-            bail!("dflash_config.target_layer_ids is empty");
+            bail!("target_layer_ids is empty");
         }
         let row_bytes = hidden_size * n_target_layers * BF16_BYTES;
         let buffer = CudaDeviceBuffer::alloc(max_tokens * row_bytes)
             .map_err(|e| anyhow!("alloc target_hidden_raw: {e}"))?;
-        let slots = config
-            .dflash_config
-            .target_layer_ids
+        let slots = target_layer_ids
             .iter()
             .enumerate()
             .map(|(target_slot, &layer_id)| TargetHiddenCaptureSlot {

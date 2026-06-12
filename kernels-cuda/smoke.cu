@@ -123,6 +123,304 @@ void expect_close(float actual, float expected, float tolerance,
 } // namespace
 
 int main() {
+  {
+    constexpr size_t rows = 2;
+    constexpr size_t hidden = 4;
+    constexpr size_t vocab = 6;
+    qwen36_device_ptr_t argmax_input =
+        dev_alloc<__nv_bfloat16>(rows * hidden);
+    qwen36_device_ptr_t argmax_weight =
+        dev_alloc<__nv_bfloat16>(vocab * hidden);
+    qwen36_device_ptr_t argmax_output = dev_alloc<uint32_t>(rows);
+    qwen36_device_ptr_t argmax_mirror = dev_alloc<uint32_t>(1);
+    qwen36_device_ptr_t argmax_workspace = dev_alloc<uint64_t>(rows);
+    copy_bf16(argmax_input, {
+                                1.0f, 0.0f, 0.0f, 0.0f,
+                                0.0f, 1.0f, 0.0f, 0.0f,
+                            });
+    copy_bf16(argmax_weight, {
+                                 0.0f, 0.0f, 0.0f, 0.0f,
+                                 1.0f, 5.0f, 0.0f, 0.0f,
+                                 2.0f, 4.0f, 0.0f, 0.0f,
+                                 3.0f, 3.0f, 0.0f, 0.0f,
+                                 1.0f, 5.0f, 0.0f, 0.0f,
+                                 -1.0f, -1.0f, 0.0f, 0.0f,
+                             });
+    qwen36_bf16_matvec_argmax_rows_spec_t argmax_spec{};
+    argmax_spec.rows = rows;
+    argmax_spec.out_features = vocab;
+    argmax_spec.in_features = hidden;
+    argmax_spec.input_bf16 = argmax_input;
+    argmax_spec.weight_bf16 = argmax_weight;
+    argmax_spec.output_token_u32 = argmax_output;
+    argmax_spec.mirror_last_output_token_u32 = argmax_mirror;
+    argmax_spec.workspace = argmax_workspace;
+    argmax_spec.workspace_bytes = rows * sizeof(uint64_t);
+    must_status(qwen36_bf16_matvec_argmax_rows(&argmax_spec),
+                "bf16 matvec argmax rows");
+    std::vector<uint32_t> argmax_values = read_raw<uint32_t>(argmax_output, rows);
+    uint32_t mirror_value = read_one<uint32_t>(argmax_mirror);
+    if (argmax_values[0] != 3 || argmax_values[1] != 1 ||
+        mirror_value != 1) {
+      fprintf(stderr,
+              "bf16 matvec argmax rows expected [3, 1] mirror=1 got [%u, %u] mirror=%u\n",
+              argmax_values[0], argmax_values[1], mirror_value);
+      exit(1);
+    }
+
+    // Predicated rescore (two-stage lm_head argmax stage 2): a non-zero
+    // skip flag must leave the row's token AND the mirror untouched.
+    qwen36_device_ptr_t skip_flags = dev_alloc<uint32_t>(rows);
+    copy_raw<uint32_t>(skip_flags, {1u, 0u});
+    copy_raw<uint32_t>(argmax_output, {77u, 77u});
+    copy_raw<uint32_t>(argmax_mirror, {55u});
+    argmax_spec.skip_flags_u32 = skip_flags;
+    must_status(qwen36_bf16_matvec_argmax_rows(&argmax_spec),
+                "bf16 matvec argmax rows predicated");
+    argmax_values = read_raw<uint32_t>(argmax_output, rows);
+    mirror_value = read_one<uint32_t>(argmax_mirror);
+    if (argmax_values[0] != 77 || argmax_values[1] != 1 || mirror_value != 1) {
+      fprintf(stderr,
+              "predicated argmax rows expected [77 (skipped), 1] mirror=1 "
+              "got [%u, %u] mirror=%u\n",
+              argmax_values[0], argmax_values[1], mirror_value);
+      exit(1);
+    }
+    copy_raw<uint32_t>(skip_flags, {1u, 1u});
+    copy_raw<uint32_t>(argmax_mirror, {55u});
+    must_status(qwen36_bf16_matvec_argmax_rows(&argmax_spec),
+                "bf16 matvec argmax rows all-skipped");
+    mirror_value = read_one<uint32_t>(argmax_mirror);
+    if (mirror_value != 55) {
+      fprintf(stderr,
+              "all-skipped argmax rows must not touch mirror, got %u\n",
+              mirror_value);
+      exit(1);
+    }
+  }
+
+  {
+    // Two-stage lm_head argmax stage 1: grid-wide top-2 + margin guard on
+    // a realistic vocab with planted leaders. Row 0 margin 2.0, row 1
+    // margin 0.25 — eps 1.0 certifies row 0 only; eps 0.1 certifies both.
+    constexpr size_t rows = 2;
+    constexpr size_t vocab = 250000;
+    std::vector<float> logits_host(rows * vocab);
+    for (size_t r = 0; r < rows; ++r) {
+      for (size_t i = 0; i < vocab; ++i) {
+        logits_host[r * vocab + i] =
+            -2.0f + static_cast<float>((r * 911 + i * 37) % 997) / 1000.0f;
+      }
+    }
+    logits_host[0 * vocab + 123456] = 7.0f;
+    logits_host[0 * vocab + 7] = 5.0f;
+    logits_host[1 * vocab + 99] = 3.25f;
+    logits_host[1 * vocab + (vocab - 1)] = 3.0f;
+    qwen36_device_ptr_t top2_logits = dev_alloc<__nv_bfloat16>(rows * vocab);
+    copy_bf16(top2_logits, logits_host);
+    qwen36_device_ptr_t top2_tokens = dev_alloc<uint32_t>(rows);
+    qwen36_device_ptr_t top2_flags = dev_alloc<uint32_t>(rows);
+    qwen36_device_ptr_t top2_mirror = dev_alloc<uint32_t>(1);
+    qwen36_device_ptr_t top2_fallbacks = dev_alloc<uint32_t>(1);
+    copy_raw<uint32_t>(top2_fallbacks, {0u});
+    qwen36_device_ptr_t top2_ws = dev_alloc<uint8_t>(rows * 240 * 16);
+    qwen36_lm_head_top2_margin_spec_t top2_spec{};
+    top2_spec.rows = rows;
+    top2_spec.vocab = vocab;
+    top2_spec.eps = 1.0f;
+    top2_spec.logits_bf16 = top2_logits;
+    top2_spec.tokens_u32 = top2_tokens;
+    top2_spec.flags_u32 = top2_flags;
+    top2_spec.mirror_last_token_u32 = top2_mirror;
+    top2_spec.fallback_count_u32 = top2_fallbacks;
+    top2_spec.workspace = top2_ws;
+    top2_spec.workspace_bytes = rows * 240 * 16;
+    must_status(qwen36_lm_head_top2_margin(&top2_spec), "lm_head top2 margin");
+    std::vector<uint32_t> t = read_raw<uint32_t>(top2_tokens, rows);
+    std::vector<uint32_t> f = read_raw<uint32_t>(top2_flags, rows);
+    uint32_t m = read_one<uint32_t>(top2_mirror);
+    uint32_t fb = read_one<uint32_t>(top2_fallbacks);
+    if (t[0] != 123456 || t[1] != 99 || f[0] != 1 || f[1] != 0 || m != 99 ||
+        fb != 1) {
+      fprintf(stderr,
+              "top2 margin eps=1.0 expected tokens [123456, 99] flags [1, 0] "
+              "mirror=99 fallbacks=1, got [%u, %u] [%u, %u] mirror=%u fb=%u\n",
+              t[0], t[1], f[0], f[1], m, fb);
+      exit(1);
+    }
+    top2_spec.eps = 0.1f;
+    must_status(qwen36_lm_head_top2_margin(&top2_spec),
+                "lm_head top2 margin eps=0.1");
+    f = read_raw<uint32_t>(top2_flags, rows);
+    fb = read_one<uint32_t>(top2_fallbacks);
+    if (f[0] != 1 || f[1] != 1 || fb != 1) {
+      fprintf(stderr,
+              "top2 margin eps=0.1 expected flags [1, 1] fallbacks still 1, "
+              "got [%u, %u] fb=%u\n",
+              f[0], f[1], fb);
+      exit(1);
+    }
+    printf("lm_head two-stage argmax gates passed (top2+margin, predicated "
+           "rescore)\n");
+  }
+
+  {
+    // lm_head FP8 GEMV batched-vs-single parity: column j of the n=5 launch
+    // must equal the n=1 launch on input j. The per-row K-walk is identical
+    // across the N template (only the row blocking changes), so the outputs
+    // must match BIT-EXACTLY — any drift means an indexing bug in the
+    // multi-N row-blocking path (which until now had no gate).
+    constexpr size_t rows = 4096; // mock vocab
+    constexpr size_t cols = 1024;
+    constexpr size_t n = 5;
+    std::vector<float> w_host(rows * cols);
+    for (size_t i = 0; i < w_host.size(); ++i) {
+      w_host[i] = 0.02f * static_cast<float>((i * 131 + 17) % 251) - 2.5f;
+    }
+    std::vector<float> x_host(n * cols);
+    for (size_t i = 0; i < x_host.size(); ++i) {
+      x_host[i] = 0.01f * static_cast<float>((i * 73 + 5) % 199) - 1.0f;
+    }
+    qwen36_device_ptr_t w_bf16 = dev_alloc<__nv_bfloat16>(rows * cols);
+    copy_bf16(w_bf16, w_host);
+    qwen36_device_ptr_t w_e4m3 = dev_alloc<uint8_t>(rows * cols);
+    qwen36_device_ptr_t w_scales = dev_alloc<float>(rows);
+    qwen36_lm_head_fp8_quantize_spec_t q{};
+    q.rows = rows;
+    q.cols = cols;
+    q.weight_bf16 = w_bf16;
+    q.weight_e4m3 = w_e4m3;
+    q.row_scales_f32 = w_scales;
+    must_status(qwen36_lm_head_fp8_quantize(&q), "lm_head fp8 quantize");
+
+    qwen36_device_ptr_t x_dev = dev_alloc<__nv_bfloat16>(n * cols);
+    copy_bf16(x_dev, x_host);
+    qwen36_device_ptr_t y_batch = dev_alloc<__nv_bfloat16>(n * rows);
+    qwen36_device_ptr_t y_single = dev_alloc<__nv_bfloat16>(rows);
+    qwen36_lm_head_fp8_gemv_spec_t g{};
+    g.rows = rows;
+    g.cols = cols;
+    g.n = n;
+    g.weight_e4m3 = w_e4m3;
+    g.row_scales_f32 = w_scales;
+    g.input_bf16 = x_dev;
+    g.output_bf16 = y_batch;
+    must_status(qwen36_lm_head_fp8_gemv(&g), "lm_head fp8 gemv n=5");
+    std::vector<float> yb = read_bf16(y_batch, n * rows);
+    for (size_t j = 0; j < n; ++j) {
+      qwen36_lm_head_fp8_gemv_spec_t g1 = g;
+      g1.n = 1;
+      g1.input_bf16.ptr = x_dev.ptr + j * cols * 2;
+      g1.output_bf16 = y_single;
+      must_status(qwen36_lm_head_fp8_gemv(&g1), "lm_head fp8 gemv n=1");
+      std::vector<float> ys = read_bf16(y_single, rows);
+      for (size_t r = 0; r < rows; ++r) {
+        // Output layout: [n, rows] row-major per the spec comment.
+        const float batched = yb[j * rows + r];
+        if (batched != ys[r]) {
+          fprintf(stderr,
+                  "lm_head fp8 gemv n=5 vs n=1 mismatch at input %zu row %zu: "
+                  "batch=%f single=%f\n",
+                  j, r, batched, ys[r]);
+          exit(1);
+        }
+      }
+    }
+    printf("lm_head fp8 gemv batched-vs-single parity gate passed (n=5)\n");
+
+    // v2 stage-1 (top-8 rescore) end-to-end on the same synthetic store:
+    // FP8 logits -> candidate selection -> FP64 rescore vs the BF16
+    // weight. Ground truth: host FP64 argmax of the bf16-rounded dot.
+    // Inputs are 0.9x copies of distinct weight rows, so each row's true
+    // winner is unambiguous and the guard should certify every row.
+    {
+      // The base weight pattern is periodic mod 251 -> rows repeat every
+      // 251 rows (exact duplicates => exact top ties => the guard
+      // rightfully refuses to certify). Overwrite the planted rows with
+      // unique high-energy patterns so each input has one unambiguous
+      // winner, then re-quantize the mutated store.
+      std::vector<float> xs_host(n * cols);
+      std::vector<size_t> planted(n);
+      for (size_t j = 0; j < n; ++j) {
+        planted[j] = 37 + j * 911;
+        for (size_t c = 0; c < cols; ++c) {
+          const float v =
+              2.5f - 0.3f * static_cast<float>((c * 7 + j * 13 + 3) % 17);
+          w_host[planted[j] * cols + c] = v;
+          xs_host[j * cols + c] =
+              0.9f * __bfloat162float(__float2bfloat16(v));
+        }
+      }
+      copy_bf16(w_bf16, w_host);
+      must_status(qwen36_lm_head_fp8_quantize(&q), "lm_head fp8 requantize");
+      copy_bf16(x_dev, xs_host);
+      must_status(qwen36_lm_head_fp8_gemv(&g), "lm_head fp8 gemv for top8");
+
+      qwen36_device_ptr_t t8_tokens = dev_alloc<uint32_t>(n);
+      qwen36_device_ptr_t t8_flags = dev_alloc<uint32_t>(n);
+      qwen36_device_ptr_t t8_fb = dev_alloc<uint32_t>(1);
+      copy_raw<uint32_t>(t8_fb, {0u});
+      qwen36_device_ptr_t t8_ws = dev_alloc<uint8_t>(n * 240 * 16);
+      qwen36_lm_head_top8_rescore_spec_t t8{};
+      t8.rows = n;
+      t8.vocab = rows;
+      t8.cols = cols;
+      t8.eps = 0.5f;
+      t8.logits_bf16 = y_batch;
+      t8.weight_bf16 = w_bf16;
+      t8.input_bf16 = x_dev;
+      t8.tokens_u32 = t8_tokens;
+      t8.flags_u32 = t8_flags;
+      t8.mirror_last_token_u32 = qwen36_device_ptr_t{0};
+      t8.fallback_count_u32 = t8_fb;
+      t8.workspace = t8_ws;
+      t8.workspace_bytes = n * 240 * 16;
+      must_status(qwen36_lm_head_top8_rescore(&t8), "lm_head top8 rescore");
+
+      std::vector<uint32_t> tok = read_raw<uint32_t>(t8_tokens, n);
+      std::vector<uint32_t> flg = read_raw<uint32_t>(t8_flags, n);
+      size_t certified = 0;
+      for (size_t j = 0; j < n; ++j) {
+        // Host FP64 argmax over bf16-rounded weight x bf16-rounded input.
+        double best = -1e300;
+        size_t best_r = 0;
+        for (size_t r = 0; r < rows; ++r) {
+          double s = 0.0;
+          for (size_t c = 0; c < cols; ++c) {
+            s += static_cast<double>(__bfloat162float(
+                     __float2bfloat16(w_host[r * cols + c]))) *
+                 static_cast<double>(__bfloat162float(
+                     __float2bfloat16(xs_host[j * cols + c])));
+          }
+          if (s > best) {
+            best = s;
+            best_r = r;
+          }
+        }
+        if (flg[j]) {
+          certified++;
+          if (tok[j] != best_r) {
+            fprintf(stderr,
+                    "top8 rescore row %zu: certified token %u != host argmax "
+                    "%zu (planted %zu)\n",
+                    j, tok[j], best_r, planted[j]);
+            exit(1);
+          }
+        }
+      }
+      if (certified < n - 1) {
+        fprintf(stderr,
+                "top8 rescore certified only %zu/%zu rows on well-separated "
+                "synthetic data\n",
+                certified, n);
+        exit(1);
+      }
+      printf("lm_head top8 rescore gate passed (%zu/%zu certified, host-FP64 "
+             "argmax parity)\n",
+             certified, n);
+    }
+  }
+
   qwen36_device_ptr_t interpreter_instructions =
       dev_alloc<qwen36_interpreter_instruction_t>(3);
   qwen36_device_ptr_t interpreter_counters = dev_alloc<int32_t>(4);
@@ -1794,6 +2092,109 @@ int main() {
             gemv_b1_code);
     return 1;
   }
+
+  // --- Chunk GEMM (multi-N gemv) parity vs cuBLASLt -----------------------
+  // The MTP verify chunk shape: n activation rows through the same FP4
+  // weights. Quantize n=5 distinct rows, run both paths on identical
+  // quantized inputs, compare all n*M outputs (FP32 accumulation order
+  // differs, so tolerance-based).
+  for (const size_t chunk_k : {size_t(1024), size_t(512)}) {
+    const size_t chunk_m = 64;
+    const size_t chunk_n = 5;
+    qwen36_device_ptr_t ck_act = dev_alloc<__nv_bfloat16>(chunk_n * chunk_k);
+    qwen36_device_ptr_t ck_b_fp4 = dev_alloc<uint8_t>(chunk_n * chunk_k / 2);
+    qwen36_device_ptr_t ck_b_scale =
+        dev_alloc<uint8_t>(((chunk_k / 16 + 3) / 4) * 4 * 128 * 4 + 4096);
+    qwen36_device_ptr_t ck_b_global = dev_alloc<float>(1);
+    std::vector<float> ck_act_host(chunk_n * chunk_k);
+    for (size_t r = 0; r < chunk_n; ++r) {
+      for (size_t k = 0; k < chunk_k; ++k) {
+        ck_act_host[r * chunk_k + k] =
+            0.25f * static_cast<float>((r * 37 + k * 13) % 17) -
+            2.0f + 0.5f * static_cast<float>(r);
+      }
+    }
+    copy_bf16(ck_act, ck_act_host);
+    qwen36_nvfp4_quantize_rows_spec_t ck_q{};
+    ck_q.rows = chunk_n;
+    ck_q.values = chunk_k;
+    ck_q.input_bf16 = ck_act;
+    ck_q.output_fp4 = ck_b_fp4;
+    ck_q.output_scale_e4m3 = ck_b_scale;
+    ck_q.output_tensor_scale_f32 = ck_b_global;
+    ck_q.input_tensor_scale_f32 = 1.0f;
+    must_status(qwen36_nvfp4_quantize_rows(&ck_q), "chunk gemv quantize rows");
+
+    qwen36_device_ptr_t ck_w = dev_alloc<uint8_t>(chunk_m * chunk_k / 2);
+    qwen36_device_ptr_t ck_w_scale = dev_alloc<uint8_t>(chunk_m * chunk_k / 16 + 4096);
+    std::vector<uint8_t> ck_w_host(chunk_m * chunk_k / 2);
+    for (size_t i = 0; i < ck_w_host.size(); ++i) {
+      ck_w_host[i] = static_cast<uint8_t>((i * 73 + 11) % 251);
+    }
+    copy_raw<uint8_t>(ck_w, ck_w_host);
+    std::vector<uint8_t> ck_ws_host(chunk_m * chunk_k / 16 + 4096, 0x38);
+    copy_raw<uint8_t>(ck_w_scale, ck_ws_host);
+
+    qwen36_device_ptr_t ck_out_ref = dev_alloc<__nv_bfloat16>(chunk_n * chunk_m);
+    qwen36_device_ptr_t ck_out_gemv = dev_alloc<__nv_bfloat16>(chunk_n * chunk_m);
+    qwen36_device_ptr_t ck_ws = dev_alloc<uint8_t>(4 * 1024 * 1024);
+    qwen36_nvfp4_gemm_spec_t ck_spec{};
+    ck_spec.m = chunk_m;
+    ck_spec.n = chunk_n;
+    ck_spec.k = chunk_k;
+    ck_spec.a_fp4 = ck_w;
+    ck_spec.a_scale = ck_w_scale;
+    ck_spec.b_fp4 = ck_b_fp4;
+    ck_spec.b_scale = ck_b_scale;
+    ck_spec.b_scale_2 = ck_b_global;
+    ck_spec.c_bf16 = ck_out_ref;
+    ck_spec.workspace = ck_ws;
+    ck_spec.workspace_bytes = 4 * 1024 * 1024;
+    ck_spec.alpha = 1.0f;
+    must_status(qwen36_nvfp4_gemm(&ck_spec), "chunk gemm cublaslt ref");
+
+    // Sweep the M-tiling factor on the same shape: chunk_m=64 is 4 m16
+    // tiles, so T∈{1,2,3,4} covers the full loop, a partial last CTA
+    // (T=3 → CTAs of 3 and 1 tiles) and the single-CTA case (T=4).
+    std::vector<float> ck_ref = read_bf16(ck_out_ref, chunk_n * chunk_m);
+    for (const int mtile : {1, 2, 3, 4}) {
+      qwen36_nvfp4_chunk_gemv_set_mtile(mtile);
+      const std::vector<float> ck_zero(chunk_n * chunk_m, 0.0f);
+      copy_bf16(ck_out_gemv, ck_zero);
+      ck_spec.c_bf16 = ck_out_gemv;
+      must_status(qwen36_decode_nvfp4_gemv(&ck_spec), "chunk gemv multi-n");
+
+      std::vector<float> ck_got = read_bf16(ck_out_gemv, chunk_n * chunk_m);
+      double dot = 0, nr = 0, ng = 0;
+      float max_abs = 0;
+      for (size_t i = 0; i < ck_ref.size(); ++i) {
+        dot += (double)ck_ref[i] * ck_got[i];
+        nr += (double)ck_ref[i] * ck_ref[i];
+        ng += (double)ck_got[i] * ck_got[i];
+        max_abs = fmaxf(max_abs, fabsf(ck_ref[i] - ck_got[i]));
+      }
+      const double cos = dot / (sqrt(nr) * sqrt(ng) + 1e-12);
+      if (cos < 0.9999 || max_abs > 0.75f) {
+        fprintf(stderr,
+                "chunk gemv n=5 K=%zu mtile=%d parity failed: cos=%.6f "
+                "max_abs=%.4f\n",
+                chunk_k, mtile, cos, max_abs);
+        for (size_t m = 0; m < 2; ++m) {
+          fprintf(stderr, "  m=%zu ref:", m);
+          for (size_t c = 0; c < chunk_n; ++c)
+            fprintf(stderr, " %8.2f", ck_ref[c * chunk_m + m]);
+          fprintf(stderr, "\n  m=%zu got:", m);
+          for (size_t c = 0; c < chunk_n; ++c)
+            fprintf(stderr, " %8.2f", ck_got[c * chunk_m + m]);
+          fprintf(stderr, "\n");
+        }
+        exit(1);
+      }
+    }
+    qwen36_nvfp4_chunk_gemv_set_mtile(0);
+  }
+  printf("chunk gemv multi-n parity gate passed (n=5, K {1024, 512}, "
+         "mtile {1,2,3,4}, vs cuBLASLt)\n");
 
   const size_t interp_gemv_m = 16;
   const size_t interp_gemv_k = 1024;
@@ -3578,128 +3979,6 @@ int main() {
     printf("decode tiled attention parity gate passed (%d cases, BF16+FP8, "
            "pos{255,2047,8191,24575}, append byte-identical)\n",
            cases);
-  }
-
-  // ------------------------------------------------------------------
-  // FP8 lm_head gate: quantize_rows + fp8_matvec vs host reference.
-  // ------------------------------------------------------------------
-  // The FP8 path replaces the BF16 lm_head everywhere (decode logits,
-  // prefill logits, MTP verify rows). Host reference replicates the
-  // quantization exactly (e4m3 RNE via float->fp8->float round trip is
-  // checked against the GPU decode), then the matvec must match it within
-  // accumulation noise AND preserve the argmax of a peaked test vector.
-  {
-    const size_t M = 4096, K = 1024;
-    const int rows = 3;
-    std::mt19937 rng(737373);
-    std::uniform_real_distribution<float> dist(-0.4f, 0.4f);
-    std::vector<float> w_host(M * K), x_host(rows * K);
-    for (auto &v : w_host) v = dist(rng);
-    for (auto &v : x_host) v = dist(rng);
-    // Make row 1234 strongly aligned with input row 0 so the argmax is
-    // unambiguous and must survive quantization.
-    for (size_t k = 0; k < K; ++k) {
-      w_host[1234 * K + k] = 0.4f * (x_host[k] >= 0.0f ? 1.0f : -1.0f);
-    }
-
-    qwen36_device_ptr_t w_dev = dev_alloc<__nv_bfloat16>(M * K);
-    copy_bf16(w_dev, w_host);
-    // Re-read what BF16 actually stored (the host reference must quantize
-    // the BF16-rounded values, not the f32 originals).
-    std::vector<float> w_bf16 = read_bf16(w_dev, M * K);
-
-    qwen36_device_ptr_t w_e4m3 = dev_alloc<uint8_t>(M * K);
-    qwen36_device_ptr_t scales = dev_alloc<float>(M);
-    qwen36_fp8_quantize_rows_spec_t qspec{};
-    qspec.out_features = M;
-    qspec.in_features = K;
-    qspec.weight_bf16 = w_dev;
-    qspec.weight_e4m3 = w_e4m3;
-    qspec.row_scale_f32 = scales;
-    must_status(qwen36_fp8_quantize_rows(&qspec), "fp8 quantize_rows");
-
-    qwen36_device_ptr_t x_dev = dev_alloc<__nv_bfloat16>(rows * K);
-    copy_bf16(x_dev, x_host);
-    std::vector<float> x_bf16 = read_bf16(x_dev, rows * K);
-    qwen36_device_ptr_t y_dev = dev_alloc<__nv_bfloat16>(rows * M);
-    qwen36_fp8_matvec_spec_t mspec{};
-    mspec.out_features = M;
-    mspec.in_features = K;
-    mspec.rows = rows;
-    mspec.input_stride = K;
-    mspec.weight_e4m3 = w_e4m3;
-    mspec.row_scale_f32 = scales;
-    mspec.input_bf16 = x_dev;
-    mspec.output_bf16 = y_dev;
-    must_status(qwen36_fp8_matvec(&mspec), "fp8 matvec");
-
-    // Host reference from the GPU-quantized bytes (decodes the same e4m3).
-    std::vector<uint8_t> e4m3_host(M * K);
-    must_status(qwen36_cuda_memcpy_d2h(e4m3_host.data(), w_e4m3, M * K),
-                "fp8 d2h codes");
-    std::vector<float> scale_host(M);
-    must_status(qwen36_cuda_memcpy_d2h(scale_host.data(), scales, M * 4),
-                "fp8 d2h scales");
-    auto e4m3_decode = [](uint8_t code) -> float {
-      const float sign = (code & 0x80) ? -1.0f : 1.0f;
-      const int exponent = (code >> 3) & 0x0f;
-      const int mantissa = code & 0x07;
-      if (exponent == 0) {
-        return sign * std::ldexp(static_cast<float>(mantissa) / 8.0f, -6);
-      }
-      return sign *
-             std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f,
-                        exponent - 7);
-    };
-    std::vector<float> y_got = read_bf16(y_dev, rows * M);
-    double worst_rel = 0.0;
-    for (int r = 0; r < rows; ++r) {
-      size_t ref_arg = 0, got_arg = 0;
-      float ref_best = -1e30f, got_best = -1e30f;
-      for (size_t m = 0; m < M; ++m) {
-        double acc = 0.0;
-        for (size_t k = 0; k < K; ++k) {
-          acc += static_cast<double>(e4m3_decode(e4m3_host[m * K + k])) *
-                 x_bf16[r * K + k];
-        }
-        const float ref = static_cast<float>(acc) * scale_host[m];
-        const float got = y_got[r * M + m];
-        const double rel = std::abs(got - ref) /
-                           std::max(1e-3, static_cast<double>(std::abs(ref)));
-        worst_rel = std::max(worst_rel, rel);
-        if (ref > ref_best) { ref_best = ref; ref_arg = m; }
-        if (got > got_best) { got_best = got; got_arg = m; }
-      }
-      if (ref_arg != got_arg || (r == 0 && ref_arg != 1234)) {
-        fprintf(stderr,
-                "fp8 lm_head gate FAIL row %d: argmax got %zu ref %zu "
-                "(planted 1234)\n",
-                r, got_arg, ref_arg);
-        exit(1);
-      }
-    }
-    if (worst_rel > 0.02) {
-      fprintf(stderr, "fp8 lm_head gate FAIL: worst rel err %.4f > 0.02\n",
-              worst_rel);
-      exit(1);
-    }
-    // Quantization quality vs the BF16 originals (sanity, not a hard gate):
-    double max_qerr = 0.0;
-    for (size_t i = 0; i < M * K; ++i) {
-      const size_t m = i / K;
-      const float deq = e4m3_decode(e4m3_host[i]) * scale_host[m];
-      max_qerr = std::max(max_qerr,
-                          static_cast<double>(std::abs(deq - w_bf16[i])));
-    }
-    printf("fp8 lm_head gate passed (rows=%d, worst rel %.5f, max quant err "
-           "%.5f)\n",
-           rows, worst_rel, max_qerr);
-
-    dev_free<__nv_bfloat16>(w_dev);
-    dev_free<uint8_t>(w_e4m3);
-    dev_free<float>(scales);
-    dev_free<__nv_bfloat16>(x_dev);
-    dev_free<__nv_bfloat16>(y_dev);
   }
 
   // ------------------------------------------------------------------

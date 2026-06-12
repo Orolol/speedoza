@@ -271,6 +271,242 @@ __device__ inline void nvfp4_gemv_mma_body_with_smem(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Multi-N chunk variant (2 <= n <= 8): same MMA loop, but the atom's N
+// dimension carries REAL activation columns instead of replicating column 0.
+// Used by the MTP verify chunk (n = drafts+1, typically 5) where cuBLASLt at
+// skinny N runs at ~34% of peak while this path re-reads no extra weight
+// bytes versus the N=1 decode GEMV.
+//
+// Differences from the N=1 body (which stays byte-identical for the decode
+// graph):
+//   - B staging: n columns in SMEM, column stride padded by 16 bytes so the
+//     8 t1-lanes hit distinct banks (K/2 is a multiple of 128 for all
+//     supported shapes).
+//   - Per-lane B/SFB column = min(t1, n-1): real columns for t1 < n,
+//     harmless replication above (their outputs are discarded).
+//   - Scale-factor loads go straight to gmem (no SF SMEM staging): the
+//     chunk path is not in the captured decode graph and the scales are
+//     L2-hot.
+//   - Cross-warp reduction holds 16 rows x 8 cols x warps per half; the
+//     first 256 threads then own one (half, row, col) cell each and write
+//     output[col * M + row] for col < n (column-major [M, n] = the cuBLASLt
+//     contract the verify consumers already expect).
+//   - M-tiling: one CTA owns `m_tile_count` consecutive m16 tiles and loops
+//     over them with B (and SFB addressing) staged ONCE. At T=1 the B
+//     re-staging costs n/16 of the weight bytes (+31% at n=5) regardless of
+//     M; T tiles per CTA divide that by T. Accumulators and the reduction
+//     buffer are reset per sub-tile (a trailing __syncthreads guards the
+//     reduction buffer against the next sub-tile's writes).
+constexpr unsigned kChunkColPadBytes = 16;
+
+template <int kWarpsPerBlockTpl>
+__host__ __device__ inline size_t nvfp4_gemm_chunk_smem_bytes(size_t K,
+                                                              size_t n) {
+  const size_t col_stride = K / 2 + kChunkColPadBytes;
+  const size_t a_tile_bytes = static_cast<size_t>(kWarpsPerBlockTpl) * 2u *
+                              static_cast<size_t>(kATilePerWarpBytes);
+  const size_t reduction_bytes = 2u * 8u * 8u *
+                                 static_cast<size_t>(kWarpsPerBlockTpl) *
+                                 sizeof(float);
+  return n * col_stride + a_tile_bytes + reduction_bytes;
+}
+
+template <int kWarpsPerBlockTpl>
+__device__ inline void nvfp4_gemm_chunk_body(
+    unsigned m_tile_first, unsigned m_tile_count,
+    const uint8_t *__restrict__ a_fp4, const uint8_t *__restrict__ a_scale,
+    const uint8_t *__restrict__ b_fp4, const uint8_t *__restrict__ b_scale,
+    float alpha, __nv_bfloat16 *__restrict__ output, size_t M, size_t K,
+    unsigned n) {
+  extern __shared__ uint8_t smem[];
+  constexpr int kWarpsPerBlock = kWarpsPerBlockTpl;
+  constexpr int kThreadsPerBlock = kWarpsPerBlock * 32;
+
+  const unsigned warp_id = threadIdx.x >> 5;
+  const unsigned lane = threadIdx.x & 31;
+
+  const size_t packed_cols = K / 2;
+  const size_t scale_cols = K / 16;
+  const size_t sf_inner_dim = gemv_round_up(scale_cols, 4);
+  const size_t col_stride = packed_cols + kChunkColPadBytes;
+
+  constexpr unsigned kATileBufBytes =
+      static_cast<unsigned>(kWarpsPerBlock) * 2u * kATilePerWarpBytes;
+  uint8_t *smem_b_fp4 = smem;
+  uint8_t *smem_a_base = smem + n * col_stride;
+  uint8_t *const smem_a_buf_w0 =
+      smem_a_base + warp_id * (2u * kATilePerWarpBytes);
+  uint8_t *smem_a_buf[2] = {smem_a_buf_w0,
+                            smem_a_buf_w0 + kATilePerWarpBytes};
+  float *smem_reduction =
+      reinterpret_cast<float *>(smem_a_base + kATileBufBytes);
+
+  // Stage the n activation columns (16-byte vectors; both strides are
+  // 16-aligned).
+  {
+    const size_t b_vecs_per_col = packed_cols / 16;
+    for (unsigned c = 0; c < n; ++c) {
+      const uint4 *src =
+          reinterpret_cast<const uint4 *>(b_fp4 + c * packed_cols);
+      uint4 *dst = reinterpret_cast<uint4 *>(smem_b_fp4 + c * col_stride);
+      for (size_t i = threadIdx.x; i < b_vecs_per_col;
+           i += static_cast<size_t>(kThreadsPerBlock)) {
+        dst[i] = src[i];
+      }
+    }
+  }
+  __syncthreads();
+
+  const unsigned t0 = lane & 3u;
+  const unsigned t1 = lane >> 2;
+  const unsigned col_b = t1 < n ? t1 : (n - 1);
+  const uint8_t *smem_b_col = smem_b_fp4 + col_b * col_stride;
+
+  const unsigned t0_sf_a = lane & 1u;
+  const unsigned t2_sf_a = lane >> 2;
+  const unsigned m_row_sf = 8u * t0_sf_a + t2_sf_a;
+
+  const unsigned a_row0_byte_off = t1 * 32u;
+  const unsigned a_row1_byte_off = (t1 + 8u) * 32u;
+  const unsigned a_off_v0 = 4u * t0;
+  const unsigned a_off_v1 = 4u * t0 + 16u;
+
+  const size_t k_chunks_total = K / kKPerMma;
+  const size_t k_chunks_per_warp =
+      k_chunks_total / static_cast<size_t>(kWarpsPerBlock);
+  const size_t kc_warp_start =
+      static_cast<size_t>(warp_id) * k_chunks_per_warp;
+
+  const unsigned a_load_row_in_tile = lane >> 1;
+  const unsigned a_load_byte_off = (lane & 1u) << 4;
+
+  constexpr unsigned kRedW = static_cast<unsigned>(kWarpsPerBlock);
+  constexpr unsigned kRedColStride = kRedW;
+  constexpr unsigned kRedRowStride = 8u * kRedColStride;
+  constexpr unsigned kRedHalfStride = 8u * kRedRowStride;
+
+  for (unsigned sub = 0; sub < m_tile_count; ++sub) {
+    const unsigned m_tile_idx = m_tile_first + sub;
+    const size_t m_base = static_cast<size_t>(m_tile_idx) * kRowsPerBlock;
+    const size_t a_row_for_sf_raw = m_base + m_row_sf;
+    const size_t a_row_for_sf =
+        a_row_for_sf_raw < M ? a_row_for_sf_raw : (M - 1);
+    const size_t a_load_global_row = m_base + a_load_row_in_tile;
+    const bool a_load_row_valid = a_load_global_row < M;
+    const uint8_t *a_load_row_ptr =
+        a_load_row_valid ? (a_fp4 + a_load_global_row * packed_cols) : nullptr;
+
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+
+    auto issue_chunk_async = [&](size_t kc_global, uint8_t *dst_buf) {
+      const size_t k_byte_base = kc_global * (kKPerMma / 2);
+      const void *src =
+          a_load_row_valid
+              ? static_cast<const void *>(a_load_row_ptr + k_byte_base +
+                                          a_load_byte_off)
+              : static_cast<const void *>(a_fp4);
+      const unsigned smem_addr =
+          __cvta_generic_to_shared(dst_buf + lane * 16u);
+      cp_async_16_pred(smem_addr, src, a_load_row_valid);
+    };
+
+    if (k_chunks_per_warp > 0) {
+      issue_chunk_async(kc_warp_start, smem_a_buf[0]);
+      cp_async_commit();
+    }
+
+    for (size_t kc_local = 0; kc_local < k_chunks_per_warp; ++kc_local) {
+      const size_t kc_global = kc_warp_start + kc_local;
+      const size_t k_byte_base = kc_global * (kKPerMma / 2);
+      const size_t k_group_base = kc_global * 4;
+      const unsigned cur_buf = static_cast<unsigned>(kc_local) & 1u;
+
+      const bool has_next = (kc_local + 1) < k_chunks_per_warp;
+      if (has_next) {
+        issue_chunk_async(kc_global + 1, smem_a_buf[cur_buf ^ 1u]);
+        cp_async_commit();
+      }
+
+      if (has_next) {
+        cp_async_wait_group<1>();
+      } else {
+        cp_async_wait_group<0>();
+      }
+      __syncwarp();
+
+      uint8_t *smem_a_tile_cur = smem_a_buf[cur_buf];
+
+      uint32_t a0 = *reinterpret_cast<const uint32_t *>(
+          smem_a_tile_cur + a_row0_byte_off + a_off_v0);
+      uint32_t a1 = *reinterpret_cast<const uint32_t *>(
+          smem_a_tile_cur + a_row1_byte_off + a_off_v0);
+      uint32_t a2 = *reinterpret_cast<const uint32_t *>(
+          smem_a_tile_cur + a_row0_byte_off + a_off_v1);
+      uint32_t a3 = *reinterpret_cast<const uint32_t *>(
+          smem_a_tile_cur + a_row1_byte_off + a_off_v1);
+
+      const size_t b_byte_off_v0 = k_byte_base + 4u * t0;
+      const size_t b_byte_off_v1 = k_byte_base + 4u * t0 + 16u;
+      uint32_t b0 =
+          *reinterpret_cast<const uint32_t *>(smem_b_col + b_byte_off_v0);
+      uint32_t b1 =
+          *reinterpret_cast<const uint32_t *>(smem_b_col + b_byte_off_v1);
+
+      const size_t sfa_off =
+          gemv_vec16_scale_offset(k_group_base, a_row_for_sf, sf_inner_dim);
+      const uint32_t sfa =
+          *reinterpret_cast<const uint32_t *>(a_scale + sfa_off);
+      const size_t sfb_off =
+          gemv_vec16_scale_offset(k_group_base, col_b, sf_inner_dim);
+      const uint32_t sfb =
+          *reinterpret_cast<const uint32_t *>(b_scale + sfb_off);
+
+      mma_mxf4nvf4_4x_m16n8k64(acc0, acc1, acc2, acc3, a0, a1, a2, a3, b0, b1,
+                               acc0, acc1, acc2, acc3, sfa, sfb);
+    }
+
+    // Reduction: every lane owns (row t1 / t1+8, cols 2*t0 and 2*t0+1).
+    // Layout: red[half][row8 = t1][col8][warp] — t1 spans 8 rows, the half
+    // index carries the +8 (acc2/acc3 are rows t1+8 in the atom).
+    smem_reduction[0u * kRedHalfStride + t1 * kRedRowStride +
+                   (2u * t0 + 0u) * kRedColStride + warp_id] = acc0;
+    smem_reduction[0u * kRedHalfStride + t1 * kRedRowStride +
+                   (2u * t0 + 1u) * kRedColStride + warp_id] = acc1;
+    smem_reduction[1u * kRedHalfStride + t1 * kRedRowStride +
+                   (2u * t0 + 0u) * kRedColStride + warp_id] = acc2;
+    smem_reduction[1u * kRedHalfStride + t1 * kRedRowStride +
+                   (2u * t0 + 1u) * kRedColStride + warp_id] = acc3;
+    __syncthreads();
+
+    // 128 cells = 2 halves x 8 rows x 8 cols; thread tid < 128 owns one.
+    if (threadIdx.x < 128u) {
+      const unsigned half = threadIdx.x >> 6;
+      const unsigned row8 = (threadIdx.x >> 3) & 7u;
+      const unsigned col = threadIdx.x & 7u;
+      if (col < n) {
+        float sum = 0.f;
+#pragma unroll
+        for (int w = 0; w < kWarpsPerBlock; ++w) {
+          sum += smem_reduction[half * kRedHalfStride + row8 * kRedRowStride +
+                                col * kRedColStride +
+                                static_cast<unsigned>(w)];
+        }
+        const size_t row = m_base + row8 + 8u * half;
+        if (row < M) {
+          output[static_cast<size_t>(col) * M + row] =
+              __float2bfloat16(sum * alpha);
+        }
+      }
+    }
+    // The next sub-tile's warps write smem_reduction again — fence the
+    // 128-thread read loop above before reuse.
+    if (sub + 1 < m_tile_count) {
+      __syncthreads();
+    }
+  }
+}
+
 template <int kWarpsPerBlockTpl>
 __device__ inline void
 nvfp4_gemv_mma_body(unsigned m_tile_idx,

@@ -1,0 +1,25 @@
+System: You are a concise senior software engineer helping during an incident review.
+User: We run a Rust CUDA inference service on a single RTX 5090. Latency regressed after a speculative decoding patch. Please analyze the symptoms and give a prioritized debugging plan.
+Assistant: I would separate prefill, target decode, drafter decode, and verification cost. I would pin the commit, CUDA library timestamp, context length, max new tokens, KV dtype, and CUDA graph setting. Then I would compare MTP=0, MTP=4, and DFlash on the same chat prompt, recording prefill seconds, decode seconds, generated tokens, acceptance length, and memory headroom.
+User: The regression appears beyond 8k context and the answer still looks plausible. What next?
+Assistant: Run the parity floor first, then compare chat and code prompts at fixed context lengths. If MTP acceptance collapses, inspect per-position acceptance. If DFlash has stable acceptance length but poor tok/s, profile batched verify and hidden-state capture.
+System: You are a concise senior software engineer helping during an incident review.
+User: We run a Rust CUDA inference service on a single RTX 5090. Latency regressed after a speculative decoding patch. Please analyze the symptoms and give a prioritized debugging plan.
+Assistant: I would separate prefill, target decode, drafter decode, and verification cost. I would pin the commit, CUDA library timestamp, context length, max new tokens, KV dtype, and CUDA graph setting. Then I would compare MTP=0, MTP=4, and DFlash on the same chat prompt, recording prefill seconds, decode seconds, generated tokens, acceptance length, and memory headroom.
+User: The regression appears beyond 8k context and the answer still looks plausible. What next?
+Assistant: Run the parity floor first, then compare chat and code prompts at fixed context lengths. If MTP acceptance collapses, inspect per-position acceptance. If DFlash has stable acceptance length but poor tok/s, profile batched verify and hidden-state capture.
+System: You are a concise senior software engineer helping during an incident review.
+User: We run a Rust CUDA inference service on a single RTX 5090. Latency regressed after a speculative decoding patch. Please analyze the symptoms and give a prioritized debugging plan.
+Assistant: I would separate prefill, target decode, drafter decode, and verification cost. I would pin the commit, CUDA library timestamp, context length, max new tokens, KV dtype, and CUDA graph setting. Then I would compare MTP=0, MTP=4, and DFlash on the same chat prompt, recording prefill seconds, decode seconds, generated tokens, acceptance length, and memory headroom.
+User: The regression appears beyond 8k context and the answer still looks plausible. What next?
+Assistant: Run the parity floor first, then compare chat and code prompts at fixed context lengths. If MTP acceptance collapses, inspect per-position acceptance. If DFlash has stable acceptance length but poor tok/s, profile batched verify and hidden-state capture.
+System: You are a concise senior software engineer helping during an incident review.
+User: We run a Rust CUDA inference service on a single RTX 5090. Latency regressed after a speculative decoding patch. Please analyze the symptoms and give a prioritized debugging plan.
+Assistant: I would separate prefill, target decode, drafter decode, and verification cost. I would pin the commit, CUDA library timestamp, context length, max new tokens, KV dtype, and CUDA graph setting. Then I would compare MTP=0, MTP=4, and DFlash on the same chat prompt, recording prefill seconds, decode seconds, generated tokens, acceptance length, and memory headroom.
+User: The regression appears beyond 8k context and the answer still looks plausible. What next?
+Assistant: Run the parity floor first, then compare chat and code prompts at fixed context lengths. If MTP acceptance collapses, inspect per-position acceptance. If DFlash has stable acceptance length but poor tok/s, profile batched verify and hidden-state capture.
+System: You are a concise senior software engineer helping during an incident review.
+User: We run a Rust CUDA inference service on a single RTX 5090. Latency regressed after a speculative decoding patch. Please analyze the symptoms and give a prioritized debugging plan.
+Assistant: I would separate prefill, target decode, drafter decode, and verification cost. I would pin the commit, CUDA library timestamp, context length, max new tokens, KV dtype, and CUDA graph setting. Then I would compare MTP=0, MTP=4, and DFlash on the same chat prompt, recording prefill seconds, decode seconds, generated tokens, acceptance length, and memory headroom.
+User: The regression appears beyond 8k context and the answer still looks plausible. What next?
+Assistant: Run the parity floor first, then compare chat and code prompts at fixed context lengths. If MTP acceptance collapses, inspect per-position acceptance. If DFlash has stable acceptance length but poor tok/s, profile batched verify and hidden-state capture.

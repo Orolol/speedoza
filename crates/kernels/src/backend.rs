@@ -7,8 +7,8 @@ use crate::drafter_attention::DrafterAttentionBlockSpec;
 use crate::interpreter::InterpreterProgramSpec;
 use crate::nvfp4_gemm::Nvfp4GemmSpec;
 use crate::ops::{
-    Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, Conv1dUpdateSpec,
-    CopyStridedRowsSpec, EmbeddingLookupSpec, Fp8MatVecSpec, Fp8QuantizeRowsSpec, GdnGateSpec,
+    Bf16GemmSpec, Bf16MatVecArgmaxRowsSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec,
+    Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec,
     Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec,
     QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, SigmoidGateSpec,
     SigmoidGateStridedSpec,
@@ -102,12 +102,24 @@ pub trait KernelBackend: Send + Sync {
         Err(CoreError::UnsupportedNoCuda("bf16_matvec"))
     }
 
-    fn fp8_quantize_rows(&self, _spec: &Fp8QuantizeRowsSpec) -> Result<()> {
-        Err(CoreError::UnsupportedNoCuda("fp8_quantize_rows"))
+    fn bf16_matvec_argmax_rows(&self, _spec: &Bf16MatVecArgmaxRowsSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("bf16_matvec_argmax_rows"))
     }
 
-    fn fp8_matvec(&self, _spec: &Fp8MatVecSpec) -> Result<()> {
-        Err(CoreError::UnsupportedNoCuda("fp8_matvec"))
+    fn lm_head_fp8_quantize(&self, _spec: &crate::ops::LmHeadFp8QuantizeSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("lm_head_fp8_quantize"))
+    }
+
+    fn lm_head_fp8_gemv(&self, _spec: &crate::ops::LmHeadFp8GemvSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("lm_head_fp8_gemv"))
+    }
+
+    fn lm_head_top2_margin(&self, _spec: &crate::ops::LmHeadTop2MarginSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("lm_head_top2_margin"))
+    }
+
+    fn lm_head_top8_rescore(&self, _spec: &crate::ops::LmHeadTop8RescoreSpec) -> Result<()> {
+        Err(CoreError::UnsupportedNoCuda("lm_head_top8_rescore"))
     }
 
     fn bf16_gemm(&self, _spec: &Bf16GemmSpec) -> Result<()> {
@@ -205,14 +217,11 @@ impl KernelBackend for CudaBackend {
         // QWEN36_STATUS_NOT_IMPLEMENTED we fall through to the cuBLASLt
         // routing. See the Direction B spec under
         // `docs/superpowers/specs/2026-05-04-direction-b-nvfp4-gemv-design.md`.
-        // Exception measured 2026-06-10 (kernels-cuda/tools/gemv_shape_bench,
-        // cold-data per-shape A/B): the mlp.down decode shape (M=5120,
-        // K=17408) is the one production shape where cuBLASLt beats the
-        // hand-rolled gemv (55.4 vs 68.0 µs — the 320-CTA grid cannot hide
-        // DRAM latency over the long K). Route it straight to cuBLASLt;
-        // every other decode shape keeps the gemv (it wins 1.3-2.9x there).
-        let cublaslt_preferred = spec.m == 5120 && spec.k == 17408;
-        if decode_gemv_enabled() && spec.n == 1 && !cublaslt_preferred {
+        // PR #29 measured the mlp.down decode shape (M=5120, K=17408)
+        // faster on cuBLASLt than on the hand-written n=1 GEMV path.
+        let cublaslt_preferred = spec.n == 1 && spec.m == 5120 && spec.k == 17408;
+        let gemv_n_ok = spec.n == 1 || (spec.n <= 8 && chunk_gemv_enabled());
+        if decode_gemv_enabled() && gemv_n_ok && !cublaslt_preferred {
             let code = unsafe { ffi::qwen36_decode_nvfp4_gemv(&ffi_spec) };
             if code != 5 {
                 return check("qwen36_decode_nvfp4_gemv", code);
@@ -315,17 +324,31 @@ impl KernelBackend for CudaBackend {
         })
     }
 
-    fn fp8_quantize_rows(&self, spec: &Fp8QuantizeRowsSpec) -> Result<()> {
-        let ffi_spec = ffi::Fp8QuantizeRowsSpec::from(spec);
-        check("qwen36_fp8_quantize_rows", unsafe {
-            ffi::qwen36_fp8_quantize_rows(&ffi_spec)
+    fn lm_head_fp8_quantize(&self, spec: &crate::ops::LmHeadFp8QuantizeSpec) -> Result<()> {
+        let ffi_spec = ffi::LmHeadFp8QuantizeSpec::from(spec);
+        check("qwen36_lm_head_fp8_quantize", unsafe {
+            ffi::qwen36_lm_head_fp8_quantize(&ffi_spec)
         })
     }
 
-    fn fp8_matvec(&self, spec: &Fp8MatVecSpec) -> Result<()> {
-        let ffi_spec = ffi::Fp8MatVecSpec::from(spec);
-        check("qwen36_fp8_matvec", unsafe {
-            ffi::qwen36_fp8_matvec(&ffi_spec)
+    fn lm_head_fp8_gemv(&self, spec: &crate::ops::LmHeadFp8GemvSpec) -> Result<()> {
+        let ffi_spec = ffi::LmHeadFp8GemvSpec::from(spec);
+        check("qwen36_lm_head_fp8_gemv", unsafe {
+            ffi::qwen36_lm_head_fp8_gemv(&ffi_spec)
+        })
+    }
+
+    fn lm_head_top2_margin(&self, spec: &crate::ops::LmHeadTop2MarginSpec) -> Result<()> {
+        let ffi_spec = ffi::LmHeadTop2MarginSpec::from(spec);
+        check("qwen36_lm_head_top2_margin", unsafe {
+            ffi::qwen36_lm_head_top2_margin(&ffi_spec)
+        })
+    }
+
+    fn lm_head_top8_rescore(&self, spec: &crate::ops::LmHeadTop8RescoreSpec) -> Result<()> {
+        let ffi_spec = ffi::LmHeadTop8RescoreSpec::from(spec);
+        check("qwen36_lm_head_top8_rescore", unsafe {
+            ffi::qwen36_lm_head_top8_rescore(&ffi_spec)
         })
     }
 
@@ -333,6 +356,13 @@ impl KernelBackend for CudaBackend {
         let ffi_spec = ffi::Bf16MatVecSpec::from(spec);
         check("qwen36_bf16_matvec", unsafe {
             ffi::qwen36_bf16_matvec(&ffi_spec)
+        })
+    }
+
+    fn bf16_matvec_argmax_rows(&self, spec: &Bf16MatVecArgmaxRowsSpec) -> Result<()> {
+        let ffi_spec = ffi::Bf16MatVecArgmaxRowsSpec::from(spec);
+        check("qwen36_bf16_matvec_argmax_rows", unsafe {
+            ffi::qwen36_bf16_matvec_argmax_rows(&ffi_spec)
         })
     }
 
@@ -516,6 +546,20 @@ fn decode_gemv_enabled() -> bool {
         );
         !(disabled_by_kill_switch || disabled_by_opt_in_flag)
     })
+}
+
+/// Multi-N (2..=8) chunk GEMMs through the hand-rolled MMA kernel.
+/// OPT-IN (`QWEN36_CHUNK_GEMV=1`), measured NEUTRAL 2026-06-12: ~50 us/call
+/// = cuBLASLt parity on the verify-chunk shape mix — the sink is per-call
+/// overhead (B re-staged per m16-tile CTA, ~491 launches/cycle), not
+/// cuBLASLt inefficiency. The win needs M-tiling (stage B once per 64-128
+/// rows); this kernel + its parity gate are the foundation for that.
+#[allow(dead_code)]
+fn chunk_gemv_enabled() -> bool {
+    matches!(
+        std::env::var("QWEN36_CHUNK_GEMV").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -1041,6 +1085,105 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct Bf16MatVecArgmaxRowsSpec {
+        pub rows: usize,
+        pub out_features: usize,
+        pub in_features: usize,
+        pub input_bf16: DevicePtr,
+        pub weight_bf16: DevicePtr,
+        pub output_token_u32: DevicePtr,
+        pub mirror_last_output_token_u32: DevicePtr,
+        pub workspace: DevicePtr,
+        pub workspace_bytes: usize,
+        pub skip_flags_u32: DevicePtr,
+    }
+
+    impl From<&crate::ops::Bf16MatVecArgmaxRowsSpec> for Bf16MatVecArgmaxRowsSpec {
+        fn from(value: &crate::ops::Bf16MatVecArgmaxRowsSpec) -> Self {
+            Self {
+                rows: value.rows,
+                out_features: value.out_features,
+                in_features: value.in_features,
+                input_bf16: value.input_bf16,
+                weight_bf16: value.weight_bf16,
+                output_token_u32: value.output_token_u32,
+                mirror_last_output_token_u32: value.mirror_last_output_token_u32,
+                workspace: value.workspace,
+                workspace_bytes: value.workspace_bytes,
+                skip_flags_u32: value.skip_flags_u32,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct LmHeadTop2MarginSpec {
+        pub rows: usize,
+        pub vocab: usize,
+        pub eps: f32,
+        pub logits_bf16: DevicePtr,
+        pub tokens_u32: DevicePtr,
+        pub flags_u32: DevicePtr,
+        pub mirror_last_token_u32: DevicePtr,
+        pub fallback_count_u32: DevicePtr,
+        pub workspace: DevicePtr,
+        pub workspace_bytes: usize,
+    }
+
+    impl From<&crate::ops::LmHeadTop2MarginSpec> for LmHeadTop2MarginSpec {
+        fn from(value: &crate::ops::LmHeadTop2MarginSpec) -> Self {
+            Self {
+                rows: value.rows,
+                vocab: value.vocab,
+                eps: value.eps,
+                logits_bf16: value.logits_bf16,
+                tokens_u32: value.tokens_u32,
+                flags_u32: value.flags_u32,
+                mirror_last_token_u32: value.mirror_last_token_u32,
+                fallback_count_u32: value.fallback_count_u32,
+                workspace: value.workspace,
+                workspace_bytes: value.workspace_bytes,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct LmHeadTop8RescoreSpec {
+        pub rows: usize,
+        pub vocab: usize,
+        pub cols: usize,
+        pub eps: f32,
+        pub logits_bf16: DevicePtr,
+        pub weight_bf16: DevicePtr,
+        pub input_bf16: DevicePtr,
+        pub tokens_u32: DevicePtr,
+        pub flags_u32: DevicePtr,
+        pub mirror_last_token_u32: DevicePtr,
+        pub fallback_count_u32: DevicePtr,
+        pub workspace: DevicePtr,
+        pub workspace_bytes: usize,
+    }
+
+    impl From<&crate::ops::LmHeadTop8RescoreSpec> for LmHeadTop8RescoreSpec {
+        fn from(value: &crate::ops::LmHeadTop8RescoreSpec) -> Self {
+            Self {
+                rows: value.rows,
+                vocab: value.vocab,
+                cols: value.cols,
+                eps: value.eps,
+                logits_bf16: value.logits_bf16,
+                weight_bf16: value.weight_bf16,
+                input_bf16: value.input_bf16,
+                tokens_u32: value.tokens_u32,
+                flags_u32: value.flags_u32,
+                mirror_last_token_u32: value.mirror_last_token_u32,
+                fallback_count_u32: value.fallback_count_u32,
+                workspace: value.workspace,
+                workspace_bytes: value.workspace_bytes,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct TopkArgmaxSpec {
         pub vocab_size: usize,
         pub k: usize,
@@ -1072,60 +1215,58 @@ mod ffi {
     }
 
     #[repr(C)]
+    pub struct LmHeadFp8QuantizeSpec {
+        pub rows: usize,
+        pub cols: usize,
+        pub weight_bf16: DevicePtr,
+        pub weight_e4m3: DevicePtr,
+        pub row_scales_f32: DevicePtr,
+    }
+
+    impl From<&crate::ops::LmHeadFp8QuantizeSpec> for LmHeadFp8QuantizeSpec {
+        fn from(value: &crate::ops::LmHeadFp8QuantizeSpec) -> Self {
+            Self {
+                rows: value.rows,
+                cols: value.cols,
+                weight_bf16: value.weight_bf16,
+                weight_e4m3: value.weight_e4m3,
+                row_scales_f32: value.row_scales_f32,
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct LmHeadFp8GemvSpec {
+        pub rows: usize,
+        pub cols: usize,
+        pub n: usize,
+        pub weight_e4m3: DevicePtr,
+        pub row_scales_f32: DevicePtr,
+        pub input_bf16: DevicePtr,
+        pub output_bf16: DevicePtr,
+    }
+
+    impl From<&crate::ops::LmHeadFp8GemvSpec> for LmHeadFp8GemvSpec {
+        fn from(value: &crate::ops::LmHeadFp8GemvSpec) -> Self {
+            Self {
+                rows: value.rows,
+                cols: value.cols,
+                n: value.n,
+                weight_e4m3: value.weight_e4m3,
+                row_scales_f32: value.row_scales_f32,
+                input_bf16: value.input_bf16,
+                output_bf16: value.output_bf16,
+            }
+        }
+    }
+
+    #[repr(C)]
     pub struct Bf16MatVecSpec {
         pub out_features: usize,
         pub in_features: usize,
         pub input_bf16: DevicePtr,
         pub weight_bf16: DevicePtr,
         pub output_bf16: DevicePtr,
-    }
-
-    #[repr(C)]
-    pub struct Fp8QuantizeRowsSpec {
-        pub out_features: usize,
-        pub in_features: usize,
-        pub weight_bf16: DevicePtr,
-        pub weight_e4m3: DevicePtr,
-        pub row_scale_f32: DevicePtr,
-    }
-
-    impl From<&crate::ops::Fp8QuantizeRowsSpec> for Fp8QuantizeRowsSpec {
-        fn from(value: &crate::ops::Fp8QuantizeRowsSpec) -> Self {
-            Self {
-                out_features: value.out_features,
-                in_features: value.in_features,
-                weight_bf16: value.weight_bf16,
-                weight_e4m3: value.weight_e4m3,
-                row_scale_f32: value.row_scale_f32,
-            }
-        }
-    }
-
-    #[repr(C)]
-    pub struct Fp8MatVecSpec {
-        pub out_features: usize,
-        pub in_features: usize,
-        pub rows: usize,
-        pub input_stride: usize,
-        pub weight_e4m3: DevicePtr,
-        pub row_scale_f32: DevicePtr,
-        pub input_bf16: DevicePtr,
-        pub output_bf16: DevicePtr,
-    }
-
-    impl From<&crate::ops::Fp8MatVecSpec> for Fp8MatVecSpec {
-        fn from(value: &crate::ops::Fp8MatVecSpec) -> Self {
-            Self {
-                out_features: value.out_features,
-                in_features: value.in_features,
-                rows: value.rows,
-                input_stride: value.input_stride,
-                weight_e4m3: value.weight_e4m3,
-                row_scale_f32: value.row_scale_f32,
-                input_bf16: value.input_bf16,
-                output_bf16: value.output_bf16,
-            }
-        }
     }
 
     impl From<&crate::ops::Bf16MatVecSpec> for Bf16MatVecSpec {
@@ -1601,8 +1742,11 @@ mod ffi {
         pub fn qwen36_embedding_lookup(spec: *const EmbeddingLookupSpec) -> i32;
         pub fn qwen36_bf16_gemm(spec: *const Bf16GemmSpec) -> i32;
         pub fn qwen36_bf16_matvec(spec: *const Bf16MatVecSpec) -> i32;
-        pub fn qwen36_fp8_quantize_rows(spec: *const Fp8QuantizeRowsSpec) -> i32;
-        pub fn qwen36_fp8_matvec(spec: *const Fp8MatVecSpec) -> i32;
+        pub fn qwen36_bf16_matvec_argmax_rows(spec: *const Bf16MatVecArgmaxRowsSpec) -> i32;
+        pub fn qwen36_lm_head_top2_margin(spec: *const LmHeadTop2MarginSpec) -> i32;
+        pub fn qwen36_lm_head_top8_rescore(spec: *const LmHeadTop8RescoreSpec) -> i32;
+        pub fn qwen36_lm_head_fp8_quantize(spec: *const LmHeadFp8QuantizeSpec) -> i32;
+        pub fn qwen36_lm_head_fp8_gemv(spec: *const LmHeadFp8GemvSpec) -> i32;
         pub fn qwen36_nvfp4_matvec(spec: *const Nvfp4MatVecSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_bf16(spec: *const Nvfp4QuantizeSpec) -> i32;
         pub fn qwen36_nvfp4_quantize_rows(spec: *const Nvfp4QuantizeRowsSpec) -> i32;

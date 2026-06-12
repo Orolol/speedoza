@@ -97,252 +97,938 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
-### 2026-06-10 — MTP : graph-capture du chemin de rejet (MtpRecover) — SHIPPED, mais l'hypothèse « launch overhead » est FALSIFIÉE
+### 2026-06-12 (suite 2) — lm_head deux étages **v2 top-8 rescore** — SHIPPED opt-in : @128 acc bit-identique + decode +21.7% (cycle −13 ms), fallbacks 42% → 6%
 
-Contexte : le sweep @1K (cycle 17→35→50→61→76 ms pour MTP 0→4) pointait
-un coût marginal ~13-15 ms/draft. Lecture du code : le multi-graph
-couvrait déjà le cycle full-accept (verify + next-drafts dans UNE
-capture) ; le seul chemin host-launched restant était le **rejet**
-(`recover_after_mtp_multi_reject` : restore + re-prefill des tokens
-commités (48 couches) + chaîne MTP complète), pris ~72-79 % des cycles
-(33 rejets / 42 cycles mesurés au trace, acc 0.71). Kill-gate : parity
-floor exact + A/B ON/OFF identique, sinon revert.
+v2 du levier n°1, conçue sur le diagnostic de l'entrée précédente : au
+lieu de garder sur top1−top2 (42% de fallback sur les lignes serrées de
+la tête MTP), on re-score TOUJOURS les 8 meilleures candidates FP8
+contre le poids BF16. Kernel `qwen36_lm_head_top8_rescore` (1 CTA/ligne,
+après le pass1 top-2 par bloc partagé avec v1) : sélection top-8 des
+GAGNANTS de blocs + borne de garde **B = max(9e gagnant, max des v2 de
+blocs)** — un bloc qui cache deux leaders gonfle son v2 → garde échoue →
+fallback complet conservateur, jamais de miss silencieux ; re-score des
+8 candidates en **accumulation FP64** (8×5120 FMA ≈ gratuit,
+ordre-stable ~1e-12) ; garde finale `best ≥ B + ε` (ε recommandé 0.5 ≈
+1.5× e_max). v1 reste accessible (`QWEN36_LM_HEAD_MARGIN_SCOPE=top2`).
 
-Fait : cache `mtp_recover_graphs` (coexiste avec le slot `decode_graph`,
-sinon l'alternance verify/recover re-capturerait chaque cycle) + kind
-`MtpRecover{committed,drafts}` (une capture par forme, re-capture sur
-changement de bucket contexte, 8 captures observées @1K/MTP4). Capturé :
-re-prefill (positions device) + final_norm + chaîne next-drafts (tokens
-shiftés stagés par l'hôte dans `mtp_verify_token_u32[0..committed]` —
-committed ≤ 8 < NEXT_DRAFT_BASE=9, pas de collision). Restore et staging
-restent host-side, ordonnés par activation du stream du graph. Kill
-switch `QWEN36_MTP_RECOVER_GRAPH=0` (et respecte
-`QWEN36_MTP_MULTI_GRAPH_DISABLE`).
+**Mesures (bench MTP=4, fallback OFF, baselines de la même session)** :
 
-Mesures (corpus 91k, @1K, MTP=4, 512 tokens pour amortir les captures) :
-ON 44.5 tok/s / cycle 72.0 ms ; OFF 43.2 / 71.4. **Cycle inchangé** — le
-+3 % tok/s vient d'une divergence de flux (bruit chunked-verify connu,
-steps 160 vs 166), pas du coût de cycle. Verdict : le chemin de rejet
-host-launched n'était PAS launch-bound ; les ~13-15 ms/draft marginaux
-sont du travail GPU **sériel** (re-prefill 48 couches ~17 ms sur rejet +
-forwards MTP dépendants en chaîne). Graphing ne comprime pas une chaîne
-sérielle. Gardé default ON : correctness prouvée, coût nul, et le
-recovery re-prefille `committed` tokens — la part graphée croît avec
-depth 6/8 (chantier suivant).
+| cellule | base | v1 (ε=1.0) | v2 (ε=0.5) | acc v2 | fb v1→v2 |
+|---|---|---|---|---|---|
+| 128/128 | 39.6 | 40.9 (+3.2%) | **48.2 (+21.7%)** | **0.4772727272727273 = bit-identique** | 187→**29** |
+| 8192/128 | 39.3 | 31.0 | 33.8 | 0.4114583333333333 (= trajectoire-loterie v1/fused) | 206→28 |
+| 24576/128 | 24.3 | 30.0 | 29.4 (+21% vs base) | 0.578 (= v1) | 105→13 |
 
-Piège de session (2× faux verdicts) : `scripts/build_cuda.sh` ne
-reconstruit QUE le `.so` kernels — le binaire Rust exige
-`cargo build --release -p qwen36-fp4 --features cuda`. Les premiers
-« gates verts » et le premier bench plat tournaient sur un binaire
-périmé ; tout a été re-validé sur le vrai binaire.
+La cellule propre (@128, acc identique 16 déc.) : **cycle 73.5 → 60.4 ms
+= −13 ms** (le bucket lm_head 12.2 ms + le GEMM verify wmma 2.3 +
+sample_argmax 1.2 remplacés par ~10×0.75 ms de chaîne FP8+top8).
+Fallbacks ~6% (vs 42% en v1) — la garde vs la 8e valeur est la bonne.
+@8K : la ligne à faible marge du cycle 6 tombe toujours en garde-échec →
+re-score complet PR #11 → même flip → même trajectoire (cohérent avec la
+classe ; la loterie reste bornée aux ~6% de lignes garde-échouées).
 
-Gates (binaire reconstruit) : parity floor hello/hello world × MTP 0-4
-identiques ; A/B ON/OFF 64 tokens × MTP 2-4 identiques ; smoke passed.
-Leçon : avant tout verdict, vérifier que le binaire contient bien le
-code (trace d'engagement > absence d'erreur).
+Verdict : **SHIPPED opt-in** (`QWEN36_LM_HEAD_FP8_MARGIN=0.5`). Défaut
+ON différé : à valider sur la grille de régimes complète (couplage avec
+la lane acceptance) — la loterie résiduelle vit dans le re-score complet
+des ~6% ; la tuer = re-dot FP64 complet prédiqué au lieu du kernel PR
+#11 (backlog, petit). Gates : smoke top8 (5/5 certifiés, parité argmax
+host-FP64 ; le gate a d'abord attrapé une DONNÉE dégénérée — pattern
+périodique mod 251 → 16 copies exactes par ligne → ties exacts → garde
+refuse, comportement correct), floor par construction (défaut intouché).
 
-Files: `crates/runtime/src/engine.rs`. Inventory updated: yes (§ flags).
+Files: kernels-cuda/{lm_head_fp8.cu,smoke.cu,include/qwen36_fp4.h},
+crates/kernels/src/{ops,backend,lib}.rs, crates/runtime/src/engine.rs.
+Inventory: oui.
 
-### 2026-06-10 — MTP : LUT split-K neutre (3e micro-fix neutre) ; depth 6/8 débloqué côté buffers mais depth 6 CASSE le parity floor — WIP gated off
+### 2026-06-12 (suite) — Chasse au "bug latent PR #11 @8K" : CORRECTION — pas de bug de câblage ; 3e instance de la classe verify-perturbation (flip d'ordre d'accumulation sur ligne à faible marge)
 
-**LUT FP8 dans `attention_flash_splitk.cu`** (levier 1 du diagnostic
-utilisateur) : 256 entrées SMEM, byte-identique (gate 144 cas vert).
-**E2e : neutre** (38.2 tok/s, cycle 79.8) — 3e fix kernel neutre
-d'affilée. Confirmation définitive : le cycle verify n'est pas borné par
-les µs des kernels individuels mais par la longueur de la chaîne série
-(nœuds graph + 4 forwards de draft séquentiels). Gardé (sain). Le levier
-occupancy (N=64→32) reste à tester mais avec une attente désormais
-faible — mesurer le wall d'UNE couche verify isolée d'abord.
+Instrument : trace de tokens par cycle dans le bench
+(`QWEN36_MTP_TOKEN_TRACE=<path>`, JSONL : current/drafts/accepted/next/
+next_drafts) — diff de deux runs → premier cycle divergent + champ.
 
-**Depth 6/8 (step 3 du plan)** : constantes débloquées
-(MTP_MAX_DRAFT_TOKENS=8, VERIFY_TOKENS=17, BUNDLE_U32S=24, mtp_logits
-×9, mtp_verify_token_u32 96 B, kMvMaxRows=10,
-kPrefillSplitLongChunkMaxTokens=16). Sweep @3K :
+Chasse @8K MTP=4 (default vs `QWEN36_MTP_FUSED_ARGMAX=1`) :
+1. Première divergence au **cycle 6, verified[0] d'un FULL REJECT**
+   (264 vs 2972) — cycles 1-5 IDENTIQUES, y compris un full reject
+   (cycle 3) et des accepts partiels → le câblage des lignes est sain,
+   la théorie "wiring bug" est MORTE.
+2. Contre-épreuve : default row-wise (`QWEN36_MTP_BATCH_LM_HEAD_DISABLE=1`,
+   cuBLAS gemv + sample_argmax) vs default batché (GEMM wmma +
+   sample_rows) — **trajectoires identiques sur 41 cycles**. Deux kernels
+   d'ordres d'accumulation différents s'accordent ; seul le warp-dot
+   PR #11 diverge sur cette ligne.
+3. Le mode marge a flippé À L'IDENTIQUE (16 décimales) parce que sa
+   garde a ÉCHOUÉ sur cette ligne (marge FP8 < ε=1.0, par construction)
+   → ligne à faible marge confirmée ; son re-score = le même kernel
+   PR #11 → même flip. Les lignes où la garde PASSE sont sans flip vs
+   default (marge ≥ 1.0 ≫ l'erreur d'ordre ~1e-2).
 
-| depth | tok/s | tok/cyc | acc | verdict |
-|---|---:|---:|---:|---|
-| 4 | 38.3 | 3.05 | 0.735 | inchangé ✓ |
-| 6 | 19.1 | 1.75 | **0.433** | **parity floor MISMATCH (hello)** — bug de correctness |
-| 8 | — | — | — | bench crash (stderr avalé) ; chat « parity OK » à confirmer, suspect |
+**Verdict : le kernel `bf16_matvec_argmax_rows` (PR #11) calcule son
+propre matvec (ordre warp-stride ≠ cuBLAS) → sur une ligne verify à
+marge ≲ l'erreur d'accumulation, l'argmax flippe.** C'est la même classe
+que le chunk GEMV (acc 0.477→0.416) et le FP8 lm_head (0.77→0.589) —
+3e instance ; la règle de classe est désormais : TOUT kernel qui
+recalcule des logits de verify avec un autre ordre d'accumulation est
+une perturbation, et sa zone de flip est bornée par sa marge d'erreur.
+@128 n'avait simplement jamais rencontré de ligne verify à faible marge.
 
-**La CLI re-verrouille >4** (correctness d'abord) ; les buffers restent
-dimensionnés. Piste pour la suite : un littéral 4/5 résiduel dans le
-chemin verify/draft-régen (multi-graph MTP=2/3 ? fenêtre de
-draft-régen ?) — `grep -n "\b4\b\|\b5\b" engine.rs` autour de
-verify_mtp_draft_tokens / prepare_mtp_drafts, et re-tester depth 5
-(au-dessus de l'ancien max d'un seul cran) pour bisecter. L'acceptance
-0.433 à depth 6 sent le draft mal régénéré (état MTP recyclé au mauvais
-offset), pas le verify.
+Conséquence pour l'acceptance : UN flip → les trajectoires divergent
+(textes différents) ; après divergence default 0.588 vs fused 0.423 mais
+sur des TEXTES différents = incomparable directement (cycles 1-5
+communs : 0.400 identique). La question résiduelle — neutralité EN
+ESPÉRANCE du mode marge — se mesure sur la grille multi-cellules
+(résultats dans l'addendum ci-dessous).
 
-Files: attention_flash_splitk.cu (LUT), engine.rs/gpu.rs/fp8_matvec.cu/
-attention.cu (constantes), main.rs (cap re-posé). Inventory: n/a (pas de
-flag nouveau).
+**Addendum — grille de neutralité en espérance (même session)** : base vs
+margin (ε=1.0), bench MTP=4 corpus, fallback OFF :
 
-### 2026-06-10 — MTP recovery steps 0-1 : la prémisse « acceptance collapse » est FAUSSE ; le coupable est le coût du cycle (75 ms), profilé kernel par kernel — DECISION
+| cellule | base acc | margin acc | Δacc | decode base→margin | fb |
+|---|---|---|---|---|---|
+| 128/128 | 0.477 | 0.477 (identique) | 0 | 39.6 → 40.9 (+3.2%) | 187 |
+| 3072/128 | 0.497 | 0.503 | +0.006 | 36.7 → 37.5 | 175 |
+| 8192/128 | 0.550 | 0.411 | −0.139 | 39.3 → 31.0 | 206 |
+| 8192/256 | 0.635 | 0.539 | −0.096 | 46.6 → 38.5 | 255 |
+| 24576/128 | 0.488 | **0.578** | **+0.090** | 24.3 → **30.0** (+23%) | 105 |
 
-Exécution de `docs/mtp-recovery-plan.md` (steps 0-1) avec un twist : le
-step 0 était déjà instrumenté (`run_bench_mtp_multi` émet acceptance
-depuis toujours) — les JSONL du dashboard du matin contenaient déjà la
-réponse.
+Scatter dans LES DEUX SENS (moyenne −0.03 ± gros bruit de trajectoire) =
+signature de loterie, PAS de dégradation systématique — cohérent avec un
+flip near-tie ~1/50-200 cycles qui relance la trajectoire, sans
+composition (contrairement au FP8 naïf qui flippait à marge ≤0.34 sur
+CHAQUE appel de la récursion). Le gain pur-cycle (cellule à acc égale) =
++2-3% — petit, comme attendu avec ~42% de fallback.
 
-**Step 0 (lecture des JSONL existants)** : acceptance MTP=4 sur le corpus
-= **0.71-0.77, ~3 tokens/cycle sur 5 max** à TOUS les ctx (128→24K).
-PAS d'effondrement. Le gate du plan s'applique : « si acceptance haute,
-re-profiler le coût du cycle ». Le coût : 128 tokens / 43 cycles à
-39.3 tok/s = **75-83 ms/cycle**, verify = 98% du temps décode. Même à
-acceptance parfaite (5 tok/cycle), 75 ms/cycle ⇒ 66 tok/s = MTP=0.
+Décision : v1 reste opt-in OFF. **v2 top-8** (la vraie perf : re-score
+plat de 8 candidates ~30 µs, garde vs la 8e valeur → fallback quasi nul
++ zone de flip rétrécie d'autant) = prochaine itération, spec au backlog.
 
-**Step 1 (A/B, ctx 3072, MTP=4)** :
+Files: crates/cli/src/main.rs (QWEN36_MTP_TOKEN_TRACE). Inventory: oui
+(ligne PR #11 corrigée, ligne deux-étages re-cadrée).
 
-| config | tok/s | tok/cyc | acc | ms/cycle |
-|---|---:|---:|---:|---:|
-| DEFAULT | 39.4 | 3.05 | 0.735 | 77.4 |
-| `QWEN36_MTP_MULTI_GRAPH_DISABLE=1` | 42.6 | 3.05 | 0.735 | 71.5 |
-| `QWEN36_ATTENTION_SPLIT_DISABLE=1` | 23.3 | 2.61 | 0.653 | 112.1 |
-| `QWEN36_DELTANET_CHUNKED_PREFILL=0` | 37.1 | 2.67 | 0.687 | 71.8 |
+### 2026-06-12 — lm_head argmax exact à deux étages (scan FP8 + garde de marge + re-score BF16 prédiqué) — WIP : bit-exact @128 (+3.2%), BLOQUÉ à 8K par un bug latent PR #11 dans les sites device-argmax
 
-Les deux suspects du plan sont **falsifiés** : le DeltaNet séquentiel
-BAISSE l'acceptance (0.687 — le chunked WY n'est pas le problème), et le
-multi-graph ne coûte que ~8%. Le split path est meilleur que son
-fallback scalaire.
+Levier n°1 de la carte des gaps (12.2 ms/cycle de matvecs lm_head BF16
+séquentiels). Design : à MTP>0, le store FP8 COEXISTE avec le BF16 ; tout
+consommateur greedy passe par GEMV FP8 → top-2 grid-wide + garde
+top1−top2 ≥ ε → re-score BF16 complet PRÉDIQUÉ par flag device (kernel
+PR #11 + skip_flags). Zéro sync host, graph-capturable. Bit-exact par
+construction quand ε ≥ 2·max|Δlogit| — la réponse au kill FP8-compose du
+2026-06-11. Calibration sonde (28 hiddens cibles, 7M logits) : e_max
+0.344, marges médiane 4.67 → ε = 1.0. Opt-in `QWEN36_LM_HEAD_FP8_MARGIN`.
 
-**Profil nsys node-trace du cycle (bench MTP=4 @3K, 14 cycles)** — les
-~50 ms/cycle au-dessus du plancher GEMM (~18 ms) sont QUATRE pathologies
-empilées :
+**Mesures (bench MTP=4, fallback OFF, max-new 128) :**
 
-| poste | ms/cycle | détail |
+| cellule | base acc | margin acc | base→margin tok/s | fallbacks |
+|---|---|---|---|---|
+| @128 | 0.4772727272727273 | **identique (16 déc.)** | 39.6 → 40.9 (+3.2%) | 187 (~42%) |
+| @128 longmode | 0.4772727272727273 | **identique** | 41.2 → 41.5 | — |
+| @8192 | 0.55 | **0.4114583333333333** ✗ | 39.3 → 31.0 | 206 |
+
+Deux découvertes :
+1. **Taux de fallback ~42%** sur le mix (les marges de la tête MTP sont
+   serrées, comme prédit) — chaque fallback paie FP8 + re-score complet
+   (kernel PR #11, plus lent que cuBLAS) → le gain net @128 est petit.
+   **v2 scopée : re-score top-8 systématique** (gather 8 lignes BF16
+   ~30 µs, garde bf16_best − fp8_8th ≥ e_max, bien plus lâche que
+   top1−top2) → coût plat ~0.74 ms/appel, fallback ~0 → le −7 ms/cycle
+   visé redevient atteignable.
+2. **La divergence @8K n'est PAS le mode marge** : bisection en trois
+   temps — (a) rows1-only reproduit 0.4114583333333333 exactement (le
+   GEMV n=5 hors de cause) ; (b) `QWEN36_MTP_FUSED_ARGMAX=1` SEUL @8K
+   (chemin PR #11 pur, BF16) donne **le même 0.4114583333333333 à 16
+   décimales** ; (c) @128 et @128-longmode bit-exacts. Conclusion : un
+   **bug de câblage latent des sites device-argmax de la PR #11,
+   spécifique à ctx 8192** (jamais benchée qu'à @128), partagé par les
+   deux modes — un site lit une mauvaise ligne/buffer à long contexte.
+   Suspects : les sites eager (2864-2988, 3194, 3718) si le graphe
+   multi-draft est désactivé à 8K, ou la ligne bonus (row=draft_count)
+   du graphe. Prochain instrument : diff de trajectoire de tokens @8K
+   default vs fused, premier cycle divergent → site coupable.
+
+Gates : smoke complet vert, dont DEUX NOUVEAUX gates — top2+marge
+(rows=2, vocab 250K, ε encadrant + re-score prédiqué + mirror) et
+**parité GEMV FP8 batched-vs-single n=5 bit-exacte** (ferme le "N>1
+restant" de l'entrée FP8 du 2026-06-11). Le défaut reste 100% inchangé
+(opt-in env). Knob de bisection : QWEN36_LM_HEAD_MARGIN_SCOPE=rows1.
+
+Files: kernels-cuda/{lm_head_fp8.cu,ops.cu,smoke.cu,include/qwen36_fp4.h},
+crates/kernels/src/{ops,backend,lib}.rs, crates/runtime/src/engine.rs,
+crates/cli/src/main.rs (lm_head_margin_fallbacks), scripts/lmhead_fp8_probe.py
+(bloc margin-gate). Inventory: oui.
+
+### 2026-06-12 — Carte des gaps du cycle verify (nsys, fenêtre 487 ms ≈ 8 cycles MTP=4 @128) — DECISION : les leviers re-classés
+
+Mesure : `nsys profile --cuda-graph-trace=node` sur bench MTP=4 @128
+(cuBLASLt défaut, fallback OFF, 24 tokens), analyse par
+`scripts/nsys_gap_analysis.py` (union des intervalles kernels, gaps,
+buckets). Résultats (par cycle = fenêtre/8) :
+
+- **Idle GPU : 5.4%** du span seulement. Micro-gaps 2-20 µs ≈ 0.5 ms/cycle
+  → le levier "capture graphe du forward verify" est PLAFONNÉ là :
+  déclassé. MAIS 19 gaps ≈ 1 ms chacun = **~1.9 ms/cycle aux frontières
+  de cycle** (bookkeeping host acceptance/seed) — adressable, zéro risque.
+- **Chunk GEMM cutlass : 344 appels × 58.8 µs = 20.2 ms/cycle** vs un
+  plancher octets de ~7.6 ms (12.7 GiB FP4 à 1.79 TB/s) — cuBLASLt comme
+  notre kernel chunk tournent à ~36% BW à N=5. Le M-tiling est mort
+  (entrée suivante) ; le gain réel = kernel classe SMEM-paging (Hazy),
+  chantier multi-jours.
+- **lm_head BF16 : 12.2 ms/cycle (20% du cycle)** — 5 matvecs pleins
+  vocab SÉQUENTIELS (4 récursions de draft + sample final), ~2.5 GB
+  chacun (gemvx 675 µs ×2 kernels), + 2.3 ms le GEMM verify 5 lignes.
+  **Levier identifié : argmax exact à deux étages** — scan FP8 (store
+  LmHeadFp8 existant, octets ÷2) + garde de marge top1−top2 ; marge < ε
+  → re-score BF16 complet (rare). Bit-exact ⇒ contourne le kill
+  FP8-compose du 2026-06-11 par construction. Cible −5-6 ms/cycle.
+  Coût : +1.27 GiB (FP8 en plus du BF16 à MTP>0) — le headroom post
+  levier-1 l'absorbe.
+- Cumulatifs confirmés : deltanet WY 6.0, splitk 2.9, rmsnorm 1.95,
+  sample_argmax 1.24, quantize_rows 448 appels = 1.06, copies 0.6.
+
+Ordre d'attaque : (1) lm_head deux étages, (2) gaps frontière de cycle,
+(3) SMEM-paging GEMM. Files: scripts/nsys_gap_analysis.py (nouveau).
+
+### 2026-06-12 — M-tiling du chunk GEMV : B stagé une fois par CTA de T tuiles m16 — NEGATIVE (dégradation monotone en T) ; le bucket est borné par la structure de latence, pas par les octets
+
+Hypothèse (issue du re-diagnostic PR #24) : le re-staging de B par CTA m16
+coûte n/16 des octets poids (+31% à n=5, indépendant de M — CTAs×n×K/2 vs
+tuiles×16×K/2) → T tuiles par CTA divisent ce surcoût par T. Implémenté :
+`nvfp4_gemm_chunk_body` prend (m_tile_first, m_tile_count) et boucle, B et
+adressage SFB stagés une fois, acc/réduction réinitialisés par sous-tuile
+(barrière de garde avant réutilisation) ; entry host avec heuristique
+T = tuiles/(2×SM) cap 8, override `QWEN36_CHUNK_GEMV_MTILE` + hook de test
+`qwen36_nvfp4_chunk_gemv_set_mtile` ; gate smoke élargi en sweep
+T ∈ {1,2,3,4} sur 4 tuiles (boucle pleine, CTA partiel 3+1, CTA unique).
+Parité verte sur les 4 T.
+
+**Mesure (bench MTP=4 @128, corpus, fallback OFF, max-new 128)** — entre
+variantes chunk l'ordre d'accumulation par élément est invariant en T →
+sorties bit-identiques (acc identique à 10 décimales), le delta est du pur
+temps de cycle :
+
+| variante | decode tok/s | cycle (corrigé acc) |
+|---|---:|---:|
+| cuBLASLt (référence) | 41.8 | 69.6 ms |
+| chunk T=1 | **36.8** | 72.4 ms |
+| chunk T=4 | 35.3 | 75.5 ms |
+| chunk T=8 | 35.1 | 75.9 ms |
+| chunk T adaptatif (gate-up 6 / in-proj 3 / reste 1) | 34.4 | 77.4 ms |
+
+Dégradation **monotone en T** ; la variante "shape-adaptive" qui ne tile
+que les 2 gros GEMMs est la pire → +5 ms/cycle sur un sous-bucket
+gate-up+in-proj de ~6-7 ms = ces GEMMs quasi doublés. Mécanisme : chaque
+sous-tuile paie en SÉRIE deux barrières CTA + le prologue cp.async
+(~5-8 µs) qui à T=1 tournaient en PARALLÈLE dans des CTAs indépendants,
+et les warps résidents/SM (donc le parallélisme mémoire) ne changent pas
+avec T — les octets B économisés (~10 µs) n'étaient pas la ressource
+limitante. Conclusion structurelle : le bucket chunk (19.3 ms, ~39% de
+la BW moyenne) est borné par latence/lancements/barrières, PAS par les
+octets. Les leviers restants qui visent juste : moins d'appels (fusion
+q/k/v du chunk, 3→1) et/ou capture graphe du forward de verify (les ~491
+lancements host sont hors graphe).
+
+**Addendum à l'entrée PR #24 (2026-06-12)** : ce bench expose ce que le
+chrono nsys kernel-seul avait raté — le kernel chunk est une perturbation
+des logits de verify (ordre d'accumulation ≠ cuBLASLt) et décale
+l'acceptance de chaîne **0.477 → 0.416** sur cette cellule (encore la
+règle de classe verify-perturbation, cf. lm_head FP8). En E2E le chemin
+chunk est donc NÉGATIF même à cycle égal (−8% tokens/cycle) : le défaut
+opt-in-OFF n'est pas une prudence, c'est le bon réglage.
+
+Verdict : **NEGATIVE**. Le kernel M-tilé reste dans l'arbre avec défaut
+T=1 (= comportement PR #24, mesuré 36.8 ici), env + hook conservés pour
+ré-exploration ; le sweep smoke garde la parité de la boucle.
+Gates : smoke complet vert (dont sweep mtile {1,2,3,4} ×2 K).
+Files: kernels-cuda/decode_gemv/{nvfp4_gemv_mma_kernel.cuh,
+nvfp4_gemv_sm120.cu}, kernels-cuda/include/qwen36_fp4.h,
+kernels-cuda/smoke.cu. Inventory: oui.
+
+### 2026-06-12 — GEMM chunk N≤8 via l'atome MMA : kernel correct (parité smoke) mais NEUTRE — le puits re-diagnostiqué : overhead par appel × 491 appels, pas cuBLASLt — opt-in, fondation M-tiling
+
+Hypothèse de départ : cuBLASLt à N=5 tourne à ~34% du pic → étendre le
+GEMV décode m16n8k64 (qui réplique sa dimension N à N=1) à N≤8 rend le
+chunk quasi gratuit. Implémenté proprement : colonnes B réelles dans
+l'atome (coordonnée N = lane>>2), stride SMEM paddé +16 (anti
+bank-conflict), SFB par colonne, réduction élargie [2×8×8×warps] (un
+bug d'indexation half/row attrapé par le gate de parité smoke ajouté —
+diagnostic propre : lignes échantillonnées parfaites, max_abs ~2e38 →
+cellules non écrites), budget SMEM gardé ≤99 KB, N=1 intouché
+(bit-identique, hors du chemin modifié).
+
+**Mesure (nsys, MTP=4 @128 pur)** : le kernel prend tout (21 600 inst,
+cutlass3x → ~11 ms résiduels) à **50 µs/appel — la parité cuBLASLt**
+(48.8), E2E −1.5 ms/cycle = bruit. **Le re-diagnostic est la vraie
+valeur** : à ces shapes, cuBLASLt n'était PAS inefficace — le coût est
+structurel : ~491 lancements GEMM/cycle dont chacun re-stage B par CTA
+m16 (gate-up : 2 176 CTAs × 12.8 KB = 28 MB re-lus ≈ +31% des octets
+poids), barrières et queues comprises. Le chemin du gain : **M-tiling**
+(64-128 lignes/CTA, B stagé une fois — architecture du kernel
+compatible, itération substantielle) et/ou réduction du NOMBRE
+d'appels (fusion q/k/v du chunk, jamais faite).
+
+Resté opt-in (`QWEN36_CHUNK_GEMV=1`), défaut cuBLASLt inchangé (floor
+re-validé). Le gate de parité smoke (n=5, K {1024,512}) reste comme
+fondation de l'itération M-tiling.
+
+Files: kernels-cuda/decode_gemv/{nvfp4_gemv_mma_kernel.cuh,
+nvfp4_gemv_sm120.cu}, crates/kernels/src/backend.rs,
+kernels-cuda/smoke.cu. Inventory: oui.
+
+### 2026-06-11 (nuit) — PR #11 (fused argmax, draft du 17 mai) rebasée sur un mois de divergence et mergée en opt-in — NEGATIVE au bench
+
+Demande utilisateur : merger la seule PR ouverte. Résolution de 7
+fichiers en conflit (purge rationalization, plomberie FP8 lm_head,
+sélecteurs prénorm — unions propres, `decode_e2m1` reste purgé).
+Gates : build+clippy 0, smoke 100% (cas fused-argmax inclus), floor
+vert défaut ET flag (sorties identiques).
+
+Mesure (`QWEN36_MTP_FUSED_ARGMAX=1`, MTP=4 @128 pur, ×2 runs) :
+**+4 à +6.6 ms/cycle** vs cuBLAS matvec + argmax séparés, acceptance
+strictement inchangée. La fusion supprime le buffer logits mais le
+kernel fusionné (réduction atomique pleine-vocab) perd plus que les
+~174 µs d'argmax économisés. Classé §2.3 archived-negative ; opt-in
+conservé comme instrument (le concept redevient intéressant si un
+futur kernel lm_head écrit déjà ses réductions par blocs).
+
+Files: merge de la branche speedoza-mtp-fused-sample. Inventory: oui.
+
+### 2026-06-11 (nuit, fin) — CORRECTION lm_head FP8 : les flips composent dans la récursion de draft → politique AUTO (ON ssi MTP=0) ; grille de régimes re-mesurée sur le main à jour — SHIPPED
+
+**Correction de l'entrée précédente.** Le « production regimes clean »
+était faux : la grille chat/code × ctx de l'agent dmtp (harnais
+`target/quick_chat_code_context_harness.py`) re-déroulée sur le main à
+jour a montré UNE cellule effondrée — chat@8K : acc 0.770 → 0.589,
+tok/s 62.4 → 44.9. A/B au prompt identique, reproduit au bit près :
+FP8=0 restaure exactement 0.770/63.1. **Le mécanisme** (per-position) :
+position 1 inchangée (0.80), positions 2-4 effondrées
+(0.8/0.8/0.73 → 0.53/0.53/0.47) — la récursion du head MTP consomme
+l'argmax lm_head du step précédent, donc les flips FP8 à faible marge
+SE COMPOSENT le long de la chaîne. La probe offline (0/28) ne pouvait
+pas le voir : elle testait des positions isolées, pas la composition.
+Leçon de classe verify-perturbation ajoutée : **toute perturbation des
+logits doit être évaluée sur la châine de drafts, pas par-position.**
+
+**Fix** : `QWEN36_LM_HEAD_FP8` devient **auto = ON ssi mtp==0** (tri-état,
+`=1`/`=0` forcent). Validé : chat@8K MTP4 (auto→BF16) **64.7 / acc
+0.787** (au-dessus des 62.4 d'origine grâce au travail cycle) ; MTP=0
+corpus 3K (auto→FP8) **61.6 tok/s** (record cellule) ; floor sain ; le
+gate synthétique MTP=4 revient à sa baseline BF16 (la note « nouvelle
+baseline ~85-90 » de l'entrée précédente est ANNULÉE).
+
+**Grille de régimes complète sur le main à jour (pure-MTP, max-new 64,
+vs la table du binaire d'avant les merges du jour)** :
+
+| cellule | MTP0 | MTP4 | DFlash (AL) |
+|---|---|---|---|
+| chat 1K | 49.7 (+7%) | 32.3 (acc 0.34) | 54.1 (2.3) |
+| chat 8K | 55.8 (+5%) | **64.7** (0.79, auto-BF16) | 38.4 (3.0) |
+| chat 32K | 46.2 (+9%) | 42.5 (0.80, +15%) | 24.0 (5.0) |
+| code 1K | 53.0 | 52.3 (0.59) | **215.6 (9.4)** |
+| code 8K | 55.8 | 65.4→attendu ~69 BF16 (0.84) | **117.7 (9.5, +7%)** |
+| code 32K | 46.2 | **52.2** (0.98, +6%) | 9.0 (1.8, effondré) |
+
+Routage qui s'en déduit (step 4, défauts à câbler) : DFlash sur code
+≤8K (110-216 tok/s), MTP=4 à 8K+ (gagne dès acc ≥0.8), MTP=0/fallback
+sur chat court et 32K-chat ; DFlash JAMAIS ≥16K (AL 1.8). Le 32K-chat
+(acc 0.80, perd encore −8%) ne basculera qu'avec le cycle long-ctx
+(relecture KV ×6 du split-K — inversion de boucle au backlog).
+
+Files: crates/runtime/src/engine.rs (politique auto). Inventory: oui.
+Artefacts : target/quick_chat_code_context_runs/20260611-164651/ (worktree).
+
+### 2026-06-11 (nuit, suite) — lm_head FP8 passe défaut ON : cycle MTP=4 @3K −6.2 ms (+7.6% pur), N=5 batché bat cuBLAS — SHIPPED (2 artefacts actés)
+
+Suite de la passe « millisecondes sur le cycle » : re-décomposition
+nsys fraîche (cycle 61.4 ms @128 : GEMM FP4 chunk 19.3 #1, lm_head
+BF16 12.4 #2, DeltaNet 6.5, split-K 3.6 après qh-grid), puis flip du
+lm_head FP8.
+
+**Kernel finalisé** : R-blocking par N (`N=1 → R=1` : 785 µs = 90% du
+pic, le blocking coûtait +12% à 1 RHS ; `2..8 → R=2` : N=5 batché
+**1.78 ms vs cuBLAS 2.2**). Mesures GPU calme.
+
+| gate | résultat |
+|---|---|
+| cycle MTP=4 @3K (pur) | 77.6 → **71.4 ms** ; tok/s 38.2 → **41.1 (+7.6%)** |
+| MTP=4 @128 (pur) | cycle 61.6 → 57.0 ; tok/s 47.9 → 41.0 (acc 0.477→0.354, artefact marges basses) |
+| MTP=0 @3K / synthétique | 60.1 / 53.3-53.7 ✓ |
+| floor | 10/10, texte identique |
+| DFlash | défaut 149.8 **AL 8.3 =** ; OFF 62.5 AL 8.5 ✓ |
+| synthétique MTP=4 | 95.3 → **~85-90** (flips argmax sur le prompt dégénéré full-accept — même classe que @128) |
+| VRAM | −1.18 GiB (poids résidents 7.82 GiB) |
+
+**Découverte/fix** : le drafter DFlash consomme le pointeur lm_head
+BF16 du target directement (drafting weight-tied, 5 sites CLI) — le
+drop FP8 le cassait (« lm_head tensor missing »). Fix :
+`EngineConfig.keep_bf16_lm_head`, posé par les 5 chemins drafter
+(DFlash tourne en long-context-mode, la VRAM y est large). AL
+re-validé inchangé.
+
+**Décision actée** : les deux régressions restantes sont des régimes
+artefacts (corpus court à marges basses ; prompt synthétique répété) —
+les régimes de production (chat acc 0.89 inchangée, ctx ≥3K, DFlash AL)
+sont propres et l'auto-fallback borne le reste. **Nouvelle baseline
+perf-gate MTP=4 synthétique : ~85-90 avec FP8** (l'ancienne 95.3 reste
+atteignable via `QWEN36_LM_HEAD_FP8=0`). Timing chat FP8 (attendu ~82
+tok/s vs 78.5 BF16) à mesurer à la prochaine fenêtre GPU calme.
+
+Files: `kernels-cuda/lm_head_fp8.cu` (R par N),
+`crates/runtime/src/engine.rs` (défaut ON + `keep_bf16_lm_head`),
+`crates/cli/src/main.rs` (5 sites drafter). Inventory: oui.
+
+### 2026-06-11 (nuit) — Fallback MTP en ligne (plan step 4) SHIPPED : « MTP ne perd (presque) plus jamais » — et le chat mesuré à +33%
+
+Réponse à « le MTP nous fait toujours perdre des perfs » : c'est vrai
+en continuation de corpus brut (acceptance 0.5 = capacité réelle de la
+tête, vLLM identique), faux en chat — mesuré ce soir :
+
+| régime (~2-3K ctx) | MTP=0 | MTP=4 pur | MTP=4 + fallback |
+|---|---:|---:|---:|
+| **chat templaté** (T257−T1) | 59.0 | **78.5 (+33%)** | 78.5 (`fallback=none`, acc/draft 0.89) |
+| corpus brut, max-new 512 | 59.8 | 38.2 (−36%) | **55.8 (−7%)**, trigger cycle 8 |
+| corpus brut, max-new 128 | 52.3 | 47.9 | 43.1 (run trop court pour amortir trigger+capture) |
+
+**Mécanique** : compteurs accepted/proposed dans les boucles chat+bench ;
+après `QWEN36_MTP_FALLBACK_WINDOW` (8) cycles, si acceptance/draft <
+`QWEN36_MTP_FALLBACK_MIN_ACCEPTANCE` (0.55 = break-even au coût de
+cycle actuel : MTP-4 gagne ssi 1+4·acc > cycle/token ≈ 3.2-4.6×), la
+génération finit sur le graphe décode plain. Raccord :
+`Engine::seed_sampled_token(current)` → `enable_decode_graph()` (qui
+forwarde ce token à la position courante) → `decode_graph_step()` en
+boucle — l'état MTP committé est déjà cohérent. `QWEN36_MTP_AUTO_FALLBACK=0`
+pour les mesures pure-MTP (le dashboard le force désormais : ses
+cellules MTP restent des before/after kernel comparables).
+
+**Bug attrapé par le garde-fou du levier 1** : la capture du graphe
+Decode avec interpreter actif (mtp>0) — combinaison inédite créée par
+le fallback — bindait les gate/up NON-fusionnés (droppés) dans le
+programme MLP interpreter → « tensor … was not uploaded » au lieu d'une
+lecture de mémoire libérée. Fix : le builder MLP interpreter retourne
+None si les poids unfused ne sont plus résidents (le chemin host
+fusionné prend le relais ; l'interpreter régresse de toute façon sur du
+décode MTP=0-shaped).
+
+Gates : floor 10/10 ; chat défaut sans trigger ; fallback forcé
+(window=2) raccord sain ; cellules corpus ci-dessus. Le seuil 0.55
+DOIT redescendre à mesure que le cycle se réduit (chaque ms de cycle
+gagnée élargit la zone où la spéculation reste active).
+
+Files: crates/cli/src/main.rs (boucles + knobs),
+crates/runtime/src/engine.rs (seed_sampled_token + garde interpreter),
+scripts/bench_dashboard.sh. Inventory: oui.
+
+### 2026-06-11 (nuit) — lm_head FP8 e4m3 : kernel + plomberie complets, N=1 à 90% du pic, opt-in en attendant N>1 et l'arbitrage acceptance court-ctx — WIP
+
+Lane temps-de-cycle, suite de la probe verte du matin (0/28 flips).
+Livré sur cette branche (`QWEN36_LM_HEAD_FP8=1`, défaut OFF) :
+
+- **Kernels** (`kernels-cuda/lm_head_fp8.cu`) : quantize one-shot
+  BF16→e4m3 + scales per-row (amax/448, cast saturant — le contrat
+  exact de la probe), et GEMV W8A16 N-RHS (N≤16, dispatch templaté,
+  register-blocking R lignes/warp, x via __ldg L1-résident).
+- **Plomberie** : FFI/backend, store `LmHeadFp8Store`, quantize à
+  l'init PUIS drop du lm_head BF16 (−2.37 +1.19 = **−1.18 GiB** ;
+  poids résidents 18.3 → 10.2 → **7.82 GiB** avec le levier 1) ;
+  TOUS les consommateurs routés via `lm_head_matvec`/`_matmul_rows`
+  (décode, MTP head ×2, verify batché, DFlash verify_block, recovery),
+  chunking N≤16 pour les blocs DFlash ≤32, interpreter-logits gated off
+  sous FP8.
+
+**Leçon kernel chèrement payée** : v1 avec tile X en SMEM +
+__syncthreads par tile = **2456 µs (29% du pic)** — les barrières
+sérialisent les rounds (latence load X non recouverte) ; les loads
+uint4 n'y changent rien (2615 µs). v2 streaming pur sans barrière
+(x en __ldg, X = 10-130 KB L1/L2-résident) = **790 µs = 1.61 TB/s =
+90% du pic**, mieux que cuBLAS BF16 (86%). La v3 register-blockée
+(R lignes/warp pour amortir x à N>1) est dans l'arbre mais mesurée
+sous contention GPU — à re-mesurer au calme.
+
+**Mesures (GPU calme, .so v2)** :
+| gate | résultat |
+|---|---|
+| floor hello/hello world × MTP {0..4} | **10/10**, texte identique au BF16 |
+| chat MTP=4 ~2K (régime production) | 49 acc / 2 rej — identique BF16 |
+| MTP=0 @3K | 59.8 → **60.9** (+1.8%) |
+| MTP=4 @3K corpus | acc 0.512 (=) mais tok/s 38.2 → 35.5 : le call
+batché N=6 (~2.6 ms) ne bat pas encore cuBLAS (2.2 ms) |
+| MTP=4 @128 corpus | **acc 0.477 → 0.354 (déterministe)** — flips
+argmax aux positions à faible marge (régime corpus court uniquement ;
+chat intact) → tok/s 47.9 → 38.2 |
+
+**Verdict** : opt-in, défaut OFF. Pour flipper ON il faut : (a) N>1
+plus rapide que cuBLAS (R-blocking à re-mesurer, ou x en SMEM chargé
+UNE fois sans barrière par tile), (b) arbitrer le couplage acceptance
+du cell @128 (les régimes production — chat, ctx ≥3K — sont propres ;
+c'est la cellule corpus-court du dashboard qui paie). Le gain VRAM
+(−1.18 GiB) suit le même flag.
+
+Files: kernels-cuda/lm_head_fp8.cu (new), include/qwen36_fp4.h,
+scripts/build_cuda.sh, crates/kernels/{ops,backend,lib}.rs,
+crates/runtime/{engine,gpu}.rs. Inventory: oui (table env).
+
+### 2026-06-11 (nuit) — Oracle vLLM exécuté : notre acceptance = la référence, régime pour régime — le dossier « acceptance trop basse » est CLOS — DECISION
+
+vLLM (checkout dmtp `/home/orosius/workspace/vllm`, 0.21.1rc1.dev53,
+method `qwen3_5_mtp`, k=4, greedy, MÊME métrique accepted/draft_tokens
+vérifiée dans `v1/spec_decode/metrics.py`) sur le MÊME checkpoint,
+les deux régimes (script : `scripts/vllm_acceptance_oracle.py`) :
+
+| régime | vLLM acc/draft (par-pos) | notre moteur |
+|---|---|---|
+| corpus brut 4×8000 chars | **0.518** (0.76/0.57/0.41/0.33) | 0.50 (0.75/0.55/0.41/0.20) |
+| chat templaté 4 prompts | **0.778** (0.92/0.82/0.74/0.64) | 0.82 (composite 0.96) |
+
+**Courbes par position quasi superposées.** Conclusions :
+1. **Aucun bug d'acceptance chez nous** — validation externe définitive,
+   après : parités internes (Codex), câblage 2×2 (FALSIFIED, entrée
+   précédente), code vLLM identique au nôtre (post-norm sur les deux
+   contrats, `qwen3_5_mtp.py` l.137/158, `Qwen3NextModel.forward`
+   retourne post-`self.norm`), et maintenant l'oracle runtime.
+2. ~0.5 en continuation brute = la vraie capacité de la tête MTP de ce
+   checkpoint ; ~0.78-0.82 en chat. La réf « 0.85-0.95 » venait d'un
+   autre workload/définition.
+3. **Tout le déficit MTP=4 vs MTP=0 du dashboard est donc du coût de
+   cycle** (75 ms ctx-flat, 4 puits nsys — entrées du matin) ; le
+   levier acceptance restant est la qualité du drafter (lane fine-tune
+   roadmap P2), pas le runtime.
+4. Bonus dashboard : le régime corpus-brut sous-estime structurellement
+   l'acceptance de production chat — confirmé par la référence.
+
+Incident à retenir (consigné en mémoire agent) : le premier run vLLM a
+planté la machine (profiling encodeur vision du wrapper VL → JIT torch
+ninja NON bridé → 32 jobs nvcc → 64 Go RAM saturés). Le run qui a
+réussi : `systemd-run --user --scope -p MemoryMax=40G -p CPUQuota=800%`
++ `MAX_JOBS=4` + `limit_mm_per_prompt={"image":0,"video":0}` + watchdog
+RAM. Le checkpoint local a maintenant les `preprocessor_config.json`
+récupérés de `Qwen/Qwen3.6-27B` (requis par vLLM).
+
+Files: `scripts/vllm_acceptance_oracle.py` (new). Inventory: n/a (hors
+moteur).
+
+### 2026-06-11 (nuit) — Câblage MTP pré-norm : hypothèse séduisante, 2×2 mesuré, FALSIFIED — la tête de CE checkpoint veut le post-norm
+
+Contexte : vLLM afficherait 0.85-0.95 d'acceptance sur ce modèle/quant
+(info utilisateur) vs notre 0.5 corpus. Hypothèse (très plausible sur
+papier) : tous nos chemins passent le hidden **post**-`model.norm`
+(`normed`) comme entrée de la tête MTP, alors que le contrat
+Qwen3-Next/DeepSeek de référence est le hidden **pré**-norm —
+`pre_fc_norm_hidden` re-normalise par-dessus → γ de `model.norm` cuit
+dans l'entrée. Invisible aux parités internes (la réf Python copie le
+même câblage) — exactement la classe de bug que les checks de la lane
+acceptance ne peuvent pas voir. Pareil pour la récursion (drafts ≥2 :
+sortie post-`mtp.norm` réinjectée).
+
+**Instrumentation** : buffer `prenorm_hidden` (forward + prefill)
+matérialisé gratuitement par le slot `residual_out` des rmsnorm
+final_norm/mtp.norm ; sélecteurs distincts pour les DEUX contrats
+(entrée backbone vs récursion) ; audit complet des 19 consommateurs
+(le lm_head batché du verify reste sur `normed`, côté target).
+
+**Mesure 2×2 (corpus dashboard, MTP=4, max-new 128, acc/draft)** :
+
+| input \ récursion | pré | post |
+|---|---|---|
+| **pré** | 0.297 @128 / 0.466 @3K | 0.373 / 0.371 |
+| **post** | 0.497 / 0.389 | **0.477 / 0.497 (historique)** |
+
+**Aucune combinaison ne bat l'historique ; tout le pré-norm est pire**
+(récursion pré-norm : positions 2-4 s'effondrent à 0.34/0.18/0.05).
+⇒ la tête MTP de CE checkpoint a été entraînée/calibrée sur le hidden
+post-norm — son contrat diffère de la réf Qwen3-Next vanilla. Le
+câblage n'est PAS notre écart vs vLLM. Défauts restaurés à l'identique
+(vérifié : acc 0.477, perpos et cycles au bit près, floor sain) ;
+les flags `QWEN36_MTP_PRENORM_{HIDDEN,RECURSION}=1` restent comme
+harnais d'expérience.
+
+**Pistes restantes pour « 0.5 vs 0.85-0.95 »** (par ordre de
+probabilité) :
+1. **Définition de la métrique + régime.** Notre composite
+   accepted/(accepted+cycles_rejetés) = 0.72 corpus et **0.96 en régime
+   chat templaté** — si les chiffres vLLM sont le composite sur du chat
+   (le cas typique des benchs serving), il n'y a PAS d'écart réel.
+   À trancher en demandant la définition/le workload exact.
+2. L'oracle externe de la lane acceptance (vLLM/modelopt sur cette
+   machine) reste le test décisif s'il faut aller plus loin.
+
+Files: `crates/runtime/src/engine.rs`, `crates/runtime/src/gpu.rs`
+(buffer + sélecteurs, défauts inchangés). Inventory: oui (table env).
+
+### 2026-06-11 (soir) — Levier VRAM 1 SHIPPED : prefill sur poids fusionnés + drop entrelacé des originaux — −8.1 GiB, la cellule 3K revit (pic 32.0 → 23.9 GiB)
+
+Suite directe de l'enquête VRAM (entrée précédente). Branche worktree
+`vram-lever1` (l'agent acceptance a engine.rs/main.rs non commités sur
+main — à merger après lui).
+
+**Ce qui a changé** (le chemin fused-prefill MLP existait depuis le
+04-05, complet — GEMM combiné [2I,T] + 2 `copy_strided_rows` de
+désentrelacement + swiglu standard — mais opt-in et jamais validé ;
+le fused-prefill in_proj était déjà ON par défaut) :
+1. `QWEN36_PREFILL_FUSED_MLP` **défaut OFF → ON** (`=0` pour revenir).
+2. **Drop entrelacé** : `MlpFusedStore::build` /
+   `LinearAttnInProjFusedStore::build` libèrent les sources de chaque
+   layer sitôt sa copie fusionnée construite (sync par layer) —
+   indispensable : le drop post-build gardait le PIC d'init à ~28.5 GiB
+   et l'init OOMait dès ~1.7 GiB de VRAM externe (vérifié : OOM sur le
+   malloc 42.6 MB du build in_proj, GPU quasi libre). Gated : les deux
+   flags prefill-fused actifs + les deux stores construits +
+   `QWEN36_KEEP_UNFUSED_WEIGHTS≠1`.
+3. `GpuWeightStore::remove` (accès post-drop → erreur « tensor
+   missing », jamais de lecture de mémoire libérée). Buffers prefill :
+   seul `block_out` passe à 2I (les 4 autres buffers wide restent à I —
+   évite +0.5-1.4 GiB de sur-allocation).
+
+**Audit des lecteurs des originaux avant drop** : décode = stores
+fusionnés (défaut), prefill MLP = fused (ce commit), prefill in_proj =
+fused (défaut), interpreter = `fused.combined_weight` (vérifié lignes
+~8661+), MLP tête MTP = tenseurs `mtp.*` BF16 distincts (non droppés),
+`common_nvfp4_quant`/destructurations = métadonnées + scales (gardés).
+Fallbacks unfused = inatteignables stores présents ; sinon erreur
+bruyante.
+
+**Mesures (RTX 5090, corpus dashboard)** :
+
+| mesure | avant | après |
+|---|---:|---:|
+| poids résidents | 18.29 GiB | **10.19 GiB** (drop 8.10 confirmé au log) |
+| pic init gpu-load 3328/MTP=4 | OOM dès ~1.7 GiB externes | **22.0 GiB** |
+| pic bench cell 3K MTP=4 | 32.0 GiB (OOM fréquent) | **23.9 GiB** (~8.7 GiB de marge) |
+| cell 3K MTP=4 decode / prefill | 39.2 / 2761 (06-10) | 38.2 / **3013** |
+| A/B ctx128 fused=1 vs =0 | — | 45.9 vs 45.4 tok/s, acc 0.477 = , cycles 44 = |
+| parity floor | 10/10 | **10/10** |
+| perf gate | 52.1 / DFlash AL 8.3 | 51.8 / DFlash 143.1 **AL 8.3 =** |
+| MTP=4 synthétique | 113.7 (matin) | 106.6 (−6%, désentrelacement sur régime verify-dominé ; >> 94.4 pré-qh-grid) |
+
+Le `chat` MTP=4 à prompt ~3K (l'OOM utilisateur du matin) repasse aussi.
+Reste connu : le résiduel synthétique −6% est récupérable avec un
+swiglu lisant directement [gate||up] (zéro copie, comme
+`swiglu_nvfp4_quantize` côté décode) — petit kernel, noté. Les
+leviers 2 (lm_head FP8, −1.27 GiB) et 3 (leaf_checkpoints tree-MTP
+lazy, −0.58 GiB) restent ouverts.
+
+Files: `crates/runtime/src/engine.rs`, `crates/runtime/src/gpu.rs`.
+Inventory: oui (§2.1 fused stores + table env :
+`QWEN36_PREFILL_FUSED_MLP` **on**, `QWEN36_KEEP_UNFUSED_WEIGHTS` new).
+
+### 2026-06-11 (soir) — Enquête VRAM : le « modèle 19 GB » devient 28.3 GiB résidents + ~1 GiB runtime — comptabilité complète, 3 leviers — DECISION
+
+Question utilisateur : les poids font 18.3 GiB sur disque, pourquoi OOM
+à ctx 3K sur 32 GB ? Réponse mesurée (gpu-load `gpu_memory_report` +
+timeline nvidia-smi 0.2 s pendant un bench complet) :
+
+**Comptabilité au cell 3K MTP=4 (max_context 3328) :**
+
+| poste | GiB | détail |
 |---|---:|---|
-| `attention_flash_splitk` | ~16 | **784 µs/launch** (×~20/cycle, 16 layers + MTP head) — énorme pour q=5 ; dimensionnement n_splits sous capture à investiguer |
-| `nvfp4_quantize_rows` | ~14.5 | **35.7 µs/launch** × ~406/cycle — quantizer 5 lignes devrait coûter ~5 µs ; grille minuscule latency-bound |
-| `fp8_matvec` (régression du jour !) | ~8.7 | grid.y=rows relisait les **1.27 GB de poids 5×** pour le verify batché (le cuBLASLt BF16 les lisait 1×) — fix immédiat ci-dessous |
-| `sample_argmax` + gemvx + rmsnorm | ~6 | secondaire |
+| poids uploadés (TOUS les tenseurs disque) | 18.29 | layers NVFP4 12.14, embed BF16 2.37, **lm_head BF16 2.37**, scales 1.42 (+ tête MTP 0.79 si MTP>0) |
+| **fused stores = poids DUPLIQUÉS** | **8.12** | MlpFusedStore 5.98 + LinearAttnInProjFused 2.14 — les originaux gate/up + in_proj_{qkv,b,a,z} restent uploadés (le chemin prefill les lit) |
+| buffers prefill (capacity = max_context ici) | 0.67 | 5 buffers « wide » (2·intermediate) de 110 MiB |
+| runtime | 1.01 | workspace 256 MiB, KV 104, état DeltaNet 72, **deltanet/conv leaf_checkpoints 576 MiB — tree-MTP (lane NEGATIVE, K=1 défaut) alloués INCONDITIONNELLEMENT** |
+| forward + checkpoints MTP + divers | 0.13 | attn_partials 38 MiB, mtp_logits 2.4 MiB… |
+| **total engine** | **~28.3** | |
+| + externe (desktop/autres) | 1.3-1.7 | variable |
+| + graphs CUDA + plans cuBLASLt (post-load) | ~0.5-1.5 | vu au décode |
+| **pic mesuré bench MTP=4 @3K** | **31.9-32.0 / 32.6** | le cliff |
 
-**Fix #1 (cette session)** : `fp8_matvec` multi-rows — toutes les rows
-stagées en SMEM BF16 (f32 dépassait le cap 99 KB à rows=5), UNE passe de
-poids, accumulateurs par row en registres. `kMvMaxRows=8` (couvre depth
-7 du step 3 ; depth 8 demandera 9 rows). **Mesuré : e2e NEUTRE**
-(38.7 vs 39.4 tok/s — bruit ; MTP=0 stable 64.8 ; smoke gate identique
-au bit près). Lecture honnête : l'appel batché rows=5 n'est qu'1×/cycle,
-les ~6 appels rows=1 (drafts) dominent le poste fp8 — le fix divise bien
-par ~4 les octets de l'appel batché mais ce n'était que ~3 ms/cycle.
-Gardé (correct par construction, nécessaire pour depth 6+ où rows
-monte). Les 30 ms/cycle des deux vrais coupables (quantize_rows 14.5 +
-split-K 16) restent le travail à faire.
+**Timeline d'un bench** (poll 0.2 s) : montée régulière 1.6 → 23.0 GiB
+en ~5 s (upload per-tensor), puis **+8.9 GiB en UN pas à t=5.3 s = build
+des fused stores** (concat D2D, rapide), plateau 31.9 pendant
+prefill+décode. L'OOM @3328 frappe pendant le build du
+LinearAttnInProjFused — le malloc de 42 598 400 octets observé partout
+= **16640×5120/2 = le poids FP4 d'UN layer de ce store** (×48 layers).
+(Pourquoi gpu-load semblait plafonner à 21 GiB : le build se produit
+~100 ms avant l'exit, le poll 0.15 s le rate ; le rapport JSON, lui,
+compte juste. Le champ `uploaded_model_tensors` du rapport est correct.)
 
-**Fix #2 (même session, diagnostic utilisateur : ops.cu:1081, un bloc de
-32 threads par groupe de 16 valeurs)** : `nvfp4_quantize_rows` réécrit en
-warp-par-groupe, 8 groupes par bloc de 256, zéro syncthreads (max par
-shfl, commutatif → bit-identique ; vieux kernel supprimé). Smoke + parité
-verts, MTP=0 stable 64.8. **Mesuré : e2e NEUTRE aussi (38.9 tok/s,
-cycle 78.3 ms).**
+**Réponse courte : oui on devrait OOM** — 18.3 de poids + 8.1 de
+DOUBLONS fused + 2.4 de buffers ≈ 28.8, il ne reste ~2 GiB de marge sur
+32.6 et le moindre desktop/agent externe la mange.
 
-**LEÇON STRUCTURANTE (deux fixes "évidents" neutres de suite)** : les
-sommes par kernel du node-trace ne sont PAS le chemin critique du cycle.
-Le multi-graph verify exécute les petits nœuds (quantize, fp8 drafts)
-**en concurrence** avec les gros — les raccourcir ne change pas le wall.
-Le chemin critique est la chaîne séquentielle inter-couches :
-FP4 GEMM → split-K attention (784 µs × 16 layers, dépendances série)
-→ DeltaNet, plus les 4 forwards de draft séquentiels. Conséquence :
-- (a) ✅ fait (hygiène, bit-exact, garde) mais ne comptez plus les µs
-  des petits nœuds ;
-- (b) le SEUL levier restant à fort ROI est le kernel split-K lui-même
-  (chemin critique) : **LUT FP8 256 entrées** (à porter de
-  attention_decode_tiled.cu, remplace le ldexpf branchy) puis
-  **occupancy 2 CTA/SM** (tile KV SMEM réduit/double-buffered façon sage
-  pipeline). Ne PAS faire de tile M=8 (probe M=16 : ~8% seulement).
-- Vérifier les ~6 quantizes/couche du chunk verify (redondance
-  possible : le décode fusionne rmsnorm+quantize, le prefill multi-row
-  les sépare) — mais sur le chemin critique seulement.
-- Steps 3-4 (depth 6, routing) après (b) : à acc/position ~0.73, depth 6
-  n'ajoute ~+0.35 tok/cycle que si le coût marginal du chunk est faible.
+**Leviers, par ROI :**
+1. **Prefill-path fusion → drop des originaux : −8.1 GiB.** Le vrai fix.
+   Le prefill lirait les poids fusionnés (sorties column-major à strider
+   dans swiglu/conv1d/gdn_gate — le chantier décrit dans les notes de
+   mai, jamais fait). Régler ça tue le cliff définitivement.
+2. **lm_head FP8 : −1.27 GiB** (remplace le BF16) — déjà planifié lane
+   temps-de-cycle, double dividende.
+3. **leaf_checkpoints tree-MTP lazy : −0.58 GiB, trivial** — n'allouer
+   que si `mtp_tree_leaves > 1` (gpu.rs:686-695 ; nécessite de passer
+   l'info dans `GpuRuntimeBuffers::allocate`, engine.rs — à faire après
+   le commit de la lane acceptance).
+4. (palliatif existant : `QWEN36_LONG_CONTEXT_MODE=1` désactive les
+   fused = −8.1 GiB contre ~−9% de décode.)
 
-### 2026-06-10 — lm_head FP8 e4m3 (voie de repêchage de la probe FP4) — SHIPPED
+Files: docs only (les fixes 2-3 attendent le commit engine.rs de la
+lane acceptance). Artefacts : /tmp/gpuload_*.json, /tmp/poll_bench.txt.
 
-La probe offline FP8 (même harness que la probe FP4 tueuse, mêmes 27
-vecteurs réels) : **0 flip top-1, |Δlogit| moyen 0.045 (3× sous le FP4)**
-→ implémentation.
+### 2026-06-11 (après-midi) — Probe lm_head FP8 e4m3 : 0 flip / 28 — lane OUVERTE (implémentation scopée, en attente) — DECISION
 
-**Design** (default ON, kill `QWEN36_LM_HEAD_FP8=0`) :
-- `kernels-cuda/fp8_matvec.cu` : `fp8_quantize_rows` (quantization GPU
-  one-shot au chargement : amax par ligne → scale f32 = amax/448, encode
-  e4m3 RNE hardware via `__nv_cvt_float_to_fp8`) +
-  `fp8_matvec` (1 warp/ligne, 8 lignes/CTA, B en SMEM f32, décode
-  `__nv_cvt_fp8x2_to_halfraw2`, accum f32, scale par ligne appliqué à la
-  sortie — exact pour l'argmax par ligne).
-- Engine : `build_lm_head_fp8()` à l'init ; dispatch dans les DEUX choke
-  points (`bf16_matvec` + `bf16_gemm_rows`) par nom de tenseur → **tous**
-  les consommateurs lm_head (logits décode, logits prefill, verify MTP
-  batché) basculent ensemble — exigence du parity floor (mixer FP8/BF16
-  selon le mode divergerait sur les tokens borderline). Exceptions
-  documentées : top-k tree (lane NEG, reste BF16) ; se désactive sous
-  `QWEN36_INTERPRETER_LOGITS` (opcode BF16).
+Probe de falsification offline (`scripts/lmhead_fp8_probe.py`, méthode du
+06-10) sur **28 vecteurs `final_normed` frais** (24 prompts variés
+FR/EN/code/SQL/JSON/math + 8 tranches de corpus à offsets/tailles
+divers ; collecte : 1 run chat max-new=1 par prompt — le dump par
+position est inaccessible sous graph, `QWEN36_DEBUG_DUMP_DECODE` ne
+bypasse pas la capture). W8A16, accum FP32 :
 
-**Bug de bring-up** (pour mémoire) : la première version du quantizer
-faisait un `__shfl_xor_sync(0xffffffff, …)` dans une branche à 8 threads
-actifs → deadlock GPU (100% util, 194 W, smoke suspendu). Réduction
-finale re-écrite en linéaire thread-0.
+| variante | top-1 flips | top-5 overlap | \|Δlogit\| mean / max |
+|---|---:|---:|---|
+| per-tensor (amax/448) | 0/28 | 4.96/5 | 0.046 / 0.484 |
+| per-row | 0/28 | 5.00/5 | 0.043 / 0.344 |
+| per-block128 | 0/28 | 5.00/5 | 0.038 / 0.282 |
 
-Gates : smoke `fp8 lm_head gate` (quantize+matvec vs référence host :
-worst rel 0.39%, argmax planté préservé, 3 rows) ; e2e TOUS verts :
-- decode-vs-prefill-check : argmax_match=true, cos 0.9977 (inchangé) ;
-- dump-logits FP8 on/off : top-1 identique sur 4 prompts (code, FR,
-  corpus 6K chars, hello world) ;
-- MTP parity floor : 10/10 identiques ;
-- fmt + clippy (±cuda) + tests workspace verts.
+vs NVFP4 (06-10, item tué) : 1 flip/27, Δ 0.144/1.24. Marge top-1 réf
+de ce set : médiane 4.64, p10 1.95, min 0.86 — **caveat : set moins
+adversarial que celui du 06-10 (p10 0.25, vecteurs mid-génération)** ;
+le verdict de production reste le parity floor E2E après implémentation.
 
-**Perf (dashboard corpus, ctx 3072, max-new 128)** :
-- MTP=0 : **61.8 → 65.2 / 65.2 / 64.7 tok/s (+5.4%)**. Cumul du jour sur
-  cette cellule : 59.4 → 65.2 (**+9.8%** = routing down→cuBLASLt + lm_head
-  FP8).
-- MTP=4 : 39.3 vs 39.5 baseline — bruit, pas de régression (le lm_head
-  y est amorti sur les tokens acceptés, gain attendu plus faible).
+**Pourquoi ça paie double** (lane temps-de-cycle) : le cycle MTP=4 fait
+~6.3 GEMV lm_head pleine-vocab (~2.0-2.2 ms pièce, 13.3 ms/cycle,
+séquentiels — non batchables) ⇒ FP8 ≈ **−6.5 ms/cycle MTP=4** et
+−0.8 ms/token MTP=0 (+4-5%). ET : remplacer (pas doubler) le lm_head
+BF16 [248320×5120] = **−1.27 GB de VRAM** — de quoi rouvrir la cellule
+3K qui OOM au plafond.
 
-Files: kernels-cuda/fp8_matvec.cu (new), include/qwen36_fp4.h (+2 specs
-ABI, miroirs backend.rs/ops.rs/lib.rs), engine.rs, smoke.cu,
-build_cuda.sh. Inventory: oui (§2.1 + env).
+**Design scopé** (à implémenter après le commit de l'agent acceptance —
+engine.rs porte ses modifs non commitées) :
+1. Kernel quantize one-shot BF16→e4m3 + scales per-row f32 (GPU, à
+   l'init) ; kernel GEMV W8A16 N-RHS (X^T en SMEM par tuiles de hidden,
+   chaque warp lit sa ligne de poids UNE fois et sert les N vecteurs —
+   N≤13 pour le verify batché).
+2. `GpuWeightStore::upload_required` est par-tenseur → skipper l'upload
+   du lm_head BF16 quand le FP8 est actif (gain net).
+3. Tous les call sites passent par `bf16_matvec/bf16_gemm_rows(&manifest.
+   lm_head, ...)` → router via un store `Option<LmHeadFp8>`.
+4. **Opt-in d'abord** (`QWEN36_LM_HEAD_FP8=1`) : ça change les logits →
+   peut reshuffler l'acceptance — à coordonner avec la lane acceptance
+   avant tout flip de défaut. Gates : smoke quantize+gemv vs réf CPU,
+   floor 10/10, dashboard A/B, perf gate.
 
-### 2026-06-10 — GEMV par shape : mlp.down routé vers cuBLASLt (+4.1% MTP=0) ; profondeur de pipeline falsifiée — SHIPPED + NEGATIVE
+Files: scripts/lmhead_fp8_probe.py (committé avec l'entrée précédente).
+Vecteurs : /tmp/lmhead_probe (régénérables via le script ci-dessus).
 
-Nouvel instrument : `kernels-cuda/tools/gemv_shape_bench.cu` — microbench
-apparié par shape de production du gemv Direction B, **données froides**
-(rotation sur N copies de A, footprint > L2 96 MB ; la v1 mono-buffer
-mesurait le L2 à 2.4 TB/s, piège classique). Total isolé 12.01 ms/token
-= l'in-situ nsys (12.10) : méthodologie validée.
+### 2026-06-11 (après-midi) — Verify attention : q-heads dans la grille du split-K — SHIPPED (+18% MTP=4 court ctx, +20% synthétique, bit-exact)
 
-| shape | M | K | CTAs | %peak gemv | cuBLASLt µs (vs gemv µs) |
-|---|---:|---:|---:|---:|---:|
-| mlp.gate_up | 34816 | 5120 | 2176 | **81%** | 96.9 vs 69.5 |
-| mlp.down | 5120 | 17408 | 320 | **41%** | **55.4 vs 68.0 ← cuBLASLt gagne** |
-| deltanet.in_proj | 16640 | 5120 | 1040 | 73% | 47.1 vs 36.9 |
-| deltanet.out_proj | 5120 | 3584 | 320 | 56% | 18.4 vs 10.4 |
-| attn.q_proj | 12288 | 5120 | 768 | 69% | 36.9 vs 28.8 |
-| attn.kv_proj | 1024 | 5120 | 64 | 26% | 18.3 vs 6.3 |
-| attn.o_proj | 5120 | 6144 | 320 | 60% | 22.5 vs 16.5 |
+Lane « temps de cycle » (l'acceptance est traitée en parallèle par un
+autre agent — aucun changement de numerics ici, le fix est bit-exact).
 
-**SHIPPED — routing par shape** : mlp.down (M=5120, K=17408) part
-désormais directement sur cuBLASLt (`backend.rs`, condition de shape
-exacte, commentaire avec la mesure) ; toutes les autres shapes gardent
-le gemv (1.3-2.9× plus rapide). E2e MTP=0 @3K : **59.4 → 61.8 tok/s
-(+4.1%)**, 3 reps stables. Gates : smoke vert, parité inchangée
-(cuBLASLt = le chemin historiquement validé).
+**Chaîne d'investigation** (chaque hypothèse tuée par une mesure) :
+1. Multi-graph OFF (+12% ce matin) re-A/B sur .so frais : wash à ctx 128
+   (−5 ms/cycle structurel mais reshuffle d'acceptance 0.48→0.41) — pas
+   un levier fiable, défaut inchangé.
+2. Théorie « 128 splits vides du bucket de capture » : FALSIFIÉE deux
+   fois — nsys host-launch ≈ capture (434 vs 535 µs/instance), et
+   l'override `QWEN36_DECODE_ATTENTION_N_SPLITS=4` ne change rien (le
+   dispatch flash split-K calcule son n_splits localement :
+   `attention.cu` ≈ l. 2660, ceil(ctx/64) capé à 48).
+3. Vérité terrain via sqlite nsys (`gridX/Y/Z`) : **grid = (4, 1, 3) =
+   12 CTAs de 128 threads sur 192 SMs à ctx 128** — ~6% d'occupation.
+   Le kernel bouclait les 6 q-heads par kv-head EN SÉRIE dans le CTA,
+   en rechargeant Q/K/V et en réinitialisant le softmax à chaque
+   itération (états indépendants par construction).
 
-**NEGATIVE — profondeur de pipeline A 2→4** (l'expérience kernel-level
-du prototype SMEM-paging) : ring de 4 buffers de 512 B/warp, 3 chunks
-en vol au lieu d'1. Résultat : **+0% partout** (81→81, 73→71, 69→66,
-56→56, 60→56) et K=17408 dépasse les 48 KB SMEM (rejeté). Reverté.
-Lecture : tripler les octets en vol par warp ne change RIEN → le gemv
-n'est PAS limité par la profondeur de prefetch par warp ; le
-pré-chauffage SMEM du design Hazy (même mécanisme, plus de complexité)
-est donc très improbablement gagnant ici. La corrélation dominante du
-tableau est le **nombre de CTAs** (64→23%, 320→56-60%, 768→66%,
-1040→73%, 2176→81%). Piste survivante pour la famille 320-CTAs
-(out_proj, o_proj ; down est routé) : **split-K au niveau CTA** avec
-reduce déterministe (PAS d'atomics FP32), à prototyper sur o_proj.
-Gain résiduel accessible ≈ 0.3-0.5 ms/token (~+2-3%) — sous la barre
-des 15%, à coupler avec lm_head FP8.
+**Fix** (`attention_flash_splitk.cu`) : grid.y énumère désormais
+(q_tile, qh_local) — un CTA par q-head au lieu de la boucle série.
+12 → 72 CTAs à ctx 128 ; (4,6,48) = 1152 au cap. Bit-exact par
+construction (mêmes séquences FP par partial, seul le CTA porteur
+change) — confirmé E2E : acceptance ET nombre de cycles strictement
+identiques sur toutes les cellules.
 
-Files: crates/kernels/src/backend.rs (routing), kernels-cuda/tools/
-gemv_shape_bench.cu (nouveau, instrument permanent). Inventory: oui.
+| mesure (MTP=4, corpus, max-new 128) | avant | après | delta |
+|---|---:|---:|---:|
+| ctx 128 tok/s | 39.9 | **47.2** | **+18.4%** |
+| ctx 128 ms/cycle | 72.9 | 61.6 | −11.3 ms |
+| ctx 8192 tok/s | 42.5 | 43.3 | +2% |
+| ctx 24576 ms/cycle (corrigé setup) | 101.2 | 104.5 | neutre (bruit) |
+| perf gate MTP=4 synthétique | 94.4 | **113.7-114.0** | **+20%** |
+| perf gate DFlash 3K split-K (AL) | ~143 (8.3) | 150.3 (8.3) | +5% |
+| perf gate MTP=0 | 52.1 | 52.1 | inchangé ✓ |
+
+(ctx 3072 non mesurable : la cellule OOM dès ~1.7 GB de VRAM externe —
+le plafond VRAM du matin est maintenant un blocant de mesure sur GPU
+partagé.)
+
+**Résiduel long-ctx identifié** : le kernel relit le KV une fois PAR
+q-head (6×) — neutre à 24K car la grille y était déjà saturée et le
+trafic inchangé. Prochain cran pour le long ctx : inverser les boucles
+(charger le tile K/V une fois, servir les 6 q-heads — coût : 6× l'état
+softmax/o_frags en registres) ou le port tiled-v2 du plan.
+
+Gates : smoke 144/144 (bit-identique scratch+engine), parity floor
+10/10, perf gate ci-dessus. Files: `kernels-cuda/attention_flash_splitk.cu`.
+Inventory: pas de flag nouveau (même dispatch). Aussi :
+`scripts/lmhead_fp8_probe.py` (instrument committé, en attente des
+dumps `final_normed` pour trancher le puits lm_head FP8 — la probe du
+06-10 vivait dans /tmp de l'instance Vast, perdue ; celle-ci est dans
+le repo).
+
+### 2026-06-11 — MTP recovery steps 0–1 : l'« acceptance collapse » est falsifié — le coupable est le coût de cycle (75 ms plancher, 4 puits nsys) — SHIPPED (instrumentation) + FALSIFIED (hypothèses 1a/1b/multi-graph)
+
+**Step 0 (instrumentation) SHIPPED.** `run_bench_mtp_multi` émet maintenant
+accepted/**proposed** (`mtp_proposed_draft_tokens`, `mtp_draft_acceptance_rate`
+= acceptés/proposés — l'ancien `mtp_acceptance_rate` divisait par
+accepted+cycles_rejetés, trompeur), l'acceptance **par position**
+(`mtp_acceptance_rate_per_position`) et `mtp_full_accept_cycles`. Colonne
+`AL / acc` dans `bench_dashboard.sh`. Cellules MTP=4 re-benchées (corpus
+dashboard, max-new 128, GPU non contendu, commit 8d43046+) :
+
+| ctx | decode tok/s | acc/draft | par position (1→4) | ms/cycle | MTP=0 ms/tok (baseline 06-10) | ratio |
+|---|---:|---:|---|---:|---:|---:|
+| 128   | 38.8 | 0.477 | 0.75 / 0.55 / 0.41 / 0.20 | 75.0 | 19.1 | 3.9× |
+| 3072  | 38.3 | 0.497 | 0.77 / 0.60 / 0.36 / 0.26 | 77.6 | 16.8 | 4.6× |
+| 8192  | 42.0 | 0.550 | 0.73 / 0.63 / 0.50 / 0.35 | 76.2 | 18.6 | 4.1× |
+| 24576 | 23.0 | 0.488 | 0.75 / 0.52 / 0.43 / 0.24 | 103.9* | 21.2 | 4.9× |
+
+(*24K : 5.57 s de décode incluent 1.00 s de setup MTP (prefill du head) ;
+(5.57−1.00)/44 cycles. `mtp_verify_seconds` ≈ 99% du décode partout.)
+
+**Lecture qui change le plan : l'acceptance est PLATE à ~0.5 sur tous les
+ctx — il n'y a PAS d'effondrement long-ctx.** Avec 1+4×0.5 ≈ 2.9 tok/cycle,
+MTP=4 gagnerait si le cycle coûtait < 2.9× un token MTP=0 ; il en coûte
+3.9–4.9×. Le problème est le coût de cycle, l'acceptance est second ordre.
+
+**Step 1 (A/B, MTP=4) : les trois suspects sont hors de cause.**
+
+| config | ctx | tok/s | acc/draft |
+|---|---|---:|---:|
+| BASE | 128 / 3072 | 38.8 / 38.3 | 0.477 / 0.497 |
+| `QWEN36_DELTANET_CHUNKED_PREFILL=0` | 128 / 3072 | **43.9** / 34.5 | 0.472 / 0.366 |
+| `QWEN36_ATTENTION_SAGE_PREFILL=0` | 3072 | 37.6 | 0.506 |
+| `QWEN36_MTP_MULTI_GRAPH_DISABLE=1` | 3072 | **43.1** | 0.503 |
+
+1. (1a) chunked DeltaNet : acceptance inchangée @128, reshuffle chaotique
+   @3K (0.366, classe de bruit AL) — PAS la cause. MAIS −9 ms/cycle @128 :
+   le kernel WY-form est PLUS CHER que le décode séquentiel sur un chunk
+   de 5 tokens (confirmé nsys : 6.3 ms/cycle de `deltanet_prefill`).
+2. (1b) sage : neutre (le verify chunk ne passe pas par sage). PAS la cause.
+3. Multi-graph : acceptance identique — exonéré. ET le chemin host-launch
+   est PLUS RAPIDE que le graph fast path (43.1 vs 38.3 tok/s @3K).
+4. **Chat vs bench (même texte, ~2K tokens)** : chat templaté accepte
+   ~0.82/draft (`mtp.stats` 49 acc / 2 rej sur 64 tokens) vs 0.50 corpus
+   brut. Le « 0.92–0.98 de mai » était le régime synthétique/chat. **Le
+   régime dashboard (continuation de corpus brut) sous-estime l'acceptance
+   de production chat** — le routing (step 4) devra en tenir compte ; pas
+   de régression moteur à chercher.
+
+**Décomposition nsys du cycle (node-trace, ctx=128 → trace ≈ pur verify ;
+74.5 ms/cycle reconstruits = la mesure)** — quatre puits :
+
+| puits | ms/cycle | détail |
+|---|---:|---|
+| GEMM FP4 chunk N=5 (cutlass3x) | 24.2 | 552 inst/cycle — chemin chunk SANS les fused stores (gate/up/qkv séparés) ; ~2× l'efficacité GEMV décode pour les mêmes octets de poids |
+| attention verify | 15.6 | `flash_splitk` 26 inst/cycle à **535 µs @ ctx 128** (!) — n_splits vient du bucket de capture (≥128 splits quasi vides) ; + `attention_prefill` 1.6 |
+| lm_head BF16 (gemvx) | 15.8 | distribution bimodale : **~6.3 vrais lm_head/cycle à ~2.0-2.2 ms** (1 batché verify N=6 + ~5 séquentiels draft/next-token — la récursion de draft dépend de l'argmax précédent, NON batchable) + ~12 micro-gemvx 10 µs + 33.8 projections head 88 µs (3.0 ms) |
+| DeltaNet WY chunk | 6.3 | 87 inst/cycle ; le séquentiel serait ~1-2 ms (cf. probe 1a) |
+| reste (gemv drafts 3.2, wmma BF16 head 2.6, rmsnorm 2.2, quantize 1.4, 7.3 argmax/cycle 1.3, divers) | ~12.6 | |
+
+Le step 2 du plan (porter tiled-v2 sur le chemin verify) ne couvre que le
+puits attention (~14 ms). Re-scope : les 4 puits sont indépendants et
+cumulables → cycle ~75 → ~30-35 ms ⇒ à acceptance 0.5, ~85-95 tok/s MTP=4
+(vs 59.4 MTP=0 @3K). Ordre suggéré par ROI/effort : (a) attention — splits
+dimensionnés sur le ctx réel plutôt que le bucket de capture, ou port
+tiled-v2 (−13 ms) ; (b) verify DeltaNet ≤8 tokens → kernel séquentiel
+(dispatch engine, le kill-switch a déjà prouvé le gain ; −5 ms) ;
+(c) lm_head FP8 e4m3 — la voie de repêchage du 06-10 vaut ~×4 plus à
+MTP=4 qu'à MTP=0 (~6 lm_head/cycle ⇒ −6-7 ms) ; re-passer la probe
+argmax-parity en FP8 d'abord ; (d) GEMM chunk N=5 fusionnés/optimisés
+(le plus gros puits, 24 ms, mais le plus lourd — la fusion prefill-path
+n'a jamais été faite). Chaque fix garde les gates du plan (smoke, parity
+floor, dashboard before/after).
+
+**Découverte VRAM (bug usabilité)** : bench MTP=4 @3K culmine à
+**32.0/32.6 GiB** — le moteur frôle le plafond. `chat` MTP=4 avec un
+prompt ~3K **OOM** (malloc 42.6 MB, la goutte d'eau ; reproductible,
+indépendant de `QWEN36_MAX_CONTEXT` et du multi-graph). Le delta
+chat-vs-bench (~quelques dizaines de Mo) suffit à basculer. À traiter
+avec le budget VRAM (les fused stores +8 GB sont le gros poste).
+
+Traces : `/tmp/mtp4_ctx*.json`, `/tmp/mtp4_{128,3k}_trace.nsys-rep`,
+`/tmp/mtp4_128_cuda_gpu_kern_sum.csv`.
+Files: `crates/cli/src/main.rs` (instrumentation + probe
+`interpreter-overhead-bench` resté de la session interpreter, commité en
+instrument), `scripts/bench_dashboard.sh`, `docs/mtp-recovery-plan.md`
+(addendum). Inventory: oui (ligne dashboard).
+
+**Addendum (même jour, après-midi) — .so périmé détecté, tout re-validé ;
+routing DeltaNet séquentiel : NEGATIVE.**
+
+1. **Incident .so périmé.** Le parity floor MTP (hello/hello world ×
+   {0..4}) était CASSÉ au début de la re-validation (MTP=0 « Hereen » vs
+   MTP≥1 divergent, déterministe) — cause : `target/cuda/*.so` datait du
+   06-09 22:49, ANTÉRIEUR aux commits kernels pullés ce matin (sage
+   cp.async 69f06ed, smoke 13e9313, port d25daca). Rebuild
+   (`build_cuda.sh`) → smoke 100% (sage 8/8 bit-identique) → **floor
+   10/10 vert**. Leçon process : après un pull qui touche
+   `kernels-cuda/`, rebuilder le .so AVANT tout bench/gate — les gates
+   mesurés sur une autre machine ne transfèrent pas.
+2. **Re-validation des mesures du matin sur .so frais** : acceptance et
+   per-position IDENTIQUES au bit près (0.477/0.503/0.550/0.488, mêmes
+   cycles), chat 49 acc/2 rej idem, MTP=0 @3K 59.8 ≈ baseline Vast 59.4.
+   Toutes les conclusions (acceptance plate ~0.5, 4 puits, régime chat)
+   tiennent. Perf gate --quick vert (52.1 / 94.4 / DFlash 3K 63.8 AL 8.5
+   — le drafter EST disponible sur cette machine, contrairement à
+   l'instance Vast : les cellules DFlash du dashboard sont mesurables ici).
+3. **Routing verify-DeltaNet → séquentiel (recette du step 1 du plan) :
+   NEGATIVE, opt-in seulement.** A/B propre sur .so frais
+   (`QWEN36_DELTANET_SEQ_SHORT_CHUNK`, chunks ≤ 8 tokens) :
+   ctx 128 : 45.2 vs 40.4 (+12%, acc inchangée) ; ctx 3072 : **31.6 vs
+   39.2 (−19%), acc 0.503 → 0.352** — reproduit le motif de la probe 1a
+   sur DEUX .so et deux mécanismes : le verify séquentiel après un
+   prompt-prefill chunké désaligne les numerics draft↔verify et
+   l'acceptance s'effondre avec le ctx (consistency dividend inversé).
+   Le gain kernel (−9 ms/cycle) est réel mais le couplage acceptance le
+   tue. Resté dans l'arbre en opt-in (défaut = chunké, sémantique HEAD
+   inchangée, parity floor 10/10 dans les deux états). Le puits DeltaNet
+   (6.3 ms/cycle) reste ouvert mais exige un fix consistency-aware
+   (p.ex. verify chunké MAIS état carried recalé, ou drafts générés
+   depuis les hidden states du même kernel).
+
+**Addendum acceptance (même jour) — la courbe par position était une
+survie de préfixe, pas une précision conditionnelle.** Les tableaux
+`mtp_acceptance_rate_per_position` doivent se lire comme
+`P(accepte au moins jusqu'au rang k)`. La précision conditionnelle du
+head, `P(rang k accepte | rangs < k acceptés)`, est nettement moins
+catastrophique sur les traces existantes : ctx 128 = 0.75/0.73/0.75/0.50,
+ctx 3072 = 0.77/0.78/0.60/0.73, ctx 8192 = 0.73/0.86/0.80/0.70,
+ctx 24576 = 0.75/0.70/0.82/0.56. Le `~0.5` global est donc surtout le
+produit d'une chaîne top-1 cumulative, pas un head qui tombe à 25% au
+rang 4. Instrumentation ajoutée : `bench` JSON sort maintenant
+`mtp_conditional_acceptance_rate_per_position`, et `chat` sous
+`QWEN36_MTP_STATS=1` sort proposed/draft_acceptance/per-position au même
+format que bench.
+
+Avis après relecture : le `~0.5` global était sur-interprété, mais le
+premier rang autour de 0.73–0.77 reste franchement trop bas pour un MTP
+sain ; on devrait viser ~0.90–0.95 sur un head aligné. Prochaine
+discrimination ajoutée dans le code : `QWEN36_MTP_RANK_AUDIT=1` force le
+host path MTP multi et capture le top-k (8 par défaut, ou valeur 2..8)
+de chaque draft au moment exact où le head le produit. `chat` imprime
+`mtp.rank_audit ... hit_rate_per_position=...`; `bench` JSON ajoute
+`mtp_rank_audit_*`. Si le vrai token est souvent dans le top-8 au rang 1,
+on regarde étalonnage/top-1 ; s'il manque le top-8, il faut traiter
+alignement runtime ou parité numérique MTP head. Gates locaux : `cargo
+fmt --all -- --check`, `cargo check -p qwen36-fp4 --features cuda`,
+`cargo clippy -p qwen36-fp4 --features cuda -- -D warnings`.
+
+Bench GPU relancé après retour driver (`target/release/qwen36`, corpus fixe,
+MTP=4, 64 tokens, `QWEN36_MTP_RANK_AUDIT=1`; `ctx=3072` nécessite
+`QWEN36_LONG_CONTEXT_MODE=1` sur cette machine, sinon OOM près du plafond
+VRAM). Résultat : le vrai token est très souvent dans le top-8 même quand
+top-1 rate, donc la priorité devient marge/argmax calibration ou drift
+numérique qui fragilise le rang 1, pas un MTP head totalement hors cible.
+Table first-position top-1 / top-8 : ctx128 **0.76 / 0.96**, ctx3072
+**0.895 / 0.947**, ctx8192 **0.64 / 0.88**, ctx24576 **0.80 / 1.00**.
+Draft acceptance globale : 0.411 / 0.603 / 0.411 / 0.571. Zoom ctx8192 :
+top-2/top-4/top-8 au rang 1 = **0.84 / 0.88 / 0.88** ; la majorité du
+manque top-1 est très proche de l'argmax, mais pas exclusivement en rang 2.
+
+Audit marges ajouté/exécuté (`QWEN36_MTP_LOGIT_AUDIT=8`, copie full logits
+diagnostic, hors perf gate). First-position, moyennes sur rejets :
+ctx128 rang **4.67**, marge top1-target **1.52** ; ctx3072 rang **141**
+sur seulement 2 rejets, marge **10.38** (outliers nets malgré top-1 global
+haut) ; ctx8192 rang **10.33**, marge **2.00** ; ctx24576 rang **2.00**,
+marge **2.72**. Donc le signal n'est pas un simple tie-break BF16 : les
+targets sont souvent proches/top-k, mais les rejets top-1 ont une marge
+suffisante pour justifier un audit de parité MTP-layer, pas seulement une
+politique de sampling. Le repo a `scripts/decode_parity.py` pour decode
+principal, mais pas encore de harness MTP-head ; prochain patch propre =
+ajouter dumps MTP (`pre_fc_norm_*`, `mtp.fc`, attn, mlp, norm, logits) puis
+étendre la référence PyTorch locale.
 
 ### 2026-06-10 — P5 plancher système : clock-lock impossible en conteneur, le reste < 1% — DECISION (différé)
 

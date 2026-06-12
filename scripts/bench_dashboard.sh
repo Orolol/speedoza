@@ -32,6 +32,10 @@ JSONL="target/dashboard-${STAMP}.jsonl"
 MAX_NEW="${MAX_NEW_TOKENS:-128}"
 
 export QWEN36_FP4_KERNEL_LIB_DIR="$ROOT/target/cuda"
+# Dashboard cells measure the PURE MTP path (kernel-work before/afters);
+# the production default since 2026-06-11 is the online auto-fallback
+# (QWEN36_MTP_AUTO_FALLBACK, drops to plain decode below 0.55 acceptance).
+export QWEN36_MTP_AUTO_FALLBACK=0
 export LD_LIBRARY_PATH="$ROOT/target/cuda:${LD_LIBRARY_PATH:-}"
 
 QUICK=0
@@ -57,7 +61,7 @@ CTXS="128 3072 8192 24576"
 [ "$QUICK" = "1" ] && CTXS="128 3072"
 
 echo
-echo "| cell | prefill tok/s | decode tok/s | AL |"
+echo "| cell | prefill tok/s | decode tok/s | AL / acc |"
 echo "|---|---:|---:|---:|"
 
 for ctx in $CTXS; do
@@ -67,9 +71,15 @@ for ctx in $CTXS; do
       --mtp-speculative-tokens "$mtp" 2>/dev/null) || { echo "| MTP=$mtp ctx=$ctx | ERROR | ERROR | |"; continue; }
     # bench prints pretty-printed JSON (multi-line); compact it for the JSONL.
     echo "$out" | python3 -c "import json,sys; d=json.load(sys.stdin); d['cell']='mtp${mtp}_ctx${ctx}'; print(json.dumps(d))" >> "$JSONL" 2>/dev/null || true
-    printf "| MTP=%s ctx=%-5s | %s | %s | |\n" "$mtp" "$ctx" \
+    # MTP cells: accepted/proposed draft acceptance (per-position detail in the JSONL).
+    acc=""
+    if [ "$mtp" != "0" ]; then
+      acc="$(echo "$out" | jnum mtp_draft_acceptance_rate)"
+    fi
+    printf "| MTP=%s ctx=%-5s | %s | %s | %s |\n" "$mtp" "$ctx" \
       "$(echo "$out" | jnum prefill_tokens_per_second)" \
-      "$(echo "$out" | jnum decode_tokens_per_second)"
+      "$(echo "$out" | jnum decode_tokens_per_second)" \
+      "$acc"
   done
 done
 

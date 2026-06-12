@@ -80,11 +80,13 @@ cargo run -p qwen36-fp4 -- budget --ctx 32768 --kv fp8
 cargo run -p qwen36-fp4 -- tokenize --model-dir /path/to/model --text "Bonjour"
 cargo run -p qwen36-fp4 -- validate-weights --model-dir /path/to/model
 cargo run -p qwen36-fp4 --features cuda -- gpu-load --model-dir /path/to/model --max-context 2256
+cargo run -p qwen36-fp4 -- validate-eagle3-drafter --drafter-dir /path/to/EAGLE3
+cargo run -p qwen36-fp4 --features cuda -- chat --model-dir /path/to/model --prompt "Bonjour" --drafter eagle3 --drafter-dir /path/to/EAGLE3
 ```
 
 ## CUDA Runtime Knobs
 
-The list below is a partial selection. The complete reference (88 env vars, defaults
+The list below is a partial selection. The complete reference (90 env vars, defaults
 verified in code, plus the component status map) is in
 [docs/code-inventory.md](docs/code-inventory.md).
 
@@ -97,6 +99,9 @@ verified in code, plus the component status map) is in
 - `QWEN36_DECODE_ATTENTION_BUCKET_MIN_CONTEXT=<tokens>` changes the minimum active-context bucket used to size decode split-KV launches. The default is 8192, so a run reserving 262K context no longer launches 262K-sized decode attention splits while decoding near 8K.
 - `QWEN36_DECODE_ATTENTION_BUCKET_DISABLE=1` restores the older behavior where decode split-KV launch shapes are sized from the configured `max_context`.
 - `QWEN36_MTP_ASSUME_ACCEPT=1` skips per-draft verification checks in the multi-token MTP graph path. It also skips recurrent snapshots for that path, so use it only when rejection is known to be impossible or acceptable for the run.
+- `QWEN36_MTP_FUSED_ARGMAX=1` enables the experimental fused BF16 `lm_head` + greedy argmax path for MTP prefill rows, avoiding the intermediate logits buffer on those samples.
+- `QWEN36_EAGLE3_DRAFT_TOKENS=<tokens>` changes the number of chain draft tokens proposed per EAGLE3 speculative iteration. The default is 8.
+- `QWEN36_EAGLE3_P_MIN=<prob>` changes the minimum top-1 drafter confidence required to keep extending an EAGLE3 chain. The default is 0.5; set it to 0 to restore the previous no-cutoff fast path.
 - `QWEN36_PREFILL_GQA_TILE2=1` enables the experimental two-token GQA prefill attention tile for BF16/FP8 KV layouts. `QWEN36_PREFILL_GQA_TILE_TOKENS=2|4` selects the tile size directly. This is an opt-in first step toward a FlashAttention-style tiled prefill path.
 - `QWEN36_PROFILE_PREFILL_CHUNKS=1` prints per-prefill-chunk timing buckets for profiling. It synchronizes between buckets and should not be used for throughput numbers.
 

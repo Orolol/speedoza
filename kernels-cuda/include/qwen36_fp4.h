@@ -91,29 +91,6 @@ typedef struct {
   size_t workspace_bytes;
 } qwen36_bf16_gemm_spec_t;
 
-// FP8 (e4m3) lm_head path: weights quantized at load time on the GPU with a
-// per-row f32 scale; the matvec reads 1 byte/element instead of 2 (the
-// lm_head BF16 read was 1.65 ms/token at 86% of DRAM peak — FP8 halves it).
-// Probe gate 2026-06-10: 0/27 argmax flips on real final_normed vectors.
-typedef struct {
-  size_t out_features; // M (rows of the weight matrix)
-  size_t in_features;  // K
-  qwen36_device_ptr_t weight_bf16;    // [M, K] input (read)
-  qwen36_device_ptr_t weight_e4m3;    // [M, K] output (written)
-  qwen36_device_ptr_t row_scale_f32;  // [M] output (written)
-} qwen36_fp8_quantize_rows_spec_t;
-
-typedef struct {
-  size_t out_features; // M
-  size_t in_features;  // K
-  size_t rows;         // input rows (1 decode; up to 5 for MTP verify)
-  size_t input_stride; // elements between input rows
-  qwen36_device_ptr_t weight_e4m3;   // [M, K]
-  qwen36_device_ptr_t row_scale_f32; // [M]
-  qwen36_device_ptr_t input_bf16;    // [rows, input_stride]
-  qwen36_device_ptr_t output_bf16;   // [rows, M]
-} qwen36_fp8_matvec_spec_t;
-
 typedef struct {
   size_t q_heads;
   size_t kv_heads;
@@ -380,6 +357,109 @@ typedef struct {
   qwen36_device_ptr_t output_bf16;
 } qwen36_bf16_matvec_spec_t;
 
+/* lm_head FP8 e4m3 (W8A16). Quantize is a one-shot init pass; the gemv
+ * serves both the single-token logits (n=1) and the batched MTP verify
+ * logits (n <= QWEN36_LM_HEAD_FP8_MAX_N). Layouts: input [n, cols] and
+ * output [n, rows], both row-major BF16. */
+#define QWEN36_LM_HEAD_FP8_MAX_N 16
+
+typedef struct {
+  size_t rows; /* vocab */
+  size_t cols; /* hidden; must be a multiple of 4 */
+  qwen36_device_ptr_t weight_bf16;
+  qwen36_device_ptr_t weight_e4m3;
+  qwen36_device_ptr_t row_scales_f32;
+} qwen36_lm_head_fp8_quantize_spec_t;
+
+typedef struct {
+  size_t rows;
+  size_t cols;
+  size_t n;
+  qwen36_device_ptr_t weight_e4m3;
+  qwen36_device_ptr_t row_scales_f32;
+  qwen36_device_ptr_t input_bf16;
+  qwen36_device_ptr_t output_bf16;
+} qwen36_lm_head_fp8_gemv_spec_t;
+
+typedef struct {
+  size_t rows;
+  size_t out_features;
+  size_t in_features;
+  qwen36_device_ptr_t input_bf16;
+  qwen36_device_ptr_t weight_bf16;
+  qwen36_device_ptr_t output_token_u32;
+  qwen36_device_ptr_t mirror_last_output_token_u32;
+  qwen36_device_ptr_t workspace;
+  size_t workspace_bytes;
+  /* Optional [rows] u32 device flags: a non-zero flag SKIPS that row (its
+   * matvec grid exits immediately and finalize leaves output/mirror
+   * untouched). NULL (ptr 0) processes every row — the historical
+   * behavior. Used as the predicated BF16 rescore of the two-stage exact
+   * lm_head argmax (flags come from qwen36_lm_head_top2_margin). */
+  qwen36_device_ptr_t skip_flags_u32;
+} qwen36_bf16_matvec_argmax_rows_spec_t;
+
+/* Two-stage exact lm_head argmax, stage 1 verdict: per-row top-2 over the
+ * FP8-path logits [rows, vocab] (row-major BF16). Writes per row:
+ *   tokens_u32[row]  = FP8 argmax token (unconditionally; stage 2
+ *                      overwrites it only when the guard fails)
+ *   flags_u32[row]   = 1 when margin top1-top2 >= eps (FP8 argmax provably
+ *                      equals the BF16 argmax when eps >= 2*max|dlogit|),
+ *                      0 when stage 2 must rescore the row in BF16.
+ * Optional mirror gets the LAST row's token (same contract as the argmax
+ * rows finalize). fallback_count_u32 (optional) is atomically incremented
+ * by the number of rows whose guard failed — a cheap device counter the
+ * bench reads to report the measured fallback rate.
+ * Workspace: rows * QWEN36_LM_HEAD_TOP2_BLOCKS * 16 bytes. */
+#define QWEN36_LM_HEAD_TOP2_BLOCKS 240
+
+typedef struct {
+  size_t rows;
+  size_t vocab;
+  float eps;
+  qwen36_device_ptr_t logits_bf16;
+  qwen36_device_ptr_t tokens_u32;
+  qwen36_device_ptr_t flags_u32;
+  qwen36_device_ptr_t mirror_last_token_u32;
+  qwen36_device_ptr_t fallback_count_u32;
+  qwen36_device_ptr_t workspace;
+  size_t workspace_bytes;
+} qwen36_lm_head_top2_margin_spec_t;
+
+/* Two-stage exact lm_head argmax, v2 ("top-8 rescore"): stage 1 verdict
+ * that rescores the top-8 FP8 candidates against the BF16 weight instead
+ * of guarding on the top1-top2 margin (v1 fell back ~42% on the
+ * tight-margin MTP-head rows). Per row of the FP8-path logits:
+ *   - block top-2 pass (shared with the v1 entry) -> workspace
+ *   - select the top-8 BLOCK WINNERS + guard bound
+ *         B = max(9th winner, max block-v2)
+ *     (a block hiding two leaders raises its v2 -> B -> guard fails ->
+ *     conservative full fallback, never a silent miss)
+ *   - rescore the 8 candidates against weight_bf16/input_bf16 in FP64
+ *     accumulation (8 x cols FMAs, order-stable)
+ *   - guard: best_rescored >= B + eps certifies every non-candidate
+ *     (bf16 logit <= fp8 logit + e_max <= B + e_max); recommended
+ *     eps ~ 1.5x the probe e_max (0.344) = 0.5.
+ * Outputs match the v1 contract: tokens written unconditionally,
+ * flags_u32[row]=1 when certified (else the predicated full BF16 rescore
+ * runs), optional mirror of the last row, fallback counter. Workspace:
+ * rows * QWEN36_LM_HEAD_TOP2_BLOCKS * 16 bytes. */
+typedef struct {
+  size_t rows;
+  size_t vocab;
+  size_t cols;
+  float eps;
+  qwen36_device_ptr_t logits_bf16;  /* [rows, vocab] FP8-path logits */
+  qwen36_device_ptr_t weight_bf16;  /* [vocab, cols] lm_head */
+  qwen36_device_ptr_t input_bf16;   /* [rows, cols] hidden vectors */
+  qwen36_device_ptr_t tokens_u32;
+  qwen36_device_ptr_t flags_u32;
+  qwen36_device_ptr_t mirror_last_token_u32;
+  qwen36_device_ptr_t fallback_count_u32;
+  qwen36_device_ptr_t workspace;
+  size_t workspace_bytes;
+} qwen36_lm_head_top8_rescore_spec_t;
+
 typedef struct {
   size_t out_features;
   size_t in_features;
@@ -583,6 +663,10 @@ int qwen36_interpreter_decode_sm120(const qwen36_interpreter_program_t *program)
 // existing cuBLASLt path on that code. Gated by `QWEN36_DECODE_GEMV=1`. See
 // `docs/superpowers/specs/2026-05-04-direction-b-nvfp4-gemv-design.md`.
 int qwen36_decode_nvfp4_gemv(const qwen36_nvfp4_gemm_spec_t *spec);
+// Test/bench hook for the multi-N chunk path: force the M-tiles-per-CTA
+// factor (>=1), or pass 0 to restore the heuristic/env default
+// (QWEN36_CHUNK_GEMV_MTILE). Smoke uses this to sweep T on one shape.
+void qwen36_nvfp4_chunk_gemv_set_mtile(int mtile);
 int qwen36_bf16_gemm(const qwen36_bf16_gemm_spec_t *spec);
 int qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec);
 int qwen36_attention_flash_prefill(const qwen36_attention_prefill_spec_t *spec);
@@ -629,8 +713,12 @@ int qwen36_sample_rows(const qwen36_sampling_rows_spec_t *spec);
 int qwen36_topk_argmax(const qwen36_topk_argmax_spec_t *spec);
 int qwen36_embedding_lookup(const qwen36_embedding_lookup_spec_t *spec);
 int qwen36_bf16_matvec(const qwen36_bf16_matvec_spec_t *spec);
-int qwen36_fp8_quantize_rows(const qwen36_fp8_quantize_rows_spec_t *spec);
-int qwen36_fp8_matvec(const qwen36_fp8_matvec_spec_t *spec);
+int qwen36_bf16_matvec_argmax_rows(
+    const qwen36_bf16_matvec_argmax_rows_spec_t *spec);
+int qwen36_lm_head_fp8_quantize(const qwen36_lm_head_fp8_quantize_spec_t *spec);
+int qwen36_lm_head_fp8_gemv(const qwen36_lm_head_fp8_gemv_spec_t *spec);
+int qwen36_lm_head_top2_margin(const qwen36_lm_head_top2_margin_spec_t *spec);
+int qwen36_lm_head_top8_rescore(const qwen36_lm_head_top8_rescore_spec_t *spec);
 int qwen36_nvfp4_matvec(const qwen36_nvfp4_matvec_spec_t *spec);
 int qwen36_nvfp4_quantize_bf16(const qwen36_nvfp4_quantize_spec_t *spec);
 int qwen36_nvfp4_quantize_rows(const qwen36_nvfp4_quantize_rows_spec_t *spec);
