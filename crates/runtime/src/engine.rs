@@ -799,10 +799,31 @@ pub struct MtpDeviceChainResult {
 /// the bench reads it to report the realized fallback rate.
 #[cfg(feature = "cuda")]
 pub struct LmHeadMarginState {
-    pub store: crate::gpu::LmHeadFp8Store,
+    pub vocab: usize,
+    pub cols: usize,
+    /// FP8 scan store (default scan dtype). `None` when the FP4 scan is
+    /// active instead.
+    pub store: Option<crate::gpu::LmHeadFp8Store>,
+    /// NVFP4 scan store (QWEN36_LM_HEAD_SCAN=fp4): lm_head quantized to
+    /// e2m1 + e4m3 block-16 swizzled scales at init via the existing
+    /// nvfp4_quantize_rows kernel, scanned through the regular nvfp4_gemm
+    /// dispatch (Direction B GEMV at n=1, cuBLASLt above). Halves the scan
+    /// bytes again vs FP8 (0.64 vs 1.27 GiB). Probe 2026-06-12 (W4A4):
+    /// e_max 1.57, true-argmax rank 0/28 under FP4 — recommended eps 2.0.
+    pub scan_fp4: Option<LmHeadFp4Scan>,
     pub eps: f32,
     pub flags_u32: qwen36_fp4_kernels::CudaDeviceBuffer,
     pub fallback_count_u32: qwen36_fp4_kernels::CudaDeviceBuffer,
+}
+
+#[cfg(feature = "cuda")]
+pub struct LmHeadFp4Scan {
+    pub weight_fp4: qwen36_fp4_kernels::CudaDeviceBuffer,
+    pub weight_scales: qwen36_fp4_kernels::CudaDeviceBuffer,
+    pub weight_ts_f32: qwen36_fp4_kernels::CudaDeviceBuffer,
+    pub x_fp4: qwen36_fp4_kernels::CudaDeviceBuffer,
+    pub x_scales: qwen36_fp4_kernels::CudaDeviceBuffer,
+    pub x_ts_f32: qwen36_fp4_kernels::CudaDeviceBuffer,
 }
 
 /// Hook the prefill loop fires after each layer's `input_layernorm`,
@@ -10698,16 +10719,60 @@ impl<B: KernelBackend> Engine<B> {
             )));
         }
         let logits = self.cuda_forward()?.mtp_logits.ptr();
-        self.backend
-            .lm_head_fp8_gemv(&qwen36_fp4_kernels::LmHeadFp8GemvSpec {
-                rows: margin.store.rows,
-                cols: margin.store.cols,
-                n: rows,
-                weight_e4m3: margin.store.weight_e4m3.ptr(),
-                row_scales_f32: margin.store.row_scales_f32.ptr(),
-                input_bf16,
-                output_bf16: logits,
+        if let Some(fp4) = &margin.scan_fp4 {
+            // NVFP4 scan: quantize the hidden rows (block-16, ts = 1.0 —
+            // the rows kernel passes the input tensor scale through, so
+            // alpha stays 1.0 with the device scale_2 pointers), then one
+            // nvfp4_gemm dispatch: n == 1 routes to the Direction B GEMV,
+            // n in 2..=8 to cuBLASLt whose [m, n] col-major output IS the
+            // [rows, vocab] row-major layout the top-2 pass expects.
+            self.backend
+                .nvfp4_quantize_rows(&qwen36_fp4_kernels::Nvfp4QuantizeRowsSpec {
+                    rows,
+                    values: margin.cols,
+                    input_bf16,
+                    output_fp4: fp4.x_fp4.ptr(),
+                    output_scale_e4m3: fp4.x_scales.ptr(),
+                    output_tensor_scale_f32: fp4.x_ts_f32.ptr(),
+                    input_tensor_scale_f32: 1.0,
+                })?;
+            let runtime = self.cuda_runtime()?;
+            let (workspace, workspace_bytes) = match runtime.workspace.as_ref() {
+                Some(buffer) => (buffer.ptr(), buffer.bytes()),
+                None => (DevicePtr::NULL, 0),
+            };
+            self.backend
+                .nvfp4_gemm(&qwen36_fp4_kernels::Nvfp4GemmSpec {
+                    m: margin.vocab,
+                    n: rows,
+                    k: margin.cols,
+                    a_fp4: fp4.weight_fp4.ptr(),
+                    a_scale: fp4.weight_scales.ptr(),
+                    a_scale_2: fp4.weight_ts_f32.ptr(),
+                    b_fp4: fp4.x_fp4.ptr(),
+                    b_scale: fp4.x_scales.ptr(),
+                    b_scale_2: fp4.x_ts_f32.ptr(),
+                    c_bf16: logits,
+                    workspace,
+                    workspace_bytes,
+                    alpha: 1.0,
+                    scale_mode: qwen36_fp4_kernels::CublasLtFp4ScaleMode::Vec16Ue4m3,
+                })?;
+        } else {
+            let store = margin.store.as_ref().ok_or_else(|| {
+                CoreError::Runtime("margin mode without scan store".to_owned())
             })?;
+            self.backend
+                .lm_head_fp8_gemv(&qwen36_fp4_kernels::LmHeadFp8GemvSpec {
+                    rows: store.rows,
+                    cols: store.cols,
+                    n: rows,
+                    weight_e4m3: store.weight_e4m3.ptr(),
+                    row_scales_f32: store.row_scales_f32.ptr(),
+                    input_bf16,
+                    output_bf16: logits,
+                })?;
+        }
         let runtime = self.cuda_runtime()?;
         let workspace = runtime.workspace.as_ref().ok_or_else(|| {
             CoreError::Runtime("two-stage lm_head argmax requires CUDA workspace".into())
@@ -10736,7 +10801,7 @@ impl<B: KernelBackend> Engine<B> {
             self.backend
                 .lm_head_top2_margin(&qwen36_fp4_kernels::LmHeadTop2MarginSpec {
                     rows,
-                    vocab: margin.store.rows,
+                    vocab: margin.vocab,
                     eps: margin.eps,
                     logits_bf16: logits,
                     tokens_u32: output_token_u32,
@@ -10750,8 +10815,8 @@ impl<B: KernelBackend> Engine<B> {
             self.backend
                 .lm_head_top8_rescore(&qwen36_fp4_kernels::LmHeadTop8RescoreSpec {
                     rows,
-                    vocab: margin.store.rows,
-                    cols: margin.store.cols,
+                    vocab: margin.vocab,
+                    cols: margin.cols,
                     eps: margin.eps,
                     logits_bf16: logits,
                     weight_bf16,
@@ -10767,8 +10832,8 @@ impl<B: KernelBackend> Engine<B> {
         self.backend
             .bf16_matvec_argmax_rows(&Bf16MatVecArgmaxRowsSpec {
                 rows,
-                out_features: margin.store.rows,
-                in_features: margin.store.cols,
+                out_features: margin.vocab,
+                in_features: margin.cols,
                 input_bf16,
                 weight_bf16,
                 output_token_u32,
@@ -11539,16 +11604,92 @@ impl Engine<CudaBackend> {
         let margin_eps = cuda_lm_head_fp8_margin_eps()
             .filter(|_| engine.config.mtp_speculative_tokens > 0 && lm_head_quantizable);
         let lm_head_margin = if let Some(eps) = margin_eps {
-            let store = quantize_lm_head_fp8(&engine, &gpu_weights)?;
+            let vocab = manifest.lm_head.shape[0];
+            let cols = manifest.lm_head.shape[1];
+            let scan_fp4_mode = std::env::var("QWEN36_LM_HEAD_SCAN")
+                .is_ok_and(|scan| scan == "fp4");
+            let (store, scan_fp4) = if scan_fp4_mode {
+                // NVFP4 scan store: quantize the BF16 lm_head with the
+                // existing rows kernel. grid.y caps at 65535, so slice by
+                // 128-row multiples — the vec16 scale swizzle is 128-row
+                // blocked, so 128-aligned slices write the exact global
+                // layout.
+                let weight_bf16 = gpu_weights
+                    .tensor(&manifest.lm_head.name)
+                    .ok_or_else(|| {
+                        CoreError::Runtime("lm_head weight missing from GPU store".to_owned())
+                    })?
+                    .ptr();
+                if vocab % 128 != 0 || cols % 16 != 0 {
+                    return Err(CoreError::Runtime(format!(
+                        "FP4 lm_head scan requires vocab % 128 == 0 and cols % 16 == 0, got {vocab}x{cols}"
+                    )));
+                }
+                let sf_inner = (cols / 16).div_ceil(4) * 4;
+                let weight_fp4 =
+                    qwen36_fp4_kernels::CudaDeviceBuffer::alloc(vocab * cols / 2)?;
+                let weight_scales =
+                    qwen36_fp4_kernels::CudaDeviceBuffer::alloc(vocab * sf_inner)?;
+                let weight_ts_f32 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(4)?;
+                const SLICE_ROWS: usize = 511 * 128; // <= 65535, 128-aligned
+                let mut row = 0_usize;
+                while row < vocab {
+                    let slice = (vocab - row).min(SLICE_ROWS);
+                    engine.backend.nvfp4_quantize_rows(
+                        &qwen36_fp4_kernels::Nvfp4QuantizeRowsSpec {
+                            rows: slice,
+                            values: cols,
+                            input_bf16: Self::ptr_offset(weight_bf16, row * cols * 2)?,
+                            output_fp4: Self::ptr_offset(
+                                weight_fp4.ptr(),
+                                row * cols / 2,
+                            )?,
+                            output_scale_e4m3: Self::ptr_offset(
+                                weight_scales.ptr(),
+                                row * sf_inner,
+                            )?,
+                            output_tensor_scale_f32: weight_ts_f32.ptr(),
+                            input_tensor_scale_f32: 1.0,
+                        },
+                    )?;
+                    row += slice;
+                }
+                qwen36_fp4_kernels::cuda_synchronize()?;
+                let x_fp4 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(16 * cols / 2)?;
+                let x_scales =
+                    qwen36_fp4_kernels::CudaDeviceBuffer::alloc(128 * sf_inner)?;
+                let x_ts_f32 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(4)?;
+                eprintln!(
+                    "engine: lm_head two-stage exact argmax ON (eps={eps}, NVFP4 scan + BF16 rescore; +{:.2} GiB FP4 store)",
+                    (vocab * cols / 2 + vocab * sf_inner) as f64 / f64::from(1_u32 << 30),
+                );
+                (
+                    None,
+                    Some(LmHeadFp4Scan {
+                        weight_fp4,
+                        weight_scales,
+                        weight_ts_f32,
+                        x_fp4,
+                        x_scales,
+                        x_ts_f32,
+                    }),
+                )
+            } else {
+                let store = quantize_lm_head_fp8(&engine, &gpu_weights)?;
+                eprintln!(
+                    "engine: lm_head two-stage exact argmax ON (eps={eps}, FP8 scan + BF16 rescore; +{:.2} GiB FP8 store)",
+                    (store.rows * store.cols + store.rows * 4) as f64 / f64::from(1_u32 << 30),
+                );
+                (Some(store), None)
+            };
             let flags_u32 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(16 * 4)?;
             let fallback_count_u32 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(4)?;
             fallback_count_u32.copy_from_host(&0u32.to_ne_bytes())?;
-            eprintln!(
-                "engine: lm_head two-stage exact argmax ON (eps={eps}, FP8 scan + BF16 rescore; +{:.2} GiB FP8 store)",
-                (store.rows * store.cols + store.rows * 4) as f64 / f64::from(1_u32 << 30),
-            );
             Some(LmHeadMarginState {
+                vocab,
+                cols,
                 store,
+                scan_fp4,
                 eps,
                 flags_u32,
                 fallback_count_u32,
