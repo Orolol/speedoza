@@ -97,6 +97,49 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-12 (nuit, suite) — Scan FP4 du lm_head (levier 2 du survey) — SHIPPED opt-in : sonde W4A4 rang 0/28, -2.2 ms/cycle vs scan FP8 a trajectoire egale ; zero nouveau kernel
+
+Le kill NVFP4 du 2026-06-10 valait pour l'argmax DIRECT. L'architecture
+top-8 (PR #28) change le calcul : le scan doit seulement placer le vrai
+argmax dans ses 8 candidates et admettre une garde — un e_max plus gros
+se paie en eps/fallbacks, pas en flips.
+
+**Sonde** (scripts/lmhead_fp4_probe.py, NVFP4 e2m1 + scales e4m3
+block-16, modelisation W4A4 — l'activation passe aussi en e2m1) :
+e_max 1.57 (vs 0.344 FP8), **rang du vrai argmax sous FP4 = 0 sur
+28/28**, fallback proxy 0% a eps 3.1, UNSAFE 0. Lane ouverte.
+
+**Implementation, zero nouveau kernel** : lm_head quantize a l'init via
+nvfp4_quantize_rows (en tranches de 511x128 lignes — grid.y plafonne a
+65535 et le swizzle vec16 est bloc-128 donc les tranches alignees 128
+ecrivent le layout global exact) ; scan = UN appel backend.nvfp4_gemm
+(n==1 -> GEMV Direction B, M=248320 K=5120 16-warp ; n>1 -> cuBLASLt
+dont la sortie col-major EST le [rows, vocab] row-major attendu par le
+pass1) ; alpha=1.0 partout (output_tensor_scale de quantize_rows =
+passthrough). Store FP4 0.71 GiB REMPLACE le store FP8 1.27 GiB.
+Opt-in : QWEN36_LM_HEAD_SCAN=fp4 (+ eps via QWEN36_LM_HEAD_FP8_MARGIN).
+
+**Mesures @128 MTP=4 (GPU calme, post-PR #29)** : FP4 et FP8 atterrissent
+sur la MEME trajectoire (acc 0.3694581280788177 a 16 dec. — le flip
+partage vient du re-score de fallback, pas du scan). A trajectoire
+egale : cycle FP4@eps1.2 62.3 ms vs FP8@eps0.5 64.5 ms = **-2.2 ms** ;
+fallbacks 42 vs 28. Sweep eps : 2.0 -> fb 101 (gain mange), 1.2 = le
+bon point, 0.8 -> fb 14 et acc 0.50/51.8 tok/s mais c'est un TIRAGE de
+loterie (moins de passages dans le re-score flippy => autre
+trajectoire) — pas le gain du levier. Reco : eps 1.2 en fp4.
+
+Notes : (1) PR #29 (mergee entre-temps : exception mlp.down->cuBLASLt
+etc.) a change la trajectoire de base @128 (0.477 -> 0.382) — la
+comparaison E2E de la famille marge vs base est re-brouillee par les
+recoveries (cycle a acc differente != apples-to-apples) ; la validation
+defaut-ON reste a faire sur la grille de regimes, comme deja note.
+(2) Le residu de loterie vit toujours dans le re-score complet PR #11
+des gardes echouees — le tuer (re-dot FP64 predique) reste au backlog.
+
+Files: scripts/lmhead_fp4_probe.py (nouveau), crates/runtime/src/engine.rs
+(LmHeadFp4Scan, init en tranches, branche scan). Inventory: oui.
+
+
 ### 2026-06-12 (nuit) — Fast-path bit-exact T<=16 du DeltaNet chunked — SHIPPED defaut ON : kernel verify -40% median (272.6 -> 162.2 us), bit-identique par construction (memcmp 11 valeurs de T)
 
 Suite directe du pivot de l'entree precedente. Le kernel chunked paie
