@@ -6,12 +6,28 @@
 // CollectiveBuilder rejects narrow-N tiles at N=1 (see Phase B2 notes), so
 // we drop down to the atom and stage register tiles by hand.
 //
-// CTA layout
-//   - 4 warps / CTA, 128 threads. Each warp owns one m16 MMA tile (16 rows).
-//   - blockDim.x = 128, gridDim.x = ceil(M / 64). Each block emits 64 rows.
-//   - For k_chunk in [0, K) step 64, every warp issues one MMA accumulating
-//     into a per-warp 4-register float accumulator, then writes the n=0
-//     column to gmem in the epilogue.
+// B3.7: kernel is now templated on kWarpsPerBlockTpl with two compiled
+// specializations:
+//   - 16 warps / CTA, 512 threads, K%1024==0 — preferred path. Higher
+//     SM-resident warp count, best latency hiding for "fat" decode shapes
+//     (e.g. K=5120 for q_proj, K=17408 for o_proj).
+//   - 8 warps / CTA, 256 threads, K%512==0 — fallback for shapes whose K
+//     is a multiple of 512 but not 1024 (e.g. K=3584 for linear-attention
+//     out_proj where value_dim=3584). Same architecture as B3.5; bench
+//     showed +5-15% over cuBLASLt at MTP=0/4.
+// The entry point picks the largest specialization the K dimension will
+// admit; shapes that don't satisfy K%512==0 fall through to cuBLASLt.
+//
+// CTA layout (B3.7: intra-CTA split-K, kWarpsPerBlockTpl warps)
+//   - Each CTA owns ONE m16 MMA tile (16 rows); all warps cooperate on
+//     the SAME 16 output rows but DIFFERENT K shards. This multiplies
+//     parallelism for low-M shapes by Nwarps× compared to the original
+//     "1 warp = 1 m16 tile" layout.
+//   - blockDim.x = kWarpsPerBlockTpl * 32, gridDim.x = ceil(M / 16).
+//   - For k_chunk in [warp_id*K_per_warp/64, (warp_id+1)*K_per_warp/64),
+//     every warp issues one MMA accumulating into its private 4-register
+//     float accumulator, then a final cross-warp reduction in smem sums
+//     the partial dot products and writes the n=0 column to gmem.
 //
 // Operand staging (lane L ∈ [0,32))
 //   t0 = L & 3, t1 = L >> 2.
@@ -32,16 +48,22 @@
 // Scale layout: identical vec16_scale_offset swizzle as the cuBLASLt and
 // CUTLASS paths so we can read SFA/SFB straight from the same buffers.
 //
-// Soft regime: n==1 && m%16==0 && k%64==0. For shapes the MMA cannot
-// service we return QWEN36_STATUS_NOT_IMPLEMENTED so the dispatcher routes
-// to cuBLASLt. Active env var: QWEN36_DECODE_GEMV=1.
+// Soft regime: n==1 && m%16==0 && k%512==0 (with k%1024==0 routing to the
+// 16-warp specialization). The k-alignment constraint comes from split-K:
+// K is sharded into Nwarps equal pieces (one per warp), each of which must
+// be a multiple of the kKPerMma=64 inner-loop chunk. For shapes the MMA
+// cannot service we return QWEN36_STATUS_NOT_IMPLEMENTED so the dispatcher
+// routes to cuBLASLt. Active env var: QWEN36_DECODE_GEMV=1.
 
 #include "qwen36_fp4.h"
 #include "active_stream.h"
+#include "nvfp4_gemv_mma_helpers.cuh"
+#include "nvfp4_gemv_mma_kernel.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <cstdlib>
 
 // We deliberately AVOID including <cutlass/...> or <cute/...> here even
 // though that header defines the MMA atom we want. Pulling cute into a
@@ -50,210 +72,127 @@
 // (begin/end/cbegin/cend etc.) as device variables, but `::cuda::std`
 // isn't declared in the host compilation unit, so g++ chokes with
 // "'::cuda' has not been declared". Mirror the exact PTX from the cute
-// atom (cute/arch/mma_sm120.hpp:3215, kind::mxf4nvf4.scale_vec::4X
-// .m16n8k64 with e2m1 × e2m1 and ue4m3 scales) inline below. This keeps
-// the TU self-contained — no cute, no cuda::std.
+// atom in nvfp4_gemv_mma_helpers.cuh instead.
 //
-// The `kind::mxf4nvf4` opcode is sm_120a-only. Building with
-// `-arch=sm_120a` emits BOTH a compute_120 (PTX-forward) image AND a
-// compute_120a image; the compute_120 image must softly fall through, so
-// we gate the asm on __CUDA_ARCH_FEAT_SM120_ALL.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200) &&                       \
-    defined(__CUDA_ARCH_FEAT_SM120_ALL)
-#define QWEN36_DECODE_GEMV_MMA_DEVICE 1
-#else
-#define QWEN36_DECODE_GEMV_MMA_DEVICE 0
-#endif
+// The cp.async / MMA / SF helpers + constants (kRowsPerBlock, kKPerMma,
+// kATilePerWarpBytes, etc.) and the QWEN36_DECODE_GEMV_* macros all live
+// in that header so other fused callers (e.g. the decode interpreter's
+// GEMV opcode) can reuse them
+// without duplicating the inline PTX. Bring them into the unqualified
+// namespace below for the existing kernel body's call sites.
 
-// Host-side guard: enabled whenever the CUDA toolchain can target sm_120a
-// (driver / nvcc 12.8+). Nothing on the host depends on the device-side
-// macro. We always compile the kernel; the device-side body is
-// conditionally a no-op for the compute_120 fallback PTX image.
-#define QWEN36_DECODE_GEMV_MMA 1
+using namespace qwen36_gemv;
 
-namespace {
-
-__host__ __device__ size_t gemv_div_ceil(size_t a, size_t b) {
-  return (a + b - 1) / b;
+// Templated kernel. Two specializations are emitted (kWarpsPerBlockTpl =
+// 16 and 8). The kernel is declared at namespace scope so explicit
+// instantiation can force the symbols into the .so.
+// Tensor scales (a_scale_2, b_scale_2) intentionally NOT in the kernel
+// signature: the runtime caller (engine.rs) already folds them into
+// `spec->alpha` before invoking the kernel, mirroring the cuBLASLt
+// contract (nvfp4_gemm.cu only passes `alpha`, never dereferences
+// a_scale_2/b_scale_2). Multiplying by them inside the kernel would
+// square the tensor-scale factor and produce silent gibberish on real
+// model weights.
+//
+// The body itself lives in nvfp4_gemv_mma_kernel.cuh so other fused
+// callers can call the same __device__ template without duplicating
+// the inline PTX. The __global__ wrapper here is a thin shim that picks
+// up __launch_bounds__ for the standalone-dispatcher launch path.
+template <int kWarpsPerBlockTpl>
+__global__ void __launch_bounds__(kWarpsPerBlockTpl * 32)
+nvfp4_gemv_mma_kernel_tpl(const uint8_t *__restrict__ a_fp4,
+                          const uint8_t *__restrict__ a_scale,
+                          const uint8_t *__restrict__ b_fp4,
+                          const uint8_t *__restrict__ b_scale, float alpha,
+                          __nv_bfloat16 *__restrict__ output, size_t M,
+                          size_t K) {
+  qwen36_gemv::nvfp4_gemv_mma_body<kWarpsPerBlockTpl>(
+      blockIdx.x, a_fp4, a_scale, b_fp4, b_scale, alpha, output, M, K);
 }
 
-__host__ __device__ size_t gemv_round_up(size_t v, size_t m) {
-  return gemv_div_ceil(v, m) * m;
-}
+// Explicit instantiations — force both specialization symbols into the .so.
+template __global__ void
+nvfp4_gemv_mma_kernel_tpl<16>(const uint8_t *, const uint8_t *, const uint8_t *,
+                              const uint8_t *, float, __nv_bfloat16 *, size_t,
+                              size_t);
+template __global__ void
+nvfp4_gemv_mma_kernel_tpl<8>(const uint8_t *, const uint8_t *, const uint8_t *,
+                             const uint8_t *, float, __nv_bfloat16 *, size_t,
+                             size_t);
 
-// cuBLASLt vec16 scale-swizzle layout. See ops.cu:vec16_scale_offset.
-__host__ __device__ size_t gemv_vec16_scale_offset(size_t inner, size_t outer,
-                                                   size_t sf_inner_dim) {
-  const size_t block_inner = (inner / 4) * 4;
-  const size_t block_outer = outer / 128;
-  const size_t block_offset = (block_inner + block_outer * sf_inner_dim) * 128;
-  const size_t tile_outer = outer % 128;
-  const size_t tile_inner = inner % 4;
-  return block_offset + (tile_outer % 32) * 16 + (tile_outer / 32) * 4 +
-         tile_inner;
-}
-
-// MMA-driven kernel. Each warp owns 16 contiguous rows; each CTA owns 4
-// warps == 64 rows. Inner loop walks K in chunks of 64.
-constexpr int kWarpsPerBlock = 4;
-constexpr int kRowsPerWarp = 16;
-constexpr int kRowsPerBlock = kWarpsPerBlock * kRowsPerWarp;  // 64
-constexpr int kThreadsPerBlock = kWarpsPerBlock * 32;          // 128
-constexpr int kKPerMma = 64;
-
-// Inline-PTX wrapper for the SM120 mxf4nvf4 scale_vec::4X m16n8k64 atom.
-// Direct mirror of cute/arch/mma_sm120.hpp:3215. Lives at file scope so
-// the kernel body stays readable.
-__device__ __forceinline__ void mma_mxf4nvf4_4x_m16n8k64(
-    float &d0, float &d1, float &d2, float &d3,
-    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-    uint32_t b0, uint32_t b1,
-    float c0, float c1, float c2, float c3,
-    uint32_t sfa0, uint32_t sfb0) {
-#if QWEN36_DECODE_GEMV_MMA_DEVICE
-  constexpr uint16_t bid = 0;
-  constexpr uint16_t tid = 0;
-  asm volatile(
-      "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-      "{%0,  %1,  %2,  %3},"
-      "{%4,  %5,  %6,  %7},"
-      "{%8,  %9},"
-      "{%10, %11, %12, %13},"
-      "{%14},"
-      "{%15, %16},"
-      "{%17},"
-      "{%18, %19};\n"
-      : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-        "r"(b0), "r"(b1),
-        "f"(c0), "f"(c1), "f"(c2), "f"(c3),
-        "r"(sfa0), "h"(bid), "h"(tid),
-        "r"(sfb0), "h"(bid), "h"(tid));
-#else
-  d0 = c0; d1 = c1; d2 = c2; d3 = c3;
-  (void)a0; (void)a1; (void)a2; (void)a3;
-  (void)b0; (void)b1; (void)sfa0; (void)sfb0;
-#endif
-}
-
-// Kernel is always declared (host needs the symbol for the launch stub).
-// On compute_120 the body is a no-op — the host wrapper guards the launch
-// behind QWEN36_DECODE_GEMV_MMA so the kernel is never invoked at runtime.
-__global__ void __launch_bounds__(kThreadsPerBlock)
-nvfp4_gemv_mma_kernel(const uint8_t *__restrict__ a_fp4,
-                      const uint8_t *__restrict__ a_scale,
-                      const float *__restrict__ a_tensor_scale,
-                      const uint8_t *__restrict__ b_fp4,
-                      const uint8_t *__restrict__ b_scale,
-                      const float *__restrict__ b_tensor_scale,
-                      float alpha, __nv_bfloat16 *__restrict__ output,
-                      size_t M, size_t K) {
-  const unsigned warp_id = threadIdx.x >> 5;
-  const unsigned lane = threadIdx.x & 31;
-  const size_t m_base =
-      static_cast<size_t>(blockIdx.x) * kRowsPerBlock + warp_id * kRowsPerWarp;
-  if (m_base >= M) {
+// Multi-N chunk wrapper (2 <= n <= 8): real activation columns in the
+// atom's N dimension. M-tiled: each CTA owns `m_tiles_per_cta` consecutive
+// m16 tiles and loops over them with B staged once (the B re-staging is
+// n/16 of the weight bytes at T=1 — +31% at n=5 — divided by T). The body
+// and the smem helper live in nvfp4_gemv_mma_kernel.cuh.
+template <int kWarpsPerBlockTpl>
+__global__ void __launch_bounds__(kWarpsPerBlockTpl * 32)
+nvfp4_gemm_chunk_kernel_tpl(const uint8_t *__restrict__ a_fp4,
+                            const uint8_t *__restrict__ a_scale,
+                            const uint8_t *__restrict__ b_fp4,
+                            const uint8_t *__restrict__ b_scale, float alpha,
+                            __nv_bfloat16 *__restrict__ output, size_t M,
+                            size_t K, unsigned n, unsigned m_tiles_per_cta) {
+  const unsigned num_tiles =
+      static_cast<unsigned>((M + qwen36_gemv::kRowsPerBlock - 1) /
+                            qwen36_gemv::kRowsPerBlock);
+  const unsigned first = blockIdx.x * m_tiles_per_cta;
+  if (first >= num_tiles) {
     return;
   }
-
-  const size_t packed_cols = K / 2;       // bytes per fp4 row
-  const size_t scale_cols = K / 16;       // scale groups per row
-  const size_t sf_inner_dim = gemv_round_up(scale_cols, 4);
-
-  // Lane decomposition for the operand layouts (canonical m16n8k* form).
-  const unsigned t0 = lane & 3u;
-  const unsigned t1 = lane >> 2;
-
-  // SFA decomposition: m_row_sf = 8*(L&1) + (L>>2).
-  const unsigned t0_sf_a = lane & 1u;
-  const unsigned t2_sf_a = lane >> 2;
-  const unsigned m_row_sf = 8u * t0_sf_a + t2_sf_a;
-  const size_t a_row_for_sf = m_base + m_row_sf;
-
-  // SFB at N=1: outer is always 0, no n-decomposition needed.
-
-  // Tensor scales (a_scale_2, b_scale_2) are NOT applied here — the
-  // runtime caller (engine.rs) already folds them into `spec->alpha`
-  // before invoking the kernel, mirroring the cuBLASLt contract
-  // (nvfp4_gemm.cu:380 only passes `alpha`, never dereferences
-  // a_scale_2/b_scale_2). Multiplying by them again would square the
-  // tensor-scale factor — the bug that produced gibberish on real
-  // model weights despite the uniform-data smoke passing.
-  (void)a_tensor_scale;
-  (void)b_tensor_scale;
-
-  // Row pointers for the two A sub-tiles owned by this lane.
-  const size_t a_row0 = m_base + t1;        // for A[0], A[2]
-  const size_t a_row1 = m_base + t1 + 8u;   // for A[1], A[3]
-  const uint8_t *a_row0_ptr = a_fp4 + a_row0 * packed_cols;
-  const uint8_t *a_row1_ptr = a_fp4 + a_row1 * packed_cols;
-
-  float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
-
-  // K chunk index stride is fixed: 4 scale groups per chunk.
-  const size_t k_chunks = K / kKPerMma;
-
-  for (size_t kc = 0; kc < k_chunks; ++kc) {
-    const size_t k_byte_base = kc * (kKPerMma / 2);  // 32 bytes per chunk
-    const size_t k_group_base = kc * 4;              // 4 scale groups / chunk
-
-    // ---- A operand: 4 uint32, each = 4 bytes = 8 fp4 elements. ----
-    const size_t a_byte_off_v0 = k_byte_base + 4u * t0;        // v1=0
-    const size_t a_byte_off_v1 = k_byte_base + 4u * t0 + 16u;  // v1=1
-    uint32_t a0 =
-        *reinterpret_cast<const uint32_t *>(a_row0_ptr + a_byte_off_v0);
-    uint32_t a1 =
-        *reinterpret_cast<const uint32_t *>(a_row1_ptr + a_byte_off_v0);
-    uint32_t a2 =
-        *reinterpret_cast<const uint32_t *>(a_row0_ptr + a_byte_off_v1);
-    uint32_t a3 =
-        *reinterpret_cast<const uint32_t *>(a_row1_ptr + a_byte_off_v1);
-
-    // ---- B operand: 2 uint32. Single activation column at N=1. ----
-    uint32_t b0 = *reinterpret_cast<const uint32_t *>(b_fp4 + a_byte_off_v0);
-    uint32_t b1 = *reinterpret_cast<const uint32_t *>(b_fp4 + a_byte_off_v1);
-
-    // ---- SFA: 4 e4m3 bytes packed into a uint32, k_group 0..3. ----
-    uint32_t sfa = 0;
-#pragma unroll
-    for (int g = 0; g < 4; ++g) {
-      const size_t off = gemv_vec16_scale_offset(
-          k_group_base + static_cast<size_t>(g), a_row_for_sf, sf_inner_dim);
-      const uint8_t b = a_scale[off];
-      sfa |= static_cast<uint32_t>(b) << (g * 8);
-    }
-
-    // ---- SFB: same packing; outer = 0 at N=1. ----
-    uint32_t sfb = 0;
-#pragma unroll
-    for (int g = 0; g < 4; ++g) {
-      const size_t off = gemv_vec16_scale_offset(
-          k_group_base + static_cast<size_t>(g), 0, sf_inner_dim);
-      const uint8_t b = b_scale[off];
-      sfb |= static_cast<uint32_t>(b) << (g * 8);
-    }
-
-    mma_mxf4nvf4_4x_m16n8k64(acc0, acc1, acc2, acc3,
-                             a0, a1, a2, a3,
-                             b0, b1,
-                             acc0, acc1, acc2, acc3,
-                             sfa, sfb);
-  }
-
-  // Epilogue: lanes with t0==0 hold the n=0 column. D[0] is row t1,
-  // D[2] is row t1+8. Apply only `alpha` — the runtime has already
-  // folded the per-tensor scales into it (see comment above).
-  if (t0 == 0u) {
-    const size_t row_lo = m_base + t1;
-    const size_t row_hi = m_base + t1 + 8u;
-    if (row_lo < M) {
-      output[row_lo] = __float2bfloat16(acc0 * alpha);
-    }
-    if (row_hi < M) {
-      output[row_hi] = __float2bfloat16(acc2 * alpha);
-    }
-  }
+  const unsigned remaining = num_tiles - first;
+  const unsigned count =
+      remaining < m_tiles_per_cta ? remaining : m_tiles_per_cta;
+  qwen36_gemv::nvfp4_gemm_chunk_body<kWarpsPerBlockTpl>(
+      first, count, a_fp4, a_scale, b_fp4, b_scale, alpha, output, M, K, n);
 }
+
+template __global__ void
+nvfp4_gemm_chunk_kernel_tpl<16>(const uint8_t *, const uint8_t *,
+                                const uint8_t *, const uint8_t *, float,
+                                __nv_bfloat16 *, size_t, size_t, unsigned,
+                                unsigned);
+template __global__ void
+nvfp4_gemm_chunk_kernel_tpl<8>(const uint8_t *, const uint8_t *,
+                               const uint8_t *, const uint8_t *, float,
+                               __nv_bfloat16 *, size_t, size_t, unsigned,
+                               unsigned);
+
+// M-tiles per CTA for the chunk path. Default 1: the T-sweep on the real
+// model (2026-06-12, MTP=4 ctx=128, bit-identical outputs across T) measured
+// MONOTONE degradation — T1 36.8 tok/s > T4 35.3 > T8 35.1 > shape-adaptive
+// 6/3/1 34.4. Mechanism: each sub-tile pays two serial CTA-wide barriers +
+// a cp.async prologue (~5-8 us) that at T=1 ran concurrently in independent
+// CTAs, while resident warps/SM (and thus memory-level parallelism) don't
+// change with T — so the B re-staging bytes saved (n/16 of weight bytes / T)
+// were not the binding resource. Override for re-exploration:
+// QWEN36_CHUNK_GEMV_MTILE (read once per process; the test hook below lets
+// smoke sweep T without re-exec).
+static int g_chunk_mtile_override = -2;  // -2 = env unread, -1 = default
+
+extern "C" void qwen36_nvfp4_chunk_gemv_set_mtile(int mtile) {
+  g_chunk_mtile_override = mtile >= 1 ? mtile : -2;
+}
+
+static unsigned chunk_gemv_pick_mtile(size_t num_tiles) {
+  if (g_chunk_mtile_override == -2) {
+    int v = -1;
+    if (const char *e = getenv("QWEN36_CHUNK_GEMV_MTILE")) {
+      const int parsed = atoi(e);
+      if (parsed >= 1 && parsed <= 64) {
+        v = parsed;
+      }
+    }
+    g_chunk_mtile_override = v;
+  }
+  if (g_chunk_mtile_override >= 1) {
+    return static_cast<unsigned>(g_chunk_mtile_override);
+  }
+  (void)num_tiles;
+  return 1u;
+}
+
+namespace {
 
 template <typename T> T *as_device_ptr(qwen36_device_ptr_t p) {
   return reinterpret_cast<T *>(static_cast<uintptr_t>(p.ptr));
@@ -275,27 +214,110 @@ extern "C" int qwen36_decode_nvfp4_gemv(
 
 #if QWEN36_DECODE_GEMV_MMA
   // MMA regime: N=1, M aligned to the m16 MMA tile, K aligned to the
-  // k64 inner-loop chunk. Anything outside this returns
-  // NOT_IMPLEMENTED so cuBLASLt picks it up.
-  if (spec->n != 1 || (spec->m % 16) != 0 || (spec->k % 64) != 0) {
+  // split-K chunk. We pick the largest-warp specialization the K dimension
+  // admits:
+  //   - kAlign16 = 16 * 64 = 1024  → 16 warps / CTA (preferred).
+  //   - kAlign8  =  8 * 64 =  512  → 8 warps / CTA  (fallback).
+  // K not divisible by 512 returns NOT_IMPLEMENTED so cuBLASLt picks it up.
+  constexpr size_t kAlign16 = 16u * static_cast<size_t>(kKPerMma);  // 1024
+  constexpr size_t kAlign8 = 8u * static_cast<size_t>(kKPerMma);    // 512
+
+  if (spec->n < 1 || spec->n > 8 || (spec->m % 16) != 0) {
+    return QWEN36_STATUS_NOT_IMPLEMENTED;
+  }
+
+  int chosen_warps = 0;
+  if ((spec->k % kAlign16) == 0) {
+    chosen_warps = 16;
+  } else if ((spec->k % kAlign8) == 0) {
+    chosen_warps = 8;
+  } else {
     return QWEN36_STATUS_NOT_IMPLEMENTED;
   }
 
   const size_t M = spec->m;
   const size_t K = spec->k;
-  const dim3 block(kThreadsPerBlock, 1, 1);
-  const dim3 grid(static_cast<unsigned>(gemv_div_ceil(M, kRowsPerBlock)), 1,
-                  1);
-
+  const dim3 grid(static_cast<unsigned>(gemv_div_ceil(M, kRowsPerBlock)), 1, 1);
   cudaStream_t stream = qwen36_internal_active_stream();
-  nvfp4_gemv_mma_kernel<<<grid, block, 0, stream>>>(
-      as_device_ptr<const uint8_t>(spec->a_fp4),
-      as_device_ptr<const uint8_t>(spec->a_scale),
-      as_device_ptr<const float>(spec->a_scale_2),
-      as_device_ptr<const uint8_t>(spec->b_fp4),
-      as_device_ptr<const uint8_t>(spec->b_scale),
-      as_device_ptr<const float>(spec->b_scale_2), spec->alpha,
-      as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K);
+
+  if (spec->n > 1) {
+    // Chunk path (MTP verify, n = drafts+1). SMEM holds n padded activation
+    // columns + the A tiles + the widened reduction; refuse shapes that
+    // would exceed the sm_120a 99 KB cap so cuBLASLt picks them up.
+    constexpr size_t kSmemCap = 99 * 1024;
+    const unsigned n = static_cast<unsigned>(spec->n);
+    const size_t smem_bytes =
+        chosen_warps == 16
+            ? qwen36_gemv::nvfp4_gemm_chunk_smem_bytes<16>(K, n)
+            : qwen36_gemv::nvfp4_gemm_chunk_smem_bytes<8>(K, n);
+    if (smem_bytes > kSmemCap) {
+      return QWEN36_STATUS_NOT_IMPLEMENTED;
+    }
+    const size_t num_tiles = gemv_div_ceil(M, kRowsPerBlock);
+    const unsigned mtile = chunk_gemv_pick_mtile(num_tiles);
+    const dim3 grid_chunk(
+        static_cast<unsigned>(gemv_div_ceil(num_tiles, mtile)), 1, 1);
+    if (chosen_warps == 16) {
+      static bool attr_set_16 = false;
+      if (!attr_set_16) {
+        cudaFuncSetAttribute(nvfp4_gemm_chunk_kernel_tpl<16>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(kSmemCap));
+        attr_set_16 = true;
+      }
+      const dim3 block(16u * 32u, 1, 1);
+      nvfp4_gemm_chunk_kernel_tpl<16>
+          <<<grid_chunk, block, smem_bytes, stream>>>(
+              as_device_ptr<const uint8_t>(spec->a_fp4),
+              as_device_ptr<const uint8_t>(spec->a_scale),
+              as_device_ptr<const uint8_t>(spec->b_fp4),
+              as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
+              as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K, n, mtile);
+    } else {
+      static bool attr_set_8 = false;
+      if (!attr_set_8) {
+        cudaFuncSetAttribute(nvfp4_gemm_chunk_kernel_tpl<8>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(kSmemCap));
+        attr_set_8 = true;
+      }
+      const dim3 block(8u * 32u, 1, 1);
+      nvfp4_gemm_chunk_kernel_tpl<8>
+          <<<grid_chunk, block, smem_bytes, stream>>>(
+              as_device_ptr<const uint8_t>(spec->a_fp4),
+              as_device_ptr<const uint8_t>(spec->a_scale),
+              as_device_ptr<const uint8_t>(spec->b_fp4),
+              as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
+              as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K, n, mtile);
+    }
+    cudaError_t err = cudaGetLastError();
+    return err == cudaSuccess ? QWEN36_STATUS_SUCCESS
+                              : QWEN36_STATUS_CUDA_ERROR;
+  }
+
+  // Smem footprint lives in the shared body helper so standalone and
+  // interpreter call sites stay ABI-equivalent.
+  const size_t smem_bytes =
+      chosen_warps == 16 ? qwen36_gemv::nvfp4_gemv_mma_smem_bytes<16>(K)
+                         : qwen36_gemv::nvfp4_gemv_mma_smem_bytes<8>(K);
+
+  if (chosen_warps == 16) {
+    const dim3 block(16u * 32u, 1, 1);
+    nvfp4_gemv_mma_kernel_tpl<16><<<grid, block, smem_bytes, stream>>>(
+        as_device_ptr<const uint8_t>(spec->a_fp4),
+        as_device_ptr<const uint8_t>(spec->a_scale),
+        as_device_ptr<const uint8_t>(spec->b_fp4),
+        as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
+        as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K);
+  } else {
+    const dim3 block(8u * 32u, 1, 1);
+    nvfp4_gemv_mma_kernel_tpl<8><<<grid, block, smem_bytes, stream>>>(
+        as_device_ptr<const uint8_t>(spec->a_fp4),
+        as_device_ptr<const uint8_t>(spec->a_scale),
+        as_device_ptr<const uint8_t>(spec->b_fp4),
+        as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
+        as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K);
+  }
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {

@@ -22,6 +22,89 @@ pub struct Bf16MatVecSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bf16MatVecArgmaxRowsSpec {
+    pub rows: usize,
+    pub out_features: usize,
+    pub in_features: usize,
+    pub input_bf16: DevicePtr,
+    pub weight_bf16: DevicePtr,
+    pub output_token_u32: DevicePtr,
+    pub mirror_last_output_token_u32: DevicePtr,
+    pub workspace: DevicePtr,
+    pub workspace_bytes: usize,
+    /// Optional `[rows]` u32 device flags — a non-zero flag skips that row
+    /// entirely (output and mirror untouched). `DevicePtr::NULL` processes
+    /// every row. Predicated BF16 rescore of the two-stage lm_head argmax.
+    pub skip_flags_u32: DevicePtr,
+}
+
+/// Stage-1 verdict of the two-stage exact lm_head argmax: per-row top-2 +
+/// margin guard over the FP8-path logits. Tokens are written
+/// unconditionally; `flags_u32[row] = 1` certifies the FP8 argmax when the
+/// margin is at least `eps`, while 0 sends the row to the predicated BF16
+/// rescore. Workspace uses `rows * 240 * 16` bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LmHeadTop2MarginSpec {
+    pub rows: usize,
+    pub vocab: usize,
+    pub eps: f32,
+    pub logits_bf16: DevicePtr,
+    pub tokens_u32: DevicePtr,
+    pub flags_u32: DevicePtr,
+    pub mirror_last_token_u32: DevicePtr,
+    pub fallback_count_u32: DevicePtr,
+    pub workspace: DevicePtr,
+    pub workspace_bytes: usize,
+}
+
+/// Workspace bytes required by [`LmHeadTop2MarginSpec`] for `rows` rows
+/// (mirrors `QWEN36_LM_HEAD_TOP2_BLOCKS * 16` in qwen36_fp4.h).
+pub const fn lm_head_top2_workspace_bytes(rows: usize) -> usize {
+    rows * 240 * 16
+}
+
+/// v2 stage-1 verdict of the two-stage exact lm_head argmax: rescores the
+/// top-8 FP8 candidates against the BF16 weight (FP64 accumulation) and
+/// certifies via `best_rescored >= max(9th winner, max block-v2) + eps`.
+/// Same output contract as [`LmHeadTop2MarginSpec`]; same workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LmHeadTop8RescoreSpec {
+    pub rows: usize,
+    pub vocab: usize,
+    pub cols: usize,
+    pub eps: f32,
+    pub logits_bf16: DevicePtr,
+    pub weight_bf16: DevicePtr,
+    pub input_bf16: DevicePtr,
+    pub tokens_u32: DevicePtr,
+    pub flags_u32: DevicePtr,
+    pub mirror_last_token_u32: DevicePtr,
+    pub fallback_count_u32: DevicePtr,
+    pub workspace: DevicePtr,
+    pub workspace_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LmHeadFp8QuantizeSpec {
+    pub rows: usize,
+    pub cols: usize,
+    pub weight_bf16: DevicePtr,
+    pub weight_e4m3: DevicePtr,
+    pub row_scales_f32: DevicePtr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LmHeadFp8GemvSpec {
+    pub rows: usize,
+    pub cols: usize,
+    pub n: usize,
+    pub weight_e4m3: DevicePtr,
+    pub row_scales_f32: DevicePtr,
+    pub input_bf16: DevicePtr,
+    pub output_bf16: DevicePtr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bf16GemmSpec {
     pub m: usize,
     pub n: usize,

@@ -74,6 +74,81 @@ pub fn get_active_stream() -> CudaStream {
     CudaStream(unsafe { ffi::qwen36_get_active_stream() })
 }
 
+/// Register a secondary "prefetch" stream the kernel library can use for
+/// productive-spin concurrent work. Passing NULL clears it.
+/// The engine owns the stream's lifetime — see [`OwnedCudaStream`].
+pub fn set_prefetch_stream(stream: CudaStream) {
+    unsafe { ffi::qwen36_set_prefetch_stream(stream.0) }
+}
+
+pub fn get_prefetch_stream() -> CudaStream {
+    CudaStream(unsafe { ffi::qwen36_get_prefetch_stream() })
+}
+
+/// CUDA event handle used to synchronize the main and prefetch streams in a
+/// way that is captureable into the decode graph. Events are created with
+/// `cudaEventDisableTiming` so the record/wait pair is near-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaEvent(pub *mut core::ffi::c_void);
+
+unsafe impl Send for CudaEvent {}
+unsafe impl Sync for CudaEvent {}
+
+impl CudaEvent {
+    pub fn create() -> Result<OwnedCudaEvent> {
+        let mut raw: *mut core::ffi::c_void = core::ptr::null_mut();
+        let status = unsafe { ffi::qwen36_cuda_event_create(&mut raw) };
+        if status != 0 {
+            return Err(CoreError::Runtime(format!(
+                "qwen36_cuda_event_create failed with status {status}"
+            )));
+        }
+        Ok(OwnedCudaEvent(CudaEvent(raw)))
+    }
+
+    pub fn record(&self, stream: CudaStream) -> Result<()> {
+        let status = unsafe { ffi::qwen36_cuda_event_record(self.0, stream.0) };
+        if status != 0 {
+            return Err(CoreError::Runtime(format!(
+                "qwen36_cuda_event_record failed with status {status}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Make `stream` wait until `event` has been recorded. Captureable: when the
+/// streams are both being recorded into the same graph, this adds a fork/join
+/// node between them.
+pub fn stream_wait_event(stream: CudaStream, event: CudaEvent) -> Result<()> {
+    let status = unsafe { ffi::qwen36_cuda_stream_wait_event(stream.0, event.0) };
+    if status != 0 {
+        return Err(CoreError::Runtime(format!(
+            "qwen36_cuda_stream_wait_event failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Owns a CUDA event and destroys it on drop.
+pub struct OwnedCudaEvent(CudaEvent);
+
+impl OwnedCudaEvent {
+    pub fn handle(&self) -> CudaEvent {
+        self.0
+    }
+}
+
+impl Drop for OwnedCudaEvent {
+    fn drop(&mut self) {
+        if !self.0.0.is_null() {
+            unsafe {
+                let _ = ffi::qwen36_cuda_event_destroy(self.0.0);
+            }
+        }
+    }
+}
+
 /// Atomically advance a device-side `int32_t` by 1. Captured into the decode
 /// graph so each replay steps the position counter without host involvement.
 pub fn increment_i32(target: DevicePtr) -> Result<()> {
@@ -81,6 +156,29 @@ pub fn increment_i32(target: DevicePtr) -> Result<()> {
     if status != 0 {
         return Err(CoreError::Runtime(format!(
             "qwen36_increment_i32 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Recycle a graph-captured assume-accept MTP window entirely on-device.
+pub fn mtp_assume_accept_chain_advance(
+    position_i32: DevicePtr,
+    draft_count: usize,
+    position_count: usize,
+    position_delta: i32,
+) -> Result<()> {
+    let status = unsafe {
+        ffi::qwen36_mtp_assume_accept_chain_advance(
+            position_i32,
+            draft_count,
+            position_count,
+            position_delta,
+        )
+    };
+    if status != 0 {
+        return Err(CoreError::Runtime(format!(
+            "qwen36_mtp_assume_accept_chain_advance failed with status {status}"
         )));
     }
     Ok(())
@@ -165,20 +263,33 @@ mod ffi {
     type Stream = *mut core::ffi::c_void;
     type Graph = *mut core::ffi::c_void;
     type GraphExec = *mut core::ffi::c_void;
+    type Event = *mut core::ffi::c_void;
 
     #[link(name = "qwen36_fp4_kernels")]
     unsafe extern "C" {
         pub fn qwen36_get_active_stream() -> Stream;
         pub fn qwen36_set_active_stream(stream: Stream);
+        pub fn qwen36_get_prefetch_stream() -> Stream;
+        pub fn qwen36_set_prefetch_stream(stream: Stream);
         pub fn qwen36_cuda_stream_create(out: *mut Stream) -> i32;
         pub fn qwen36_cuda_stream_destroy(stream: Stream) -> i32;
         pub fn qwen36_cuda_stream_synchronize(stream: Stream) -> i32;
         pub fn qwen36_cuda_stream_begin_capture(stream: Stream) -> i32;
         pub fn qwen36_cuda_stream_end_capture(stream: Stream, out: *mut Graph) -> i32;
+        pub fn qwen36_cuda_event_create(out: *mut Event) -> i32;
+        pub fn qwen36_cuda_event_destroy(event: Event) -> i32;
+        pub fn qwen36_cuda_event_record(event: Event, stream: Stream) -> i32;
+        pub fn qwen36_cuda_stream_wait_event(stream: Stream, event: Event) -> i32;
         pub fn qwen36_cuda_graph_instantiate(graph: Graph, out: *mut GraphExec) -> i32;
         pub fn qwen36_cuda_graph_destroy(graph: Graph) -> i32;
         pub fn qwen36_cuda_graph_exec_destroy(exec: GraphExec) -> i32;
         pub fn qwen36_cuda_graph_launch(exec: GraphExec, stream: Stream) -> i32;
         pub fn qwen36_increment_i32(target: DevicePtr) -> i32;
+        pub fn qwen36_mtp_assume_accept_chain_advance(
+            position_i32: DevicePtr,
+            draft_count: usize,
+            position_count: usize,
+            position_delta: i32,
+        ) -> i32;
     }
 }

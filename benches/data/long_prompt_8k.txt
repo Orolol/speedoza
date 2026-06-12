@@ -1,0 +1,548 @@
+# `qwen36-fp4` — Inference Engine Spec
+
+> Single-stream inference engine for **Qwen3.6-27B-Text-NVFP4-MTP** on **NVIDIA RTX 5090** (Blackwell SM120). From-scratch implementation, no compromise on the hot path.
+
+---
+
+## 0. Objectives
+
+### Primary
+Maximize tokens/sec in **single-stream (batch=1) decode** for `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP` on RTX 5090, with:
+- **MTP speculative decoding** functional (with state rollback for DeltaNet layers)
+- **TurboQuant** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) for the KV cache of the 16 attention layers
+- **NVFP4** native compute path via cuBLASLt on SM120
+
+**Target**: ≥ 1.5× the throughput of vLLM (same model, same hardware, same context length).
+
+### Secondary
+Fast prefill for long contexts up to 262K tokens (native, no YaRN initially).
+
+### Non-objectives — explicitly rejected
+- ❌ Multi-batch / continuous batching / serving (vLLM exists)
+- ❌ Multi-model / multi-architecture / dynamic dispatch
+- ❌ Multi-GPU
+- ❌ Vision tower (we use the `-Text-` variant which has it stripped)
+- ❌ Training, fine-tuning, gradient computation
+- ❌ Quantization formats other than NVFP4 (E2M1, micro-block 16, scale E4M3 + scale FP32 per-tensor)
+- ❌ Custom tokenizer (use HF `tokenizers` Rust crate)
+- ❌ HTTP / OpenAI-compatible API (CLI + library only)
+
+---
+
+## 1. Model topology (verified)
+
+```
+Qwen3.6-27B (27.78B params, hybrid linear-attn + full-attn)
+├── 64 layers organized into 16 macro-blocks of 4 layers each
+│   └── Pattern per macro-block: [DeltaNet, DeltaNet, DeltaNet, GatedAttention]
+│       each sublayer followed by a SwiGLU FFN (intermediate=17408)
+├── Vocab: 248K tokens
+├── 1 MTP head (mtp_num_hidden_layers=1) — kept in bf16
+└── Hidden dim: TBD at load (likely 5120, confirm against Qwen3-Next-80B-A3B)
+```
+
+### 48 DeltaNet layers (linear attention)
+- **Gated DeltaNet** with delta-rule + scalar gate ([Yang et al. 2024](https://arxiv.org/abs/2412.06464))
+- **Includes conv1d** (Mamba-style short causal conv, kernel size ~4) — confirmed by model card via `*linear_attn.conv1d*` in the quantization ignore list
+- 48 V heads, 16 QK heads, head_dim 128
+- **State**: matrix `S ∈ R^{48 × 128 × 128}` per layer (bf16) + small conv1d history buffer (~3 tokens)
+- **No KV cache**: the recurrent state replaces it
+- conv1d weights stay in **bf16** (not NVFP4)
+
+### 16 Gated Attention layers (full softmax attention)
+- GQA: 24 Q heads, 4 KV heads, head_dim 256
+- **Partial RoPE on 64 dims** (not on the full 256)
+- **Output gate** (sigmoid on a projection)
+- KV cache: standard `(K, V) ∈ R^{2 × max_ctx × 4 × 256}` per layer
+
+### MTP head
+- 1 layer kept in bf16
+- 15 tensors total, ~850 MB
+
+### Critical implication for TurboQuant
+The vLLM heuristic "skip first/last 2 layers" for numerical stability is **broken on hybrid models** (`vllm/engine/arg_utils.py:1652` rejects them outright).
+
+In `Qwen3.6-27B`, attention layers are at global indices `{3, 7, 11, ..., 63}`. We **redefine the skip policy as "skip first and last attention layer"**, i.e. skip global layers `{3, 63}`. See §6.
+
+---
+
+## 2. Storage and loading
+
+### NVFP4 modelopt format on disk
+The checkpoint exposes:
+- **NVFP4 weights**: `uint8` tensors (2 E2M1 values packed per byte) + `weight_scale` (FP8 E4M3, one per 16-element micro-block) + `weight_scale_2` (FP32 per-tensor)
+- **bf16 weights** (from quantization ignore list):
+  - `lm_head`
+  - `mtp.*` (15 tensors, ~850 MB)
+  - `*linear_attn.conv1d*` (48 conv1d, one per DeltaNet layer)
+  - Embeddings (probable, confirm at load)
+- **Activations**: dynamically NVFP4-quantized at runtime (not pre-quantized)
+
+References:
+- NVFP4 spec: [NVIDIA blog](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/)
+- modelopt format: [TensorRT-Model-Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
+
+### Layout pipeline disk → RAM → VRAM
+1. `mmap` of safetensors files (zero-copy CPU)
+2. Pre-allocate one contiguous GPU buffer per layer (reduces fragmentation)
+3. **Never decompress NVFP4 ahead of time** — keep it packed in VRAM, dequant is fused inside the matmul kernels via cuBLASLt
+
+### VRAM budget (target: ctx=32K)
+| Component | Size |
+|---|---|
+| NVFP4 weights | ~14 GB |
+| bf16 weights (MTP + 48× conv1d + lm_head) | ~850 MB |
+| KV cache 16 attn layers, ctx=32K, FP8 (TurboQuant) | ~1 GB |
+| DeltaNet state (48 layers) | ~75 MB |
+| Activations + workspace | ~2 GB |
+| **Total** | **~18 GB** of 32 GB |
+
+→ comfortably fits 128K context, 262K achievable with more aggressive KV quant.
+
+---
+
+## 3. Code architecture
+
+```
+qwen36-fp4/
+├── crates/
+│   ├── core/              # types, layout descriptors, traits
+│   ├── loader/            # safetensors mmap + GPU upload
+│   ├── tokenizer/         # wrapper around HF `tokenizers` crate
+│   ├── kernels/           # CUDA kernels + Rust bindings
+│   │   ├── nvfp4_gemm/    # NVFP4 × bf16 → bf16 GEMM via cuBLASLt
+│   │   ├── deltanet/      # chunkwise prefill + recurrent decode
+│   │   ├── attention/     # FA3 binding + custom decode kernel
+│   │   ├── turboquant/    # KV cache quant + Q×Kquant matmul
+│   │   ├── rmsnorm/       # fused RMSNorm + residual
+│   │   ├── rope/          # partial RoPE (64 dims of 256)
+│   │   ├── swiglu/        # fused SwiGLU activation
+│   │   └── sampling/      # fused top-k / top-p / temp / penalty
+│   ├── runtime/           # CUDA graph capture, KV cache mgmt, DeltaNet state
+│   ├── mtp/               # speculative decoding with rollback
+│   └── cli/               # binary entrypoint
+├── kernels-cuda/          # raw .cu sources compiled to .so
+└── benches/               # criterion benches vs vLLM
+```
+
+---
+
+## 4. Phased roadmap
+
+### Phase 0 — Discovery prototype (day 1)
+Before writing anything structural: a 200-line Rust binary that:
+- mmaps the safetensors of `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`
+- lists every tensor with its name, shape, dtype
+- confirms: hidden_dim, conv1d kernel_size, RoPE base, exact ignore list, position of `mtp.*` tensors
+- prints the layer-by-layer dtype distribution (which layers are NVFP4 vs bf16)
+
+**Deliverable**: a `model_layout.json` confirming all assumptions in §1 before phase 1.
+
+### Phase 1 — Reference forward pass, unoptimized (week 1–2)
+Goal: generate 10 coherent tokens, verify correctness against `transformers` HF.
+
+- [ ] safetensors NVFP4 modelopt loader
+- [ ] Tokenizer wrapper (Qwen3.6 chat template included)
+- [ ] Naive forward path via cuBLASLt:
+  - NVFP4×bf16 GEMM via `cublasLtMatmul` with `CUBLASLT_MATMUL_DESC_FP4_SCALE_MODE` (Blackwell native path)
+  - **Reference DeltaNet**: temporarily reuse [`flash-linear-attention`](https://github.com/fla-org/flash-linear-attention) via Python FFI — lets us debug correctness before writing custom kernels
+  - **Reference attention**: Flash Attention 3 binding (used as-is, already optimal for prefill)
+  - RMSNorm / RoPE / SwiGLU: trivial Triton kernels
+- [ ] Minimal sampling (greedy + top-p)
+- [ ] **Numerical equality test** with `transformers` to ε precision over 100 prompts
+
+**Deliverable**: `qwen36 chat "..."` works, ~5–10 tok/s. Not impressive, but correct.
+
+### Phase 2 — Custom DeltaNet kernels (week 3–4)
+The hottest path least well served by existing libraries. Reference: [Gated DeltaNet paper (Yang et al. 2024)](https://arxiv.org/abs/2412.06464) + [`fla-org/flash-linear-attention`](https://github.com/fla-org/flash-linear-attention) source. Specific innovations for our case:
+
+1. **Fused chunkwise prefill kernel**: a single Triton kernel per layer doing `RMSNorm → conv1d → QKV proj NVFP4 → chunkwise delta-rule → output gate → output proj NVFP4`. Chunk size = 64 (sweet spot for SM120 shared-mem). The state matrix is held in SRAM between chunks.
+
+2. **Sequential decode kernel**: for batch=1, DeltaNet is **fully memory-bound** (a 128×128 mat-vec per head + a rank-1 update). Persistent kernel that loops over tokens within a single launch when in spec decode (1 MTP draft + verify).
+
+3. **State checkpoint for MTP rollback**: before each MTP draft batch, snapshot the 48 DeltaNet state matrices into a dedicated buffer (~75 MB). On rejection, restore from snapshot and replay the K accepted tokens. Cost: a 75 MB GPU→GPU memcpy = ~40 µs at 5090 bandwidth. Negligible.
+
+**Deliverable**: DeltaNet kernel 1.3–1.5× faster than `flash-linear-attention` on this specific shape.
+
+### Phase 3 — TurboQuant for attention KV cache (week 5)
+**Required reading first**: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) — TurboQuant.
+
+Implementation for the 16 attention layers only:
+- K quantization in FP8 E4M3 with Hadamard rotation (TurboQuant's key trick)
+- V quantization in FP8 or INT4 — pick based on FamilyBench validation
+- **Hybrid-aware skip policy**: skip *attention layers* at positions `{first, last}` in the **attention layer sequence**, not in the global 0–63 index. For Qwen3.6-27B with pattern `[D D D A]×16`, attention layers are at global indices `{3, 7, 11, ..., 63}` → skip = `{3, 63}`.
+- **Fused Q×Kquant matmul**: a single Triton kernel doing dequant → matmul → softmax → V dequant → matmul, keeping intermediates in SRAM. Inspired by FA3 but with custom FP8 code path.
+
+**Deliverable**: KV cache halved vs FP8 baseline, quartered vs BF16. Correctness validated against FamilyBench (used as regression test).
+
+### Phase 4 — MTP speculative decoding (week 6)
+Per the model card: `--speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":1}'`. Single MTP layer → drafts **1 token per cycle**.
+
+Algorithm per step:
+1. Forward pass `[main + MTP]` on the last accepted token → produces `logit_main` and `logit_mtp_draft`
+2. Sample `t_main` from `logit_main`, sample `t_draft` from `logit_mtp_draft`
+3. Forward main-only on `t_main` with **DeltaNet state snapshot taken** → produces `logit_verify`
+4. If `argmax(logit_verify) == t_draft` (greedy) or via probabilistic rejection sampling, **accept and advance 2 tokens**. Otherwise advance 1 token.
+
+With ~70% acceptance rate on code (realistic per existing MTP benchmarks), this gains ~1.5× on pure decode. Combined with other optimizations, this is where we build our lead over vLLM.
+
+### Phase 5 — CUDA Graph + final tuning (week 7)
+- Capture the full decode loop into CUDA graphs (one per typical KV cache size: 1K, 4K, 16K, 64K, 256K). Eliminates ~30 µs of launch overhead per token.
+- Profiling with Nsight Compute, fix kernels not saturating bandwidth.
+- Tune DeltaNet chunk sizes and attention block sizes via grid search on actual hardware.
+- Fused sampling kernel (single launch for temp + top-k + top-p + penalty + multinomial).
+
+**Final deliverable**: binary running Qwen3.6-27B NVFP4 + MTP + TurboQuant at **>2× vLLM stock** on RTX 5090.
+
+---
+
+## 5. Language and toolchain
+
+**Choice**: **Rust** for host orchestration + **CUDA C++** for custom kernels + **Triton (Python)** for prototype/exotic kernels.
+
+### Rationale
+1. **Not pure Python**: Python+PyTorch launch overhead on SM120 is 20–50 µs per op. With ~200 ops per decode token, that's 4–10 ms of pure host overhead per token. Killer for >150 tok/s targets.
+
+2. **Not pure C++**: modern tooling (cargo, reproducible builds, safe FFI) and the type system for GPU memory management are clearly superior in Rust. ~5000 lines of host orchestration to write — no reason to suffer.
+
+3. **Why Rust specifically over Zig or others**:
+   - [`cudarc`](https://crates.io/crates/cudarc) is mature, zero-cost CUDA driver bindings, used in production (Candle, llm-rs)
+   - `safetensors` has an excellent native crate
+   - HF `tokenizers` is **natively written in Rust** — direct API, no FFI
+
+4. **Why Triton for exotic kernels**: writing the DeltaNet chunkwise directly in CUDA C++ costs an extra 3 weeks. Triton lets us iterate in hours. Always possible to rewrite hot paths in CUDA C++ post-validation where Triton leaves 10–15% on the table (typically the persistent decode kernel). For standard NVFP4 GEMMs, cuBLASLt is unbeatable anyway.
+
+5. **Not Mojo**: not mature enough for Blackwell, ecosystem still tiny, compiler still has SM120 bugs. Maybe in 2 years.
+
+### Concrete stack
+- **Rust 1.85+** with edition 2024
+- **`cudarc` 0.13+** for driver / cuBLAS / cuDNN bindings
+- **`safetensors`** crate
+- **`tokenizers`** crate (HF, native Rust)
+- **`pyo3`** to invoke Triton kernels compiled ahead-of-time (`triton.compile()` produces PTX, loaded in Rust via `cudarc`)
+- **CUDA 13.0** ⚠️ **NOT 13.2** (produces gibberish on Qwen3.6 per Unsloth docs)
+- Build pipeline: `cargo` + `nvcc` + Triton AOT compile script
+
+---
+
+## 6. Identified technical risks
+
+1. **conv1d in DeltaNet** — not described in most Gated DeltaNet writeups but present in the checkpoint. Likely a short conv (kernel size 4) Mamba-style. **Verify in `config.json` of the HF repo before Phase 1.**
+
+2. **TurboQuant + DeltaNet rollback** — if K/V quantization noise diverges between draft and verify, MTP acceptance rate drops. **Mitigation**: Phase 4 includes a "TurboQuant off for verify-side attention layers" fallback variant for ablation.
+
+3. **CUDA Graph + state mutation** — CUDA graphs don't tolerate pointer mutation well. For the growing KV cache, use a pre-allocated `max_ctx` buffer with masking. For the DeltaNet state (fixed size), no problem.
+
+4. **NVFP4 GEMM correctness on SM120** — early cuBLASLt implementations on SM120 had bugs through CUDA 12.9. **Must be on CUDA 13.0+**, with systematic numerical regression tests.
+
+5. **conv1d quantization** — model card keeps it in bf16. So the 48 DeltaNet conv1d remain a separate bf16 kernel. Not a problem, but **don't accidentally quantize them**.
+
+---
+
+## 7. Validation plan
+
+### Numerical correctness
+- Reference: `transformers` HF on the bf16 unquantized base model
+- Tolerance: ε = 1e-2 on logits (NVFP4 introduces visible noise; we measure against quantized baseline too)
+- Suite: 100 prompts, ranging over short/long, code/text, single/multi-turn
+
+### Behavioral regression
+- **FamilyBench / TreeEval** as primary regression test (we already trust it)
+- 9 question types, up to 10 generations / 1000 people
+- Run after each phase, compare against vLLM baseline on the same model
+
+### Performance benchmarks
+- Single-stream decode tok/s at contexts: 256, 1K, 4K, 16K, 64K, 128K
+- Prefill throughput at the same contexts
+- **Baseline**: vLLM 0.19+ with the same NVFP4-MTP model and `--speculative-config qwen3_5_mtp`
+- Reporting: criterion benches with regression tracking across commits
+
+---
+
+## 8. Reference resources
+
+- **Base model**: [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)
+- **Quantized model used**: [sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP](https://huggingface.co/sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP)
+- **Gated DeltaNet paper**: [arXiv:2412.06464](https://arxiv.org/abs/2412.06464)
+- **TurboQuant paper**: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
+- **Reference DeltaNet impl**: [fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention)
+- **NVFP4 specification**: [NVIDIA Technical Blog](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/)
+- **modelopt quantizer**: [NVIDIA/TensorRT-Model-Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
+- **vLLM hybrid TurboQuant patch**: [Sandermage/genesis-vllm-patches](https://github.com/Sandermage/genesis-vllm-patches) (reference for the skip-policy bug, not used directly)
+
+---
+
+## 9. Suggested execution order
+
+1. **Phase 0 first** — do not skip. Confirms every assumption listed in §1 against the actual checkpoint. ~1 day.
+2. **Phase 1** — reference forward, focus exclusively on correctness, not performance. ~2 weeks.
+3. **Phases 2–4** — can be parallelized across multiple Claude Code sessions if convenient (DeltaNet kernels and TurboQuant are mostly independent).
+4. **Phase 5** — final integration, no new features, only profiling and tuning.
+
+**Total wall-clock estimate**: 7 weeks of focused work for a single experienced developer. Significantly faster if Phases 2 and 3 are parallelized.# AGENT.md
+
+This file provides guidance to AI coding agents (Claude Code, Codex, Cursor, etc.) when working with code in this repository.
+
+## Project
+
+Single-stream inference engine for `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`, targeting **RTX 5090 / Blackwell SM120 only**. Rust 1.85 (edition 2024) Cargo workspace + a CUDA shared library built out-of-band by shell scripts. The repo is performance- and hardware-specific; **prefer explicit failure over silent fallback**.
+
+Full design intent: `doc.md`. Operational docs: `docs/`.
+
+## Workspace map
+
+- `crates/core` — topology, dtype, tensor classification, memory budgets
+- `crates/loader` — `config.json` + safetensors mmap; emits `model_layout.json`
+- `crates/tokenizer` — HF tokenizer wrapper + Qwen chat rendering
+- `crates/kernels` — Rust kernel specs, CUDA FFI, `NoCudaBackend` / `CudaBackend`
+- `crates/runtime` — KV cache + DeltaNet state planning, GPU weight upload, engine shell
+- `crates/mtp` — speculative decode controller (snapshot / restore / replay)
+- `crates/cli` — `qwen36-fp4` binary: `discover`, `inspect-config`, `budget`, `tokenize`, `validate-weights`, `gpu-load`
+- `kernels-cuda/` — CUDA sources and the public C ABI in `include/qwen36_fp4.h`
+
+## Build and test
+
+CPU-only loop (always works, no GPU required):
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+CUDA loop (run before any change touching kernels, ABI, or runtime GPU paths):
+
+```bash
+./scripts/build_cuda.sh
+./scripts/smoke_cuda.sh
+export QWEN36_FP4_KERNEL_LIB_DIR="$PWD/target/cuda"
+export LD_LIBRARY_PATH="$QWEN36_FP4_KERNEL_LIB_DIR:${LD_LIBRARY_PATH:-}"
+cargo test  --workspace --features qwen36-fp4-kernels/cuda
+cargo clippy --workspace --features qwen36-fp4-kernels/cuda -- -D warnings
+```
+
+Single test: `cargo test -p <crate> <name>` (e.g. `cargo test -p qwen36-fp4-mtp rollback`).
+End-to-end smoke against a real checkpoint: `cargo run -p qwen36-fp4 --features cuda -- gpu-load --model-dir <path> --max-context 2256`.
+
+## Build environment
+
+- `QWEN36_FP4_CUDA_MIN_VERSION=13.0` and `QWEN36_FP4_SM=120` are set in `.cargo/config.toml`.
+- CUDA 13.0+ required, but **avoid CUDA 13.2** (known Blackwell bugs).
+- Kernel build links `-lcublasLt` and outputs `target/cuda/libqwen36_fp4_kernels.so`.
+- Build overrides: `CUDA_HOME`, `NVCC`, `OUT_DIR`, `QWEN36_FP4_SM`.
+
+## Non-obvious rules (read before editing)
+
+**ABI sync.** Any change to `kernels-cuda/include/qwen36_fp4.h` MUST be mirrored in:
+- `crates/kernels/src/backend.rs`
+- the relevant typed spec module under `crates/kernels/src/`
+- `kernels-cuda/smoke.cu` if the new field is required
+
+While the ABI is still evolving, append new fields at the end of structs.
+
+**Hybrid TurboQuant policy.** The model has 64 layers but only 16 are full attention. The vLLM heuristic ("skip first and last 2 layers") is wrong here. **Skip the first and last *full-attention* layers** — global indices `{3, 63}`. DeltaNet layers are not affected.
+
+**Model topology.** Qwen3.6-27B is hybrid: 48 Gated DeltaNet layers (linear attention, conv1d, bf16 recurrent state, no KV cache) + 16 full Gated Attention layers (GQA, partial RoPE on 64 of 256 dims, FP8/FP4 KV via TurboQuant) + 1 MTP head. Only full-attention layers carry a KV cache.
+
+**No fake inference paths.** Never return generated tokens from an incomplete path. Surface `UnsupportedNoCuda` (or an explicit error) instead of mock output.
+
+**Checkpoint assumptions live in `qwen36 discover` output**, not in code comments. `model_layout.json` is the first debugging artifact for any model mismatch.
+
+## Kernel development loop
+
+1. Edit the C spec in `kernels-cuda/include/qwen36_fp4.h`.
+2. Mirror it in `crates/kernels/src/backend.rs` and the typed Rust spec.
+3. Implement the CUDA kernel under `kernels-cuda/`.
+4. Add coverage in `kernels-cuda/smoke.cu`.
+5. Compare against a CPU / PyTorch reference **before** optimizing.
+6. Profile with Nsight Compute on the 5090.
+
+## Numerical parity status
+
+The engine is now **internally numerically validated** against a PyTorch decomposition of the shipped `modelopt` NVFP4 checkpoint for both prefill and one-token decode local boundaries. This covers:
+
+- single-token prompt `"hello"`
+- two-token prompt `"hello world"`
+- all 64 layer local boundaries
+- all full-attention layers
+- multi-token DeltaNet recurrence within prefill
+- one-token decode after prefill with carried KV/DeltaNet/conv state
+- final RMSNorm + `lm_head`
+
+The user-visible generation path no longer produces the earlier blank/`+` nonsense after the `q_proj` layout and decode fused-quantization fixes. Greedy chat still emits the model's thinking text and can truncate/repeat if `max_new_tokens` is too short; that is sampling/stop-policy behavior, not the previous numerical corruption.
+
+Remaining gap:
+
+- **External reference logits** from official Transformers/vLLM/modelopt are still not proven end-to-end. The local PyTorch decomposition now follows the official architecture semantics we can inspect, but do not claim external parity until a separate implementation's logits are compared.
+
+## Current optimization status
+
+The active optimization track is single-GPU RTX 5090 throughput for exactly `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP` and the shipped NVFP4/MTP quantization. No generic-model fallback is required; prefer explicit guards and hard errors when an assumption is model-specific.
+
+### Direction B decode_gemv (NVFP4 N=1 hand-rolled gemv) — **default ON**
+
+Decode-time NVFP4 GEMMs at gemv shape are routed through a hand-rolled tensor-core kernel built on the SM_120a `mma.kind::mxf4nvf4.scale_vec::4X.m16n8k64` atom (`kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu`). Soft-fallback to cuBLASLt for any unsupported shape via the existing dispatch in `crates/kernels/src/backend.rs`. Build script must use `-arch=sm_120a` (mandatory for the FP4 block-scaled MMA PTX).
+
+**Enabled by default.** Two opt-out env vars (kill switches, either disables):
+- `QWEN36_DECODE_GEMV_DISABLE=1` (preferred name)
+- `QWEN36_DECODE_GEMV=0` (back-compat with the original opt-in flag)
+
+Supported regime: `n==1 && m%16==0 && (k%1024==0 OR k%512==0)`. The entry point picks 16 warps/CTA when K%1024==0 (preferred path, ~47% occupancy at M=5120) or 8 warps/CTA when K%512==0 only (fallback for K=3584 out_proj on linear-attention layers). Anything outside that returns NOT_IMPLEMENTED. Two template instantiations compiled into the .so.
+
+Bench (`bench --prompt-tokens 128 --max-new-tokens 128`, average of 3 warm runs, 2026-05-05):
+
+| Mode  | cuBLASLt | gemv  | Δ |
+|-------|----------|-------|---|
+| MTP=0 | 43.5 tok/s | **49.85 tok/s** | **+14.5%** |
+| MTP=4 | 95.4 tok/s | **99.3 tok/s**  | **+4.1%**  |
+
+Hard parity gate: `chat --prompt "hello" / "hello world" --max-new-tokens 12 --mtp-speculative-tokens {0..4}` matches the cuBLASLt baseline byte-for-byte for all 10 combinations.
+
+**Important runtime contract:** the kernel does NOT apply `a_scale_2`/`b_scale_2` (the per-tensor scales). The runtime caller in `crates/runtime/src/engine.rs` pre-folds them into `spec->alpha`, mirroring the cuBLASLt contract (`kernels-cuda/nvfp4_gemm.cu` only passes `alpha` and never dereferences `a_scale_2`/`b_scale_2`). A kernel that multiplies the per-tensor scales again on top of `alpha` produces gibberish on real model weights despite uniform-data smoke passing — this happened during B3.1 development and was caught only by end-to-end chat parity. Treat any future hand-rolled GEMM kernel the same way.
+
+**Notes on what was tried and didn't ship:**
+- Sub-byte LDSM (`SM100_SU4_DU8x16_x4_LDSM_N`, `b4x16_p64`) is a blocker for the k64 mxf4nvf4 atom — CUTLASS only binds it to the k32 f8f6f4 path. Plain `SM75_U32x4_LDSM_N` would consolidate 4 `ld.shared.u32` → 1 `ldmatrix` but offers limited gain (smem reads aren't the bottleneck). See `docs/superpowers/notes/2026-05-04-direction-b-cutlass-blockers.md` for the full investigation.
+- TMA multicast (B4 in original spec) projected at <2% gain after setup overhead — activation reads are tiny (~5% of gmem traffic).
+- Persistent grid doesn't help when each gemv call is independent; launch overhead is already amortized.
+
+Full optimization history in commit log: `git log -- kernels-cuda/decode_gemv/`. Archived plans at `docs/superpowers/plans/archive/`.
+
+### MTP speculative decoding
+
+- Runtime and CLI support `--mtp-speculative-tokens 0..=3`.
+- MTP is automatically disabled for prompts longer than `QWEN36_MTP_MAX_PROMPT_TOKENS` (default `1_000_000`) to avoid pathological long-context regressions while tuning.
+- MTP=1 keeps the optimized two-token verify graph path.
+- MTP=2/3 is functional in chat and bench paths. It snapshots/restores DeltaNet recurrent state, conv history, main full-attention KV slices, and MTP KV slices for the exact verification token count. Rejection recovery commits only the accepted prefix instead of resetting and re-prefilling the full prompt.
+- MTP=2/3 full-accept verification currently graph-captures the main verify chunk, per-draft greedy samples, and the next current-token sample. Next-draft generation intentionally stays on the validated host launch path. Do not move recursive MTP draft generation into the graph unless `chat --prompt "hello" --max-new-tokens 12` matches exactly for MTP 0, 2, and 3 afterward.
+- MTP=1/2/3 share the chunked-verify forward pass, which is **not bit-equal** to the per-token decode path. For the gated prompts (`hello`, `hello world`) parity holds, but on prompts with a borderline argmax (e.g. `Write a short poem about cats.`, `Count from 1 to 5.`, `Write Python hello world`) all three speculative modes produce a self-consistent token stream that diverges from MTP=0 by 1–2 tokens. The divergence is independent of `QWEN36_MTP_MULTI_GRAPH_DISABLE`, so it is a chunked-verify numerical-noise issue, not a graph-capture bug. Treat the gated prompts as the parity floor; do not weaken them.
+- `QWEN36_MTP_MULTI_GRAPH_DISABLE=1` disables the MTP=2/3 graph fast path and forces the host launch path. Keep this env var while bisecting MTP numerical issues.
+- `QWEN36_MTP_TRACE=1` prints MTP verify windows, sampled verification tokens, next tokens, and next drafts.
+
+Important invariant: when a captured graph leaves a non-default active stream installed, later host-launched kernels also run on that stream. Any host read of `token_u32` or `sampled_token_u32` must synchronize the active stream before D2H copy, otherwise the host can read stale tokens and drift. `Engine::read_current_token` and `Engine::read_sampled_token` currently enforce this.
+
+Latest local checks before resuming optimization:
+
+- `cargo fmt --all`
+- `cargo check -p qwen36-fp4 --features cuda`
+- `cargo build --release -p qwen36-fp4 --features cuda`
+- Exact chat-token parity for `chat --prompt "hello" --max-new-tokens 12` with MTP 0, 2, and 3.
+
+Bench reference (RTX 5090, `--prompt-tokens 128 --max-new-tokens 32`, full-accept regime, median of 5 runs — re-measure before drawing further conclusions):
+
+| MTP | decode tok/s | speedup | accepted / decode steps |
+|--|--|--|--|
+| 0 | 45.5  | 1.00× | n/a |
+| 1 | 62.5  | 1.37× | 16/16  (acceptance 1.00) |
+| 2 | 74.2  | 1.63× | 21/22  (acceptance 1.00) |
+| 3 | 86.3  | 1.90× | 24/24  (acceptance 1.00) |
+
+### 2026-05-02 — Re-bench after PR #2 merge (MTP4 + batched lm_head + sample_rows)
+
+WSL2, RTX 5090, model `Qwen3.6-27B-Text-NVFP4-MTP`, run on the
+`feat/perf-tree-mtp-stack` branch (no tree-MTP code wired up — these
+numbers are pure post-PR-#2 baseline). Median of 5 runs each.
+
+`--prompt-tokens 128 --max-new-tokens 128`:
+
+| MTP | decode tok/s | speedup | accepted_drafts / total_drafts |
+|--|--|--|--|
+| 0 | 41.6  | 1.00× | n/a |
+| 1 | 55.6  | 1.34× | 64 |
+| 2 | 73.4  | 1.77× | 85 |
+| 3 | 79.9  | 1.92× | 96 |
+| 4 | 98.3  | 2.36× | 102 |
+
+`--prompt-tokens 128 --max-new-tokens 32` (matches PR #2's reported setup):
+
+| MTP | decode tok/s | speedup | accepted_drafts |
+|--|--|--|--|
+| 0 | 34.3  | 1.00× | n/a |
+| 1 | 42.0  | 1.22× | 16 |
+| 2 | 41.0  | 1.20× | 21 |
+| 3 | 46.7  | 1.36× | 24 |
+| 4 | 55.1  | 1.61× | 25 |
+
+PR #2 reported MTP4 = 117-120 tok/s on the same `--prompt-tokens 128
+--max-new-tokens 32` setup; the numbers here are ~2x lower, attributed
+to WSL2 launch latency (`docs/AGENT.md` notes 1-3 µs per kernel launch
+penalty) and high run-to-run variance. The n=128 numbers are more
+amortised and therefore higher.
+
+`mtp_accepted_draft_tokens` is the cumulative count of accepted draft
+tokens across the run (not per-cycle). At MTP=4 / n=128: 102 accepted
+across ~25 cycles ≈ 4 drafts/cycle accepted = full-accept regime.
+
+### 2026-05-03 — Re-bench after tree-MTP infra (no behavioural change)
+
+Hard parity gate: `chat --prompt "hello" --max-new-tokens 12` and
+`chat --prompt "hello world" --max-new-tokens 12` produce identical
+output strings for `--mtp-speculative-tokens` ∈ {0, 1, 2, 3, 4}. ✅
+Confirms the 18 tree-MTP infra commits (top-K kernel, tree-mask
+attention path, walk_tree_acceptance, leaf buffers, per-leaf
+snapshots, verify_mtp_tree_draft orchestrator) introduce no
+regression on the chain MTP path.
+
+`--prompt-tokens 128 --max-new-tokens 128`, median of 3 runs (excluded
+isolated spikes attributable to a concurrent game running on the
+same GPU):
+
+| MTP | decode tok/s | speedup vs MTP=3 | accepted_drafts |
+|--|--|--|--|
+| 0 | 42.8  | 0.44× | n/a |
+| 1 | 61.3  | 0.63× | 64 |
+| 2 | 83.1  | 0.86× | 85 |
+| 3 | 96.7  | 1.00× | 96 |
+| 4 | 107.2 | 1.11× | 102 |
+
+These numbers are ~5-15 % above the 2026-05-02 re-bench (MTP3 79.9 →
+96.7, MTP4 98.3 → 107.2) but the delta is within run-to-run variance
+caused by GPU contention (one MTP=4 run dropped to 75 tok/s). No
+performance-relevant code landed between the two benches; treat both
+as snapshots of the post-PR-#2 baseline.
+
+### 2026-05-04 — Tree-MTP α (P1.I) bench: NEGATIVE result
+
+Tree-MTP K>1 dispatch is fully wired: chat parity gate ✅ for K ∈ {1, 2,
+4} on `hello` / `hello world` (identical token streams to chain MTP=3).
+But the bench shows tree-MTP K>1 is dramatically slower than chain MTP
+on this hardware/architecture:
+
+| MTP | K | tok/s | leaf_accept_rate |
+|--|--|--|--|
+| 3 | 1 (chain fallback) | 110 | n/a |
+| 3 | 2 | 41 | 0.00 |
+| 3 | 4 | 27 | 0.00 |
+| 4 | 1 (chain fallback) | 123 | n/a |
+| 4 | 2 | 49 | 0.00 |
+
+**Root cause:** tree-MTP processes K leaves via single-token
+`forward_token_cuda` calls (one per leaf, full 64-layer forward each).
+At ~25 ms per single-token decode in WSL2, K=2 adds ~50 ms / cycle and
+K=4 adds ~100 ms / cycle. Chain MTP cycle is ~10 ms total. Per-cycle
+overhead dominates the +1 token gain by ~10×.
+
+**leaf_accept_rate = 0** is partly an artefact of the bench prompt (a
+synthetic "x" repeated 128 tokens — MTP head's top-K disagrees with
+the base model's argmax for the next position). Real prompts would
+show non-zero leaf accept, but the per-cycle overhead would still
+swamp the gain at this architecture.
+
+**Path to make tree-MTP profitable** — Phase 2 work:
+
+1. Batched leaf forward: process all K leaves through the model in ONE
+   chunk pass. Requires (a) tree-mask attention (already implemented in
+   `attention_prefill_kernel`, P1.D) PROPERLY USED in a custom
+   `prefill_cuda_chunk_tree` variant; (b) batched DeltaNet kernel that
+   fans K (state, output) pairs from one input state in a single launch.
+   This collapses the K × 25 ms cost to ~1 × 30 ms (~3 ms / leaf vs
+   25 ms / leaf today).
+2. Or: drop tree-MTP for this hardware and pivot to a different
+   optimisation track (NVFP4 gemv kernel for batch=1, PDL chains, etc.)
+
+**Phase 1 outcome:** infrastructure complete (top-K kernel, tree-mask
+attention path, walk_tree_acceptance v3, leaf buffers, per-leaf
+snapshots, verify_mtp_tree_draft α with MTP head KV advance + next-
+cycle pre-compute) and parity-validated. The infra stays useful for
+Phase 2; the perf gain is deferred to that scope.
+
+The current numbers reflect four decode-side optimisations that landed in this branch:

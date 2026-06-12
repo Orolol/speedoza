@@ -54,6 +54,18 @@ pub struct CudaCounters {
 
 #[cfg(feature = "cuda")]
 impl CudaDeviceBuffer {
+    /// Wrap an existing device allocation without taking ownership of its
+    /// lifetime. Callers must `mem::forget` the returned value after using it
+    /// as a temporary view, otherwise `Drop` will free the raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must reference a live CUDA device allocation of at least `bytes`
+    /// bytes for the full lifetime of the returned temporary wrapper.
+    pub unsafe fn from_raw_ptr(ptr: DevicePtr, bytes: usize) -> Self {
+        Self { ptr, bytes }
+    }
+
     pub fn alloc(bytes: usize) -> Result<Self> {
         if bytes == 0 {
             return Err(CoreError::Runtime(
@@ -235,6 +247,15 @@ impl CudaDeviceBuffer {
             ffi::qwen36_cuda_memset(self.ptr, i32::from(value), self.bytes)
         })
     }
+
+    /// Async memset that targets the registered active stream so the
+    /// operation can be captured inside a CUDA graph (e.g. zeroing
+    /// per-launch scratch words without breaking decode-time capture).
+    pub fn memset_async(&self, value: u8) -> Result<()> {
+        check("qwen36_cuda_memset_async", unsafe {
+            crate::backend::qwen36_cuda_memset_async_raw(self.ptr, i32::from(value), self.bytes)
+        })
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -373,6 +394,22 @@ pub fn cuda_clear_l2_access_window() -> Result<()> {
     })
 }
 
+/// Productive-spin L2 warmup. Launches `target_cta_count` CTAs on the
+/// registered prefetch stream to walk `[base, base+bytes)` read-only and
+/// pull every byte into L2. Pass `0` for `target_cta_count` to use the
+/// kernel default (128 CTAs). Returns an error if no prefetch stream has
+/// been registered with the kernel library.
+#[cfg(feature = "cuda")]
+pub fn cuda_l2_prefetch(
+    base: crate::backend::DevicePtr,
+    bytes: usize,
+    target_cta_count: i32,
+) -> Result<()> {
+    check("qwen36_l2_prefetch", unsafe {
+        ffi::qwen36_l2_prefetch(base, bytes, target_cta_count)
+    })
+}
+
 #[cfg(feature = "cuda")]
 fn check(kernel: &'static str, code: i32) -> Result<()> {
     if code == 0 {
@@ -455,6 +492,7 @@ mod ffi {
             hit_ratio: f32,
         ) -> i32;
         pub fn qwen36_cuda_clear_l2_access_window() -> i32;
+        pub fn qwen36_l2_prefetch(base: DevicePtr, bytes: usize, target_cta_count: i32) -> i32;
     }
 }
 

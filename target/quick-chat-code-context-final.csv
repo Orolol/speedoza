@@ -1,0 +1,19 @@
+family,ctx,mode,status,prompt_tokens,generated_tokens,prefill_tps,tokgen_tps,prefill_seconds,decode_seconds,mtp_draft_acceptance_rate,acceptance_length,notes,source
+chat,1024,MTP0,ok,1024,64,3176.9855789116464,46.24955229801057,0.322318114,1.383797179,,,manual final retry long-context,manual stdout
+chat,1024,MTP4,ok,1024,64,3409.007393857392,29.689769556730074,0.300380692,2.15562468,0.3119266055045872,,retry long-context,/home/orosius/speedoza/target/quick-chat-code-context-rerun-20260611-163246.csv
+chat,1024,DFlash,ok,1090,64,3316.527524847759,53.63369476200305,0.328657004,1.193279715,,2.2857142857142856,,/home/orosius/speedoza/target/quick-chat-code-context-20260611-162839.csv
+chat,8192,MTP0,ok,8192,64,2876.5614548466315,53.13649070903561,2.847844598,1.204445366,,,,/home/orosius/speedoza/target/quick-chat-code-context-20260611-162839.csv
+chat,8192,MTP4,ok,8192,64,2877.8817025718186,62.4407286261698,2.84653813,1.024972024,0.7704918032786885,,,/home/orosius/speedoza/target/quick-chat-code-context-20260611-162839.csv
+chat,8192,DFlash,ok,8284,69,2226.780045772937,38.13192874760637,3.720169855,1.80950721,,3.0,,/home/orosius/speedoza/target/quick-chat-code-context-20260611-162839.csv
+chat,32768,MTP0,ok,32768,64,1460.3078191524353,42.46491010353699,22.439104667,1.507126704,,,,/home/orosius/speedoza/target/quick-chat-code-context-20260611-162839.csv
+chat,32768,MTP4,ok,32768,64,1240.9309534739361,37.02897438501199,26.405981661,1.728376253,0.8,,final retry long-context,/home/orosius/speedoza/target/quick-chat-code-context-final-retry-20260611-163533.csv
+chat,32768,DFlash,ok,32786,65,1003.8386803075946,23.742222323285354,32.660626297,2.737738663,,5.0,compact argv-safe chat prompt,/home/orosius/speedoza/target/quick-chat-code-context-rerun-20260611-163246.csv
+code,1024,MTP0,ok,1024,64,3648.043932025057,50.71543792828197,0.280698374,1.26194316,,,retry long-context,/home/orosius/speedoza/target/quick-chat-code-context-rerun-20260611-163246.csv
+code,1024,MTP4,ok,1024,64,3651.984898015326,49.27994246320318,0.280395464,1.298702815,0.5569620253164557,,retry long-context,/home/orosius/speedoza/target/quick-chat-code-context-rerun-20260611-163246.csv
+code,1024,DFlash,ok,1058,75,3282.9555427249293,217.855168518743,0.322270584,0.344265415,,9.375,,/home/orosius/speedoza/target/quick-chat-code-context-rerun-20260611-163246.csv
+code,8192,MTP0,ok,8192,64,2874.221013872544,53.20642249238993,2.850163561,1.202862305,,,,/home/orosius/speedoza/target/quick-chat-code-context-20260611-162839.csv
+code,8192,MTP4,ok,8192,64,2877.83376931098,68.73027727642054,2.846585542,0.931176223,0.8596491228070176,,,/home/orosius/speedoza/target/quick-chat-code-context-20260611-162839.csv
+code,8192,DFlash,ok,8204,76,2098.5992557260442,109.6840580150387,3.909274235,0.692899236,,9.5,compact retry,/home/orosius/speedoza/target/quick-chat-code-context-final-retry-20260611-163533.csv
+code,32768,MTP0,ok,32768,64,1459.0175525986845,44.02290976712025,22.458948449,1.453788501,,,,/home/orosius/speedoza/target/quick-chat-code-context-20260611-162839.csv
+code,32768,MTP4,ok,32768,64,1386.6715166180047,49.19024449110228,23.630686581,1.301070988,0.9807692307692307,,,/home/orosius/speedoza/target/quick-chat-code-context-20260611-162839.csv
+code,32768,DFlash,ok,32798,64,1011.1412914575772,8.65031330792786,32.436614227,7.39857595,,1.8285714285714285,,/home/orosius/speedoza/target/quick-chat-code-context-rerun-20260611-163246.csv

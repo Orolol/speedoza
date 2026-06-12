@@ -1,0 +1,68 @@
+[
+  {
+    "family": "chat",
+    "target_tokens": 1024,
+    "path": "/home/orosius/speedoza/target/quick_chat_code_prompts/chat_1024.txt",
+    "unit_tokens_add_special_true": 218,
+    "unit_tokens_add_special_false": 218,
+    "repetitions": 5,
+    "estimated_tokens_add_special_true": 1090,
+    "estimated_tokens_add_special_false": 1090,
+    "bytes": 5055
+  },
+  {
+    "family": "chat",
+    "target_tokens": 8192,
+    "path": "/home/orosius/speedoza/target/quick_chat_code_prompts/chat_8192.txt",
+    "unit_tokens_add_special_true": 218,
+    "unit_tokens_add_special_false": 218,
+    "repetitions": 38,
+    "estimated_tokens_add_special_true": 8284,
+    "estimated_tokens_add_special_false": 8284,
+    "bytes": 38418
+  },
+  {
+    "family": "chat",
+    "target_tokens": 32768,
+    "path": "/home/orosius/speedoza/target/quick_chat_code_prompts/chat_32768.txt",
+    "unit_tokens_add_special_true": 218,
+    "unit_tokens_add_special_false": 218,
+    "repetitions": 151,
+    "estimated_tokens_add_special_true": 32918,
+    "estimated_tokens_add_special_false": 32918,
+    "bytes": 152661
+  },
+  {
+    "family": "code",
+    "target_tokens": 1024,
+    "path": "/home/orosius/speedoza/target/quick_chat_code_prompts/code_1024.txt",
+    "unit_tokens_add_special_true": 529,
+    "unit_tokens_add_special_false": 529,
+    "repetitions": 2,
+    "estimated_tokens_add_special_true": 1058,
+    "estimated_tokens_add_special_false": 1058,
+    "bytes": 3666
+  },
+  {
+    "family": "code",
+    "target_tokens": 8192,
+    "path": "/home/orosius/speedoza/target/quick_chat_code_prompts/code_8192.txt",
+    "unit_tokens_add_special_true": 529,
+    "unit_tokens_add_special_false": 529,
+    "repetitions": 16,
+    "estimated_tokens_add_special_true": 8464,
+    "estimated_tokens_add_special_false": 8464,
+    "bytes": 29328
+  },
+  {
+    "family": "code",
+    "target_tokens": 32768,
+    "path": "/home/orosius/speedoza/target/quick_chat_code_prompts/code_32768.txt",
+    "unit_tokens_add_special_true": 529,
+    "unit_tokens_add_special_false": 529,
+    "repetitions": 62,
+    "estimated_tokens_add_special_true": 32798,
+    "estimated_tokens_add_special_false": 32798,
+    "bytes": 113646
+  }
+]

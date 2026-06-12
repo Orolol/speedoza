@@ -628,6 +628,8 @@ dependencies = [
  "anyhow",
  "clap",
  "qwen36-fp4-core",
+ "qwen36-fp4-drafter",
+ "qwen36-fp4-kernels",
  "qwen36-fp4-loader",
  "qwen36-fp4-runtime",
  "qwen36-fp4-tokenizer",
@@ -638,6 +640,21 @@ dependencies = [
 name = "qwen36-fp4-core"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "qwen36-fp4-drafter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "memmap2",
+ "qwen36-fp4-core",
+ "qwen36-fp4-kernels",
+ "qwen36-fp4-loader",
+ "safetensors",
  "serde",
  "serde_json",
  "thiserror",

@@ -3,7 +3,9 @@ use std::mem::size_of;
 
 use qwen36_fp4_core::{CoreError, ModelTopology, Result, TensorDtype, TensorInfo, TensorRole};
 use qwen36_fp4_kernels::{
-    CudaDeviceBuffer, DevicePtr, Nvfp4RetileScalesSpec, cuda_synchronize, nvfp4_retile_scales,
+    CudaDeviceBuffer, DevicePtr, InterpreterInstruction, Nvfp4RetileScalesSpec,
+    attention_decode_spec_abi_size, cuda_synchronize, deltanet_decode_spec_abi_size,
+    nvfp4_retile_scales,
 };
 use qwen36_fp4_loader::MappedModel;
 use qwen36_fp4_mtp::MTP_TREE_MAX_LEAVES;
@@ -74,6 +76,21 @@ impl GpuWeightStore {
         self.tensors.get(name)
     }
 
+    /// Remove a tensor from the store, freeing its device memory. Returns
+    /// the bytes released (0 if the tensor was not resident). Any later
+    /// lookup of the name fails loudly through the usual "tensor missing"
+    /// error path rather than reading freed memory.
+    pub fn remove(&mut self, name: &str) -> u64 {
+        match self.tensors.remove(name) {
+            Some(tensor) => {
+                let bytes = tensor.buffer.bytes() as u64;
+                self.total_bytes = self.total_bytes.saturating_sub(bytes);
+                bytes
+            }
+            None => 0,
+        }
+    }
+
     pub fn scalar_f32(&self, name: &str) -> Option<f32> {
         self.tensor(name).and_then(GpuTensor::scalar_f32)
     }
@@ -131,6 +148,25 @@ pub struct LinearAttnInProjFused {
     pub combined_out_features: usize,
 }
 
+/// lm_head quantized to FP8 e4m3 with per-row scales (W8A16). Replaces the
+/// BF16 lm_head entirely at engine init (the BF16 original is dropped from
+/// the weight store): every logits GEMV reads half the bytes, and the
+/// resident footprint shrinks by ~1.2 GiB on the shipped checkpoint.
+/// Probe basis: scripts/lmhead_fp8_probe.py (0/28 argmax flips, per-row).
+#[derive(Debug)]
+pub struct LmHeadFp8Store {
+    pub weight_e4m3: CudaDeviceBuffer,
+    pub row_scales_f32: CudaDeviceBuffer,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl LmHeadFp8Store {
+    pub fn total_bytes(&self) -> u64 {
+        self.weight_e4m3.bytes() as u64 + self.row_scales_f32.bytes() as u64
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct LinearAttnInProjFusedStore {
     /// Indexed by global layer_index. `None` for full-attention layers.
@@ -139,7 +175,14 @@ pub struct LinearAttnInProjFusedStore {
 }
 
 impl LinearAttnInProjFusedStore {
-    pub fn build(weights: &GpuWeightStore, manifest: &ModelWeightsManifest) -> Result<Self> {
+    /// See `MlpFusedStore::build` for the `drop_sources` contract (frees
+    /// each layer's original in_proj qkv/b/a/z weight + block_scale once
+    /// its fused copy is built, keeping the init peak near steady-state).
+    pub fn build(
+        weights: &mut GpuWeightStore,
+        manifest: &ModelWeightsManifest,
+        drop_sources: bool,
+    ) -> Result<Self> {
         let mut layers: Vec<Option<LinearAttnInProjFused>> =
             Vec::with_capacity(manifest.layers.len());
         let mut total_bytes = 0_u64;
@@ -150,6 +193,25 @@ impl LinearAttnInProjFusedStore {
                     total_bytes += entry.combined_weight.bytes() as u64
                         + entry.combined_block_scale.bytes() as u64;
                     layers.push(Some(entry));
+                    if drop_sources {
+                        cuda_synchronize()?;
+                        for binding in [
+                            &linear.in_proj_qkv,
+                            &linear.in_proj_b,
+                            &linear.in_proj_a,
+                            &linear.in_proj_z,
+                        ] {
+                            if let LinearWeightBinding::Nvfp4 {
+                                weight,
+                                block_scale,
+                                ..
+                            } = binding
+                            {
+                                weights.remove(&weight.name);
+                                weights.remove(&block_scale.name);
+                            }
+                        }
+                    }
                 }
                 LayerWeights::FullAttention(_) => layers.push(None),
             }
@@ -346,10 +408,17 @@ fn build_linear_attn_layer_fused(
 }
 
 impl MlpFusedStore {
+    /// `drop_sources` frees each layer's original gate/up weight +
+    /// block_scale right after its fused copy is built (synchronizing
+    /// first so the D2D concat has retired). This keeps the init memory
+    /// peak at ~steady-state + one layer instead of steady-state + the
+    /// full unfused set — without it, engine init needs ~8 GiB of
+    /// headroom it immediately gives back.
     pub fn build(
-        weights: &GpuWeightStore,
+        weights: &mut GpuWeightStore,
         manifest: &ModelWeightsManifest,
         intermediate_size: usize,
+        drop_sources: bool,
     ) -> Result<Self> {
         let mut layers = Vec::with_capacity(manifest.layers.len());
         let mut total_bytes = 0_u64;
@@ -367,6 +436,20 @@ impl MlpFusedStore {
             total_bytes +=
                 entry.combined_weight.bytes() as u64 + entry.combined_block_scale.bytes() as u64;
             layers.push(entry);
+            if drop_sources {
+                cuda_synchronize()?;
+                for binding in [&common.mlp_gate_proj, &common.mlp_up_proj] {
+                    if let LinearWeightBinding::Nvfp4 {
+                        weight,
+                        block_scale,
+                        ..
+                    } = binding
+                    {
+                        weights.remove(&weight.name);
+                        weights.remove(&block_scale.name);
+                    }
+                }
+            }
         }
         // MTP head MLP weights ship as BF16 in the Qwen3.6 checkpoint (not
         // NVFP4), so they cannot use the fused FP4 GEMM path. Skip them here;
@@ -528,6 +611,12 @@ pub struct GpuForwardBuffers {
     pub hidden: CudaDeviceBuffer,
     pub residual: CudaDeviceBuffer,
     pub normed: CudaDeviceBuffer,
+    /// Pre-final-norm hidden (`hidden + residual`, before `model.norm`),
+    /// materialized by the final-norm rmsnorm via its `residual_out` slot.
+    /// This is the hidden the MTP head's `pre_fc_norm_hidden` expects —
+    /// feeding it post-norm `normed` bakes the final-norm γ into the head
+    /// input (the 2026-06-11 acceptance bug).
+    pub prenorm_hidden: CudaDeviceBuffer,
     pub block_out: CudaDeviceBuffer,
     pub qkv: CudaDeviceBuffer,
     pub aux: CudaDeviceBuffer,
@@ -555,16 +644,54 @@ pub struct GpuForwardBuffers {
     /// `qwen36_attention_prefill` when running the tree-MTP verify chunk.
     /// Sized for `MtpKvSnapshotLayout::VERIFY_TOKENS` rows × 8 bytes.
     pub tree_ancestor_bitmap_u64: CudaDeviceBuffer,
-    /// Per-q-head per-split scratch for split-KV decode attention. Sized
-    /// for `n_splits = ceil(max_context / kSplitTimestepsPerBlock)`.
-    /// Layout `[q_heads, n_splits, head_dim]` FP32. Keeping the partial
-    /// accumulator in FP32 avoids adding a BF16 rounding point before the final
-    /// softmax reduction.
+    /// Per-q-head per-split scratch for split-KV attention. Decode (N=1)
+    /// uses layout `[q_heads, n_splits, head_dim]` FP32; the DFlash verify
+    /// split-K path (`attention_flash_splitk.cu`, #55) reuses this same
+    /// buffer with layout `[tokens, q_heads, n_splits, head_dim]` for up to
+    /// `VERIFY_SPLIT_MAX_TOKENS` rows and `VERIFY_SPLIT_MAX_NSPLITS` splits.
+    /// It is sized to the max element count over both uses. Keeping the
+    /// partial accumulator in FP32 avoids adding a BF16 rounding point
+    /// before the final softmax reduction.
     pub attn_partial_acc: CudaDeviceBuffer,
     /// `[q_heads, n_splits]` FP32 — per-split running max from online softmax.
     pub attn_partial_max: CudaDeviceBuffer,
     /// `[q_heads, n_splits]` FP32 — per-split softmax denominator.
     pub attn_partial_denom: CudaDeviceBuffer,
+    /// Reusable instruction buffer for the opt-in decode-interpreter final
+    /// logits program (`final RMSNorm + LM_HEAD_TILED`).
+    pub interpreter_logits_instructions: CudaDeviceBuffer,
+    /// Reusable counter buffer for `interpreter_logits_instructions`.
+    pub interpreter_logits_counters: CudaDeviceBuffer,
+    /// Reusable instruction buffer for a single decode-interpreter
+    /// RMSNorm+NVFP4-quantize program.
+    pub interpreter_norm_instructions: CudaDeviceBuffer,
+    /// Reusable counter buffer for `interpreter_norm_instructions`.
+    pub interpreter_norm_counters: CudaDeviceBuffer,
+    /// Reusable instruction buffer for the opt-in decode-interpreter MLP
+    /// program and the combined post-attn RMSNorm+MLP slice.
+    pub interpreter_mlp_instructions: CudaDeviceBuffer,
+    /// Reusable counter buffer for `interpreter_mlp_instructions`.
+    pub interpreter_mlp_counters: CudaDeviceBuffer,
+    /// Reusable instruction buffer for the opt-in decode-interpreter partial
+    /// RoPE program.
+    pub interpreter_rope_instructions: CudaDeviceBuffer,
+    /// Reusable counter buffer for `interpreter_rope_instructions`.
+    pub interpreter_rope_counters: CudaDeviceBuffer,
+    /// Reusable ABI spec buffer for the opt-in decode-interpreter DeltaNet
+    /// recurrence program.
+    pub interpreter_deltanet_spec: CudaDeviceBuffer,
+    /// Reusable instruction buffer for `DELTANET_RECUR`.
+    pub interpreter_deltanet_instructions: CudaDeviceBuffer,
+    /// Reusable counter buffer for `interpreter_deltanet_instructions`.
+    pub interpreter_deltanet_counters: CudaDeviceBuffer,
+    /// Reusable ABI spec buffer for the opt-in decode-interpreter BF16 full
+    /// attention decode program.
+    pub interpreter_attention_spec: CudaDeviceBuffer,
+    /// Reusable instruction buffer for `ATTN_DECODE_FULL` and the opt-in
+    /// `ROPE_PARTIAL` + `ATTN_DECODE_FULL` combined slice.
+    pub interpreter_attention_instructions: CudaDeviceBuffer,
+    /// Reusable counter buffer for `interpreter_attention_instructions`.
+    pub interpreter_attention_counters: CudaDeviceBuffer,
 }
 
 /// Must match the smallest supported split size in `kernels-cuda/attention.cu`.
@@ -584,6 +711,11 @@ pub struct GpuPrefillBuffers {
     pub hidden: CudaDeviceBuffer,
     pub residual: CudaDeviceBuffer,
     pub normed: CudaDeviceBuffer,
+    /// Pre-final-norm hidden rows (`hidden + residual` before `model.norm`,
+    /// or before `mtp.norm` on the MTP-head forward), materialized via the
+    /// rmsnorm `residual_out` slot. The MTP head consumes THIS, not `normed`
+    /// (see GpuForwardBuffers::prenorm_hidden).
+    pub prenorm_hidden: CudaDeviceBuffer,
     pub block_out: CudaDeviceBuffer,
     pub qkv: CudaDeviceBuffer,
     pub aux: CudaDeviceBuffer,
@@ -795,12 +927,25 @@ impl GpuForwardBuffers {
         let n_splits = attention_partial_n_splits(max_context);
         let attn_q_heads = topology.attention_num_heads;
         let attn_head_dim = topology.attention_head_dim;
-        let attn_partial_acc_bytes = attn_q_heads * n_splits * attn_head_dim * 4;
-        let attn_partial_scalar_bytes = attn_q_heads * n_splits * 4;
+        // The buffer is shared by two split-KV consumers:
+        //   decode (N=1):  [q_heads, n_splits, head_dim]
+        //   DFlash verify: [tokens<=32, q_heads, n_splits<=48, head_dim]
+        //     (attention_flash_splitk.cu — dispatch caps tokens and n_splits)
+        // Size to the max element count over both so either path fits.
+        const VERIFY_SPLIT_MAX_TOKENS: usize = 32;
+        const VERIFY_SPLIT_MAX_NSPLITS: usize = 48;
+        let decode_acc = attn_q_heads * n_splits * attn_head_dim;
+        let verify_acc =
+            VERIFY_SPLIT_MAX_TOKENS * attn_q_heads * VERIFY_SPLIT_MAX_NSPLITS * attn_head_dim;
+        let decode_scalar = attn_q_heads * n_splits;
+        let verify_scalar = VERIFY_SPLIT_MAX_TOKENS * attn_q_heads * VERIFY_SPLIT_MAX_NSPLITS;
+        let attn_partial_acc_bytes = decode_acc.max(verify_acc) * 4;
+        let attn_partial_scalar_bytes = decode_scalar.max(verify_scalar) * 4;
         Ok(Self {
             hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
             residual: CudaDeviceBuffer::alloc(hidden_bytes)?,
             normed: CudaDeviceBuffer::alloc(hidden_bytes)?,
+            prenorm_hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
             block_out: CudaDeviceBuffer::alloc(hidden_bytes)?,
             qkv: CudaDeviceBuffer::alloc(wide_bytes)?,
             aux: CudaDeviceBuffer::alloc(wide_bytes)?,
@@ -824,6 +969,32 @@ impl GpuForwardBuffers {
             attn_partial_acc: CudaDeviceBuffer::alloc(attn_partial_acc_bytes.max(1))?,
             attn_partial_max: CudaDeviceBuffer::alloc(attn_partial_scalar_bytes.max(1))?,
             attn_partial_denom: CudaDeviceBuffer::alloc(attn_partial_scalar_bytes.max(1))?,
+            interpreter_logits_instructions: CudaDeviceBuffer::alloc(
+                3 * size_of::<InterpreterInstruction>(),
+            )?,
+            interpreter_logits_counters: CudaDeviceBuffer::zeroed(4 * size_of::<i32>())?,
+            interpreter_norm_instructions: CudaDeviceBuffer::alloc(
+                2 * size_of::<InterpreterInstruction>(),
+            )?,
+            interpreter_norm_counters: CudaDeviceBuffer::zeroed(2 * size_of::<i32>())?,
+            interpreter_mlp_instructions: CudaDeviceBuffer::alloc(
+                7 * size_of::<InterpreterInstruction>(),
+            )?,
+            interpreter_mlp_counters: CudaDeviceBuffer::zeroed(12 * size_of::<i32>())?,
+            interpreter_rope_instructions: CudaDeviceBuffer::alloc(
+                2 * size_of::<InterpreterInstruction>(),
+            )?,
+            interpreter_rope_counters: CudaDeviceBuffer::zeroed(2 * size_of::<i32>())?,
+            interpreter_deltanet_spec: CudaDeviceBuffer::alloc(deltanet_decode_spec_abi_size())?,
+            interpreter_deltanet_instructions: CudaDeviceBuffer::alloc(
+                14 * size_of::<InterpreterInstruction>(),
+            )?,
+            interpreter_deltanet_counters: CudaDeviceBuffer::zeroed(26 * size_of::<i32>())?,
+            interpreter_attention_spec: CudaDeviceBuffer::alloc(attention_decode_spec_abi_size())?,
+            interpreter_attention_instructions: CudaDeviceBuffer::alloc(
+                18 * size_of::<InterpreterInstruction>(),
+            )?,
+            interpreter_attention_counters: CudaDeviceBuffer::zeroed(34 * size_of::<i32>())?,
         })
     }
 
@@ -832,6 +1003,7 @@ impl GpuForwardBuffers {
             self.hidden.bytes(),
             self.residual.bytes(),
             self.normed.bytes(),
+            self.prenorm_hidden.bytes(),
             self.block_out.bytes(),
             self.qkv.bytes(),
             self.aux.bytes(),
@@ -853,6 +1025,20 @@ impl GpuForwardBuffers {
             self.attn_partial_acc.bytes(),
             self.attn_partial_max.bytes(),
             self.attn_partial_denom.bytes(),
+            self.interpreter_logits_instructions.bytes(),
+            self.interpreter_logits_counters.bytes(),
+            self.interpreter_norm_instructions.bytes(),
+            self.interpreter_norm_counters.bytes(),
+            self.interpreter_mlp_instructions.bytes(),
+            self.interpreter_mlp_counters.bytes(),
+            self.interpreter_rope_instructions.bytes(),
+            self.interpreter_rope_counters.bytes(),
+            self.interpreter_deltanet_spec.bytes(),
+            self.interpreter_deltanet_instructions.bytes(),
+            self.interpreter_deltanet_counters.bytes(),
+            self.interpreter_attention_spec.bytes(),
+            self.interpreter_attention_instructions.bytes(),
+            self.interpreter_attention_counters.bytes(),
         ]
         .into_iter()
         .map(|bytes| bytes as u64)
@@ -868,17 +1054,23 @@ impl GpuPrefillBuffers {
     ) -> Result<Self> {
         let capacity = capacity.max(1);
         let hidden_bytes = capacity * topology.hidden_size * 2;
-        let mut wide_bf16_values = topology
+        let wide_bf16_values = topology
             .intermediate_size
             .max(topology.hidden_size)
             .max(topology.linear_attention_qkv_dim())
             .max(topology.linear_attention_value_dim())
             .max(topology.full_attention_q_dim_with_gate())
             .max(topology.full_attention_q_dim());
-        if fused_mlp_prefill {
-            wide_bf16_values = wide_bf16_values.max(2 * topology.intermediate_size);
-        }
+        // Only block_out receives the fused-MLP combined GEMM output
+        // [tokens, 2*intermediate]; the other wide buffers keep the unfused
+        // width (sizing all five to 2I would cost ~4 x capacity*I*2 extra).
+        let block_out_values = if fused_mlp_prefill {
+            wide_bf16_values.max(2 * topology.intermediate_size)
+        } else {
+            wide_bf16_values
+        };
         let wide_bytes = capacity * wide_bf16_values * 2;
+        let block_out_bytes = capacity * block_out_values * 2;
         let activation_fp4_bytes = capacity * wide_bf16_values.div_ceil(2);
         let activation_scale_bytes = vec16_scale_bytes(wide_bf16_values, capacity);
         let linear_heads = topology.linear_num_value_heads;
@@ -887,7 +1079,8 @@ impl GpuPrefillBuffers {
             hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
             residual: CudaDeviceBuffer::alloc(hidden_bytes)?,
             normed: CudaDeviceBuffer::alloc(hidden_bytes)?,
-            block_out: CudaDeviceBuffer::alloc(wide_bytes)?,
+            prenorm_hidden: CudaDeviceBuffer::alloc(hidden_bytes)?,
+            block_out: CudaDeviceBuffer::alloc(block_out_bytes)?,
             qkv: CudaDeviceBuffer::alloc(wide_bytes)?,
             aux: CudaDeviceBuffer::alloc(wide_bytes)?,
             aux2: CudaDeviceBuffer::alloc(wide_bytes)?,
@@ -907,6 +1100,7 @@ impl GpuPrefillBuffers {
             self.hidden.bytes(),
             self.residual.bytes(),
             self.normed.bytes(),
+            self.prenorm_hidden.bytes(),
             self.block_out.bytes(),
             self.qkv.bytes(),
             self.aux.bytes(),
@@ -949,15 +1143,18 @@ fn upload_tensor(model: &MappedModel, info: TensorInfo) -> Result<UploadedTensor
                 .then(|| f32::from_le_bytes(data.try_into().expect("four bytes were checked")));
             let mut staging = None;
             let buffer = if info.role == TensorRole::Nvfp4BlockScale {
-                let upload = upload_retiled_scales(&info, data)?;
+                let upload = upload_retiled_scales(&info, data).map_err(|err| {
+                    anyhow::anyhow!("upload retiled scales for {}: {err}", info.name)
+                })?;
                 staging = Some(upload.staging);
                 upload.tiled
             } else {
-                let buffer = CudaDeviceBuffer::alloc(data.len())
-                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                let buffer = CudaDeviceBuffer::alloc(data.len()).map_err(|err| {
+                    anyhow::anyhow!("upload tensor {} ({} bytes): {err}", info.name, data.len())
+                })?;
                 buffer
                     .copy_from_host(data)
-                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                    .map_err(|err| anyhow::anyhow!("copy tensor {}: {err}", info.name))?;
                 buffer
             };
             Ok(UploadedTensor {

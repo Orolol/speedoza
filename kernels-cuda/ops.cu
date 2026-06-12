@@ -1,5 +1,9 @@
 #include "qwen36_fp4.h"
 #include "active_stream.h"
+#include "interpreter/opcodes/lm_head_tiled.cuh"
+#include "interpreter/opcodes/rmsnorm_nvfp4_quant.cuh"
+#include "interpreter/opcodes/rope_partial.cuh"
+#include "interpreter/opcodes/swiglu_nvfp4_quant.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -18,12 +22,18 @@ __device__ bool better_score(float candidate, uint32_t candidate_idx,
          (candidate == current && candidate_idx < current_idx);
 }
 
-__device__ float decode_e2m1(uint8_t packed, bool high_nibble) {
-  const uint8_t code = high_nibble ? (packed >> 4) : (packed & 0x0f);
-  const float values[8] = {0.0f, 0.5f, 1.0f, 1.5f,
-                           2.0f, 3.0f, 4.0f, 6.0f};
-  const float magnitude = values[code & 0x07];
-  return (code & 0x08) != 0 ? -magnitude : magnitude;
+__device__ uint32_t ordered_float_key(float value) {
+  const uint32_t bits = __float_as_uint(value);
+  return (bits & 0x80000000u) != 0 ? ~bits : (bits ^ 0x80000000u);
+}
+
+__device__ unsigned long long argmax_atomic_key(float score, uint32_t token) {
+  if (!isfinite(score)) {
+    return 0;
+  }
+  const uint64_t score_key = static_cast<uint64_t>(ordered_float_key(score));
+  const uint64_t tie_key = static_cast<uint64_t>(0xffffffffu - token);
+  return static_cast<unsigned long long>((score_key << 32) | tie_key);
 }
 
 __device__ float decode_e4m3(uint8_t code) {
@@ -235,172 +245,9 @@ __global__ void rmsnorm_nvfp4_quantize_kernel(
     uint8_t *output_scale, float *tensor_scale, size_t hidden, float eps,
     float input_tensor_scale) {
   extern __shared__ float scratch[];
-  float local_sum = 0.0f;
-
-  // Vectorised first-pass sum-of-squares using __nv_bfloat162. The per-group
-  // quantisation pass below stays scalar because each group reads a strided
-  // slice of `weight` and writes a 16-element FP4 block; vectorising it
-  // requires unwinding the group loop.
-  const size_t pairs = hidden / 2;
-  const __nv_bfloat162 *input2 = reinterpret_cast<const __nv_bfloat162 *>(input);
-  const __nv_bfloat162 *residual2 =
-      residual != nullptr
-          ? reinterpret_cast<const __nv_bfloat162 *>(residual)
-          : nullptr;
-  for (size_t p = threadIdx.x; p < pairs; p += blockDim.x) {
-    const __nv_bfloat162 vp = input2[p];
-    float a = __low2float(vp);
-    float b = __high2float(vp);
-    if (residual2 != nullptr) {
-      const __nv_bfloat162 rp = residual2[p];
-      a += __low2float(rp);
-      b += __high2float(rp);
-    }
-    local_sum += a * a + b * b;
-  }
-  if ((hidden & 1u) != 0u && threadIdx.x == 0u) {
-    const size_t d = hidden - 1;
-    float value = __bfloat162float(input[d]);
-    if (residual != nullptr) {
-      value += __bfloat162float(residual[d]);
-    }
-    local_sum += value * value;
-  }
-
-  scratch[threadIdx.x] = local_sum;
-  __syncthreads();
-
-  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-    }
-    __syncthreads();
-  }
-
-  const float norm_scale =
-      rsqrtf(scratch[0] / static_cast<float>(hidden) + eps);
-  const size_t groups = div_ceil_size(hidden, 16);
-  const size_t scale_inner_dim = round_up_size(groups, 4);
-  const float global_scale =
-      input_tensor_scale > 0.0f ? input_tensor_scale : 1.0f;
-
-  for (size_t group = threadIdx.x; group < groups; group += blockDim.x) {
-    const size_t start = group * 16;
-    float amax = 0.0f;
-    // Alias-safe when residual_out == residual: each group caches residual
-    // values before pass 2 writes residual_out, and no later read observes the
-    // overwritten residual storage.
-    float residual_values[16];
-    float weighted_values[16];
-    const size_t group_end = (start + 16 <= hidden) ? 16 : (hidden - start);
-    if (group_end == 16) {
-      // Vectorised pair I/O for full 16-element groups (the common case;
-      // hidden is a multiple of 16 for Qwen3.6). Halves global BF16
-      // transactions for input/residual/weight reads and output_bf16 writes.
-      const __nv_bfloat162 *input_pair =
-          reinterpret_cast<const __nv_bfloat162 *>(input + start);
-      const __nv_bfloat162 *residual_pair =
-          residual != nullptr
-              ? reinterpret_cast<const __nv_bfloat162 *>(residual + start)
-              : nullptr;
-      const __nv_bfloat162 *weight_pair =
-          reinterpret_cast<const __nv_bfloat162 *>(weight + start);
-      __nv_bfloat162 *output_pair =
-          output_bf16 != nullptr
-              ? reinterpret_cast<__nv_bfloat162 *>(output_bf16 + start)
-              : nullptr;
-      #pragma unroll
-      for (size_t p = 0; p < 8; ++p) {
-        const __nv_bfloat162 ip = input_pair[p];
-        float a = __low2float(ip);
-        float b = __high2float(ip);
-        if (residual_pair != nullptr) {
-          const __nv_bfloat162 rp = residual_pair[p];
-          a += __low2float(rp);
-          b += __high2float(rp);
-        }
-        const __nv_bfloat162 wp = weight_pair[p];
-        const float w0 = __low2float(wp);
-        const float w1 = __high2float(wp);
-        const float weighted0 = a * norm_scale * (1.0f + w0);
-        const float weighted1 = b * norm_scale * (1.0f + w1);
-        residual_values[p * 2] = a;
-        residual_values[p * 2 + 1] = b;
-        weighted_values[p * 2] = weighted0;
-        weighted_values[p * 2 + 1] = weighted1;
-        if (output_pair != nullptr) {
-          output_pair[p] = __floats2bfloat162_rn(weighted0, weighted1);
-        }
-        amax = fmaxf(amax, fmaxf(fabsf(weighted0), fabsf(weighted1)));
-      }
-    } else {
-      // Boundary partial group (hidden not a multiple of 16).
-      for (size_t offset = 0; offset < group_end; ++offset) {
-        const size_t d = start + offset;
-        float value = __bfloat162float(input[d]);
-        if (residual != nullptr) {
-          value += __bfloat162float(residual[d]);
-        }
-        const float weighted =
-            value * norm_scale * (1.0f + __bfloat162float(weight[d]));
-        residual_values[offset] = value;
-        weighted_values[offset] = weighted;
-        if (output_bf16 != nullptr) {
-          output_bf16[d] = __float2bfloat16(weighted);
-        }
-        amax = fmaxf(amax, fabsf(weighted));
-      }
-    }
-
-    const float scale_value =
-        amax > 0.0f ? fmaxf(amax / (6.0f * global_scale), 1.0e-8f)
-                    : 1.0f;
-    const uint8_t scale_code = encode_e4m3_positive(scale_value);
-    output_scale[vec16_scale_offset(group, 0, scale_inner_dim)] = scale_code;
-    const float decoded_scale =
-        fmaxf(decode_e4m3(scale_code) * global_scale, 1.0e-8f);
-
-    for (size_t offset = 0; offset < 16 && start + offset < hidden;
-         offset += 2) {
-      const size_t d = start + offset;
-      uint8_t packed = encode_e2m1(weighted_values[offset] / decoded_scale);
-      if (d + 1 < hidden) {
-        packed |= static_cast<uint8_t>(
-            encode_e2m1(weighted_values[offset + 1] / decoded_scale) << 4);
-      }
-      output_fp4[d / 2] = packed;
-    }
-    if (residual_out != nullptr) {
-      if (group_end == 16) {
-        __nv_bfloat162 *resout_pair =
-            reinterpret_cast<__nv_bfloat162 *>(residual_out + start);
-        #pragma unroll
-        for (size_t p = 0; p < 8; ++p) {
-          resout_pair[p] = __floats2bfloat162_rn(residual_values[p * 2],
-                                                 residual_values[p * 2 + 1]);
-        }
-      } else {
-        for (size_t offset = 0; offset < group_end; ++offset) {
-          residual_out[start + offset] = __float2bfloat16(residual_values[offset]);
-        }
-      }
-    }
-  }
-
-  if (threadIdx.x == 0 && tensor_scale != nullptr) {
-    *tensor_scale = global_scale;
-  }
-}
-
-__device__ void apply_rope_half_pair(__nv_bfloat16 *values, size_t offset,
-                                     size_t half_dim, size_t pair, float cosv,
-                                     float sinv) {
-  const size_t first = offset + pair;
-  const size_t second = offset + half_dim + pair;
-  const float x0 = __bfloat162float(values[first]);
-  const float x1 = __bfloat162float(values[second]);
-  values[first] = __float2bfloat16(x0 * cosv - x1 * sinv);
-  values[second] = __float2bfloat16(x1 * cosv + x0 * sinv);
+  qwen36_interpreter::rmsnorm_nvfp4_quantize_body(
+      input, weight, residual, residual_out, output_bf16, output_fp4,
+      output_scale, tensor_scale, hidden, eps, input_tensor_scale, scratch);
 }
 
 __global__ void partial_rope_kernel(int32_t const *positions,
@@ -411,34 +258,10 @@ __global__ void partial_rope_kernel(int32_t const *positions,
                                     size_t q_heads, size_t kv_heads,
                                     size_t head_dim, size_t rope_dims,
                                     float base_theta) {
-  const size_t half_dim = rope_dims / 2;
-  const size_t token = blockIdx.y;
-  const size_t p = blockIdx.x;
-  // Resolve the scalar position from device memory when available so a
-  // captured CUDA graph can step through positions without re-recording.
-  const int32_t resolved_scalar = scalar_position_device != nullptr
-                                      ? *scalar_position_device
-                                      : scalar_position;
-  const int32_t token_position =
-      use_scalar_position != 0 ? resolved_scalar : positions[token];
-  const float position = static_cast<float>(token_position);
-  const float inv_freq = powf(
-      base_theta, -static_cast<float>(2 * p) / static_cast<float>(rope_dims));
-  const float angle = position * inv_freq;
-  const float cosv = cosf(angle);
-  const float sinv = sinf(angle);
-  for (size_t head = threadIdx.x; head < q_heads + kv_heads;
-       head += blockDim.x) {
-    if (head < q_heads) {
-      const size_t q_head = head;
-      const size_t head_offset = (token * q_heads + q_head) * head_dim;
-      apply_rope_half_pair(q, head_offset, half_dim, p, cosv, sinv);
-    } else {
-      const size_t kv_head = head - q_heads;
-      const size_t head_offset = (token * kv_heads + kv_head) * head_dim;
-      apply_rope_half_pair(k, head_offset, half_dim, p, cosv, sinv);
-    }
-  }
+  qwen36_interpreter::partial_rope_pair_body(
+      blockIdx.y, blockIdx.x, positions, scalar_position, use_scalar_position,
+      scalar_position_device, q, k, q_heads, kv_heads, head_dim, rope_dims,
+      base_theta);
 }
 
 __global__ void swiglu_kernel(const __nv_bfloat16 *gate,
@@ -468,66 +291,9 @@ __global__ void swiglu_nvfp4_quantize_kernel(
   __shared__ float scratch[32];
   __shared__ float decoded_scale;
   __shared__ float staged[16];
-
-  const float global_scale =
-      input_tensor_scale > 0.0f ? input_tensor_scale : 1.0f;
-  const size_t group = blockIdx.x;
-  const size_t scale_inner_dim = round_up_size(div_ceil_size(values, 16), 4);
-  const size_t start = group * 16;
-
-  // 32 threads cover 16 elements (one per 2 threads is wasted but simpler);
-  // thread i loads element start+i for i in [0, 16).
-  float local_amax = 0.0f;
-  if (threadIdx.x < 16) {
-    const size_t idx = start + threadIdx.x;
-    if (idx < values) {
-      const float g = __bfloat162float(gate[idx]);
-      const float u = __bfloat162float(up[idx]);
-      const float silu = g / (1.0f + expf(-g));
-      const float y = silu * u;
-      staged[threadIdx.x] = y;
-      local_amax = fabsf(y);
-    } else {
-      staged[threadIdx.x] = 0.0f;
-    }
-  }
-
-  scratch[threadIdx.x] = local_amax;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      scratch[threadIdx.x] =
-          fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + stride]);
-    }
-    __syncthreads();
-  }
-
-  if (threadIdx.x == 0) {
-    const float scale_value =
-        scratch[0] > 0.0f
-            ? fmaxf(scratch[0] / (6.0f * global_scale), 1.0e-8f)
-            : 1.0f;
-    const uint8_t scale_code = encode_e4m3_positive(scale_value);
-    output_scale[vec16_scale_offset(group, 0, scale_inner_dim)] = scale_code;
-    decoded_scale = fmaxf(decode_e4m3(scale_code) * global_scale, 1.0e-8f);
-    if (group == 0 && tensor_scale != nullptr) {
-      *tensor_scale = global_scale;
-    }
-  }
-  __syncthreads();
-
-  if (threadIdx.x < 8) {
-    const size_t col = start + threadIdx.x * 2;
-    if (col < values) {
-      const float v0 = staged[threadIdx.x * 2] / decoded_scale;
-      uint8_t packed = encode_e2m1(v0);
-      if (col + 1 < values) {
-        const float v1 = staged[threadIdx.x * 2 + 1] / decoded_scale;
-        packed |= static_cast<uint8_t>(encode_e2m1(v1) << 4);
-      }
-      output_fp4[col / 2] = packed;
-    }
-  }
+  qwen36_interpreter::swiglu_nvfp4_quantize_group_body(
+      blockIdx.x, gate, up, output_fp4, output_scale, tensor_scale, values,
+      input_tensor_scale, scratch, &decoded_scale, staged);
 }
 
 __global__ void sample_argmax_kernel(const __nv_bfloat16 *logits,
@@ -680,22 +446,71 @@ __global__ void bf16_matvec_kernel(const __nv_bfloat16 *input,
                                    const __nv_bfloat16 *weight,
                                    __nv_bfloat16 *output, size_t in_features) {
   extern __shared__ float scratch[];
-  const size_t row = blockIdx.x;
+  qwen36_interpreter::bf16_matvec_row_body(blockIdx.x, input, weight, output,
+                                           in_features, scratch, blockDim.x);
+}
+
+constexpr int kBf16ArgmaxRowsPerBlock = 8;
+constexpr int kBf16ArgmaxLanesPerRow = 32;
+constexpr int kBf16ArgmaxThreadsPerBlock =
+    kBf16ArgmaxRowsPerBlock * kBf16ArgmaxLanesPerRow;
+
+__global__ void __launch_bounds__(kBf16ArgmaxThreadsPerBlock)
+bf16_matvec_argmax_rows_kernel(const __nv_bfloat16 *__restrict__ input,
+                               const __nv_bfloat16 *__restrict__ weight,
+                               unsigned long long *__restrict__ best_keys,
+                               const uint32_t *__restrict__ skip_flags,
+                               size_t rows, size_t out_features,
+                               size_t in_features) {
+  const unsigned warp_id = threadIdx.x >> 5;
+  const unsigned lane = threadIdx.x & 31;
+  const size_t row = blockIdx.y;
+  const size_t vocab = blockIdx.x * kBf16ArgmaxRowsPerBlock + warp_id;
+  if (row >= rows || vocab >= out_features) {
+    return;
+  }
+  // Two-stage lm_head: a non-zero flag means the FP8 margin guard already
+  // settled this row — the whole grid slice exits on one cached read.
+  if (skip_flags != nullptr && skip_flags[row] != 0u) {
+    return;
+  }
+
+  const __nv_bfloat16 *row_input = input + row * in_features;
+  const __nv_bfloat16 *row_weight = weight + vocab * in_features;
   float sum = 0.0f;
-  const __nv_bfloat16 *row_weight = weight + row * in_features;
-  for (size_t col = threadIdx.x; col < in_features; col += blockDim.x) {
-    sum += __bfloat162float(input[col]) * __bfloat162float(row_weight[col]);
+  for (size_t col = lane; col < in_features; col += kBf16ArgmaxLanesPerRow) {
+    sum += __bfloat162float(row_input[col]) *
+           __bfloat162float(row_weight[col]);
   }
-  scratch[threadIdx.x] = sum;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-    }
-    __syncthreads();
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(0xffffffff, sum, offset);
   }
-  if (threadIdx.x == 0) {
-    output[row] = __float2bfloat16(scratch[0]);
+  if (lane == 0) {
+    const unsigned long long key =
+        argmax_atomic_key(sum, static_cast<uint32_t>(vocab));
+    atomicMax(best_keys + row, key);
+  }
+}
+
+__global__ void bf16_matvec_argmax_rows_finalize_kernel(
+    const unsigned long long *__restrict__ best_keys,
+    uint32_t *__restrict__ output_tokens,
+    uint32_t *__restrict__ mirror_last_output_token,
+    const uint32_t *__restrict__ skip_flags, size_t rows) {
+  const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  if (skip_flags != nullptr && skip_flags[row] != 0u) {
+    return;  // stage-1 token stands; leave output and mirror untouched
+  }
+  const unsigned long long key = best_keys[row];
+  const uint32_t token =
+      key == 0 ? 0u : 0xffffffffu - static_cast<uint32_t>(key & 0xffffffffull);
+  output_tokens[row] = token;
+  if (mirror_last_output_token != nullptr && row + 1 == rows) {
+    *mirror_last_output_token = token;
   }
 }
 
@@ -1279,6 +1094,57 @@ extern "C" int qwen36_bf16_matvec(const qwen36_bf16_matvec_spec_t *spec) {
       ptr<const __nv_bfloat16>(spec->weight_bf16),
       ptr<__nv_bfloat16>(spec->output_bf16), spec->in_features);
   cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int qwen36_bf16_matvec_argmax_rows(
+    const qwen36_bf16_matvec_argmax_rows_spec_t *spec) {
+  if (spec == nullptr) {
+    return QWEN36_STATUS_NULL_POINTER;
+  }
+  if (spec->rows == 0 || spec->out_features == 0 || spec->in_features == 0 ||
+      spec->input_bf16.ptr == 0 || spec->weight_bf16.ptr == 0 ||
+      spec->output_token_u32.ptr == 0 || spec->workspace.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const size_t workspace_needed = spec->rows * sizeof(unsigned long long);
+  if (spec->workspace_bytes < workspace_needed) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+
+  cudaStream_t stream = qwen36_internal_active_stream();
+  cudaError_t err =
+      cudaMemsetAsync(ptr<unsigned long long>(spec->workspace), 0,
+                      workspace_needed, stream);
+  if (err != cudaSuccess) {
+    return QWEN36_STATUS_CUDA_ERROR;
+  }
+
+  const dim3 grid(
+      static_cast<unsigned int>(
+          div_ceil_size(spec->out_features, kBf16ArgmaxRowsPerBlock)),
+      static_cast<unsigned int>(spec->rows));
+  bf16_matvec_argmax_rows_kernel<<<grid, kBf16ArgmaxThreadsPerBlock, 0,
+                                   stream>>>(
+      ptr<const __nv_bfloat16>(spec->input_bf16),
+      ptr<const __nv_bfloat16>(spec->weight_bf16),
+      ptr<unsigned long long>(spec->workspace),
+      ptr<const uint32_t>(spec->skip_flags_u32), spec->rows,
+      spec->out_features, spec->in_features);
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    return QWEN36_STATUS_CUDA_ERROR;
+  }
+
+  const int threads = 128;
+  const unsigned int blocks =
+      static_cast<unsigned int>(div_ceil_size(spec->rows, threads));
+  bf16_matvec_argmax_rows_finalize_kernel<<<blocks, threads, 0, stream>>>(
+      ptr<const unsigned long long>(spec->workspace),
+      ptr<uint32_t>(spec->output_token_u32),
+      ptr<uint32_t>(spec->mirror_last_output_token_u32),
+      ptr<const uint32_t>(spec->skip_flags_u32), spec->rows);
+  err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }
 

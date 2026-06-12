@@ -1,7 +1,7 @@
 #include "qwen36_fp4.h"
 #include "active_stream.h"
+#include "interpreter/opcodes/deltanet_recur.cuh"
 
-#include <cstring>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -11,6 +11,11 @@ template <typename T> T *ptr(qwen36_device_ptr_t value) {
   return reinterpret_cast<T *>(static_cast<uintptr_t>(value.ptr));
 }
 
+#if 0
+// Historical inline body kept temporarily for diff readability. The active
+// standalone wrapper below now calls qwen36_interpreter::deltanet_decode_body,
+// which is the same body the interpreter opcode executes.
+//
 // FlashQLA-inspired Gated DeltaNet decode kernel.
 //
 // Numerically equivalent to the reference scalar implementation but rewritten
@@ -262,6 +267,26 @@ deltanet_decode_kernel(
     }
   }
 }
+#endif
+
+__global__ void __launch_bounds__(qwen36_interpreter::kDeltaNetLogicalThreads)
+deltanet_decode_shared_kernel(
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ v,
+    const float *__restrict__ gate,
+    const float *__restrict__ beta,
+    __nv_bfloat16 *__restrict__ state,
+    __nv_bfloat16 *__restrict__ output, qwen36_deltanet_shape_t shape,
+    size_t tokens, size_t q_token_stride, size_t k_token_stride,
+    size_t v_token_stride, float state_decay, float update_scale,
+    bool qk_l2norm) {
+  __shared__ qwen36_interpreter::DeltaNetScratch scratch;
+  qwen36_interpreter::deltanet_decode_body(
+      blockIdx.x, blockIdx.y, q, k, v, gate, beta, state, output, shape,
+      tokens, q_token_stride, k_token_stride, v_token_stride, state_decay,
+      update_scale, qk_l2norm, scratch);
+}
 
 } // namespace
 
@@ -290,7 +315,7 @@ qwen36_deltanet_decode(const qwen36_deltanet_decode_spec_t *spec) {
   const float state_decay = spec->state_decay == 0.0f ? 1.0f : spec->state_decay;
   const float update_scale =
       spec->update_scale == 0.0f ? 1.0f : spec->update_scale;
-  deltanet_decode_kernel<<<grid, threads, 0, qwen36_internal_active_stream()>>>(
+  deltanet_decode_shared_kernel<<<grid, threads, 0, qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->q_bf16),
       ptr<const __nv_bfloat16>(spec->k_bf16),
       ptr<const __nv_bfloat16>(spec->v_bf16),

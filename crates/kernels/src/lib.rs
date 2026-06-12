@@ -1,8 +1,10 @@
 pub mod attention;
 pub mod backend;
 pub mod deltanet;
+pub mod drafter_attention;
 #[cfg(feature = "cuda")]
 pub mod graph;
+pub mod interpreter;
 pub mod memory;
 pub mod nvfp4_gemm;
 pub mod ops;
@@ -15,10 +17,18 @@ pub mod turboquant;
 pub use attention::{AttentionDecodeSpec, AttentionPrefillSpec, AttentionShape};
 #[cfg(feature = "cuda")]
 pub use backend::CudaBackend;
-#[cfg(feature = "cuda")]
-pub use backend::nvfp4_retile_scales;
 pub use backend::{DevicePtr, KernelBackend, NoCudaBackend};
+#[cfg(feature = "cuda")]
+pub use backend::{
+    attention_decode_spec_abi_bytes, attention_decode_spec_abi_size,
+    deltanet_decode_spec_abi_bytes, deltanet_decode_spec_abi_size, nvfp4_retile_scales,
+};
 pub use deltanet::{DeltaNetDecodeSpec, DeltaNetPrefillSpec, DeltaNetShape};
+pub use drafter_attention::DrafterAttentionBlockSpec;
+pub use interpreter::{
+    InterpreterDep, InterpreterInstruction, InterpreterOpcode, InterpreterOpcodeSet,
+    InterpreterProgram, InterpreterProgramSpec, interpreter_opcodes_enabled_from_env,
+};
 #[cfg(feature = "cuda")]
 pub use memory::{
     CudaCounters, CudaDeviceBuffer, CudaDiagnostics, cuda_clear_l2_access_window,
@@ -27,10 +37,12 @@ pub use memory::{
 };
 pub use nvfp4_gemm::{CublasLtFp4ScaleMode, Nvfp4GemmPlan, Nvfp4GemmSpec};
 pub use ops::{
-    Bf16GemmSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec, Conv1dPrefillSpec, Conv1dUpdateSpec,
-    CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec, Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec,
-    Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec, QProjDeinterleaveSpec, QProjSigmoidGateSpec,
-    RmsNormNvfp4QuantizeSpec, SigmoidGateSpec, SigmoidGateStridedSpec,
+    Bf16GemmSpec, Bf16MatVecArgmaxRowsSpec, Bf16MatVecSpec, Conv1dGdnGateFusedSpec,
+    Conv1dPrefillSpec, Conv1dUpdateSpec, CopyStridedRowsSpec, EmbeddingLookupSpec, GdnGateSpec,
+    LmHeadFp8GemvSpec, LmHeadFp8QuantizeSpec, LmHeadTop2MarginSpec, LmHeadTop8RescoreSpec,
+    Nvfp4MatVecSpec, Nvfp4QuantizeRowsSpec, Nvfp4QuantizeSpec, Nvfp4RetileScalesSpec,
+    QProjDeinterleaveSpec, QProjSigmoidGateSpec, RmsNormNvfp4QuantizeSpec, SigmoidGateSpec,
+    SigmoidGateStridedSpec, lm_head_top2_workspace_bytes,
 };
 pub use rmsnorm::RmsNormSpec;
 pub use rope::PartialRopeSpec;
