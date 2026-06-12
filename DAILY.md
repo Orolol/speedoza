@@ -97,6 +97,33 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-12 (soir) — Grille rapide ctx~64 : chat/code x base/MTP-4/Eagle3/DFlash — DECISION : routage court-contexte = DFlash, MTP-4 > base sur prompts naturels
+
+Demande utilisateur. Defauts de prod (auto-fallback ON, marge v2 OFF),
+max-new 128, prompts naturels ~64 tokens (target/quick64/), bench trim
+exact pour base/MTP-4, template chat pour les drafters (~+18 tokens).
+
+| mode | chat | code |
+|---|---|---|
+| base (MTP=0) | 48.5 | 47.1 |
+| MTP-4 | 58.8 (acc 0.73) | 66.5 (acc 0.81) |
+| Eagle3 (PRISM, compressed) | 61.9 (AL 1.91) | 64.8 (AL 2.17) |
+| DFlash | **158.5** (AL 6.70) | **218.1** (AL 9.43) |
+
+- DFlash 3.3x base en chat, 4.6x en code a ctx court — confirme le
+  routage DFlash <= 8K de la grille de regimes.
+- MTP-4 bat base partout sur prompts NATURELS courts (acc 0.73-0.81 vs
+  0.48 sur le corpus @128) ; fallback arme, jamais declenche.
+- Eagle3 : AL ~2 seulement — bat base, ne bat pas DFlash ni MTP-4-code.
+  Checkpoint = ~/models/Qwen3.6-27B-PRISM-EAGLE3/compressed (le dossier
+  racine n'a pas de config.json). `chat --drafter dflash` imprime une
+  ligne texte "[dflash] ... (X tok/s)", pas le JSON de drafter-chat-smoke.
+- Caveats : 1 graine/cellule (loterie de trajectoire), 15-28% util GPU
+  externe pendant les runs, marge v2 OFF (MTP-4 prendrait ~+15-20%).
+
+Files: target/quick64/ (prompts + scripts, non versionnes). Inventory: n/a.
+
+
 ### 2026-06-12 (suite 2) — lm_head deux étages **v2 top-8 rescore** — SHIPPED opt-in : @128 acc bit-identique + decode +21.7% (cycle −13 ms), fallbacks 42% → 6%
 
 v2 du levier n°1, conçue sur le diagnostic de l'entrée précédente : au
