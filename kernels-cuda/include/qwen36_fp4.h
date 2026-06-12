@@ -596,6 +596,10 @@ int qwen36_interpreter_decode_sm120(const qwen36_interpreter_program_t *program)
 // existing cuBLASLt path on that code. Gated by `QWEN36_DECODE_GEMV=1`. See
 // `docs/superpowers/specs/2026-05-04-direction-b-nvfp4-gemv-design.md`.
 int qwen36_decode_nvfp4_gemv(const qwen36_nvfp4_gemm_spec_t *spec);
+// Test/bench hook for the multi-N chunk path: force the M-tiles-per-CTA
+// factor (>=1), or pass 0 to restore the heuristic/env default
+// (QWEN36_CHUNK_GEMV_MTILE). Smoke uses this to sweep T on one shape.
+void qwen36_nvfp4_chunk_gemv_set_mtile(int mtile);
 int qwen36_bf16_gemm(const qwen36_bf16_gemm_spec_t *spec);
 int qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec);
 int qwen36_attention_flash_prefill(const qwen36_attention_prefill_spec_t *spec);

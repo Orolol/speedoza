@@ -1899,37 +1899,48 @@ int main() {
     ck_spec.alpha = 1.0f;
     must_status(qwen36_nvfp4_gemm(&ck_spec), "chunk gemm cublaslt ref");
 
-    ck_spec.c_bf16 = ck_out_gemv;
-    must_status(qwen36_decode_nvfp4_gemv(&ck_spec), "chunk gemv multi-n");
-
+    // Sweep the M-tiling factor on the same shape: chunk_m=64 is 4 m16
+    // tiles, so T∈{1,2,3,4} covers the full loop, a partial last CTA
+    // (T=3 → CTAs of 3 and 1 tiles) and the single-CTA case (T=4).
     std::vector<float> ck_ref = read_bf16(ck_out_ref, chunk_n * chunk_m);
-    std::vector<float> ck_got = read_bf16(ck_out_gemv, chunk_n * chunk_m);
-    double dot = 0, nr = 0, ng = 0;
-    float max_abs = 0;
-    for (size_t i = 0; i < ck_ref.size(); ++i) {
-      dot += (double)ck_ref[i] * ck_got[i];
-      nr += (double)ck_ref[i] * ck_ref[i];
-      ng += (double)ck_got[i] * ck_got[i];
-      max_abs = fmaxf(max_abs, fabsf(ck_ref[i] - ck_got[i]));
-    }
-    const double cos = dot / (sqrt(nr) * sqrt(ng) + 1e-12);
-    if (cos < 0.9999 || max_abs > 0.75f) {
-      fprintf(stderr,
-              "chunk gemv n=5 K=%zu parity failed: cos=%.6f max_abs=%.4f\n",
-              chunk_k, cos, max_abs);
-      for (size_t m = 0; m < 2; ++m) {
-        fprintf(stderr, "  m=%zu ref:", m);
-        for (size_t c = 0; c < chunk_n; ++c)
-          fprintf(stderr, " %8.2f", ck_ref[c * chunk_m + m]);
-        fprintf(stderr, "\n  m=%zu got:", m);
-        for (size_t c = 0; c < chunk_n; ++c)
-          fprintf(stderr, " %8.2f", ck_got[c * chunk_m + m]);
-        fprintf(stderr, "\n");
+    for (const int mtile : {1, 2, 3, 4}) {
+      qwen36_nvfp4_chunk_gemv_set_mtile(mtile);
+      const std::vector<float> ck_zero(chunk_n * chunk_m, 0.0f);
+      copy_bf16(ck_out_gemv, ck_zero);
+      ck_spec.c_bf16 = ck_out_gemv;
+      must_status(qwen36_decode_nvfp4_gemv(&ck_spec), "chunk gemv multi-n");
+
+      std::vector<float> ck_got = read_bf16(ck_out_gemv, chunk_n * chunk_m);
+      double dot = 0, nr = 0, ng = 0;
+      float max_abs = 0;
+      for (size_t i = 0; i < ck_ref.size(); ++i) {
+        dot += (double)ck_ref[i] * ck_got[i];
+        nr += (double)ck_ref[i] * ck_ref[i];
+        ng += (double)ck_got[i] * ck_got[i];
+        max_abs = fmaxf(max_abs, fabsf(ck_ref[i] - ck_got[i]));
       }
-      exit(1);
+      const double cos = dot / (sqrt(nr) * sqrt(ng) + 1e-12);
+      if (cos < 0.9999 || max_abs > 0.75f) {
+        fprintf(stderr,
+                "chunk gemv n=5 K=%zu mtile=%d parity failed: cos=%.6f "
+                "max_abs=%.4f\n",
+                chunk_k, mtile, cos, max_abs);
+        for (size_t m = 0; m < 2; ++m) {
+          fprintf(stderr, "  m=%zu ref:", m);
+          for (size_t c = 0; c < chunk_n; ++c)
+            fprintf(stderr, " %8.2f", ck_ref[c * chunk_m + m]);
+          fprintf(stderr, "\n  m=%zu got:", m);
+          for (size_t c = 0; c < chunk_n; ++c)
+            fprintf(stderr, " %8.2f", ck_got[c * chunk_m + m]);
+          fprintf(stderr, "\n");
+        }
+        exit(1);
+      }
     }
+    qwen36_nvfp4_chunk_gemv_set_mtile(0);
   }
-  printf("chunk gemv multi-n parity gate passed (n=5, K {1024, 512}, vs cuBLASLt)\n");
+  printf("chunk gemv multi-n parity gate passed (n=5, K {1024, 512}, "
+         "mtile {1,2,3,4}, vs cuBLASLt)\n");
 
   const size_t interp_gemv_m = 16;
   const size_t interp_gemv_k = 1024;
