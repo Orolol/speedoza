@@ -97,6 +97,37 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-12 — Carte des gaps du cycle verify (nsys, fenêtre 487 ms ≈ 8 cycles MTP=4 @128) — DECISION : les leviers re-classés
+
+Mesure : `nsys profile --cuda-graph-trace=node` sur bench MTP=4 @128
+(cuBLASLt défaut, fallback OFF, 24 tokens), analyse par
+`scripts/nsys_gap_analysis.py` (union des intervalles kernels, gaps,
+buckets). Résultats (par cycle = fenêtre/8) :
+
+- **Idle GPU : 5.4%** du span seulement. Micro-gaps 2-20 µs ≈ 0.5 ms/cycle
+  → le levier "capture graphe du forward verify" est PLAFONNÉ là :
+  déclassé. MAIS 19 gaps ≈ 1 ms chacun = **~1.9 ms/cycle aux frontières
+  de cycle** (bookkeeping host acceptance/seed) — adressable, zéro risque.
+- **Chunk GEMM cutlass : 344 appels × 58.8 µs = 20.2 ms/cycle** vs un
+  plancher octets de ~7.6 ms (12.7 GiB FP4 à 1.79 TB/s) — cuBLASLt comme
+  notre kernel chunk tournent à ~36% BW à N=5. Le M-tiling est mort
+  (entrée suivante) ; le gain réel = kernel classe SMEM-paging (Hazy),
+  chantier multi-jours.
+- **lm_head BF16 : 12.2 ms/cycle (20% du cycle)** — 5 matvecs pleins
+  vocab SÉQUENTIELS (4 récursions de draft + sample final), ~2.5 GB
+  chacun (gemvx 675 µs ×2 kernels), + 2.3 ms le GEMM verify 5 lignes.
+  **Levier identifié : argmax exact à deux étages** — scan FP8 (store
+  LmHeadFp8 existant, octets ÷2) + garde de marge top1−top2 ; marge < ε
+  → re-score BF16 complet (rare). Bit-exact ⇒ contourne le kill
+  FP8-compose du 2026-06-11 par construction. Cible −5-6 ms/cycle.
+  Coût : +1.27 GiB (FP8 en plus du BF16 à MTP>0) — le headroom post
+  levier-1 l'absorbe.
+- Cumulatifs confirmés : deltanet WY 6.0, splitk 2.9, rmsnorm 1.95,
+  sample_argmax 1.24, quantize_rows 448 appels = 1.06, copies 0.6.
+
+Ordre d'attaque : (1) lm_head deux étages, (2) gaps frontière de cycle,
+(3) SMEM-paging GEMM. Files: scripts/nsys_gap_analysis.py (nouveau).
+
 ### 2026-06-12 — M-tiling du chunk GEMV : B stagé une fois par CTA de T tuiles m16 — NEGATIVE (dégradation monotone en T) ; le bucket est borné par la structure de latence, pas par les octets
 
 Hypothèse (issue du re-diagnostic PR #24) : le re-staging de B par CTA m16
