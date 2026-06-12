@@ -97,6 +97,69 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-12 (suite) — Chasse au "bug latent PR #11 @8K" : CORRECTION — pas de bug de câblage ; 3e instance de la classe verify-perturbation (flip d'ordre d'accumulation sur ligne à faible marge)
+
+Instrument : trace de tokens par cycle dans le bench
+(`QWEN36_MTP_TOKEN_TRACE=<path>`, JSONL : current/drafts/accepted/next/
+next_drafts) — diff de deux runs → premier cycle divergent + champ.
+
+Chasse @8K MTP=4 (default vs `QWEN36_MTP_FUSED_ARGMAX=1`) :
+1. Première divergence au **cycle 6, verified[0] d'un FULL REJECT**
+   (264 vs 2972) — cycles 1-5 IDENTIQUES, y compris un full reject
+   (cycle 3) et des accepts partiels → le câblage des lignes est sain,
+   la théorie "wiring bug" est MORTE.
+2. Contre-épreuve : default row-wise (`QWEN36_MTP_BATCH_LM_HEAD_DISABLE=1`,
+   cuBLAS gemv + sample_argmax) vs default batché (GEMM wmma +
+   sample_rows) — **trajectoires identiques sur 41 cycles**. Deux kernels
+   d'ordres d'accumulation différents s'accordent ; seul le warp-dot
+   PR #11 diverge sur cette ligne.
+3. Le mode marge a flippé À L'IDENTIQUE (16 décimales) parce que sa
+   garde a ÉCHOUÉ sur cette ligne (marge FP8 < ε=1.0, par construction)
+   → ligne à faible marge confirmée ; son re-score = le même kernel
+   PR #11 → même flip. Les lignes où la garde PASSE sont sans flip vs
+   default (marge ≥ 1.0 ≫ l'erreur d'ordre ~1e-2).
+
+**Verdict : le kernel `bf16_matvec_argmax_rows` (PR #11) calcule son
+propre matvec (ordre warp-stride ≠ cuBLAS) → sur une ligne verify à
+marge ≲ l'erreur d'accumulation, l'argmax flippe.** C'est la même classe
+que le chunk GEMV (acc 0.477→0.416) et le FP8 lm_head (0.77→0.589) —
+3e instance ; la règle de classe est désormais : TOUT kernel qui
+recalcule des logits de verify avec un autre ordre d'accumulation est
+une perturbation, et sa zone de flip est bornée par sa marge d'erreur.
+@128 n'avait simplement jamais rencontré de ligne verify à faible marge.
+
+Conséquence pour l'acceptance : UN flip → les trajectoires divergent
+(textes différents) ; après divergence default 0.588 vs fused 0.423 mais
+sur des TEXTES différents = incomparable directement (cycles 1-5
+communs : 0.400 identique). La question résiduelle — neutralité EN
+ESPÉRANCE du mode marge — se mesure sur la grille multi-cellules
+(résultats dans l'addendum ci-dessous).
+
+**Addendum — grille de neutralité en espérance (même session)** : base vs
+margin (ε=1.0), bench MTP=4 corpus, fallback OFF :
+
+| cellule | base acc | margin acc | Δacc | decode base→margin | fb |
+|---|---|---|---|---|---|
+| 128/128 | 0.477 | 0.477 (identique) | 0 | 39.6 → 40.9 (+3.2%) | 187 |
+| 3072/128 | 0.497 | 0.503 | +0.006 | 36.7 → 37.5 | 175 |
+| 8192/128 | 0.550 | 0.411 | −0.139 | 39.3 → 31.0 | 206 |
+| 8192/256 | 0.635 | 0.539 | −0.096 | 46.6 → 38.5 | 255 |
+| 24576/128 | 0.488 | **0.578** | **+0.090** | 24.3 → **30.0** (+23%) | 105 |
+
+Scatter dans LES DEUX SENS (moyenne −0.03 ± gros bruit de trajectoire) =
+signature de loterie, PAS de dégradation systématique — cohérent avec un
+flip near-tie ~1/50-200 cycles qui relance la trajectoire, sans
+composition (contrairement au FP8 naïf qui flippait à marge ≤0.34 sur
+CHAQUE appel de la récursion). Le gain pur-cycle (cellule à acc égale) =
++2-3% — petit, comme attendu avec ~42% de fallback.
+
+Décision : v1 reste opt-in OFF. **v2 top-8** (la vraie perf : re-score
+plat de 8 candidates ~30 µs, garde vs la 8e valeur → fallback quasi nul
++ zone de flip rétrécie d'autant) = prochaine itération, spec au backlog.
+
+Files: crates/cli/src/main.rs (QWEN36_MTP_TOKEN_TRACE). Inventory: oui
+(ligne PR #11 corrigée, ligne deux-étages re-cadrée).
+
 ### 2026-06-12 — lm_head argmax exact à deux étages (scan FP8 + garde de marge + re-score BF16 prédiqué) — WIP : bit-exact @128 (+3.2%), BLOQUÉ à 8K par un bug latent PR #11 dans les sites device-argmax
 
 Levier n°1 de la carte des gaps (12.2 ms/cycle de matvecs lm_head BF16

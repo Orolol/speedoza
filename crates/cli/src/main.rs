@@ -1905,6 +1905,28 @@ fn run_bench_mtp_multi(
         engine.prepare_mtp_drafts_from_sampled(&prompt_tokens, current_token, draft_window)?;
     let mtp_setup_seconds = setup_start.elapsed().as_secs_f64();
 
+    // Per-cycle token trace (QWEN36_MTP_TOKEN_TRACE=<path>, JSONL): the
+    // bisection instrument for argmax-path divergences — diff two runs and
+    // the first differing field (drafts / accepted / next / next_drafts)
+    // fingers the divergent call-site class. Added 2026-06-12 to hunt the
+    // latent PR #11 device-argmax wiring bug at ctx 8192.
+    let mut token_trace = match std::env::var("QWEN36_MTP_TOKEN_TRACE") {
+        Ok(path) => Some(std::fs::File::create(path)?),
+        Err(_) => None,
+    };
+    if let Some(trace) = &mut token_trace {
+        use std::io::Write;
+        writeln!(
+            trace,
+            "{}",
+            serde_json::json!({
+                "cycle": 0,
+                "current": current_token,
+                "initial_drafts": draft_tokens,
+            })
+        )?;
+    }
+
     let mut generated = 0_usize;
     let mut accepted_draft_tokens = 0_usize;
     let mut rejected_draft_tokens = 0_usize;
@@ -1968,6 +1990,21 @@ fn run_bench_mtp_multi(
         )?;
         mtp_verify_seconds += verify_start.elapsed().as_secs_f64();
         main_decode_steps += 1;
+        if let Some(trace) = &mut token_trace {
+            use std::io::Write;
+            writeln!(
+                trace,
+                "{}",
+                serde_json::json!({
+                    "cycle": main_decode_steps,
+                    "current": current_token,
+                    "drafts": &draft_tokens[..verify_count],
+                    "accepted": verify.accepted_drafts,
+                    "next": verify.next_token,
+                    "next_drafts": verify.next_draft_tokens,
+                })
+            )?;
+        }
         accepted_draft_tokens += verify.accepted_drafts;
         proposed_draft_tokens += verify_count;
         for slot in proposed_per_position.iter_mut().take(verify_count) {
