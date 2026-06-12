@@ -46,7 +46,7 @@ activated by flag/env. **NEG** = built, benchmarked negative/neutral, kept in tr
 | Engine (prefill chunked + decode CUDA graph) | `crates/runtime/src/engine.rs` | the core; graph captured at first decode, replayed after |
 | Fused weight stores (gate+up MLP; DeltaNet 4-way in_proj) | `crates/runtime/src/gpu.rs` (`MlpFusedStore`, `LinearAttnInProjFusedStore`) | ON only when `max_context < 8192` (auto long-context mode disables them to save ~8 GB VRAM). Since 2026-06-11 prefill ALSO consumes them (combined GEMM + strided deinterleave) and engine init drops the unfused originals layer-by-layer during the build (−8.1 GiB resident AND at init peak); `QWEN36_KEEP_UNFUSED_WEIGHTS=1` keeps the duplicates |
 | NVFP4 GEMM via cuBLASLt | `kernels-cuda/nvfp4_gemm.cu` | prefill GEMMs + decode fallback shapes |
-| Hand-rolled NVFP4 decode GEMV ("Direction B") | `kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu` | **default ON** for n==1, m%16==0, k%512==0 shapes; +14.5% MTP=0. Kill: `QWEN36_DECODE_GEMV_DISABLE=1` |
+| Hand-rolled NVFP4 decode GEMV ("Direction B") | `kernels-cuda/decode_gemv/nvfp4_gemv_sm120.cu` | **default ON** for n==1, m%16==0, k%512==0 shapes; +14.5% MTP=0. Kill: `QWEN36_DECODE_GEMV_DISABLE=1`. **Exception (2026-06-10):** the mlp.down shape (M=5120, K=17408) routes straight to cuBLASLt — measured 55.4 vs 68.0 µs cold-data (`tools/gemv_shape_bench`), +4.1% MTP=0 e2e |
 | Sage INT8 prefill attention | `kernels-cuda/attention_sage_prefill.cu` | **default ON** for chunks ≥1024 tokens (see §3) |
 | Flash BF16 wmma prefill attention | `kernels-cuda/attention_flash_prefill.cu` | next in dispatch chain; also the tile reused by split-K verify |
 | FA-2 split-K verify attention | `kernels-cuda/attention_flash_splitk.cu` | **default ON** for 2–32-token chunks (MTP/DFlash verify); 2.2–4.3× end-to-end DFlash, 144-case parity gate |
@@ -110,7 +110,8 @@ Full details in `DAILY.md` (dated sections):
 - **Lossy env-tuned split-K verify** (`QWEN36_PREFILL_SPLIT_MAX_TOKENS=16`) — 5× at 7K but AL-destroying at 3K; superseded by the faithful `attention_flash_splitk.cu`.
 - **KVarN (huawei-csl) KV-cache quantization** — evaluated 2026-06-10, NOT integrated: it is a vLLM fork (Python/Triton), KV is not the bottleneck at ≤24K (already FP8 + in-house TQ3/TQ35), and sub-4-bit V risks the known speculative-loop AL amplification. If the B1 lane (aggressive KV quant for 64K–262K) is reopened, its recipe (asymmetric K4/V2 RTN + Hadamard rotation, 128-token tiles, calibration-free) is the reference to port — see `DAILY.md` § 2026-06-10.
 - **Synthetic-prompt MTP acceptance dips** (acc 0.84 at 4K) — artefact of single-token-repeat bench prompts; falsified as a kernel bug. Use `--prompt-file` or `chat`+`QWEN36_MTP_STATS=1`.
-- **lm_head NVFP4** — falsified 2026-06-10 by an offline numpy probe before any kernel work: 1 top-1 flip / 27 real `final_normed` positions (3.7%); low-margin (p10 0.25) positions sit under FP4 noise (max Δlogit 1.24). Retry only via FP8 lm_head or FP4-topk+BF16-rescore (see DAILY).
+- **lm_head NVFP4** — falsified 2026-06-10 by an offline numpy probe before any kernel work: 1 top-1 flip / 27 real `final_normed` positions (3.7%); low-margin (p10 0.25) positions sit under FP4 noise (max Δlogit 1.24). Retry only via FP8 lm_head (probe PASSED: 0 flips/27, Δ 3× smaller) or FP4-topk+BF16-rescore (see DAILY).
+- **GEMV per-warp pipeline depth 2→4** — falsified 2026-06-10: +0% on every production shape (cold-data `tools/gemv_shape_bench`), and K=17408 blows the 48 KB SMEM cap. The gemv is NOT limited by per-warp prefetch depth; efficiency tracks CTA count (320 CTAs → 56-60%, 2176 → 81%). Surviving idea for the M=5120 family: CTA-level split-K with a deterministic reduce (no FP32 atomics). The Hazy-style SMEM-paging prototype is de-prioritized by this result — same mechanism, more complexity.
 - **Interpreter whole-decode single-launch + MLP chunking** — closed 2026-06-10: substrate probe measured 4.71 µs/grid-barrier (512-barrier program = 2.4 ms/token vs the <0.5 ms gate) and MLP-chunking benched +0.0% at MTP=4 on real text. The historical "+7.3% MTP=4 interpreter" gain is a synthetic-prompt artefact (ON vs OFF = 39.5 vs 39.5 tok/s on the dashboard corpus). Lane frozen; deletion candidate under the complexity budget.
 
 ### 2.6 Known open issues
@@ -187,6 +188,7 @@ Defaults verified in code 2026-06-12. "bool" vars accept `1/true/yes/on`.
 | `QWEN36_MTP_STATS` | off | print `mtp.stats accepted=… acceptance_rate=…` (the reference way to measure acceptance) |
 | `QWEN36_MTP_TRACE` | off | verbose verify-window trace |
 | `QWEN36_MTP_MULTI_GRAPH_DISABLE` | off | force host-launch path for MTP=2/3 (bisection aid) |
+| `QWEN36_MTP_RECOVER_GRAPH` | **1** | `0` falls back to the host-launched reject-recovery path (re-prefill + next-draft chain). Graph cache `MtpRecover{committed,drafts}`, one capture per shape; cycle-time neutral @depth 4 (recovery is serial GPU work, not launch-bound — DAILY 2026-06-10), kept ON for depth 6/8 |
 | `QWEN36_MTP_TREE_DISABLE` | off | kill tree-MTP dispatch (force chain) |
 | `QWEN36_MTP_BATCH_LM_HEAD_DISABLE` | off | kill batched lm_head in verify |
 | `QWEN36_MTP_SNAPSHOT_RECURRENT` | **on** | `=0` skips recurrent-state snapshots (unsafe unless full-accept) |
@@ -302,6 +304,7 @@ in `crates/kernels/src/backend.rs` + the typed spec module + `smoke.cu`** (see A
 | `verify_perf_gate.sh` | **run before/after any perf change** — DFlash split-K + MTP interpreter gates vs baselines |
 | `bench_dashboard.sh` | **THE perf dashboard** (roadmap P0): fixed grid MTP {0,4} × ctx {128,3K,8K,24K} on the frozen `benches/data/bench_corpus_91k.txt` + 2 DFlash cells; every roadmap perf item cites before/after from this script. MTP cells report accepted/proposed draft acceptance (`AL / acc` column); per-position acceptance arrays land in the JSONL (2026-06-11) |
 | `nsight_audit.sh` | ncu DRAM-bandwidth audit of the decode hot path (sizes the P3 lane) |
+| `kernels-cuda/tools/gemv_shape_bench.cu` | cold-data per-shape gemv-vs-cuBLASLt microbench (build line in its header) — the instrument behind the per-shape routing |
 | `bench_matrix.sh`, `bench_tq35_contexts.sh`, `bench_attention_ab.sh`, `profile_bench.sh` | bench sweeps / A-B / nsys profiling |
 | `quality_tq35.sh` | TQ35 vs BF16 KV logits quality |
 | `decode_parity.py`, `dflash_parity.py` | PyTorch parity (64-layer decode boundaries / drafter fixtures) |

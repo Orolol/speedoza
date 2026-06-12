@@ -6,6 +6,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <math.h>
 #include <random>
 #include <stdio.h>

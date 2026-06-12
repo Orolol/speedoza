@@ -69,11 +69,16 @@ __device__ __forceinline__ float sk_decode_e4m3(uint8_t code) {
                        exponent - 7);
 }
 
+// FP8 decodes go through a 256-entry SMEM LUT (built once per CTA from
+// sk_decode_e4m3, so byte-identical) instead of the branchy ldexpf path —
+// the verify chunk decodes 32 KB of KV per K-iter and the MTP=4 cycle
+// spends ~16 ms in this kernel (DAILY § 2026-06-10 MTP recovery).
 __device__ __forceinline__ __nv_bfloat16
-sk_load_kv_bf16(const void *cache, int kv_cache_dtype, size_t index) {
+sk_load_kv_bf16(const void *cache, int kv_cache_dtype, const float *fp8_lut,
+                size_t index) {
   if (kv_cache_dtype == kSkKvCacheFp8) {
     return __float2bfloat16(
-        sk_decode_e4m3(reinterpret_cast<const uint8_t *>(cache)[index]));
+        fp8_lut[reinterpret_cast<const uint8_t *>(cache)[index]]);
   }
   return reinterpret_cast<const __nv_bfloat16 *>(cache)[index];
 }
@@ -142,6 +147,12 @@ __global__ void attention_flash_splitk_kernel(
   const size_t k_iter_end =
       min(k_iter_start + iters_per_split, total_k_iters);
 
+  __shared__ float sm_fp8_lut[256];
+  for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) {
+    sm_fp8_lut[i] = sk_decode_e4m3(static_cast<uint8_t>(i));
+  }
+  __syncthreads();
+
   extern __shared__ unsigned char smem_raw[];
   __nv_bfloat16 *sm_Q = reinterpret_cast<__nv_bfloat16 *>(smem_raw);
   __nv_bfloat16 *sm_K = sm_Q + kSkM * kSkD;
@@ -190,7 +201,7 @@ __global__ void attention_flash_splitk_kernel(
         if (kv_idx >= kv_total) {
           return __float2bfloat16(0.0f);
         }
-        return sk_load_kv_bf16(cache_k, kv_cache_dtype,
+        return sk_load_kv_bf16(cache_k, kv_cache_dtype, sm_fp8_lut,
                                (kv_idx * shape.kv_heads + kvh) * head_dim + d);
       });
       sk_coop_load_bf16(sm_V, kSkN * kSkD, [&](size_t i) -> __nv_bfloat16 {
@@ -200,7 +211,7 @@ __global__ void attention_flash_splitk_kernel(
         if (kv_idx >= kv_total) {
           return __float2bfloat16(0.0f);
         }
-        return sk_load_kv_bf16(cache_v, kv_cache_dtype,
+        return sk_load_kv_bf16(cache_v, kv_cache_dtype, sm_fp8_lut,
                                (kv_idx * shape.kv_heads + kvh) * head_dim + d);
       });
       __syncthreads();

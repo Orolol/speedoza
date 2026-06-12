@@ -695,63 +695,67 @@ __global__ void nvfp4_quantize_fused_kernel(const __nv_bfloat16 *input,
   }
 }
 
-__global__ void nvfp4_quantize_rows_kernel(const __nv_bfloat16 *input,
-                                           uint8_t *output, uint8_t *scale,
-                                           float *tensor_scale, size_t rows,
-                                           size_t values,
-                                           float input_tensor_scale) {
-  __shared__ float scratch[32];
-  __shared__ float decoded_scale;
+// Wide variant of nvfp4_quantize_rows_kernel: one WARP per 16-value group,
+// 8 groups per 256-thread block. The original launched one 32-thread block
+// per group (5 440 blocks for a 5x17408 verify activation) and was pure
+// node-latency — 35.7 µs/launch where ~5 µs is enough (~14.5 ms/cycle on
+// the MTP=4 verify path). Same amax (max is order-independent) and same
+// encode helpers, so the output is bit-identical; no __syncthreads at all.
+__global__ void nvfp4_quantize_rows_wide_kernel(const __nv_bfloat16 *input,
+                                                uint8_t *output, uint8_t *scale,
+                                                float *tensor_scale,
+                                                size_t rows, size_t values,
+                                                float input_tensor_scale) {
   const float global_scale =
       input_tensor_scale > 0.0f ? input_tensor_scale : 1.0f;
-  const size_t group = blockIdx.x;
-  const size_t row = blockIdx.y;
   const size_t scale_inner_dim = round_up_size(div_ceil_size(values, 16), 4);
+  const size_t groups = div_ceil_size(values, 16);
+  const unsigned warp_id = threadIdx.x >> 5;
+  const unsigned lane = threadIdx.x & 31;
+  const size_t group =
+      static_cast<size_t>(blockIdx.x) * (blockDim.x >> 5) + warp_id;
+  const size_t row = blockIdx.y;
+  if (group >= groups) {
+    return;
+  }
   const size_t start = group * 16;
   const __nv_bfloat16 *row_input = input + row * values;
   uint8_t *row_output = output + row * div_ceil_size(values, 2);
-  float local_amax = 0.0f;
-  for (size_t offset = threadIdx.x; offset < 16 && start + offset < values;
-       offset += blockDim.x) {
-    local_amax =
-        fmaxf(local_amax, fabsf(__bfloat162float(row_input[start + offset])));
-  }
 
-  scratch[threadIdx.x] = local_amax;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      scratch[threadIdx.x] =
-          fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + stride]);
-    }
-    __syncthreads();
+  const size_t col = start + lane;
+  float v = (lane < 16 && col < values)
+                ? fabsf(__bfloat162float(row_input[col]))
+                : 0.0f;
+#pragma unroll
+  for (int off = 8; off > 0; off >>= 1) {
+    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, off));
   }
-
-  if (threadIdx.x == 0) {
+  // lanes 0..15 now all hold the group amax.
+  float decoded_scale;
+  uint8_t scale_code;
+  if (lane == 0) {
     const float scale_value =
-        scratch[0] > 0.0f
-            ? fmaxf(scratch[0] / (6.0f * global_scale), 1.0e-8f)
-            : 1.0f;
-    const uint8_t scale_code = encode_e4m3_positive(scale_value);
+        v > 0.0f ? fmaxf(v / (6.0f * global_scale), 1.0e-8f) : 1.0f;
+    scale_code = encode_e4m3_positive(scale_value);
     scale[vec16_scale_offset(group, row, scale_inner_dim)] = scale_code;
     decoded_scale = fmaxf(decode_e4m3(scale_code) * global_scale, 1.0e-8f);
     if (row == 0 && group == 0 && tensor_scale != nullptr) {
       *tensor_scale = global_scale;
     }
   }
-  __syncthreads();
-
-  if (threadIdx.x < 8) {
-    const size_t col = start + threadIdx.x * 2;
-    if (col < values) {
-      const float value0 = __bfloat162float(row_input[col]) / decoded_scale;
+  decoded_scale = __shfl_sync(0xffffffff, decoded_scale, 0);
+  if (lane < 8) {
+    const size_t pack_col = start + lane * 2;
+    if (pack_col < values) {
+      const float value0 =
+          __bfloat162float(row_input[pack_col]) / decoded_scale;
       uint8_t packed = encode_e2m1(value0);
-      if (col + 1 < values) {
+      if (pack_col + 1 < values) {
         const float value1 =
-            __bfloat162float(row_input[col + 1]) / decoded_scale;
+            __bfloat162float(row_input[pack_col + 1]) / decoded_scale;
         packed |= static_cast<uint8_t>(encode_e2m1(value1) << 4);
       }
-      row_output[col / 2] = packed;
+      row_output[pack_col / 2] = packed;
     }
   }
 }
@@ -1206,10 +1210,14 @@ qwen36_nvfp4_quantize_rows(const qwen36_nvfp4_quantize_rows_spec_t *spec) {
     return QWEN36_STATUS_INVALID_ARGUMENT;
   }
 
-  const unsigned int scale_blocks =
+  // 8 warp-groups per 256-thread block (see the wide kernel's comment; the
+  // one-block-per-group launch was pure node latency on small rows).
+  const unsigned int scale_groups =
       static_cast<unsigned int>((spec->values + 15) / 16);
-  const dim3 grid(scale_blocks, static_cast<unsigned int>(spec->rows));
-  nvfp4_quantize_rows_kernel<<<grid, 32, 0, qwen36_internal_active_stream()>>>(
+  const dim3 grid((scale_groups + 7) / 8,
+                  static_cast<unsigned int>(spec->rows));
+  nvfp4_quantize_rows_wide_kernel<<<grid, 256, 0,
+                                    qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<uint8_t>(spec->output_fp4), ptr<uint8_t>(spec->output_scale_e4m3),
       ptr<float>(spec->output_tensor_scale_f32), spec->rows, spec->values,

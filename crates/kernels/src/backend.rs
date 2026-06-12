@@ -217,8 +217,11 @@ impl KernelBackend for CudaBackend {
         // QWEN36_STATUS_NOT_IMPLEMENTED we fall through to the cuBLASLt
         // routing. See the Direction B spec under
         // `docs/superpowers/specs/2026-05-04-direction-b-nvfp4-gemv-design.md`.
+        // PR #29 measured the mlp.down decode shape (M=5120, K=17408)
+        // faster on cuBLASLt than on the hand-written n=1 GEMV path.
+        let cublaslt_preferred = spec.n == 1 && spec.m == 5120 && spec.k == 17408;
         let gemv_n_ok = spec.n == 1 || (spec.n <= 8 && chunk_gemv_enabled());
-        if decode_gemv_enabled() && gemv_n_ok {
+        if decode_gemv_enabled() && gemv_n_ok && !cublaslt_preferred {
             let code = unsafe { ffi::qwen36_decode_nvfp4_gemv(&ffi_spec) };
             if code != 5 {
                 return check("qwen36_decode_nvfp4_gemv", code);
