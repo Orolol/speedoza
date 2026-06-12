@@ -2,6 +2,7 @@
 #include "active_stream.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -82,7 +83,8 @@ deltanet_prefill_kernel(
     size_t v_token_stride,
     float state_decay,
     float update_scale,
-    bool qk_l2norm) {
+    bool qk_l2norm,
+    bool tiny_chunk_enabled) {
   constexpr int C = kPrefillChunk;
   constexpr int K = kPrefillKeyDim;
   constexpr int V = kPrefillValDim;
@@ -152,6 +154,18 @@ deltanet_prefill_kernel(
   for (int n = 0; n < num_chunks; ++n) {
     const int chunk_start = n * C;
     const int valid = max(0, min(C, static_cast<int>(tokens) - chunk_start));
+    // Tiny-chunk fast path (speculative verify windows, T <= 16): bound the
+    // C-wide phases to one 16-wide tile. BIT-EXACT by construction — every
+    // skipped operand is a provable zero (padded rows have q = k = v = 0,
+    // beta = 0, so each skipped FLOP contributed an exact +0.0 to an fp32
+    // accumulator) and every skipped write lands in a cell the bounded flow
+    // never reads. Inputs (Phase 1) stay fully zero-filled so no stale SMEM
+    // can ever reach an mma (0 x garbage would be NaN). expD_last keeps
+    // reading sm_expD[C-1], which equals exp(D[valid-1]) exactly because
+    // the padded gates add +0.0f to the running cumsum. Gate: bit-identical
+    // memcmp vs the full path in smoke (T in {1..40}).
+    const int cw = (tiny_chunk_enabled && valid <= 16) ? 16 : C;
+    const int c_tiles = cw / 16;
 
     // === Phase 1: Load q, k, v, g, β for this chunk into SMEM ===
     // q/k row stride = q_token_stride (in BF16 elements). qh selects which of the
@@ -262,31 +276,33 @@ deltanet_prefill_kernel(
       const int m_tile = warp_id / 2;   // 0..1
       const int n_tile = warp_id % 2;   // 0..1
 
-      fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major> a_frag;
-      fragment<matrix_b, 16, 16, 16, __nv_bfloat16, col_major> b_frag;
-      fragment<accumulator, 16, 16, 16, float> c_frag;
-      fill_fragment(c_frag, 0.0f);
+      if (m_tile < c_tiles && n_tile < c_tiles) {
+        fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major> a_frag;
+        fragment<matrix_b, 16, 16, 16, __nv_bfloat16, col_major> b_frag;
+        fragment<accumulator, 16, 16, 16, float> c_frag;
+        fill_fragment(c_frag, 0.0f);
 
-      #pragma unroll
-      for (int k_tile = 0; k_tile < K / 16; ++k_tile) {
-        load_matrix_sync(a_frag, sm_q + m_tile * 16 * K + k_tile * 16, K);
-        load_matrix_sync(b_frag, sm_k + n_tile * 16 * K + k_tile * 16, K);
-        mma_sync(c_frag, a_frag, b_frag, c_frag);
-      }
+        #pragma unroll
+        for (int k_tile = 0; k_tile < K / 16; ++k_tile) {
+          load_matrix_sync(a_frag, sm_q + m_tile * 16 * K + k_tile * 16, K);
+          load_matrix_sync(b_frag, sm_k + n_tile * 16 * K + k_tile * 16, K);
+          mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
 
-      store_matrix_sync(warp_scratch, c_frag, 16, mem_row_major);
-      #pragma unroll
-      for (int e = 0; e < 8; ++e) {
-        const int idx_in_tile = lane * 8 + e;
-        const int row_in_tile = idx_in_tile / 16;
-        const int col_in_tile = idx_in_tile % 16;
-        const int i = m_tile * 16 + row_in_tile;
-        const int j = n_tile * 16 + col_in_tile;
-        if (j > i) {
-          sm_attn[i * C + j] = 0.0f;
-        } else {
-          const float qk = warp_scratch[row_in_tile * 16 + col_in_tile];
-          sm_attn[i * C + j] = qk * __expf(sm_D[i] - sm_D[j]);
+        store_matrix_sync(warp_scratch, c_frag, 16, mem_row_major);
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const int idx_in_tile = lane * 8 + e;
+          const int row_in_tile = idx_in_tile / 16;
+          const int col_in_tile = idx_in_tile % 16;
+          const int i = m_tile * 16 + row_in_tile;
+          const int j = n_tile * 16 + col_in_tile;
+          if (j > i) {
+            sm_attn[i * C + j] = 0.0f;
+          } else {
+            const float qk = warp_scratch[row_in_tile * 16 + col_in_tile];
+            sm_attn[i * C + j] = qk * __expf(sm_D[i] - sm_D[j]);
+          }
         }
       }
     }
@@ -294,8 +310,10 @@ deltanet_prefill_kernel(
 
     // === Phase 5a: materialize k_beta = k * β into sm_wdec (temporary) ===
     // sm_wdec is free until Phase 8 (which overwrites it with w_dec).
+    // Rows >= cw are only ever read by the Phase-5b tiles the tiny path
+    // skips, so the fill is bounded by cw.
     {
-      for (int idx = tid; idx < C * K; idx += blockDim.x) {
+      for (int idx = tid; idx < cw * K; idx += blockDim.x) {
         const int i = idx / K;
         sm_wdec[idx] = f2bf(bf2f(sm_k[idx]) * sm_beta[i]);
       }
@@ -312,31 +330,33 @@ deltanet_prefill_kernel(
       const int m_tile = warp_id / 2;
       const int n_tile = warp_id % 2;
 
-      fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major> a_frag;
-      fragment<matrix_b, 16, 16, 16, __nv_bfloat16, col_major> b_frag;
-      fragment<accumulator, 16, 16, 16, float> c_frag;
-      fill_fragment(c_frag, 0.0f);
+      if (m_tile < c_tiles && n_tile < c_tiles) {
+        fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major> a_frag;
+        fragment<matrix_b, 16, 16, 16, __nv_bfloat16, col_major> b_frag;
+        fragment<accumulator, 16, 16, 16, float> c_frag;
+        fill_fragment(c_frag, 0.0f);
 
-      #pragma unroll
-      for (int k_tile = 0; k_tile < K / 16; ++k_tile) {
-        load_matrix_sync(a_frag, sm_wdec + m_tile * 16 * K + k_tile * 16, K);
-        load_matrix_sync(b_frag, sm_k    + n_tile * 16 * K + k_tile * 16, K);
-        mma_sync(c_frag, a_frag, b_frag, c_frag);
-      }
+        #pragma unroll
+        for (int k_tile = 0; k_tile < K / 16; ++k_tile) {
+          load_matrix_sync(a_frag, sm_wdec + m_tile * 16 * K + k_tile * 16, K);
+          load_matrix_sync(b_frag, sm_k    + n_tile * 16 * K + k_tile * 16, K);
+          mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
 
-      store_matrix_sync(warp_scratch, c_frag, 16, mem_row_major);
-      #pragma unroll
-      for (int e = 0; e < 8; ++e) {
-        const int idx_in_tile = lane * 8 + e;
-        const int row_in_tile = idx_in_tile / 16;
-        const int col_in_tile = idx_in_tile % 16;
-        const int i = m_tile * 16 + row_in_tile;
-        const int j = n_tile * 16 + col_in_tile;
-        if (j >= i) {
-          sm_A[i * C + j] = 0.0f;
-        } else {
-          const float dot = warp_scratch[row_in_tile * 16 + col_in_tile];
-          sm_A[i * C + j] = -dot * __expf(sm_D[i] - sm_D[j]);
+        store_matrix_sync(warp_scratch, c_frag, 16, mem_row_major);
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const int idx_in_tile = lane * 8 + e;
+          const int row_in_tile = idx_in_tile / 16;
+          const int col_in_tile = idx_in_tile % 16;
+          const int i = m_tile * 16 + row_in_tile;
+          const int j = n_tile * 16 + col_in_tile;
+          if (j >= i) {
+            sm_A[i * C + j] = 0.0f;
+          } else {
+            const float dot = warp_scratch[row_in_tile * 16 + col_in_tile];
+            sm_A[i * C + j] = -dot * __expf(sm_D[i] - sm_D[j]);
+          }
         }
       }
     }
@@ -346,7 +366,10 @@ deltanet_prefill_kernel(
     // Sequential along i.  At iteration i, threads with j<i update A[i,j].
     // No thread writes a value that another thread reads inside one i (each
     // thread writes only A[i,j]; reads are A[i,l] for l!=j and A[l,j] for l<i).
-    for (int i = 1; i < C; ++i) {
+    // The serial walk only needs the LIVE rows: padded rows have M[i,·] = 0
+    // (k_beta = 0), so their forward-sub result is exactly zero — written
+    // directly below instead of burning C-valid serial barrier rounds.
+    for (int i = 1; i < valid; ++i) {
       float acc = 0.0f;
       if (tid < i) {
         const int j = tid;
@@ -361,16 +384,26 @@ deltanet_prefill_kernel(
       }
       __syncthreads();
     }
+    // Padded rows [valid, cw): zero (what the propagation would compute).
+    for (int idx = tid; idx < (cw - valid) * cw; idx += blockDim.x) {
+      const int i = valid + idx / cw;
+      const int j = idx % cw;
+      sm_A[i * C + j] = 0.0f;
+    }
+    __syncthreads();
     // Add identity to make A = I + (M+M²+…).
-    if (tid < C) {
+    if (tid < cw) {
       sm_A[tid * C + tid] += 1.0f;
     }
     __syncthreads();
 
     // Convert sm_A (f32) → sm_A_bf16 for wmma matrix_a use in Phases 7 and 8.
+    // The bounded tile flow only loads rows/cols < cw.
     {
-      for (int idx = tid; idx < C * C; idx += blockDim.x) {
-        sm_A_bf16[idx] = f2bf(sm_A[idx]);
+      for (int idx = tid; idx < cw * cw; idx += blockDim.x) {
+        const int i = idx / cw;
+        const int j = idx % cw;
+        sm_A_bf16[i * C + j] = f2bf(sm_A[i * C + j]);
       }
     }
     __syncthreads();
@@ -378,22 +411,27 @@ deltanet_prefill_kernel(
     // === Phase 7a: v_pre = v * β in-place in sm_v ===
     // After Phase 7b, sm_v no longer holds v; we'll repurpose it for Phase 8a.
     {
-      for (int idx = tid; idx < C * V; idx += blockDim.x) {
+      for (int idx = tid; idx < cw * V; idx += blockDim.x) {
         const int i = idx / V;
         sm_v[idx] = f2bf(bf2f(sm_v[idx]) * sm_beta[i]);
       }
     }
     __syncthreads();
 
+    // Tile share per warp for the [cw, V/K]-shaped wmma phases below:
+    // c_tiles * 8 output tiles spread over 4 warps (2 each on the tiny path).
+    const int row_tiles_share = c_tiles * 2;
+
     // === Phase 7b: u_new = A @ v_pre via wmma ===
-    // [C×C] @ [C×V] → [C×V]. M_tiles=2, N_tiles=8, K_tiles=2. 16 tiles, 4/warp.
+    // [C×C] @ [C×V] → [C×V]. M_tiles=c_tiles, N_tiles=8, K_tiles=c_tiles.
     {
       using namespace nvcuda::wmma;
       const int warp_id = tid / 32;
       const int lane    = tid % 32;
       float *warp_scratch = sm_wmma_scratch + warp_id * 16 * 16;
 
-      for (int tile_id = warp_id * 4; tile_id < (warp_id + 1) * 4; ++tile_id) {
+      for (int tile_id = warp_id * row_tiles_share;
+           tile_id < (warp_id + 1) * row_tiles_share; ++tile_id) {
         const int m_tile = tile_id / 8;
         const int n_tile = tile_id % 8;
 
@@ -402,8 +440,7 @@ deltanet_prefill_kernel(
         fragment<accumulator, 16, 16, 16, float> c_frag;
         fill_fragment(c_frag, 0.0f);
 
-        #pragma unroll
-        for (int k_tile = 0; k_tile < C / 16; ++k_tile) {  // C=32 / 16 = 2
+        for (int k_tile = 0; k_tile < c_tiles; ++k_tile) {
           load_matrix_sync(a_frag, sm_A_bf16 + m_tile * 16 * C + k_tile * 16, C);
           load_matrix_sync(b_frag, sm_v      + k_tile * 16 * V + n_tile * 16, V);
           mma_sync(c_frag, a_frag, b_frag, c_frag);
@@ -425,7 +462,7 @@ deltanet_prefill_kernel(
 
     // === Phase 8a: scaled_k = k * β * exp(D) into sm_v (overwriting v_pre) ===
     {
-      for (int idx = tid; idx < C * K; idx += blockDim.x) {
+      for (int idx = tid; idx < cw * K; idx += blockDim.x) {
         const int i = idx / K;
         const int kd = idx % K;
         sm_v[idx] = f2bf(bf2f(sm_k[i * K + kd]) * sm_beta[i] * sm_expD[i]);
@@ -441,7 +478,8 @@ deltanet_prefill_kernel(
       const int lane    = tid % 32;
       float *warp_scratch = sm_wmma_scratch + warp_id * 16 * 16;
 
-      for (int tile_id = warp_id * 4; tile_id < (warp_id + 1) * 4; ++tile_id) {
+      for (int tile_id = warp_id * row_tiles_share;
+           tile_id < (warp_id + 1) * row_tiles_share; ++tile_id) {
         const int m_tile = tile_id / 8;
         const int n_tile = tile_id % 8;
 
@@ -450,8 +488,7 @@ deltanet_prefill_kernel(
         fragment<accumulator, 16, 16, 16, float> c_frag;
         fill_fragment(c_frag, 0.0f);
 
-        #pragma unroll
-        for (int k_tile = 0; k_tile < C / 16; ++k_tile) {
+        for (int k_tile = 0; k_tile < c_tiles; ++k_tile) {
           load_matrix_sync(a_frag, sm_A_bf16 + m_tile * 16 * C + k_tile * 16, C);
           load_matrix_sync(b_frag, sm_v      + k_tile * 16 * K + n_tile * 16, K);
           mma_sync(c_frag, a_frag, b_frag, c_frag);
@@ -479,8 +516,9 @@ deltanet_prefill_kernel(
       const int lane    = tid % 32;
       float *warp_scratch = sm_wmma_scratch + warp_id * 16 * 16;
 
-      for (int tile_id = warp_id * 4; tile_id < (warp_id + 1) * 4; ++tile_id) {
-        const int m_tile = tile_id / 8;   // 0..1 (C/16)
+      for (int tile_id = warp_id * row_tiles_share;
+           tile_id < (warp_id + 1) * row_tiles_share; ++tile_id) {
+        const int m_tile = tile_id / 8;   // 0..c_tiles-1 (cw/16)
         const int n_tile = tile_id % 8;   // 0..7 (V/16)
 
         fragment<matrix_a, 16, 16, 16, __nv_bfloat16, row_major> a_frag;
@@ -514,7 +552,7 @@ deltanet_prefill_kernel(
     // === Phase 10a: q_scaled[i, d] = q[i, d] * exp(D[i]) in-place ===
     // q is no longer needed after this chunk's o_inter matmul, so we overwrite.
     {
-      for (int idx = tid; idx < C * K; idx += blockDim.x) {
+      for (int idx = tid; idx < cw * K; idx += blockDim.x) {
         const int i = idx / K;
         sm_q[idx] = f2bf(bf2f(sm_q[idx]) * sm_expD[i]);
       }
@@ -530,7 +568,8 @@ deltanet_prefill_kernel(
       const int lane    = tid % 32;
       float *warp_scratch = sm_wmma_scratch + warp_id * 16 * 16;
 
-      for (int tile_id = warp_id * 4; tile_id < (warp_id + 1) * 4; ++tile_id) {
+      for (int tile_id = warp_id * row_tiles_share;
+           tile_id < (warp_id + 1) * row_tiles_share; ++tile_id) {
         const int m_tile = tile_id / 8;
         const int n_tile = tile_id % 8;
 
@@ -555,10 +594,10 @@ deltanet_prefill_kernel(
           const int i  = m_tile * 16 + row_in_tile;
           const int vd = n_tile * 16 + col_in_tile;
           const float o_inter = warp_scratch[row_in_tile * 16 + col_in_tile];
-          // o_intra plain: sum_j attn[i, j] * v_new[j, vd] (j > i contribution is 0).
+          // o_intra plain: sum_j attn[i, j] * v_new[j, vd] (j > i contribution
+          // is 0; j >= cw terms are attn(=0) * v_new = exact +0.0 — skipped).
           float o_intra = 0.0f;
-          #pragma unroll
-          for (int j = 0; j < C; ++j) {
+          for (int j = 0; j < cw; ++j) {
             o_intra += sm_attn[i * C + j] * bf2f(sm_vnew[j * V + vd]);
           }
           sm_out[i * V + vd] = f2bf(o_inter + o_intra);
@@ -585,7 +624,7 @@ deltanet_prefill_kernel(
     // Pre-multiplying once saves an FMA per S_next cell and a redundant SMEM read.
     {
       __nv_bfloat16 *sm_k_scaled = sm_wdec;
-      for (int idx = tid; idx < C * K; idx += blockDim.x) {
+      for (int idx = tid; idx < cw * K; idx += blockDim.x) {
         const int i = idx / K;
         const int kd = idx % K;
         sm_k_scaled[idx] = f2bf(bf2f(sm_k[i * K + kd]) * sm_coef[i]);
@@ -618,9 +657,9 @@ deltanet_prefill_kernel(
         fragment<accumulator, 16, 16, 16, float> c_frag;
         fill_fragment(c_frag, 0.0f);
 
-        // K_wmma loop: 32/16 = 2 iterations.
-        #pragma unroll
-        for (int k_tile = 0; k_tile < 2; ++k_tile) {
+        // K_wmma loop: cw/16 iterations (the chunk-token reduction; rows
+        // c >= cw have k_scaled = 0 exactly, so the skipped mma adds +0.0).
+        for (int k_tile = 0; k_tile < c_tiles; ++k_tile) {
           // A (k_scaled^T) as col_major: storage offset for tile starting at
           // (logical_row=m_tile*16, logical_col=k_tile*16) is k_tile*16*K + m_tile*16.
           load_matrix_sync(a_frag,
@@ -668,6 +707,16 @@ deltanet_prefill_kernel(
 }
 
 } // namespace
+
+// Test/bench hook: force the tiny-chunk (T <= 16) fast path ON (1), OFF (0),
+// or restore the default (any other value => enabled unless
+// QWEN36_DELTANET_TINY_CHUNK=0). Smoke uses it for the bit-exact memcmp
+// gate between the bounded and full paths.
+static int g_deltanet_tiny_override = -1;
+
+extern "C" void qwen36_deltanet_prefill_set_tiny(int mode) {
+  g_deltanet_tiny_override = (mode == 0 || mode == 1) ? mode : -1;
+}
 
 extern "C" int
 qwen36_deltanet_prefill(const qwen36_deltanet_prefill_spec_t *spec) {
@@ -732,6 +781,17 @@ qwen36_deltanet_prefill(const qwen36_deltanet_prefill_spec_t *spec) {
   const dim3 grid(static_cast<unsigned int>(spec->shape.v_heads), 1, 1);
   const dim3 block(kPrefillThreads, 1, 1);
 
+  const bool tiny_chunk_enabled =
+      g_deltanet_tiny_override == 1 ||
+      (g_deltanet_tiny_override != 0 && [] {
+        static int env_cached = -1;
+        if (env_cached < 0) {
+          const char *e = getenv("QWEN36_DELTANET_TINY_CHUNK");
+          env_cached = (e != nullptr && (e[0] == '0' || e[0] == 'f')) ? 0 : 1;
+        }
+        return env_cached == 1;
+      }());
+
   deltanet_prefill_kernel<<<grid, block, smem_bytes,
                             qwen36_internal_active_stream()>>>(
       ptr<const __nv_bfloat16>(spec->q_bf16),
@@ -743,7 +803,7 @@ qwen36_deltanet_prefill(const qwen36_deltanet_prefill_spec_t *spec) {
       ptr<__nv_bfloat16>(spec->output_bf16),
       spec->shape, spec->tokens,
       spec->q_token_stride, spec->k_token_stride, spec->v_token_stride,
-      state_decay, update_scale, spec->qk_l2norm != 0);
+      state_decay, update_scale, spec->qk_l2norm != 0, tiny_chunk_enabled);
 
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;

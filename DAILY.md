@@ -97,6 +97,49 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-12 (nuit) — Fast-path bit-exact T<=16 du DeltaNet chunked — SHIPPED defaut ON : kernel verify -40% median (272.6 -> 162.2 us), bit-identique par construction (memcmp 11 valeurs de T)
+
+Suite directe du pivot de l'entree precedente. Le kernel chunked paie
+C=32 dans toutes ses phases pour un verify de 5 tokens ; les lignes
+paddees etant des zeros exacts (q=k=v=0, beta=0), borner les phases a
+cw=16 quand valid<=16 est BIT-IDENTIQUE : chaque FLOP saute contribuait
+un +0.0 IEEE exact, chaque ecriture sautee va vers une cellule jamais
+lue par le flot borne (preuve phase par phase dans le commentaire du
+kernel ; aucun garbage ne peut entrer dans une mma — Phase 1 garde le
+zero-fill complet).
+
+Changements (deltanet_prefill.cu, cw = valid<=16 ? 16 : 32) :
+- Phase 6 forward-sub : bornee a `valid` iterations serie (4 au lieu de
+  31 pour T=5) + zero-fill explicite des lignes [valid, cw) — s'applique
+  aussi au dernier chunk partiel des prefills longs.
+- Phases 4/5b : 1 tuile WMMA [16,16] au lieu de 4 ; 7b/8b/9/10b :
+  m_tile borne, 8 tuiles redistribuees sur les 4 warps ; 12b : reduction
+  sur C bornee a 1 k_tile ; o_intra borne a cw ; fills 5a/7a/8a/10a/12a
+  bornes.
+- Env kill QWEN36_DELTANET_TINY_CHUNK=0 + hook de test
+  qwen36_deltanet_prefill_set_tiny.
+
+Gates : **memcmp output+state bit-exact sur T in {1,2,3,5,8,12,16,17,
+31,33,40}** (frontieres de tuiles + multi-chunk) ; smoke complet vert ;
+E2E MTP=4 @128 : acceptance IDENTIQUE a 17 decimales tiny on/off.
+
+Mesure kernel (nsys cuda_gpu_kern_sum, 96 appels identiques, meme
+workload) : median 272.6 -> 162.2 us = **-40%/appel**, total -4.9 ms
+sur le run ; max ~egal (les chunks pleins du prefill ne regressent
+pas). Theorique ~-5 ms/cycle MTP=4 (48 couches x -110 us). Le E2E
+n'etait pas lisible (contention GPU externe ~21% util pendant les runs,
+et les replays de graphe sont invisibles dans kern_sum) — re-mesure
+E2E sur GPU calme a faire pour chiffrer le tok/s.
+
+Defaut ON (bit-exact par construction + gates). Note : les boucles
+k_tile precedemment unrollees (#pragma) sont passees en borne runtime
+c_tiles — pas de regression visible sur les chunks pleins (max nsys
+~egal).
+
+Files: kernels-cuda/deltanet_prefill.cu, kernels-cuda/smoke.cu,
+kernels-cuda/include/qwen36_fp4.h. Inventory: oui.
+
+
 ### 2026-06-12 (soir, suite) — DeltaNet verify : hypothese "arrondi bf16 par token" FALSIFIED ; le NEG du short-chunk re-confirme (monotone en ctx) ; pivot vers le fast-path chunked T<=16 bit-exact
 
 Levier 1 du survey vLLM/llama.cpp. Trois resultats :

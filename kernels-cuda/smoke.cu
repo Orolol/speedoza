@@ -1103,6 +1103,55 @@ int main() {
     dev_free<__nv_bfloat16>(state_res);
     dev_free<__nv_bfloat16>(out_res);
 
+    // Tiny-chunk (T <= 16) fast path of the CHUNKED kernel: must be
+    // BIT-IDENTICAL to the full C=32 path (every skipped operand is an
+    // exact zero). memcmp gate over partial-chunk widths, tile boundaries
+    // and the multi-chunk case.
+    {
+      qwen36_device_ptr_t st_full = dev_alloc<__nv_bfloat16>(state_values);
+      qwen36_device_ptr_t st_tiny = dev_alloc<__nv_bfloat16>(state_values);
+      qwen36_device_ptr_t o_full = dev_alloc<__nv_bfloat16>(v_values);
+      qwen36_device_ptr_t o_tiny = dev_alloc<__nv_bfloat16>(v_values);
+      const size_t t_cases[] = {1, 2, 3, 5, 8, 12, 16, 17, 31, 33, 40};
+      for (const size_t t_tokens : t_cases) {
+        copy_bf16(st_full, h_state);
+        copy_bf16(st_tiny, h_state);
+        qwen36_deltanet_prefill_spec_t tc = chunk_spec;
+        tc.tokens = t_tokens;
+        tc.state_bf16 = st_full;
+        tc.output_bf16 = o_full;
+        qwen36_deltanet_prefill_set_tiny(0);
+        must_status(qwen36_deltanet_prefill(&tc), "deltanet tiny gate (full)");
+        tc.state_bf16 = st_tiny;
+        tc.output_bf16 = o_tiny;
+        qwen36_deltanet_prefill_set_tiny(1);
+        must_status(qwen36_deltanet_prefill(&tc), "deltanet tiny gate (tiny)");
+        qwen36_deltanet_prefill_set_tiny(-1);
+
+        const size_t out_vals = t_tokens * kVHeads * kValDim;
+        std::vector<uint16_t> of = read_raw<uint16_t>(o_full, out_vals);
+        std::vector<uint16_t> ot = read_raw<uint16_t>(o_tiny, out_vals);
+        std::vector<uint16_t> sf = read_raw<uint16_t>(st_full, state_values);
+        std::vector<uint16_t> st = read_raw<uint16_t>(st_tiny, state_values);
+        size_t out_diff = 0, st_diff = 0;
+        for (size_t i = 0; i < out_vals; ++i) out_diff += of[i] != ot[i];
+        for (size_t i = 0; i < state_values; ++i) st_diff += sf[i] != st[i];
+        if (out_diff != 0 || st_diff != 0) {
+          fprintf(stderr,
+                  "deltanet tiny-chunk T=%zu NOT bit-identical: output "
+                  "diffs=%zu state diffs=%zu\n",
+                  t_tokens, out_diff, st_diff);
+          exit(1);
+        }
+      }
+      printf("deltanet tiny-chunk bit-exact gate passed (T in "
+             "{1,2,3,5,8,12,16,17,31,33,40})\n");
+      dev_free<__nv_bfloat16>(st_full);
+      dev_free<__nv_bfloat16>(st_tiny);
+      dev_free<__nv_bfloat16>(o_full);
+      dev_free<__nv_bfloat16>(o_tiny);
+    }
+
     dev_free<__nv_bfloat16>(pq);
     dev_free<__nv_bfloat16>(pk);
     dev_free<__nv_bfloat16>(pv);
