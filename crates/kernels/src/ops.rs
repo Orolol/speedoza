@@ -32,6 +32,35 @@ pub struct Bf16MatVecArgmaxRowsSpec {
     pub mirror_last_output_token_u32: DevicePtr,
     pub workspace: DevicePtr,
     pub workspace_bytes: usize,
+    /// Optional `[rows]` u32 device flags — a non-zero flag skips that row
+    /// entirely (output and mirror untouched). `DevicePtr::NULL` processes
+    /// every row. Predicated BF16 rescore of the two-stage lm_head argmax.
+    pub skip_flags_u32: DevicePtr,
+}
+
+/// Stage-1 verdict of the two-stage exact lm_head argmax: per-row top-2 +
+/// margin guard over the FP8-path logits. Tokens are written
+/// unconditionally; `flags_u32[row] = 1` certifies the FP8 argmax (margin
+/// >= eps), 0 sends the row to the predicated BF16 rescore. Workspace:
+/// `rows * 240 * 16` bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LmHeadTop2MarginSpec {
+    pub rows: usize,
+    pub vocab: usize,
+    pub eps: f32,
+    pub logits_bf16: DevicePtr,
+    pub tokens_u32: DevicePtr,
+    pub flags_u32: DevicePtr,
+    pub mirror_last_token_u32: DevicePtr,
+    pub fallback_count_u32: DevicePtr,
+    pub workspace: DevicePtr,
+    pub workspace_bytes: usize,
+}
+
+/// Workspace bytes required by [`LmHeadTop2MarginSpec`] for `rows` rows
+/// (mirrors `QWEN36_LM_HEAD_TOP2_BLOCKS * 16` in qwen36_fp4.h).
+pub const fn lm_head_top2_workspace_bytes(rows: usize) -> usize {
+    rows * 240 * 16
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

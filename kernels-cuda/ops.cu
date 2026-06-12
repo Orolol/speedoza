@@ -459,6 +459,7 @@ __global__ void __launch_bounds__(kBf16ArgmaxThreadsPerBlock)
 bf16_matvec_argmax_rows_kernel(const __nv_bfloat16 *__restrict__ input,
                                const __nv_bfloat16 *__restrict__ weight,
                                unsigned long long *__restrict__ best_keys,
+                               const uint32_t *__restrict__ skip_flags,
                                size_t rows, size_t out_features,
                                size_t in_features) {
   const unsigned warp_id = threadIdx.x >> 5;
@@ -466,6 +467,11 @@ bf16_matvec_argmax_rows_kernel(const __nv_bfloat16 *__restrict__ input,
   const size_t row = blockIdx.y;
   const size_t vocab = blockIdx.x * kBf16ArgmaxRowsPerBlock + warp_id;
   if (row >= rows || vocab >= out_features) {
+    return;
+  }
+  // Two-stage lm_head: a non-zero flag means the FP8 margin guard already
+  // settled this row — the whole grid slice exits on one cached read.
+  if (skip_flags != nullptr && skip_flags[row] != 0u) {
     return;
   }
 
@@ -490,10 +496,14 @@ bf16_matvec_argmax_rows_kernel(const __nv_bfloat16 *__restrict__ input,
 __global__ void bf16_matvec_argmax_rows_finalize_kernel(
     const unsigned long long *__restrict__ best_keys,
     uint32_t *__restrict__ output_tokens,
-    uint32_t *__restrict__ mirror_last_output_token, size_t rows) {
+    uint32_t *__restrict__ mirror_last_output_token,
+    const uint32_t *__restrict__ skip_flags, size_t rows) {
   const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= rows) {
     return;
+  }
+  if (skip_flags != nullptr && skip_flags[row] != 0u) {
+    return;  // stage-1 token stands; leave output and mirror untouched
   }
   const unsigned long long key = best_keys[row];
   const uint32_t token =
@@ -1118,8 +1128,9 @@ extern "C" int qwen36_bf16_matvec_argmax_rows(
                                    stream>>>(
       ptr<const __nv_bfloat16>(spec->input_bf16),
       ptr<const __nv_bfloat16>(spec->weight_bf16),
-      ptr<unsigned long long>(spec->workspace), spec->rows, spec->out_features,
-      spec->in_features);
+      ptr<unsigned long long>(spec->workspace),
+      ptr<const uint32_t>(spec->skip_flags_u32), spec->rows,
+      spec->out_features, spec->in_features);
   err = cudaGetLastError();
   if (err != cudaSuccess) {
     return QWEN36_STATUS_CUDA_ERROR;
@@ -1131,7 +1142,8 @@ extern "C" int qwen36_bf16_matvec_argmax_rows(
   bf16_matvec_argmax_rows_finalize_kernel<<<blocks, threads, 0, stream>>>(
       ptr<const unsigned long long>(spec->workspace),
       ptr<uint32_t>(spec->output_token_u32),
-      ptr<uint32_t>(spec->mirror_last_output_token_u32), spec->rows);
+      ptr<uint32_t>(spec->mirror_last_output_token_u32),
+      ptr<const uint32_t>(spec->skip_flags_u32), spec->rows);
   err = cudaGetLastError();
   return err == cudaSuccess ? QWEN36_STATUS_SUCCESS : QWEN36_STATUS_CUDA_ERROR;
 }

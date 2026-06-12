@@ -609,6 +609,25 @@ fn cuda_lm_head_fp8_enabled(mtp_speculative_tokens: usize) -> bool {
     cuda_env_bool_value("QWEN36_LM_HEAD_FP8").unwrap_or(mtp_speculative_tokens == 0)
 }
 
+/// Two-stage exact lm_head argmax ("margin mode", 2026-06-12): at MTP>0,
+/// every greedy lm_head consumer runs an FP8 scan + top1-top2 margin guard,
+/// with a flag-predicated full-BF16 rescore when the guard fails. Bit-exact
+/// versus the BF16 argmax whenever eps >= 2*max|dlogit| — this is what the
+/// naive FP8 policy above could not give (flips compound down the draft
+/// recursion). Probe (scripts/lmhead_fp8_probe.py on 28 target hiddens):
+/// e_max 0.344, FP8 margins median 4.67/min 0.99 -> eps 1.0 keeps the
+/// guard provably safe with ~0-4% expected fallbacks on target hiddens
+/// (MTP-head hiddens run tighter margins; the device fallback counter
+/// reports the realized rate). Opt-in: QWEN36_LM_HEAD_FP8_MARGIN=<eps>.
+/// Costs +1.27 GiB (FP8 store coexists with the BF16 weight).
+#[cfg(feature = "cuda")]
+fn cuda_lm_head_fp8_margin_eps() -> Option<f32> {
+    std::env::var("QWEN36_LM_HEAD_FP8_MARGIN")
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|eps| *eps > 0.0)
+}
+
 #[cfg(feature = "cuda")]
 fn mtp_postnorm_recursion_enabled() -> bool {
     !cuda_env_bool_value("QWEN36_MTP_PRENORM_RECURSION").unwrap_or(false)
@@ -759,6 +778,20 @@ pub struct MtpDeviceChainResult {
     pub next_draft_tokens: Vec<u32>,
 }
 
+/// Device-side state of the two-stage exact lm_head argmax (margin mode,
+/// QWEN36_LM_HEAD_FP8_MARGIN). The FP8 store coexists with the BF16
+/// lm_head weight; `flags_u32` ([MAX_N] u32) carries the per-row guard
+/// verdicts between the top-2 kernel and the predicated BF16 rescore, and
+/// `fallback_count_u32` (1 u32) accumulates failed guards across the run —
+/// the bench reads it to report the realized fallback rate.
+#[cfg(feature = "cuda")]
+pub struct LmHeadMarginState {
+    pub store: crate::gpu::LmHeadFp8Store,
+    pub eps: f32,
+    pub flags_u32: qwen36_fp4_kernels::CudaDeviceBuffer,
+    pub fallback_count_u32: qwen36_fp4_kernels::CudaDeviceBuffer,
+}
+
 /// Hook the prefill loop fires after each layer's `input_layernorm`,
 /// passing the engine's prefill `layer_idx` (= the transformers
 /// `hidden_states[layer_idx]` index), a device pointer to the freshly-
@@ -791,6 +824,13 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
     #[cfg(feature = "cuda")]
     pub mlp_fused: Option<MlpFusedStore>,
     pub lm_head_fp8: Option<crate::gpu::LmHeadFp8Store>,
+    /// Two-stage exact lm_head argmax state (margin mode). Distinct from
+    /// `lm_head_fp8` on purpose: that field means "the BF16 weight is GONE,
+    /// every logits consumer reads FP8". Margin mode keeps BOTH — generic
+    /// logits consumers stay on BF16; only the greedy-argmax device path
+    /// runs FP8-scan + guard + predicated BF16 rescore.
+    #[cfg(feature = "cuda")]
+    pub lm_head_margin: Option<LmHeadMarginState>,
     /// Pre-concatenated DeltaNet in_proj_qkv/_b/_a/_z NVFP4 weights for the
     /// decode linear-attention fast path (one combined cuBLASLt FP4 GEMM
     /// instead of four). Indexed by global layer index; `None` for full-attn
@@ -1006,6 +1046,8 @@ impl<B: KernelBackend> Engine<B> {
             #[cfg(feature = "cuda")]
             mlp_fused: None,
             lm_head_fp8: None,
+            #[cfg(feature = "cuda")]
+            lm_head_margin: None,
             #[cfg(feature = "cuda")]
             linear_attn_in_proj_fused: None,
             #[cfg(feature = "cuda")]
@@ -1499,7 +1541,7 @@ impl<B: KernelBackend> Engine<B> {
 
         let capture_result = (|| -> Result<(graph::CudaGraph, graph::CudaGraphExec)> {
             graph::begin_capture(stream_handle)?;
-            let fused_argmax = mtp_fused_argmax_enabled();
+            let fused_argmax = self.mtp_device_argmax_enabled();
             self.prefill_cuda_chunk(2, start_position, start_position_device_i32, false)?;
             self.final_norm_prefill_rows(2)?;
             let verified_token_ptr = self.cuda_forward()?.mtp_verify_token_u32.ptr_at(8)?;
@@ -1604,7 +1646,7 @@ impl<B: KernelBackend> Engine<B> {
         let assume_accept = mtp_assume_accept_enabled();
         let batched_lm_head = mtp_batched_lm_head_enabled();
         let device_chain = assume_accept && mtp_device_chain_enabled();
-        let fused_argmax = mtp_fused_argmax_enabled();
+        let fused_argmax = self.mtp_device_argmax_enabled();
         let device_chain_batch = if device_chain {
             device_chain_batch.max(1)
         } else {
@@ -2752,7 +2794,7 @@ impl<B: KernelBackend> Engine<B> {
 
     #[cfg(feature = "cuda")]
     fn sample_prefill_row_to_host(&self, row: usize) -> Result<u32> {
-        if mtp_fused_argmax_enabled() {
+        if self.mtp_device_argmax_enabled() {
             self.prefill_row_argmax_into(
                 row,
                 self.cuda_forward()?.token_u32.ptr(),
@@ -2819,13 +2861,13 @@ impl<B: KernelBackend> Engine<B> {
             first_mtp_position,
             DevicePtr::NULL,
             first_target_hidden_bf16,
-            !mtp_fused_argmax_enabled(),
+            !self.mtp_device_argmax_enabled(),
         )?;
         let first_out = self
             .cuda_forward()?
             .mtp_verify_token_u32
             .ptr_at(MTP_GRAPH_NEXT_DRAFT_BASE * 4)?;
-        if mtp_fused_argmax_enabled() {
+        if self.mtp_device_argmax_enabled() {
             self.prefill_row_argmax_into(0, first_out, DevicePtr::NULL)?;
         } else {
             self.queue_sample_greedy_into(first_out)?;
@@ -2850,13 +2892,13 @@ impl<B: KernelBackend> Engine<B> {
                 DevicePtr::NULL,
                 self.mtp_prefill_recursion_hidden()?,
                 input_token,
-                !mtp_fused_argmax_enabled(),
+                !self.mtp_device_argmax_enabled(),
             )?;
             let output_token = self
                 .cuda_forward()?
                 .mtp_verify_token_u32
                 .ptr_at(output_slot * 4)?;
-            if mtp_fused_argmax_enabled() {
+            if self.mtp_device_argmax_enabled() {
                 self.prefill_row_argmax_into(0, output_token, DevicePtr::NULL)?;
             } else {
                 self.queue_sample_greedy_into(output_token)?;
@@ -2894,13 +2936,13 @@ impl<B: KernelBackend> Engine<B> {
             start_position,
             DevicePtr::NULL,
             target_hidden_bf16,
-            !mtp_fused_argmax_enabled(),
+            !self.mtp_device_argmax_enabled(),
         )?;
         let first_out = self
             .cuda_forward()?
             .mtp_verify_token_u32
             .ptr_at(MTP_GRAPH_NEXT_DRAFT_BASE * 4)?;
-        if mtp_fused_argmax_enabled() {
+        if self.mtp_device_argmax_enabled() {
             self.prefill_row_argmax_into(shifted_tokens.len() - 1, first_out, DevicePtr::NULL)?;
         } else {
             self.queue_sample_greedy_into(first_out)?;
@@ -2936,13 +2978,13 @@ impl<B: KernelBackend> Engine<B> {
                     DevicePtr::NULL,
                     target_hidden,
                     input_token,
-                    !mtp_fused_argmax_enabled(),
+                    !self.mtp_device_argmax_enabled(),
                 )?;
                 let output_token = self
                     .cuda_forward()?
                     .mtp_verify_token_u32
                     .ptr_at(output_slot * 4)?;
-                if mtp_fused_argmax_enabled() {
+                if self.mtp_device_argmax_enabled() {
                     self.prefill_row_argmax_into(0, output_token, DevicePtr::NULL)?;
                 } else {
                     self.queue_sample_greedy_into(output_token)?;
@@ -3146,9 +3188,9 @@ impl<B: KernelBackend> Engine<B> {
             start_position,
             DevicePtr::NULL,
             self.mtp_prefill_target_hidden()?,
-            !mtp_fused_argmax_enabled(),
+            !self.mtp_device_argmax_enabled(),
         )?;
-        if mtp_fused_argmax_enabled() {
+        if self.mtp_device_argmax_enabled() {
             self.prefill_row_argmax_into(
                 1,
                 self.cuda_forward()?.sampled_token_u32.ptr(),
@@ -3670,9 +3712,9 @@ impl<B: KernelBackend> Engine<B> {
                 start_position,
                 DevicePtr::NULL,
                 normed_ptr,
-                !mtp_fused_argmax_enabled(),
+                !self.mtp_device_argmax_enabled(),
             )?;
-            if mtp_fused_argmax_enabled() {
+            if self.mtp_device_argmax_enabled() {
                 self.prefill_row_argmax_into(
                     0,
                     self.cuda_forward()?.sampled_token_u32.ptr(),
@@ -10342,6 +10384,109 @@ impl<B: KernelBackend> Engine<B> {
         })
     }
 
+    /// True when the MTP greedy-sample sites should take the device-side
+    /// argmax route instead of "BF16 lm_head matvec + sample kernel":
+    /// either the PR#11 fused matvec+argmax opt-in, or margin mode (the
+    /// two-stage exact argmax — FP8 scan + guard + predicated BF16
+    /// rescore — implemented inside `prefill_lm_head_argmax_rows_into`).
+    #[cfg(feature = "cuda")]
+    fn mtp_device_argmax_enabled(&self) -> bool {
+        mtp_fused_argmax_enabled() || self.lm_head_margin.is_some()
+    }
+
+    /// Realized fallback count of the two-stage exact argmax (margin mode):
+    /// number of greedy lm_head rows whose FP8 margin failed the guard and
+    /// were rescored in BF16 since engine init. `None` when margin mode is
+    /// off. Synchronizes the device before reading.
+    #[cfg(feature = "cuda")]
+    pub fn lm_head_margin_fallback_count(&self) -> Result<Option<u32>> {
+        let Some(margin) = &self.lm_head_margin else {
+            return Ok(None);
+        };
+        qwen36_fp4_kernels::cuda_synchronize()?;
+        let mut bytes = [0u8; 4];
+        margin.fallback_count_u32.copy_to_host(&mut bytes)?;
+        Ok(Some(u32::from_ne_bytes(bytes)))
+    }
+
+    /// Two-stage exact argmax over `rows` hidden vectors (margin mode):
+    /// FP8 GEMV into `forward.mtp_logits`, top-2 + margin guard writing
+    /// tokens/flags, then the flag-predicated BF16 matvec+argmax rescore
+    /// (rare). Entirely device-side — no host sync, CUDA-graph-capturable.
+    /// Bit-exact vs the BF16 argmax when eps >= 2*max|dlogit|.
+    #[cfg(feature = "cuda")]
+    fn lm_head_two_stage_argmax_rows(
+        &self,
+        margin: &LmHeadMarginState,
+        input_bf16: DevicePtr,
+        rows: usize,
+        output_token_u32: DevicePtr,
+        mirror_last_output_token_u32: DevicePtr,
+    ) -> Result<()> {
+        // Capacity bound = the mtp_logits buffer rows (the FP8 logits land
+        // there), itself <= the 16-row flags buffer.
+        if rows == 0 || rows > MTP_MAX_DRAFT_TOKENS + 1 {
+            return Err(CoreError::Runtime(format!(
+                "two-stage lm_head argmax expects 1..={} rows, got {rows}",
+                MTP_MAX_DRAFT_TOKENS + 1
+            )));
+        }
+        let logits = self.cuda_forward()?.mtp_logits.ptr();
+        self.backend
+            .lm_head_fp8_gemv(&qwen36_fp4_kernels::LmHeadFp8GemvSpec {
+                rows: margin.store.rows,
+                cols: margin.store.cols,
+                n: rows,
+                weight_e4m3: margin.store.weight_e4m3.ptr(),
+                row_scales_f32: margin.store.row_scales_f32.ptr(),
+                input_bf16,
+                output_bf16: logits,
+            })?;
+        let runtime = self.cuda_runtime()?;
+        let workspace = runtime.workspace.as_ref().ok_or_else(|| {
+            CoreError::Runtime("two-stage lm_head argmax requires CUDA workspace".into())
+        })?;
+        let top2_ws = qwen36_fp4_kernels::lm_head_top2_workspace_bytes(rows);
+        if workspace.bytes() < top2_ws {
+            return Err(CoreError::Runtime(format!(
+                "two-stage lm_head argmax workspace has {} bytes, needs {top2_ws}",
+                workspace.bytes()
+            )));
+        }
+        // The top-2 pair fully consumes the workspace before the rescore's
+        // memset reuses it (same stream, sequential) — sharing is safe.
+        self.backend
+            .lm_head_top2_margin(&qwen36_fp4_kernels::LmHeadTop2MarginSpec {
+                rows,
+                vocab: margin.store.rows,
+                eps: margin.eps,
+                logits_bf16: logits,
+                tokens_u32: output_token_u32,
+                flags_u32: margin.flags_u32.ptr(),
+                mirror_last_token_u32: mirror_last_output_token_u32,
+                fallback_count_u32: margin.fallback_count_u32.ptr(),
+                workspace: workspace.ptr(),
+                workspace_bytes: workspace.bytes(),
+            })?;
+        let manifest = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| CoreError::Runtime("missing weight manifest".to_owned()))?;
+        self.backend
+            .bf16_matvec_argmax_rows(&Bf16MatVecArgmaxRowsSpec {
+                rows,
+                out_features: margin.store.rows,
+                in_features: margin.store.cols,
+                input_bf16,
+                weight_bf16: self.tensor_ptr(self.cuda_weights()?, &manifest.lm_head)?,
+                output_token_u32,
+                mirror_last_output_token_u32,
+                workspace: workspace.ptr(),
+                workspace_bytes: workspace.bytes(),
+                skip_flags_u32: margin.flags_u32.ptr(),
+            })
+    }
+
     #[cfg(feature = "cuda")]
     fn prefill_lm_head_argmax_rows_into(
         &self,
@@ -10350,6 +10495,22 @@ impl<B: KernelBackend> Engine<B> {
         output_token_u32: DevicePtr,
         mirror_last_output_token_u32: DevicePtr,
     ) -> Result<()> {
+        // Bisection knob (debug): QWEN36_LM_HEAD_MARGIN_SCOPE=rows1 keeps the
+        // two-stage route on single-row calls only; batched rows fall through
+        // to the fused BF16 kernel below. Default: all rows.
+        let margin_scope_rows1 = std::env::var("QWEN36_LM_HEAD_MARGIN_SCOPE")
+            .is_ok_and(|scope| scope == "rows1");
+        if let Some(margin) = &self.lm_head_margin {
+            if rows == 1 || !margin_scope_rows1 {
+                return self.lm_head_two_stage_argmax_rows(
+                    margin,
+                    input_bf16,
+                    rows,
+                    output_token_u32,
+                    mirror_last_output_token_u32,
+                );
+            }
+        }
         let manifest = self
             .weights
             .as_ref()
@@ -10383,6 +10544,7 @@ impl<B: KernelBackend> Engine<B> {
                 mirror_last_output_token_u32,
                 workspace: workspace.ptr(),
                 workspace_bytes: workspace.bytes(),
+                skip_flags_u32: DevicePtr::NULL,
             })
     }
 
@@ -11043,44 +11205,74 @@ impl Engine<CudaBackend> {
         // its weight reads). Done before the fused-store builds so the
         // transient (BF16 + e4m3 coexisting) lands at the init-memory low
         // point.
-        let lm_head_fp8 = if cuda_lm_head_fp8_enabled(engine.config.mtp_speculative_tokens)
-            && !engine.config.keep_bf16_lm_head
-            && manifest.lm_head.dtype == qwen36_fp4_core::TensorDtype::Bf16
+        let lm_head_quantizable = manifest.lm_head.dtype == qwen36_fp4_core::TensorDtype::Bf16
             && manifest.lm_head.shape.len() == 2
-            && manifest.lm_head.shape[1] % 4 == 0
-        {
-            let rows = manifest.lm_head.shape[0];
-            let cols = manifest.lm_head.shape[1];
-            let weight_bf16 = gpu_weights
-                .tensor(&manifest.lm_head.name)
-                .ok_or_else(|| {
-                    CoreError::Runtime("lm_head weight missing from GPU store".to_owned())
-                })?
-                .ptr();
-            let weight_e4m3 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(rows * cols)?;
-            let row_scales_f32 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(rows * 4)?;
-            engine
-                .backend
-                .lm_head_fp8_quantize(&qwen36_fp4_kernels::LmHeadFp8QuantizeSpec {
+            && manifest.lm_head.shape[1] % 4 == 0;
+        let quantize_lm_head_fp8 =
+            |engine: &Self, gpu_weights: &GpuWeightStore| -> Result<crate::gpu::LmHeadFp8Store> {
+                let rows = manifest.lm_head.shape[0];
+                let cols = manifest.lm_head.shape[1];
+                let weight_bf16 = gpu_weights
+                    .tensor(&manifest.lm_head.name)
+                    .ok_or_else(|| {
+                        CoreError::Runtime("lm_head weight missing from GPU store".to_owned())
+                    })?
+                    .ptr();
+                let weight_e4m3 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(rows * cols)?;
+                let row_scales_f32 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(rows * 4)?;
+                engine
+                    .backend
+                    .lm_head_fp8_quantize(&qwen36_fp4_kernels::LmHeadFp8QuantizeSpec {
+                        rows,
+                        cols,
+                        weight_bf16,
+                        weight_e4m3: weight_e4m3.ptr(),
+                        row_scales_f32: row_scales_f32.ptr(),
+                    })?;
+                qwen36_fp4_kernels::cuda_synchronize()?;
+                Ok(crate::gpu::LmHeadFp8Store {
+                    weight_e4m3,
+                    row_scales_f32,
                     rows,
                     cols,
-                    weight_bf16,
-                    weight_e4m3: weight_e4m3.ptr(),
-                    row_scales_f32: row_scales_f32.ptr(),
-                })?;
-            qwen36_fp4_kernels::cuda_synchronize()?;
+                })
+            };
+        // Margin mode (two-stage exact argmax) takes precedence at MTP>0:
+        // FP8 store built IN ADDITION to the BF16 weight (which stays — the
+        // predicated rescore and every generic logits consumer need it).
+        let margin_eps = cuda_lm_head_fp8_margin_eps()
+            .filter(|_| engine.config.mtp_speculative_tokens > 0 && lm_head_quantizable);
+        let lm_head_margin = if let Some(eps) = margin_eps {
+            let store = quantize_lm_head_fp8(&engine, &gpu_weights)?;
+            let flags_u32 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(16 * 4)?;
+            let fallback_count_u32 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(4)?;
+            fallback_count_u32.copy_from_host(&0u32.to_ne_bytes())?;
+            eprintln!(
+                "engine: lm_head two-stage exact argmax ON (eps={eps}, FP8 scan + BF16 rescore; +{:.2} GiB FP8 store)",
+                (store.rows * store.cols + store.rows * 4) as f64 / f64::from(1_u32 << 30),
+            );
+            Some(LmHeadMarginState {
+                store,
+                eps,
+                flags_u32,
+                fallback_count_u32,
+            })
+        } else {
+            None
+        };
+        let lm_head_fp8 = if lm_head_margin.is_none()
+            && cuda_lm_head_fp8_enabled(engine.config.mtp_speculative_tokens)
+            && !engine.config.keep_bf16_lm_head
+            && lm_head_quantizable
+        {
+            let store = quantize_lm_head_fp8(&engine, &gpu_weights)?;
             let freed = gpu_weights.remove(&manifest.lm_head.name);
             eprintln!(
                 "engine: lm_head BF16 -> FP8 e4m3 per-row ({:.2} GiB freed, {:.2} GiB resident; QWEN36_LM_HEAD_FP8=0 to disable)",
                 freed as f64 / f64::from(1_u32 << 30),
-                (rows * cols + rows * 4) as f64 / f64::from(1_u32 << 30),
+                (store.rows * store.cols + store.rows * 4) as f64 / f64::from(1_u32 << 30),
             );
-            Some(crate::gpu::LmHeadFp8Store {
-                weight_e4m3,
-                row_scales_f32,
-                rows,
-                cols,
-            })
+            Some(store)
         } else {
             None
         };
@@ -11174,6 +11366,7 @@ impl Engine<CudaBackend> {
         engine.gpu_prefill = Some(gpu_prefill);
         engine.mlp_fused = mlp_fused;
         engine.lm_head_fp8 = lm_head_fp8;
+        engine.lm_head_margin = lm_head_margin;
         engine.linear_attn_in_proj_fused = linear_attn_in_proj_fused;
         Ok(engine)
     }

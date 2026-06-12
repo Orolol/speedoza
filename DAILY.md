@@ -97,6 +97,88 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-12 — lm_head argmax exact à deux étages (scan FP8 + garde de marge + re-score BF16 prédiqué) — WIP : bit-exact @128 (+3.2%), BLOQUÉ à 8K par un bug latent PR #11 dans les sites device-argmax
+
+Levier n°1 de la carte des gaps (12.2 ms/cycle de matvecs lm_head BF16
+séquentiels). Design : à MTP>0, le store FP8 COEXISTE avec le BF16 ; tout
+consommateur greedy passe par GEMV FP8 → top-2 grid-wide + garde
+top1−top2 ≥ ε → re-score BF16 complet PRÉDIQUÉ par flag device (kernel
+PR #11 + skip_flags). Zéro sync host, graph-capturable. Bit-exact par
+construction quand ε ≥ 2·max|Δlogit| — la réponse au kill FP8-compose du
+2026-06-11. Calibration sonde (28 hiddens cibles, 7M logits) : e_max
+0.344, marges médiane 4.67 → ε = 1.0. Opt-in `QWEN36_LM_HEAD_FP8_MARGIN`.
+
+**Mesures (bench MTP=4, fallback OFF, max-new 128) :**
+
+| cellule | base acc | margin acc | base→margin tok/s | fallbacks |
+|---|---|---|---|---|
+| @128 | 0.4772727272727273 | **identique (16 déc.)** | 39.6 → 40.9 (+3.2%) | 187 (~42%) |
+| @128 longmode | 0.4772727272727273 | **identique** | 41.2 → 41.5 | — |
+| @8192 | 0.55 | **0.4114583333333333** ✗ | 39.3 → 31.0 | 206 |
+
+Deux découvertes :
+1. **Taux de fallback ~42%** sur le mix (les marges de la tête MTP sont
+   serrées, comme prédit) — chaque fallback paie FP8 + re-score complet
+   (kernel PR #11, plus lent que cuBLAS) → le gain net @128 est petit.
+   **v2 scopée : re-score top-8 systématique** (gather 8 lignes BF16
+   ~30 µs, garde bf16_best − fp8_8th ≥ e_max, bien plus lâche que
+   top1−top2) → coût plat ~0.74 ms/appel, fallback ~0 → le −7 ms/cycle
+   visé redevient atteignable.
+2. **La divergence @8K n'est PAS le mode marge** : bisection en trois
+   temps — (a) rows1-only reproduit 0.4114583333333333 exactement (le
+   GEMV n=5 hors de cause) ; (b) `QWEN36_MTP_FUSED_ARGMAX=1` SEUL @8K
+   (chemin PR #11 pur, BF16) donne **le même 0.4114583333333333 à 16
+   décimales** ; (c) @128 et @128-longmode bit-exacts. Conclusion : un
+   **bug de câblage latent des sites device-argmax de la PR #11,
+   spécifique à ctx 8192** (jamais benchée qu'à @128), partagé par les
+   deux modes — un site lit une mauvaise ligne/buffer à long contexte.
+   Suspects : les sites eager (2864-2988, 3194, 3718) si le graphe
+   multi-draft est désactivé à 8K, ou la ligne bonus (row=draft_count)
+   du graphe. Prochain instrument : diff de trajectoire de tokens @8K
+   default vs fused, premier cycle divergent → site coupable.
+
+Gates : smoke complet vert, dont DEUX NOUVEAUX gates — top2+marge
+(rows=2, vocab 250K, ε encadrant + re-score prédiqué + mirror) et
+**parité GEMV FP8 batched-vs-single n=5 bit-exacte** (ferme le "N>1
+restant" de l'entrée FP8 du 2026-06-11). Le défaut reste 100% inchangé
+(opt-in env). Knob de bisection : QWEN36_LM_HEAD_MARGIN_SCOPE=rows1.
+
+Files: kernels-cuda/{lm_head_fp8.cu,ops.cu,smoke.cu,include/qwen36_fp4.h},
+crates/kernels/src/{ops,backend,lib}.rs, crates/runtime/src/engine.rs,
+crates/cli/src/main.rs (lm_head_margin_fallbacks), scripts/lmhead_fp8_probe.py
+(bloc margin-gate). Inventory: oui.
+
+### 2026-06-12 — Carte des gaps du cycle verify (nsys, fenêtre 487 ms ≈ 8 cycles MTP=4 @128) — DECISION : les leviers re-classés
+
+Mesure : `nsys profile --cuda-graph-trace=node` sur bench MTP=4 @128
+(cuBLASLt défaut, fallback OFF, 24 tokens), analyse par
+`scripts/nsys_gap_analysis.py` (union des intervalles kernels, gaps,
+buckets). Résultats (par cycle = fenêtre/8) :
+
+- **Idle GPU : 5.4%** du span seulement. Micro-gaps 2-20 µs ≈ 0.5 ms/cycle
+  → le levier "capture graphe du forward verify" est PLAFONNÉ là :
+  déclassé. MAIS 19 gaps ≈ 1 ms chacun = **~1.9 ms/cycle aux frontières
+  de cycle** (bookkeeping host acceptance/seed) — adressable, zéro risque.
+- **Chunk GEMM cutlass : 344 appels × 58.8 µs = 20.2 ms/cycle** vs un
+  plancher octets de ~7.6 ms (12.7 GiB FP4 à 1.79 TB/s) — cuBLASLt comme
+  notre kernel chunk tournent à ~36% BW à N=5. Le M-tiling est mort
+  (entrée suivante) ; le gain réel = kernel classe SMEM-paging (Hazy),
+  chantier multi-jours.
+- **lm_head BF16 : 12.2 ms/cycle (20% du cycle)** — 5 matvecs pleins
+  vocab SÉQUENTIELS (4 récursions de draft + sample final), ~2.5 GB
+  chacun (gemvx 675 µs ×2 kernels), + 2.3 ms le GEMM verify 5 lignes.
+  **Levier identifié : argmax exact à deux étages** — scan FP8 (store
+  LmHeadFp8 existant, octets ÷2) + garde de marge top1−top2 ; marge < ε
+  → re-score BF16 complet (rare). Bit-exact ⇒ contourne le kill
+  FP8-compose du 2026-06-11 par construction. Cible −5-6 ms/cycle.
+  Coût : +1.27 GiB (FP8 en plus du BF16 à MTP>0) — le headroom post
+  levier-1 l'absorbe.
+- Cumulatifs confirmés : deltanet WY 6.0, splitk 2.9, rmsnorm 1.95,
+  sample_argmax 1.24, quantize_rows 448 appels = 1.06, copies 0.6.
+
+Ordre d'attaque : (1) lm_head deux étages, (2) gaps frontière de cycle,
+(3) SMEM-paging GEMM. Files: scripts/nsys_gap_analysis.py (nouveau).
+
 ### 2026-06-12 — M-tiling du chunk GEMV : B stagé une fois par CTA de T tuiles m16 — NEGATIVE (dégradation monotone en T) ; le bucket est borné par la structure de latence, pas par les octets
 
 Hypothèse (issue du re-diagnostic PR #24) : le re-staging de B par CTA m16
