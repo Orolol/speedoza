@@ -97,6 +97,43 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-12 (soir, suite) — DeltaNet verify : hypothese "arrondi bf16 par token" FALSIFIED ; le NEG du short-chunk re-confirme (monotone en ctx) ; pivot vers le fast-path chunked T<=16 bit-exact
+
+Levier 1 du survey vLLM/llama.cpp. Trois resultats :
+
+1. **Re-mesure SEQ_SHORT_CHUNK multi-cellules** (la question loterie) :
+   +0.11 acc @128 / -0.15 @3072 / -0.23 @8192 — degradation MONOTONE en
+   contexte => vraie derive d'etat qui se compose, PAS la loterie de
+   trajectoire. Le verdict 2026-06-11 tenait. (Gain kernel confirme
+   enorme : 31.9 -> 43.5 tok/s @128.)
+2. **Kernel FP32-resident construit et FALSIFIE comme remede** : variante
+   de deltanet_decode (etat du head en FP32 SMEM 128x129 a travers la
+   boucle multi-tokens, arrondi bf16 UNIQUE en epilogue — la cadence du
+   chunked). Smoke : derive d'etat vs chunked (T=40) legacy mean 1.42e-4
+   -> resident 1.22e-4 = **-14% seulement**, pas les ~250x attendus.
+   L'arrondi par token n'est PAS la source dominante : c'est l'ecart
+   ALGORITHMIQUE WY-chunked <-> delta-rule sequentiel (ordres
+   d'operations differents, ~1e-4 fp32 par chunk) qui se compose dans la
+   recurrence. Conclusion structurelle : le verify DOIT utiliser le meme
+   algorithme que le prefill. Le resident reste dans l'arbre : il
+   ameliore strictement le chemin opt-in SEQ_SHORT_CHUNK (drift -14%,
+   meme perf), tokens==1 (graphe decode) intouche, gates smoke
+   legacy/resident-vs-chunked + assertion drift_resident <= drift_legacy.
+3. **Pivot (prochaine attaque)** : fast-path du kernel CHUNKED pour
+   T <= 16 — C=32 est cable dans toutes les phases (forward-sub SERIE de
+   32 lignes, tuiles WMMA [32,32], reductions sur C) ; pour T=5 les
+   lignes paddees sont des zeros exacts => leur travail est sautable en
+   restant BIT-IDENTIQUE (+0.0 IEEE dans les accumulateurs fp32, lignes
+   identite dans le tril-solve). Gate = memcmp vs kernel actuel sur
+   T in {1..8} — pas de gate d'acceptance necessaire, par construction.
+   Cible : bucket 6 ms -> 2-3 ms.
+
+Files: kernels-cuda/deltanet.cu (deltanet_decode_resident_kernel +
+routage tokens>1 + hook qwen36_deltanet_set_resident),
+kernels-cuda/include/qwen36_fp4.h, kernels-cuda/smoke.cu (A/B
+legacy/resident vs chunked + drift). Inventory: oui.
+
+
 ### 2026-06-12 (soir) — Grille rapide ctx~64 : chat/code x base/MTP-4/Eagle3/DFlash — DECISION : routage court-contexte = DFlash, MTP-4 > base sur prompts naturels
 
 Demande utilisateur. Defauts de prod (auto-fallback ON, marge v2 OFF),

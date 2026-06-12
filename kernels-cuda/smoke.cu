@@ -989,6 +989,10 @@ int main() {
     copy_bf16(state_seq, h_state);
     copy_bf16(state_chunk, h_state);
 
+    qwen36_device_ptr_t state_res = dev_alloc<__nv_bfloat16>(state_values);
+    qwen36_device_ptr_t out_res = dev_alloc<__nv_bfloat16>(v_values);
+    copy_bf16(state_res, h_state);
+
     qwen36_deltanet_decode_spec_t seq_spec{};
     seq_spec.tokens_in_persistent_loop = kTokens;
     seq_spec.q_token_stride = kQkHeads * kKeyDim;
@@ -1005,8 +1009,17 @@ int main() {
     seq_spec.state_decay = 1.0f;
     seq_spec.update_scale = 1.0f;
     seq_spec.qk_l2norm = 1;
+    // Legacy generic body (per-token BF16 state rounding), forced.
+    qwen36_deltanet_set_resident(0);
     must_status(qwen36_deltanet_decode(&seq_spec),
                 "deltanet sequential (prefill parity ref)");
+    // FP32-resident multi-token variant, forced, on identical inputs.
+    qwen36_deltanet_set_resident(1);
+    seq_spec.state_bf16 = state_res;
+    seq_spec.output_bf16 = out_res;
+    must_status(qwen36_deltanet_decode(&seq_spec),
+                "deltanet resident (fp32 state)");
+    qwen36_deltanet_set_resident(-1);
 
     qwen36_deltanet_prefill_spec_t chunk_spec{};
     chunk_spec.tokens = kTokens;
@@ -1048,6 +1061,47 @@ int main() {
     gate_cos(read_bf16(state_seq, state_values),
              read_bf16(state_chunk, state_values),
              "deltanet chunked-vs-sequential final state");
+    gate_cos(read_bf16(out_res, v_values), read_bf16(out_chunk, v_values),
+             "deltanet chunked-vs-resident output");
+    gate_cos(read_bf16(state_res, state_values),
+             read_bf16(state_chunk, state_values),
+             "deltanet chunked-vs-resident final state");
+
+    // Design claim of the resident variant: rounding the state once per
+    // call (like the chunked kernel) must leave it CLOSER to the chunked
+    // result than the per-token-rounding legacy body.
+    {
+      const std::vector<float> s_chunk = read_bf16(state_chunk, state_values);
+      const std::vector<float> s_legacy = read_bf16(state_seq, state_values);
+      const std::vector<float> s_resident = read_bf16(state_res, state_values);
+      float max_legacy = 0.0f, max_resident = 0.0f;
+      double sum_legacy = 0.0, sum_resident = 0.0;
+      size_t diff_legacy = 0, diff_resident = 0;
+      for (size_t i = 0; i < state_values; ++i) {
+        const float dl = fabsf(s_legacy[i] - s_chunk[i]);
+        const float dr = fabsf(s_resident[i] - s_chunk[i]);
+        max_legacy = fmaxf(max_legacy, dl);
+        max_resident = fmaxf(max_resident, dr);
+        sum_legacy += dl;
+        sum_resident += dr;
+        diff_legacy += dl != 0.0f;
+        diff_resident += dr != 0.0f;
+      }
+      printf("deltanet state drift vs chunked (T=40): legacy max=%.6f "
+             "mean=%.3e nz=%zu | resident max=%.6f mean=%.3e nz=%zu\n",
+             max_legacy, sum_legacy / state_values, diff_legacy, max_resident,
+             sum_resident / state_values, diff_resident);
+      if (max_resident > max_legacy) {
+        fprintf(stderr,
+                "deltanet resident state drift %.6f exceeds legacy %.6f — "
+                "fp32-resident state must not be WORSE than per-token "
+                "rounding\n",
+                max_resident, max_legacy);
+        exit(1);
+      }
+    }
+    dev_free<__nv_bfloat16>(state_res);
+    dev_free<__nv_bfloat16>(out_res);
 
     dev_free<__nv_bfloat16>(pq);
     dev_free<__nv_bfloat16>(pk);
