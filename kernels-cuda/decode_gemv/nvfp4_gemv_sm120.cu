@@ -63,6 +63,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <cstdlib>
 
 // We deliberately AVOID including <cutlass/...> or <cute/...> here even
 // though that header defines the MMA atom we want. Pulling cute into a
@@ -120,8 +121,10 @@ nvfp4_gemv_mma_kernel_tpl<8>(const uint8_t *, const uint8_t *, const uint8_t *,
                              size_t);
 
 // Multi-N chunk wrapper (2 <= n <= 8): real activation columns in the
-// atom's N dimension. Same launch shape as the N=1 GEMV; the body and the
-// smem helper live in nvfp4_gemv_mma_kernel.cuh.
+// atom's N dimension. M-tiled: each CTA owns `m_tiles_per_cta` consecutive
+// m16 tiles and loops over them with B staged once (the B re-staging is
+// n/16 of the weight bytes at T=1 — +31% at n=5 — divided by T). The body
+// and the smem helper live in nvfp4_gemv_mma_kernel.cuh.
 template <int kWarpsPerBlockTpl>
 __global__ void __launch_bounds__(kWarpsPerBlockTpl * 32)
 nvfp4_gemm_chunk_kernel_tpl(const uint8_t *__restrict__ a_fp4,
@@ -129,19 +132,65 @@ nvfp4_gemm_chunk_kernel_tpl(const uint8_t *__restrict__ a_fp4,
                             const uint8_t *__restrict__ b_fp4,
                             const uint8_t *__restrict__ b_scale, float alpha,
                             __nv_bfloat16 *__restrict__ output, size_t M,
-                            size_t K, unsigned n) {
+                            size_t K, unsigned n, unsigned m_tiles_per_cta) {
+  const unsigned num_tiles =
+      static_cast<unsigned>((M + qwen36_gemv::kRowsPerBlock - 1) /
+                            qwen36_gemv::kRowsPerBlock);
+  const unsigned first = blockIdx.x * m_tiles_per_cta;
+  if (first >= num_tiles) {
+    return;
+  }
+  const unsigned remaining = num_tiles - first;
+  const unsigned count =
+      remaining < m_tiles_per_cta ? remaining : m_tiles_per_cta;
   qwen36_gemv::nvfp4_gemm_chunk_body<kWarpsPerBlockTpl>(
-      blockIdx.x, a_fp4, a_scale, b_fp4, b_scale, alpha, output, M, K, n);
+      first, count, a_fp4, a_scale, b_fp4, b_scale, alpha, output, M, K, n);
 }
 
 template __global__ void
 nvfp4_gemm_chunk_kernel_tpl<16>(const uint8_t *, const uint8_t *,
                                 const uint8_t *, const uint8_t *, float,
-                                __nv_bfloat16 *, size_t, size_t, unsigned);
+                                __nv_bfloat16 *, size_t, size_t, unsigned,
+                                unsigned);
 template __global__ void
 nvfp4_gemm_chunk_kernel_tpl<8>(const uint8_t *, const uint8_t *,
                                const uint8_t *, const uint8_t *, float,
-                               __nv_bfloat16 *, size_t, size_t, unsigned);
+                               __nv_bfloat16 *, size_t, size_t, unsigned,
+                               unsigned);
+
+// M-tiles per CTA for the chunk path. Default 1: the T-sweep on the real
+// model (2026-06-12, MTP=4 ctx=128, bit-identical outputs across T) measured
+// MONOTONE degradation — T1 36.8 tok/s > T4 35.3 > T8 35.1 > shape-adaptive
+// 6/3/1 34.4. Mechanism: each sub-tile pays two serial CTA-wide barriers +
+// a cp.async prologue (~5-8 us) that at T=1 ran concurrently in independent
+// CTAs, while resident warps/SM (and thus memory-level parallelism) don't
+// change with T — so the B re-staging bytes saved (n/16 of weight bytes / T)
+// were not the binding resource. Override for re-exploration:
+// QWEN36_CHUNK_GEMV_MTILE (read once per process; the test hook below lets
+// smoke sweep T without re-exec).
+static int g_chunk_mtile_override = -2;  // -2 = env unread, -1 = default
+
+extern "C" void qwen36_nvfp4_chunk_gemv_set_mtile(int mtile) {
+  g_chunk_mtile_override = mtile >= 1 ? mtile : -2;
+}
+
+static unsigned chunk_gemv_pick_mtile(size_t num_tiles) {
+  if (g_chunk_mtile_override == -2) {
+    int v = -1;
+    if (const char *e = getenv("QWEN36_CHUNK_GEMV_MTILE")) {
+      const int parsed = atoi(e);
+      if (parsed >= 1 && parsed <= 64) {
+        v = parsed;
+      }
+    }
+    g_chunk_mtile_override = v;
+  }
+  if (g_chunk_mtile_override >= 1) {
+    return static_cast<unsigned>(g_chunk_mtile_override);
+  }
+  (void)num_tiles;
+  return 1u;
+}
 
 namespace {
 
@@ -204,6 +253,10 @@ extern "C" int qwen36_decode_nvfp4_gemv(
     if (smem_bytes > kSmemCap) {
       return QWEN36_STATUS_NOT_IMPLEMENTED;
     }
+    const size_t num_tiles = gemv_div_ceil(M, kRowsPerBlock);
+    const unsigned mtile = chunk_gemv_pick_mtile(num_tiles);
+    const dim3 grid_chunk(
+        static_cast<unsigned>(gemv_div_ceil(num_tiles, mtile)), 1, 1);
     if (chosen_warps == 16) {
       static bool attr_set_16 = false;
       if (!attr_set_16) {
@@ -213,12 +266,13 @@ extern "C" int qwen36_decode_nvfp4_gemv(
         attr_set_16 = true;
       }
       const dim3 block(16u * 32u, 1, 1);
-      nvfp4_gemm_chunk_kernel_tpl<16><<<grid, block, smem_bytes, stream>>>(
-          as_device_ptr<const uint8_t>(spec->a_fp4),
-          as_device_ptr<const uint8_t>(spec->a_scale),
-          as_device_ptr<const uint8_t>(spec->b_fp4),
-          as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
-          as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K, n);
+      nvfp4_gemm_chunk_kernel_tpl<16>
+          <<<grid_chunk, block, smem_bytes, stream>>>(
+              as_device_ptr<const uint8_t>(spec->a_fp4),
+              as_device_ptr<const uint8_t>(spec->a_scale),
+              as_device_ptr<const uint8_t>(spec->b_fp4),
+              as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
+              as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K, n, mtile);
     } else {
       static bool attr_set_8 = false;
       if (!attr_set_8) {
@@ -228,12 +282,13 @@ extern "C" int qwen36_decode_nvfp4_gemv(
         attr_set_8 = true;
       }
       const dim3 block(8u * 32u, 1, 1);
-      nvfp4_gemm_chunk_kernel_tpl<8><<<grid, block, smem_bytes, stream>>>(
-          as_device_ptr<const uint8_t>(spec->a_fp4),
-          as_device_ptr<const uint8_t>(spec->a_scale),
-          as_device_ptr<const uint8_t>(spec->b_fp4),
-          as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
-          as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K, n);
+      nvfp4_gemm_chunk_kernel_tpl<8>
+          <<<grid_chunk, block, smem_bytes, stream>>>(
+              as_device_ptr<const uint8_t>(spec->a_fp4),
+              as_device_ptr<const uint8_t>(spec->a_scale),
+              as_device_ptr<const uint8_t>(spec->b_fp4),
+              as_device_ptr<const uint8_t>(spec->b_scale), spec->alpha,
+              as_device_ptr<__nv_bfloat16>(spec->c_bf16), M, K, n, mtile);
     }
     cudaError_t err = cudaGetLastError();
     return err == cudaSuccess ? QWEN36_STATUS_SUCCESS

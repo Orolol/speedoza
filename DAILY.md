@@ -97,6 +97,61 @@ Garde-fous process qui ont fait leurs preuves (à garder) :
 
 ## Journal
 
+### 2026-06-12 — M-tiling du chunk GEMV : B stagé une fois par CTA de T tuiles m16 — NEGATIVE (dégradation monotone en T) ; le bucket est borné par la structure de latence, pas par les octets
+
+Hypothèse (issue du re-diagnostic PR #24) : le re-staging de B par CTA m16
+coûte n/16 des octets poids (+31% à n=5, indépendant de M — CTAs×n×K/2 vs
+tuiles×16×K/2) → T tuiles par CTA divisent ce surcoût par T. Implémenté :
+`nvfp4_gemm_chunk_body` prend (m_tile_first, m_tile_count) et boucle, B et
+adressage SFB stagés une fois, acc/réduction réinitialisés par sous-tuile
+(barrière de garde avant réutilisation) ; entry host avec heuristique
+T = tuiles/(2×SM) cap 8, override `QWEN36_CHUNK_GEMV_MTILE` + hook de test
+`qwen36_nvfp4_chunk_gemv_set_mtile` ; gate smoke élargi en sweep
+T ∈ {1,2,3,4} sur 4 tuiles (boucle pleine, CTA partiel 3+1, CTA unique).
+Parité verte sur les 4 T.
+
+**Mesure (bench MTP=4 @128, corpus, fallback OFF, max-new 128)** — entre
+variantes chunk l'ordre d'accumulation par élément est invariant en T →
+sorties bit-identiques (acc identique à 10 décimales), le delta est du pur
+temps de cycle :
+
+| variante | decode tok/s | cycle (corrigé acc) |
+|---|---:|---:|
+| cuBLASLt (référence) | 41.8 | 69.6 ms |
+| chunk T=1 | **36.8** | 72.4 ms |
+| chunk T=4 | 35.3 | 75.5 ms |
+| chunk T=8 | 35.1 | 75.9 ms |
+| chunk T adaptatif (gate-up 6 / in-proj 3 / reste 1) | 34.4 | 77.4 ms |
+
+Dégradation **monotone en T** ; la variante "shape-adaptive" qui ne tile
+que les 2 gros GEMMs est la pire → +5 ms/cycle sur un sous-bucket
+gate-up+in-proj de ~6-7 ms = ces GEMMs quasi doublés. Mécanisme : chaque
+sous-tuile paie en SÉRIE deux barrières CTA + le prologue cp.async
+(~5-8 µs) qui à T=1 tournaient en PARALLÈLE dans des CTAs indépendants,
+et les warps résidents/SM (donc le parallélisme mémoire) ne changent pas
+avec T — les octets B économisés (~10 µs) n'étaient pas la ressource
+limitante. Conclusion structurelle : le bucket chunk (19.3 ms, ~39% de
+la BW moyenne) est borné par latence/lancements/barrières, PAS par les
+octets. Les leviers restants qui visent juste : moins d'appels (fusion
+q/k/v du chunk, 3→1) et/ou capture graphe du forward de verify (les ~491
+lancements host sont hors graphe).
+
+**Addendum à l'entrée PR #24 (2026-06-12)** : ce bench expose ce que le
+chrono nsys kernel-seul avait raté — le kernel chunk est une perturbation
+des logits de verify (ordre d'accumulation ≠ cuBLASLt) et décale
+l'acceptance de chaîne **0.477 → 0.416** sur cette cellule (encore la
+règle de classe verify-perturbation, cf. lm_head FP8). En E2E le chemin
+chunk est donc NÉGATIF même à cycle égal (−8% tokens/cycle) : le défaut
+opt-in-OFF n'est pas une prudence, c'est le bon réglage.
+
+Verdict : **NEGATIVE**. Le kernel M-tilé reste dans l'arbre avec défaut
+T=1 (= comportement PR #24, mesuré 36.8 ici), env + hook conservés pour
+ré-exploration ; le sweep smoke garde la parité de la boucle.
+Gates : smoke complet vert (dont sweep mtile {1,2,3,4} ×2 K).
+Files: kernels-cuda/decode_gemv/{nvfp4_gemv_mma_kernel.cuh,
+nvfp4_gemv_sm120.cu}, kernels-cuda/include/qwen36_fp4.h,
+kernels-cuda/smoke.cu. Inventory: oui.
+
 ### 2026-06-12 — GEMM chunk N≤8 via l'atome MMA : kernel correct (parité smoke) mais NEUTRE — le puits re-diagnostiqué : overhead par appel × 491 appels, pas cuBLASLt — opt-in, fondation M-tiling
 
 Hypothèse de départ : cuBLASLt à N=5 tourne à ~34% du pic → étendre le
