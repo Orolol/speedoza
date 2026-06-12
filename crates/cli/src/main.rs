@@ -2088,6 +2088,7 @@ fn run_bench_mtp_multi(
             "mtp_rebuilds": rebuilds,
             "mtp_setup_seconds": mtp_setup_seconds,
             "mtp_verify_seconds": mtp_verify_seconds,
+            "lm_head_margin_fallbacks": engine.lm_head_margin_fallback_count()?,
             "cuda_counters_decode": cuda_counters,
         }))?
     );

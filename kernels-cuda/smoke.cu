@@ -165,6 +165,166 @@ int main() {
               argmax_values[0], argmax_values[1], mirror_value);
       exit(1);
     }
+
+    // Predicated rescore (two-stage lm_head argmax stage 2): a non-zero
+    // skip flag must leave the row's token AND the mirror untouched.
+    qwen36_device_ptr_t skip_flags = dev_alloc<uint32_t>(rows);
+    copy_raw<uint32_t>(skip_flags, {1u, 0u});
+    copy_raw<uint32_t>(argmax_output, {77u, 77u});
+    copy_raw<uint32_t>(argmax_mirror, {55u});
+    argmax_spec.skip_flags_u32 = skip_flags;
+    must_status(qwen36_bf16_matvec_argmax_rows(&argmax_spec),
+                "bf16 matvec argmax rows predicated");
+    argmax_values = read_raw<uint32_t>(argmax_output, rows);
+    mirror_value = read_one<uint32_t>(argmax_mirror);
+    if (argmax_values[0] != 77 || argmax_values[1] != 1 || mirror_value != 1) {
+      fprintf(stderr,
+              "predicated argmax rows expected [77 (skipped), 1] mirror=1 "
+              "got [%u, %u] mirror=%u\n",
+              argmax_values[0], argmax_values[1], mirror_value);
+      exit(1);
+    }
+    copy_raw<uint32_t>(skip_flags, {1u, 1u});
+    copy_raw<uint32_t>(argmax_mirror, {55u});
+    must_status(qwen36_bf16_matvec_argmax_rows(&argmax_spec),
+                "bf16 matvec argmax rows all-skipped");
+    mirror_value = read_one<uint32_t>(argmax_mirror);
+    if (mirror_value != 55) {
+      fprintf(stderr,
+              "all-skipped argmax rows must not touch mirror, got %u\n",
+              mirror_value);
+      exit(1);
+    }
+  }
+
+  {
+    // Two-stage lm_head argmax stage 1: grid-wide top-2 + margin guard on
+    // a realistic vocab with planted leaders. Row 0 margin 2.0, row 1
+    // margin 0.25 — eps 1.0 certifies row 0 only; eps 0.1 certifies both.
+    constexpr size_t rows = 2;
+    constexpr size_t vocab = 250000;
+    std::vector<float> logits_host(rows * vocab);
+    for (size_t r = 0; r < rows; ++r) {
+      for (size_t i = 0; i < vocab; ++i) {
+        logits_host[r * vocab + i] =
+            -2.0f + static_cast<float>((r * 911 + i * 37) % 997) / 1000.0f;
+      }
+    }
+    logits_host[0 * vocab + 123456] = 7.0f;
+    logits_host[0 * vocab + 7] = 5.0f;
+    logits_host[1 * vocab + 99] = 3.25f;
+    logits_host[1 * vocab + (vocab - 1)] = 3.0f;
+    qwen36_device_ptr_t top2_logits = dev_alloc<__nv_bfloat16>(rows * vocab);
+    copy_bf16(top2_logits, logits_host);
+    qwen36_device_ptr_t top2_tokens = dev_alloc<uint32_t>(rows);
+    qwen36_device_ptr_t top2_flags = dev_alloc<uint32_t>(rows);
+    qwen36_device_ptr_t top2_mirror = dev_alloc<uint32_t>(1);
+    qwen36_device_ptr_t top2_fallbacks = dev_alloc<uint32_t>(1);
+    copy_raw<uint32_t>(top2_fallbacks, {0u});
+    qwen36_device_ptr_t top2_ws = dev_alloc<uint8_t>(rows * 240 * 16);
+    qwen36_lm_head_top2_margin_spec_t top2_spec{};
+    top2_spec.rows = rows;
+    top2_spec.vocab = vocab;
+    top2_spec.eps = 1.0f;
+    top2_spec.logits_bf16 = top2_logits;
+    top2_spec.tokens_u32 = top2_tokens;
+    top2_spec.flags_u32 = top2_flags;
+    top2_spec.mirror_last_token_u32 = top2_mirror;
+    top2_spec.fallback_count_u32 = top2_fallbacks;
+    top2_spec.workspace = top2_ws;
+    top2_spec.workspace_bytes = rows * 240 * 16;
+    must_status(qwen36_lm_head_top2_margin(&top2_spec), "lm_head top2 margin");
+    std::vector<uint32_t> t = read_raw<uint32_t>(top2_tokens, rows);
+    std::vector<uint32_t> f = read_raw<uint32_t>(top2_flags, rows);
+    uint32_t m = read_one<uint32_t>(top2_mirror);
+    uint32_t fb = read_one<uint32_t>(top2_fallbacks);
+    if (t[0] != 123456 || t[1] != 99 || f[0] != 1 || f[1] != 0 || m != 99 ||
+        fb != 1) {
+      fprintf(stderr,
+              "top2 margin eps=1.0 expected tokens [123456, 99] flags [1, 0] "
+              "mirror=99 fallbacks=1, got [%u, %u] [%u, %u] mirror=%u fb=%u\n",
+              t[0], t[1], f[0], f[1], m, fb);
+      exit(1);
+    }
+    top2_spec.eps = 0.1f;
+    must_status(qwen36_lm_head_top2_margin(&top2_spec),
+                "lm_head top2 margin eps=0.1");
+    f = read_raw<uint32_t>(top2_flags, rows);
+    fb = read_one<uint32_t>(top2_fallbacks);
+    if (f[0] != 1 || f[1] != 1 || fb != 1) {
+      fprintf(stderr,
+              "top2 margin eps=0.1 expected flags [1, 1] fallbacks still 1, "
+              "got [%u, %u] fb=%u\n",
+              f[0], f[1], fb);
+      exit(1);
+    }
+    printf("lm_head two-stage argmax gates passed (top2+margin, predicated "
+           "rescore)\n");
+  }
+
+  {
+    // lm_head FP8 GEMV batched-vs-single parity: column j of the n=5 launch
+    // must equal the n=1 launch on input j. The per-row K-walk is identical
+    // across the N template (only the row blocking changes), so the outputs
+    // must match BIT-EXACTLY — any drift means an indexing bug in the
+    // multi-N row-blocking path (which until now had no gate).
+    constexpr size_t rows = 4096; // mock vocab
+    constexpr size_t cols = 1024;
+    constexpr size_t n = 5;
+    std::vector<float> w_host(rows * cols);
+    for (size_t i = 0; i < w_host.size(); ++i) {
+      w_host[i] = 0.02f * static_cast<float>((i * 131 + 17) % 251) - 2.5f;
+    }
+    std::vector<float> x_host(n * cols);
+    for (size_t i = 0; i < x_host.size(); ++i) {
+      x_host[i] = 0.01f * static_cast<float>((i * 73 + 5) % 199) - 1.0f;
+    }
+    qwen36_device_ptr_t w_bf16 = dev_alloc<__nv_bfloat16>(rows * cols);
+    copy_bf16(w_bf16, w_host);
+    qwen36_device_ptr_t w_e4m3 = dev_alloc<uint8_t>(rows * cols);
+    qwen36_device_ptr_t w_scales = dev_alloc<float>(rows);
+    qwen36_lm_head_fp8_quantize_spec_t q{};
+    q.rows = rows;
+    q.cols = cols;
+    q.weight_bf16 = w_bf16;
+    q.weight_e4m3 = w_e4m3;
+    q.row_scales_f32 = w_scales;
+    must_status(qwen36_lm_head_fp8_quantize(&q), "lm_head fp8 quantize");
+
+    qwen36_device_ptr_t x_dev = dev_alloc<__nv_bfloat16>(n * cols);
+    copy_bf16(x_dev, x_host);
+    qwen36_device_ptr_t y_batch = dev_alloc<__nv_bfloat16>(n * rows);
+    qwen36_device_ptr_t y_single = dev_alloc<__nv_bfloat16>(rows);
+    qwen36_lm_head_fp8_gemv_spec_t g{};
+    g.rows = rows;
+    g.cols = cols;
+    g.n = n;
+    g.weight_e4m3 = w_e4m3;
+    g.row_scales_f32 = w_scales;
+    g.input_bf16 = x_dev;
+    g.output_bf16 = y_batch;
+    must_status(qwen36_lm_head_fp8_gemv(&g), "lm_head fp8 gemv n=5");
+    std::vector<float> yb = read_bf16(y_batch, n * rows);
+    for (size_t j = 0; j < n; ++j) {
+      qwen36_lm_head_fp8_gemv_spec_t g1 = g;
+      g1.n = 1;
+      g1.input_bf16.ptr = x_dev.ptr + j * cols * 2;
+      g1.output_bf16 = y_single;
+      must_status(qwen36_lm_head_fp8_gemv(&g1), "lm_head fp8 gemv n=1");
+      std::vector<float> ys = read_bf16(y_single, rows);
+      for (size_t r = 0; r < rows; ++r) {
+        // Output layout: [n, rows] row-major per the spec comment.
+        const float batched = yb[j * rows + r];
+        if (batched != ys[r]) {
+          fprintf(stderr,
+                  "lm_head fp8 gemv n=5 vs n=1 mismatch at input %zu row %zu: "
+                  "batch=%f single=%f\n",
+                  j, r, batched, ys[r]);
+          exit(1);
+        }
+      }
+    }
+    printf("lm_head fp8 gemv batched-vs-single parity gate passed (n=5)\n");
   }
 
   qwen36_device_ptr_t interpreter_instructions =

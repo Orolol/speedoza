@@ -137,6 +137,29 @@ def main():
 
     print("\ngate: top1_flips must be 0 for the FP8 lm_head lane to open.")
 
+    # --- Margin-gate analysis (2026-06-12, two-stage exact argmax) --------
+    # Design: FP8 scan + top1-top2 margin guard; margin < eps falls back to
+    # a full BF16 rescore. Exactness condition: if every |dlogit| <= e_max,
+    # then fp8_margin >= 2*e_max implies fp8 top-1 == ref top-1 (each logit
+    # moved by at most e_max, so no contender can overtake). Report the
+    # fallback rate at candidate eps and verify zero flips survive outside
+    # the fallback zone for the per-row variant (the shipped kernel layout).
+    L = logits["per-row"]
+    e_max = float(np.abs(L - ref).max())
+    p2 = np.partition(L, -2, axis=1)
+    m_fp8 = p2[:, -1] - p2[:, -2]
+    top1_fp8 = L.argmax(axis=1)
+    print(f"\nmargin-gate (per-row): e_max={e_max:.4f}  "
+          f"fp8 margin: median={np.median(m_fp8):.3f} "
+          f"p10={np.percentile(m_fp8, 10):.3f} min={m_fp8.min():.3f}")
+    for mult in (1.0, 1.5, 2.0, 3.0, 4.0):
+        eps = mult * e_max
+        fb = m_fp8 < eps
+        flips_outside = int(((top1_fp8 != ref_top1) & ~fb).sum())
+        print(f"  eps={eps:.4f} ({mult:.1f}x e_max): fallback "
+              f"{int(fb.sum())}/{n} ({100*fb.mean():.1f}%)  "
+              f"flips outside fallback={flips_outside} (must be 0)")
+
 
 if __name__ == "__main__":
     main()

@@ -200,6 +200,141 @@ __global__ void lm_head_fp8_gemv_kernel(const uint8_t *__restrict__ weight,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Two-stage exact argmax, stage 1: per-row top-2 + margin verdict over the
+// FP8-path logits. Two passes so the scan is grid-wide (the historical
+// sample_argmax runs ONE block over the whole vocab — ~170 us for a 0.5 MB
+// read; this pair lands ~10-15 us).
+//
+// top-2 merge discipline: every thread tracks ITS OWN top-2 (a block top-2
+// built from per-thread top-1s would be wrong — the two global leaders can
+// land in the same thread's stride). Merging two top-2 pairs keeps the
+// best (v, i) and the better of the two seconds. Ties break toward the
+// smaller index for determinism; exactness never rests on ties (a tie
+// means margin 0 -> stage 2 rescores in BF16 anyway).
+
+struct Top2 {
+  float v1;
+  float v2;
+  uint32_t i1;
+};
+
+__device__ inline void top2_consider(Top2 &t, float v, uint32_t i) {
+  if (v > t.v1 || (v == t.v1 && i < t.i1)) {
+    t.v2 = t.v1;
+    t.v1 = v;
+    t.i1 = i;
+  } else if (v > t.v2) {
+    t.v2 = v;
+  }
+}
+
+__device__ inline void top2_merge(Top2 &t, const Top2 &o) {
+  if (o.v1 > t.v1 || (o.v1 == t.v1 && o.i1 < t.i1)) {
+    t.v2 = fmaxf(t.v1, o.v2);
+    t.v1 = o.v1;
+    t.i1 = o.i1;
+  } else {
+    t.v2 = fmaxf(t.v2, o.v1);
+  }
+}
+
+constexpr int kTop2Threads = 256;
+constexpr int kTop2Blocks = QWEN36_LM_HEAD_TOP2_BLOCKS;
+
+// Workspace entry layout: 16 bytes per (row, block).
+struct Top2WsEntry {
+  float v1;
+  float v2;
+  uint32_t i1;
+  uint32_t pad;
+};
+
+__device__ inline Top2 top2_block_reduce(Top2 mine, Top2 *warp_smem) {
+  const unsigned lane = threadIdx.x & 31;
+  const unsigned warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    Top2 other;
+    other.v1 = __shfl_down_sync(0xffffffffu, mine.v1, offset);
+    other.v2 = __shfl_down_sync(0xffffffffu, mine.v2, offset);
+    other.i1 = __shfl_down_sync(0xffffffffu, mine.i1, offset);
+    top2_merge(mine, other);
+  }
+  if (lane == 0) {
+    warp_smem[warp] = mine;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    const unsigned n_warps = (blockDim.x + 31) >> 5;
+    mine = lane < n_warps
+               ? warp_smem[lane]
+               : Top2{-INFINITY, -INFINITY, 0xffffffffu};
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      Top2 other;
+      other.v1 = __shfl_down_sync(0xffffffffu, mine.v1, offset);
+      other.v2 = __shfl_down_sync(0xffffffffu, mine.v2, offset);
+      other.i1 = __shfl_down_sync(0xffffffffu, mine.i1, offset);
+      top2_merge(mine, other);
+    }
+  }
+  return mine;
+}
+
+__global__ void __launch_bounds__(kTop2Threads)
+lm_head_top2_pass1_kernel(const __nv_bfloat16 *__restrict__ logits,
+                          Top2WsEntry *__restrict__ ws, size_t rows,
+                          size_t vocab) {
+  __shared__ Top2 warp_smem[kTop2Threads / 32];
+  const size_t row = blockIdx.y;
+  if (row >= rows) {
+    return;
+  }
+  const __nv_bfloat16 *row_logits = logits + row * vocab;
+  Top2 mine{-INFINITY, -INFINITY, 0xffffffffu};
+  for (size_t i = static_cast<size_t>(blockIdx.x) * kTop2Threads + threadIdx.x;
+       i < vocab; i += static_cast<size_t>(gridDim.x) * kTop2Threads) {
+    top2_consider(mine, __bfloat162float(row_logits[i]),
+                  static_cast<uint32_t>(i));
+  }
+  mine = top2_block_reduce(mine, warp_smem);
+  if (threadIdx.x == 0) {
+    ws[row * gridDim.x + blockIdx.x] = Top2WsEntry{mine.v1, mine.v2, mine.i1, 0u};
+  }
+}
+
+__global__ void __launch_bounds__(kTop2Threads)
+lm_head_top2_pass2_kernel(const Top2WsEntry *__restrict__ ws,
+                          uint32_t *__restrict__ tokens,
+                          uint32_t *__restrict__ flags,
+                          uint32_t *__restrict__ mirror_last,
+                          uint32_t *__restrict__ fallback_count, size_t rows,
+                          unsigned blocks_per_row, float eps) {
+  __shared__ Top2 warp_smem[kTop2Threads / 32];
+  const size_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  Top2 mine{-INFINITY, -INFINITY, 0xffffffffu};
+  for (unsigned b = threadIdx.x; b < blocks_per_row; b += kTop2Threads) {
+    const Top2WsEntry e = ws[row * blocks_per_row + b];
+    top2_merge(mine, Top2{e.v1, e.v2, e.i1});
+  }
+  mine = top2_block_reduce(mine, warp_smem);
+  if (threadIdx.x == 0) {
+    const bool guard_ok = (mine.v1 - mine.v2) >= eps;
+    tokens[row] = mine.i1;
+    flags[row] = guard_ok ? 1u : 0u;
+    if (mirror_last != nullptr && row + 1 == rows) {
+      *mirror_last = mine.i1;
+    }
+    if (!guard_ok && fallback_count != nullptr) {
+      atomicAdd(fallback_count, 1u);
+    }
+  }
+}
+
 template <int N>
 void launch_lm_head_fp8_gemv(const qwen36_lm_head_fp8_gemv_spec_t *spec) {
   constexpr int rows_per_cta = lm_head_fp8_rows_per_warp<N>() * kGemvWarpsPerCta;
@@ -228,6 +363,36 @@ qwen36_lm_head_fp8_quantize(const qwen36_lm_head_fp8_quantize_spec_t *spec) {
       ptr<const __nv_bfloat16>(spec->weight_bf16),
       ptr<uint8_t>(spec->weight_e4m3), ptr<float>(spec->row_scales_f32),
       spec->rows, spec->cols);
+  return cudaGetLastError() == cudaSuccess ? QWEN36_STATUS_SUCCESS
+                                           : QWEN36_STATUS_CUDA_ERROR;
+}
+
+extern "C" int
+qwen36_lm_head_top2_margin(const qwen36_lm_head_top2_margin_spec_t *spec) {
+  if (spec == nullptr || spec->rows == 0 || spec->vocab == 0 ||
+      spec->logits_bf16.ptr == 0 || spec->tokens_u32.ptr == 0 ||
+      spec->flags_u32.ptr == 0 || spec->workspace.ptr == 0) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  const size_t ws_needed = spec->rows * kTop2Blocks * sizeof(Top2WsEntry);
+  if (spec->workspace_bytes < ws_needed) {
+    return QWEN36_STATUS_INVALID_ARGUMENT;
+  }
+  cudaStream_t stream = qwen36_internal_active_stream();
+  const dim3 grid1(kTop2Blocks, static_cast<unsigned>(spec->rows));
+  lm_head_top2_pass1_kernel<<<grid1, kTop2Threads, 0, stream>>>(
+      ptr<const __nv_bfloat16>(spec->logits_bf16),
+      ptr<Top2WsEntry>(spec->workspace), spec->rows, spec->vocab);
+  if (cudaGetLastError() != cudaSuccess) {
+    return QWEN36_STATUS_CUDA_ERROR;
+  }
+  lm_head_top2_pass2_kernel<<<static_cast<unsigned>(spec->rows), kTop2Threads,
+                              0, stream>>>(
+      ptr<const Top2WsEntry>(spec->workspace), ptr<uint32_t>(spec->tokens_u32),
+      ptr<uint32_t>(spec->flags_u32),
+      ptr<uint32_t>(spec->mirror_last_token_u32),
+      ptr<uint32_t>(spec->fallback_count_u32), spec->rows, kTop2Blocks,
+      spec->eps);
   return cudaGetLastError() == cudaSuccess ? QWEN36_STATUS_SUCCESS
                                            : QWEN36_STATUS_CUDA_ERROR;
 }

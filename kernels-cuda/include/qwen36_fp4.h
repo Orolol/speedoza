@@ -391,7 +391,40 @@ typedef struct {
   qwen36_device_ptr_t mirror_last_output_token_u32;
   qwen36_device_ptr_t workspace;
   size_t workspace_bytes;
+  /* Optional [rows] u32 device flags: a non-zero flag SKIPS that row (its
+   * matvec grid exits immediately and finalize leaves output/mirror
+   * untouched). NULL (ptr 0) processes every row — the historical
+   * behavior. Used as the predicated BF16 rescore of the two-stage exact
+   * lm_head argmax (flags come from qwen36_lm_head_top2_margin). */
+  qwen36_device_ptr_t skip_flags_u32;
 } qwen36_bf16_matvec_argmax_rows_spec_t;
+
+/* Two-stage exact lm_head argmax, stage 1 verdict: per-row top-2 over the
+ * FP8-path logits [rows, vocab] (row-major BF16). Writes per row:
+ *   tokens_u32[row]  = FP8 argmax token (unconditionally; stage 2
+ *                      overwrites it only when the guard fails)
+ *   flags_u32[row]   = 1 when margin top1-top2 >= eps (FP8 argmax provably
+ *                      equals the BF16 argmax when eps >= 2*max|dlogit|),
+ *                      0 when stage 2 must rescore the row in BF16.
+ * Optional mirror gets the LAST row's token (same contract as the argmax
+ * rows finalize). fallback_count_u32 (optional) is atomically incremented
+ * by the number of rows whose guard failed — a cheap device counter the
+ * bench reads to report the measured fallback rate.
+ * Workspace: rows * QWEN36_LM_HEAD_TOP2_BLOCKS * 16 bytes. */
+#define QWEN36_LM_HEAD_TOP2_BLOCKS 240
+
+typedef struct {
+  size_t rows;
+  size_t vocab;
+  float eps;
+  qwen36_device_ptr_t logits_bf16;
+  qwen36_device_ptr_t tokens_u32;
+  qwen36_device_ptr_t flags_u32;
+  qwen36_device_ptr_t mirror_last_token_u32;
+  qwen36_device_ptr_t fallback_count_u32;
+  qwen36_device_ptr_t workspace;
+  size_t workspace_bytes;
+} qwen36_lm_head_top2_margin_spec_t;
 
 typedef struct {
   size_t out_features;
@@ -650,6 +683,7 @@ int qwen36_bf16_matvec_argmax_rows(
     const qwen36_bf16_matvec_argmax_rows_spec_t *spec);
 int qwen36_lm_head_fp8_quantize(const qwen36_lm_head_fp8_quantize_spec_t *spec);
 int qwen36_lm_head_fp8_gemv(const qwen36_lm_head_fp8_gemv_spec_t *spec);
+int qwen36_lm_head_top2_margin(const qwen36_lm_head_top2_margin_spec_t *spec);
 int qwen36_nvfp4_matvec(const qwen36_nvfp4_matvec_spec_t *spec);
 int qwen36_nvfp4_quantize_bf16(const qwen36_nvfp4_quantize_spec_t *spec);
 int qwen36_nvfp4_quantize_rows(const qwen36_nvfp4_quantize_rows_spec_t *spec);
