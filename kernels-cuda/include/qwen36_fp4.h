@@ -672,6 +672,11 @@ int qwen36_attention_prefill(const qwen36_attention_prefill_spec_t *spec);
 int qwen36_attention_flash_prefill(const qwen36_attention_prefill_spec_t *spec);
 int qwen36_attention_sage_prefill(const qwen36_attention_prefill_spec_t *spec);
 int qwen36_deltanet_decode(const qwen36_deltanet_decode_spec_t *spec);
+/* Test/bench hook for the FP32-resident multi-token DeltaNet path:
+ * 1 forces it ON, 0 forces it OFF (generic per-token body), any other
+ * value restores the default (resident when eligible: gated, tokens > 1,
+ * key_dim = value_dim = 128; env kill: QWEN36_DELTANET_RESIDENT=0). */
+void qwen36_deltanet_set_resident(int mode);
 int qwen36_deltanet_prefill(const qwen36_deltanet_prefill_spec_t *spec);
 int qwen36_attention_decode(const qwen36_attention_decode_spec_t *spec);
 
