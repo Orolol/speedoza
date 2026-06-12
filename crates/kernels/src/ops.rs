@@ -40,9 +40,9 @@ pub struct Bf16MatVecArgmaxRowsSpec {
 
 /// Stage-1 verdict of the two-stage exact lm_head argmax: per-row top-2 +
 /// margin guard over the FP8-path logits. Tokens are written
-/// unconditionally; `flags_u32[row] = 1` certifies the FP8 argmax (margin
-/// >= eps), 0 sends the row to the predicated BF16 rescore. Workspace:
-/// `rows * 240 * 16` bytes.
+/// unconditionally; `flags_u32[row] = 1` certifies the FP8 argmax when the
+/// margin is at least `eps`, while 0 sends the row to the predicated BF16
+/// rescore. Workspace uses `rows * 240 * 16` bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LmHeadTop2MarginSpec {
     pub rows: usize,

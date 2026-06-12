@@ -823,6 +823,7 @@ pub struct Engine<B: KernelBackend = NoCudaBackend> {
     /// holds for the shipped Qwen3.6 NVFP4 checkpoint.
     #[cfg(feature = "cuda")]
     pub mlp_fused: Option<MlpFusedStore>,
+    #[cfg(feature = "cuda")]
     pub lm_head_fp8: Option<crate::gpu::LmHeadFp8Store>,
     /// Two-stage exact lm_head argmax state (margin mode). Distinct from
     /// `lm_head_fp8` on purpose: that field means "the BF16 weight is GONE,
@@ -1045,6 +1046,7 @@ impl<B: KernelBackend> Engine<B> {
             gpu_prefill: None,
             #[cfg(feature = "cuda")]
             mlp_fused: None,
+            #[cfg(feature = "cuda")]
             lm_head_fp8: None,
             #[cfg(feature = "cuda")]
             lm_head_margin: None,
@@ -1281,6 +1283,7 @@ impl<B: KernelBackend> Engine<B> {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub fn read_sampled_token(&self) -> Result<u32> {
         self.synchronize_active_stream_for_host_read()?;
         let mut token = [0_u8; 4];
@@ -10258,6 +10261,7 @@ impl<B: KernelBackend> Engine<B> {
         self.bf16_matvec(&manifest.lm_head, input, output)
     }
 
+    #[cfg(feature = "cuda")]
     /// Batched lm_head logits: input [rows, hidden] row-major, output
     /// [rows, vocab] row-major. The FP8 kernel caps one launch at
     /// QWEN36_LM_HEAD_FP8_MAX_N rows; larger batches (DFlash verify blocks
@@ -10289,6 +10293,7 @@ impl<B: KernelBackend> Engine<B> {
         self.bf16_gemm_rows(&manifest.lm_head, input, output, rows)
     }
 
+    #[cfg(feature = "cuda")]
     fn bf16_matvec(&self, weight: &TensorInfo, input: DevicePtr, output: DevicePtr) -> Result<()> {
         let out_features = *weight
             .shape
@@ -10466,8 +10471,8 @@ impl<B: KernelBackend> Engine<B> {
         // rows) stays reachable via QWEN36_LM_HEAD_MARGIN_SCOPE=top2 for
         // A/Bs. Either stage-1 fully consumes the workspace before the
         // predicated rescore's memset reuses it (same stream, sequential).
-        let use_top2 = std::env::var("QWEN36_LM_HEAD_MARGIN_SCOPE")
-            .is_ok_and(|scope| scope == "top2");
+        let use_top2 =
+            std::env::var("QWEN36_LM_HEAD_MARGIN_SCOPE").is_ok_and(|scope| scope == "top2");
         if use_top2 {
             self.backend
                 .lm_head_top2_margin(&qwen36_fp4_kernels::LmHeadTop2MarginSpec {
@@ -10526,8 +10531,8 @@ impl<B: KernelBackend> Engine<B> {
         // Bisection knob (debug): QWEN36_LM_HEAD_MARGIN_SCOPE=rows1 keeps the
         // two-stage route on single-row calls only; batched rows fall through
         // to the fused BF16 kernel below. Default: all rows.
-        let margin_scope_rows1 = std::env::var("QWEN36_LM_HEAD_MARGIN_SCOPE")
-            .is_ok_and(|scope| scope == "rows1");
+        let margin_scope_rows1 =
+            std::env::var("QWEN36_LM_HEAD_MARGIN_SCOPE").is_ok_and(|scope| scope == "rows1");
         if let Some(margin) = &self.lm_head_margin {
             if rows == 1 || !margin_scope_rows1 {
                 return self.lm_head_two_stage_argmax_rows(
@@ -11248,15 +11253,15 @@ impl Engine<CudaBackend> {
                     .ptr();
                 let weight_e4m3 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(rows * cols)?;
                 let row_scales_f32 = qwen36_fp4_kernels::CudaDeviceBuffer::alloc(rows * 4)?;
-                engine
-                    .backend
-                    .lm_head_fp8_quantize(&qwen36_fp4_kernels::LmHeadFp8QuantizeSpec {
+                engine.backend.lm_head_fp8_quantize(
+                    &qwen36_fp4_kernels::LmHeadFp8QuantizeSpec {
                         rows,
                         cols,
                         weight_bf16,
                         weight_e4m3: weight_e4m3.ptr(),
                         row_scales_f32: row_scales_f32.ptr(),
-                    })?;
+                    },
+                )?;
                 qwen36_fp4_kernels::cuda_synchronize()?;
                 Ok(crate::gpu::LmHeadFp8Store {
                     weight_e4m3,

@@ -21,13 +21,14 @@ qwen36 chat  --model-dir <m> --prompt "<text>" --max-new-tokens 256 [--mtp-specu
 qwen36 bench --model-dir <m> --prompt-tokens N --max-new-tokens M [--prompt-file <f>] [--mtp-speculative-tokens 0..4]
 ```
 
-Three production decode modes, in order of typical throughput:
+Production decode modes, in order of typical throughput:
 
 | Mode | Activation | Status |
 |---|---|---|
 | Base decode (MTP=0) | default | captured CUDA graph, ~50 tok/s, near-flat to 24K ctx |
 | Chain MTP 1–4 | `--mtp-speculative-tokens N` | ~2.3× at MTP=4 full-accept; interpreter auto-enables |
 | DFlash speculative | `--drafter dflash --drafter-dir <d>` + `QWEN36_LONG_CONTEXT_MODE=1` | 1.8× geo-mean vs MTP=3, up to 3.8× on code; loses >5K-token prompts with short gen |
+| EAGLE3 speculative | `--drafter eagle3 --drafter-dir <d>` | experimental chain path with llama.cpp-style `draft_n=8` / `p_min=0.5` defaults; validates `LlamaForCausalLMEagle3` checkpoints and uses target hidden-state capture + batched verify |
 
 Everything else in the repo is support (loading, validation, parity, profiling) or
 archived experiments.
@@ -63,6 +64,7 @@ activated by flag/env. **NEG** = built, benchmarked negative/neutral, kept in tr
 | Component | Activation | Files | Notes |
 |---|---|---|---|
 | DFlash drafter (block-diffusion speculative decoding) | `chat --drafter dflash --drafter-dir <d>`, requires `QWEN36_LONG_CONTEXT_MODE=1` (VRAM) | `crates/drafter/*`, `kernels-cuda/drafter_attention.cu` | z-lab 2B BF16 drafter; verify goes through prefill chunks (split-K kernel). AL is content-sensitive, not length-sensitive (eval battery: `scripts/drafter_al_eval.sh`, geomean baseline 5.10) |
+| EAGLE3 drafter | `validate-eagle3-drafter`, `eagle3-load`, `chat --drafter eagle3 --drafter-dir <d>` | `crates/drafter/src/eagle3*.rs`, CLI | Supports Qwen3.6-style `LlamaForCausalLMEagle3` BF16 checkpoints, including compressed `d2t` draft vocab precomputed to target ids. Runtime is greedy chain with optional top-1 confidence cutoff (`QWEN36_EAGLE3_P_MIN`, default 0.5) and reuses the DFlash hidden-capture hook + batched verify. Current main drops unfused target weights before drafter upload, so short-context runs no longer require `QWEN36_LONG_CONTEXT_MODE=1`. |
 | TurboQuant 3/3.5 KV cache | `QWEN36_KV_CACHE_DTYPE=tq3|tq35` | `kernels-cuda/turboquant.cu` | int-quantized KV; TQ dtypes exclude flash/sage/tiled kernels (scalar paths only) |
 | Tree-MTP (K>1 leaves) | `--mtp-tree-leaves K` | `crates/mtp`, engine, top-K kernel, tree-mask attention | **functional but 2.7–4× SLOWER than chain** (leaves go through single-token forwards). Phase-2 (batched leaf forward) never built. Default K=1 = chain. |
 | GQA tiled prefill (2/4-token tiles) | `QWEN36_PREFILL_GQA_TILE2=1` / `QWEN36_PREFILL_GQA_TILE_TOKENS=2\|4` | `attention.cu` | experimental first step toward tiled prefill; superseded in practice by flash/sage |
@@ -143,9 +145,9 @@ not in Rust — grep there, not in `engine.rs`, when wondering which kernel runs
 
 **Drafter attention** (`drafter_attention.cu`): naive v1 by default; FA-tiled variant opt-in (negative, §2.3).
 
-## 4. Environment variable reference (complete, 88 vars)
+## 4. Environment variable reference (complete, 90 vars)
 
-Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
+Defaults verified in code 2026-06-12. "bool" vars accept `1/true/yes/on`.
 
 ### 4.1 Kernel-path toggles (read in CUDA code via `getenv`)
 
@@ -229,6 +231,8 @@ Defaults verified in code 2026-06-10. "bool" vars accept `1/true/yes/on`.
 |---|---|---|
 | `QWEN36_DRAFTER_SWA_WINDOW` | checkpoint (2048) | override sliding window — **proven dead lever** |
 | `QWEN36_DRAFTER_SWA_ALL` | 0 | apply window to the full-attention layer too |
+| `QWEN36_EAGLE3_DRAFT_TOKENS` | 8 | number of EAGLE3 chain draft tokens proposed per speculative iteration |
+| `QWEN36_EAGLE3_P_MIN` | 0.5 | minimum EAGLE3 top-1 softmax confidence to keep extending a draft chain; `0` restores the previous no-cutoff fast path |
 
 ### 4.8 Debug / profiling / parity
 
